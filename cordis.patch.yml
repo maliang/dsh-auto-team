@@ -1,0 +1,11 @@
+# dsh-auto-team bundle patch（宿主面加载行）
+#
+# 注意 1：新增行必须写在 `insert:` 块里——顶层 `- id:` 是「替换现有行」语义，
+#   找不到目标行会被 loader 静默跳过（只有 warn: patch entry not found）。
+# 注意 2：name 必须是包根名 'dsh-auto-team'（= exports["."]），
+#   写成 'dsh-auto-team/host' 这类子路径时 clientModules 按 entry 名解析
+#   <pkg>/package.json 会失败 → 被判定为「无 dsh.client 声明」而跳过扫描，
+#   浏览器端面板永远不会出现（AC-1 / AC-3 的判定点）。
+- insert:
+    - id: auto-team-host
+      name: 'dsh-auto-team'

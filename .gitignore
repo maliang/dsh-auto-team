@@ -1,2 +1,15 @@
 # TeamFlow 运行日志（插件自有产物，非交付物；host 提交时另有 pathspec 强制排除）
 logs/teamflow/
+
+# 依赖与构建中间产物
+node_modules/
+*.tsbuildinfo
+coverage/
+dist/
+.DS_Store
+
+# 运行时状态与本机记忆副本（项目记忆入库策略见 ARCHITECTURE §7 待澄清项）
+.auto-team/
+
+# 明确不忽略 lib/：lib/index.js 与 lib/client.js 是分发与 `pnpm add file:` 的安装源
+# （AC-4 / AC-7），必须入库。

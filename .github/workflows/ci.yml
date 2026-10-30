@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          # engines.node >= 22.18：node:test 直接跑 .ts 依赖原生类型擦除
+          node-version: '22.18'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile=false
+      - name: 类型检查
+        run: pnpm typecheck
+      - name: 单测（node --test，纯逻辑模块）
+        run: pnpm test
+      - name: 双产物构建
+        run: pnpm build
+      - name: 产物自检（AC-7 / AC-8：两条产物都必须能被 node 加载）
+        run: |
+          node --input-type=module -e "await import('./lib/index.js')"
+          node --input-type=module -e "await import('./lib/client.js')"
+      - name: 打包内容自检（AC-4：lib 与 cordis.patch.yml 必须在 files 里）
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack.txt
+          grep -q 'lib/index.js' /tmp/pack.txt
+          grep -q 'lib/client.js' /tmp/pack.txt
+          grep -q 'cordis.patch.yml' /tmp/pack.txt

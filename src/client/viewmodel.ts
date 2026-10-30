@@ -1,0 +1,435 @@
+/**
+ * 面板的**纯视图模型**：没有 JSX、没有 React、没有 IO。
+ *
+ * 存在的理由（TECHNICAL §6 / DESIGN §0.4）：AC-18 的「成员已死但面板还显示运行中」、
+ * AC-22 的「逐角色模型逐字展示 + 未下发标注」这些**可核验文本**原先长在带 JSX 的组件里，
+ * 只能靠 QA 眼看。抽到这里之后 `node --test` 就能直接断言文案与状态映射。
+ *
+ * 纪律：
+ *  1. 单向流动 —— viewmodel 出文案，组件只渲染。组件里**禁止**再写一份状态→文案的映射表
+ *     （同一状态两处文案必然漂移，是本项目的历史 bug 族）。
+ *  2. 数据只读不造 —— 缺字段一律给保守默认值（见 viewExtras），绝不用 `!` 强断。
+ *  3. 纯函数 —— 同样的输入永远同样的输出，时间由调用方传入（便于单测固定）。
+ */
+import type {
+  MemberStatus,
+  MemberView,
+  PanelAction,
+  PanelSnapshot,
+  PlanTask,
+  RoleModelRoute,
+  TaskStatus,
+} from '../shared/types.ts'
+
+/** dock 胶囊的 5 种 tone（DESIGN §2：关/待派发=idle，计划就绪=plan，在跑=run，失败=fail，全绿=done）。 */
+export type CapsuleTone = 'idle' | 'run' | 'plan' | 'done' | 'fail'
+
+export interface Capsule {
+  tone: CapsuleTone
+  text: string
+}
+
+/** 徽标的语义 tone（styles.ts 的 [data-tone] 选择器据此上色）。 */
+export type BadgeTone = 'business' | 'neutral' | 'warn' | 'danger' | 'success'
+
+/** 「图标 + 文字 + 颜色」三元组：色弱与暗色主题下靠形状仍可分（DESIGN §0.4）。 */
+export interface Badge {
+  icon: string
+  text: string
+  tone: BadgeTone
+}
+
+/** 成员状态（7 态）+ 任务专属态（3 个）的完整映射表 —— **全项目唯一一份**。 */
+const BADGES: Record<string, Badge> = {
+  running: { icon: '●', text: '运行中', tone: 'business' },
+  idle: { icon: '○', text: '空闲', tone: 'neutral' },
+  blocked: { icon: '⛓', text: '阻塞', tone: 'warn' },
+  rework: { icon: '↺', text: '待返工', tone: 'warn' },
+  done: { icon: '✓', text: '已通过', tone: 'success' },
+  failed: { icon: '✕', text: '失败', tone: 'danger' },
+  interrupted: { icon: '⚡', text: '已中断', tone: 'danger' },
+  // 任务侧独有（MemberStatus 里没有，但 PlanTab 的任务行要显示）
+  pending: { icon: '·', text: '待派发', tone: 'neutral' },
+  ready: { icon: '▸', text: '就绪', tone: 'business' },
+  gate: { icon: '⚖', text: '门禁中', tone: 'warn' },
+}
+
+const UNKNOWN_BADGE: Badge = { icon: '?', text: '未知', tone: 'neutral' }
+
+/**
+ * 状态 → 徽标三元组。
+ *
+ * 入参故意放宽到 string：宿主侧的 4 态（running|inactive|provisioning|failed）在
+ * `host/team/watcher.ts` 就被映射成 7 态了，组件拿到的永远是 7 态；放宽只是为了
+ * 遇到未预期值时**显示原文而不是空白**（空白正是「界面点了没反应」的同类体验）。
+ */
+export function statusBadge(status: MemberStatus | TaskStatus | string): Badge {
+  return BADGES[status] ?? { ...UNKNOWN_BADGE, text: status === '' ? '未知' : status }
+}
+
+/** 各处展示「最近一次刷新/事件」用的时钟格式（本地时间，秒级 —— 对账要用到秒）。 */
+export function formatClock(ts: number | null | undefined): string {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return '—'
+  const date = new Date(ts)
+  const pad = (value: number): string => (value < 10 ? `0${value}` : String(value))
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** 计划时间戳（AC-30）：要能一眼看出「计划生成于派发之前」，所以带日期。 */
+export function formatStamp(ts: number | null | undefined): string {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return '—'
+  const date = new Date(ts)
+  const pad = (value: number): string => (value < 10 ? `0${value}` : String(value))
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${formatClock(ts)}`
+}
+
+/** 相对时间（成员「最近事件」一列）：`now` 由调用方传入，保证纯函数可测。 */
+export function formatRelative(ts: number | null | undefined, now: number): string {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return '—'
+  const base = Number.isFinite(now) ? now : ts
+  const delta = Math.max(0, base - ts)
+  if (delta < 5000) return '刚刚'
+  if (delta < 60_000) return `${Math.floor(delta / 1000)} 秒前`
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
+  return `${Math.floor(delta / 86_400_000)} 天前`
+}
+
+/** 取末尾 n 行（门禁证据只给尾部，全量在 artifacts 指向的日志里）。 */
+export function tailLines(text: string | null | undefined, n: number): string[] {
+  if (typeof text !== 'string' || text === '') return []
+  const count = Math.floor(n)
+  if (!Number.isFinite(count) || count <= 0) return []
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  // 命令输出几乎总以换行结尾，末尾的空行不该占用「尾部 n 行」的名额
+  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop()
+  return lines.slice(-count)
+}
+
+/* ────────────────────────── 运行时投影（容忍字段缺席） ────────────────────────── */
+
+/** 一条直达消息（AC-16）：from/to/taskId/时间戳都要能核验。 */
+export interface MessageView {
+  at: number
+  from: string
+  to: string
+  toMemberId?: string
+  taskId?: string
+  body: string
+  messageId?: string
+}
+
+/** 一次逐角色模型的路由审计（AC-22）。 */
+export interface RouteView {
+  taskId: string
+  roleId: string
+  declared: RoleModelRoute | null
+  actual: RoleModelRoute | null
+  at: number
+  verdict: 'ok' | 'drift' | 'unverified'
+}
+
+export interface ConcurrencyView {
+  limit: number
+  running: number
+  source: 'host' | 'default'
+}
+
+export interface ViewExtras {
+  plannedAt?: number
+  messages: MessageView[]
+  routeAudits: RouteView[]
+  concurrency: ConcurrencyView
+}
+
+/** 宿主未给出并发上限时的展示兜底（与 host/config.ts 的默认值同值；client 不得 import host）。 */
+const FALLBACK_CONCURRENCY_LIMIT = 3
+
+function num(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function str(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function routeOf(value: unknown): RoleModelRoute | null {
+  if (value === null || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const provider = str(raw.provider).trim()
+  const model = str(raw.model).trim()
+  if (provider === '' && model === '') return null
+  const route: RoleModelRoute = { provider, model }
+  const effort = raw.reasoningEffort
+  if (effort === 'low' || effort === 'medium' || effort === 'high') route.reasoningEffort = effort
+  return route
+}
+
+function messagesOf(value: unknown): MessageView[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => {
+    const raw = (item ?? {}) as Record<string, unknown>
+    const message: MessageView = {
+      at: num(raw.at) ?? 0,
+      from: str(raw.from),
+      to: str(raw.to),
+      body: str(raw.body),
+    }
+    const toMemberId = str(raw.toMemberId)
+    if (toMemberId !== '') message.toMemberId = toMemberId
+    const taskId = str(raw.taskId)
+    if (taskId !== '') message.taskId = taskId
+    const messageId = str(raw.messageId)
+    if (messageId !== '') message.messageId = messageId
+    return message
+  })
+}
+
+function routesOf(value: unknown): RouteView[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => {
+    const raw = (item ?? {}) as Record<string, unknown>
+    const verdict = raw.verdict === 'ok' || raw.verdict === 'drift' ? raw.verdict : 'unverified'
+    return {
+      taskId: str(raw.taskId),
+      roleId: str(raw.roleId),
+      declared: routeOf(raw.declared),
+      actual: routeOf(raw.actual),
+      at: num(raw.at) ?? 0,
+      verdict,
+    }
+  })
+}
+
+function countRunning(tasks: PlanTask[]): number {
+  return tasks.filter((task) => task.status === 'running' || task.status === 'gate').length
+}
+
+function concurrencyOf(value: unknown, tasks: PlanTask[]): ConcurrencyView {
+  const raw = (value ?? {}) as Record<string, unknown>
+  const limit = num(raw.limit)
+  const running = num(raw.running)
+  return {
+    limit: limit !== undefined && limit > 0 ? limit : FALLBACK_CONCURRENCY_LIMIT,
+    running: running !== undefined && running >= 0 ? running : countRunning(tasks),
+    source: raw.source === 'host' ? 'host' : 'default',
+  }
+}
+
+/**
+ * 面板快照之外的扩展字段（plannedAt / messages / routeAudits / concurrency）。
+ *
+ * 为什么单独投影而不是直接读字段：这几个字段是本期新增的，宿主与 client 的发布节奏
+ * 可以不同步。缺字段时给空数组/兜底值，界面降级成「少一栏」而不是整页白屏。
+ */
+export function viewExtras(snapshot: PanelSnapshot | null | undefined): ViewExtras {
+  const raw = (snapshot ?? {}) as Record<string, unknown>
+  const tasks = Array.isArray(raw.tasks) ? (raw.tasks as PlanTask[]) : []
+  const extras: ViewExtras = {
+    messages: messagesOf(raw.messages),
+    routeAudits: routesOf(raw.routeAudits),
+    concurrency: concurrencyOf(raw.concurrency, tasks),
+  }
+  const plannedAt = num(raw.plannedAt)
+  if (plannedAt !== undefined) extras.plannedAt = plannedAt
+  return extras
+}
+
+/** 取某任务/角色最近一次路由审计。 */
+export function routeAuditFor(
+  audits: readonly RouteView[],
+  key: { taskId?: string; roleId?: string },
+): RouteView | undefined {
+  let found: RouteView | undefined
+  for (const audit of audits) {
+    if (key.taskId !== undefined && audit.taskId !== key.taskId) continue
+    if (key.roleId !== undefined && audit.roleId !== key.roleId) continue
+    if (found === undefined || audit.at >= found.at) found = audit
+  }
+  return found
+}
+
+/** 把 `provider/model #effort` 这样的文本解析回 structure（宿主老字段 modelRoute 是字符串）。 */
+export function parseRouteText(text: string | null | undefined): RoleModelRoute | null {
+  const raw = typeof text === 'string' ? text.trim() : ''
+  if (raw === '') return null
+  const [head, ...rest] = raw.split('#')
+  const [provider = '', model = ''] = (head ?? '').split('/')
+  const effort = rest.join('#').trim()
+  const route: RoleModelRoute = { provider: provider.trim(), model: model.trim() }
+  if (effort === 'low' || effort === 'medium' || effort === 'high') route.reasoningEffort = effort
+  if (route.provider === '' && route.model === '') return null
+  return route
+}
+
+/** 路由文案：`provider/model #effort`，逐字不省略（AC-22）。 */
+export function routeTextOf(route: RoleModelRoute | null | undefined): string {
+  if (route === null || route === undefined) return ''
+  const provider = (route.provider ?? '').trim()
+  const model = (route.model ?? '').trim()
+  if (provider === '' && model === '') return ''
+  const effort = route.reasoningEffort !== undefined ? ` #${route.reasoningEffort}` : ''
+  return `${provider}/${model}${effort}`
+}
+
+function routeVerdictLabel(audit: RouteView | null | undefined): string {
+  if (audit === null || audit === undefined) return '未下发'
+  if (audit.verdict === 'ok') return '已核对'
+  if (audit.verdict === 'drift') {
+    const actual = routeTextOf(audit.actual)
+    return actual === '' ? '路由漂移' : `路由漂移（实际 ${actual}）`
+  }
+  return '未下发'
+}
+
+/**
+ * 逐角色模型文案（AC-22）。
+ *
+ * 三档口径（诚实优先于好看）：
+ *  - 未配置 → `会话默认模型`；
+ *  - 已配置且审计 ok → `provider/model · 已核对`；
+ *  - 已配置但宿主没下发（verdict=unverified，或压根没审计过）→ 显式 `· 未下发`。
+ *    **绝不静默退回队长模型** —— 用户必须知道这一条没生效。
+ */
+export function formatModelRoute(
+  route: RoleModelRoute | null | undefined,
+  audit?: RouteView | null,
+): string {
+  const base = routeTextOf(route)
+  if (base === '') return '会话默认模型'
+  return `${base} · ${routeVerdictLabel(audit)}`
+}
+
+/** 成员行上的路由文案：优先用宿主新给的 route 对象，否则解析老的 modelRoute 字符串。 */
+export function memberRouteText(
+  member: MemberView,
+  audits: readonly RouteView[] = [],
+): string {
+  const explicit = (member as unknown as { model?: RoleModelRoute }).model
+  const declared = routeOf(explicit) ?? parseRouteText(member.modelRoute)
+  const audit = routeAuditFor(audits, { taskId: member.taskId, roleId: member.roleId })
+  if (declared === null) {
+    // 宿主既没给 route 对象、modelRoute 也解析不出结构：原样展示，别吞掉信息
+    const raw = typeof member.modelRoute === 'string' ? member.modelRoute.trim() : ''
+    if (raw === '') return '会话默认模型'
+    return `${raw} · ${routeVerdictLabel(audit)}`
+  }
+  return formatModelRoute(declared, audit)
+}
+
+/**
+ * dock 胶囊文案（DESIGN §2 的 5 种 tone）。
+ *
+ * 优先级有意如此：失败 > 中断 > 在跑 > 全绿 > 计划就绪 —— 用户最需要「坏消息」先冒头。
+ */
+export function capsuleOf(enabled: boolean, snapshot: PanelSnapshot | null | undefined): Capsule {
+  if (!enabled) return { tone: 'idle', text: '已关闭' }
+  if (snapshot === null || snapshot === undefined) return { tone: 'idle', text: '待派发' }
+
+  const tasks = snapshot.tasks ?? []
+  const members = snapshot.members ?? []
+  const extras = viewExtras(snapshot)
+  const failed = tasks.filter((task) => task.status === 'failed').length
+  const interrupted = members.filter((member) => member.status === 'interrupted').length
+  const running = countRunning(tasks)
+  const done = tasks.filter((task) => task.status === 'done').length
+  const limit = extras.concurrency.limit
+
+  if (snapshot.planStatus === 'cancelled') return { tone: 'idle', text: '已取消' }
+  if (snapshot.planStatus === 'terminated') return { tone: 'idle', text: '已终止' }
+  if (snapshot.planStatus === 'paused') return { tone: 'idle', text: '已暂停' }
+  if (failed > 0) return { tone: 'fail', text: `有失败 · ${failed}` }
+  if (interrupted > 0) return { tone: 'fail', text: `已中断 · ${interrupted}` }
+  if (running > 0) return { tone: 'run', text: `运行中 ${running}/${limit}` }
+  if (tasks.length > 0 && done === tasks.length) {
+    return { tone: 'done', text: `已完成 · ${tasks.length} 任务` }
+  }
+  // AC-30：计划已生成但**一个成员都还没创建** —— 这是「先计划、后派发」的可视证据
+  if (tasks.length > 0 && members.length === 0) {
+    return { tone: 'plan', text: `计划就绪 · ${tasks.length} 任务` }
+  }
+  if (members.length === 0) return { tone: 'idle', text: '待派发' }
+  if (snapshot.planStatus === 'dispatching') {
+    return { tone: 'run', text: `派发中 · ${members.length}/${limit}` }
+  }
+  return { tone: 'idle', text: `进行中 · ${done}/${tasks.length}` }
+}
+
+/* ────────────────────────── 动作与回执 ────────────────────────── */
+
+/**
+ * 面板可发的动作。
+ *
+ * 为什么在 PanelAction 之外再补三个形态：`dispatch{runId}` / `setTaskRole` / `receipt`
+ * 是本期新增的（AC-30 / AC-14 / AC-19）。写成联合而不是篡改类型契约 ——
+ * 契约的唯一来源仍是 `src/shared/types.ts`，这里只是「client 侧可能多问一句」的视图。
+ * 收紧的唯一入口是 `Panel.tsx` 里的那一处 `as PanelAction`。
+ */
+export type ClientAction =
+  | PanelAction
+  | { type: 'dispatch'; runId?: string }
+  | { type: 'setTaskRole'; taskId: string; roleId: string }
+  | { type: 'receipt'; taskId: string; note?: string }
+
+/** 一次动作的结果摘要（只给界面用：成功/拒绝/传输失败三种都要有话可说）。 */
+export interface ActFeedback {
+  ok: boolean
+  message?: string
+  notices: string[]
+}
+
+/**
+ * 把 act() 的返回**解一次包**（唯一解包口，组件里不许再解）。
+ *
+ * 兼容三种历史形态：
+ *   { error }                                  —— 传输/校验失败
+ *   { data: { snapshot, rejected, notices } }   —— 本期 ActResult 包装
+ *   { data: PanelSnapshot }                     —— 脚手架期直接返回快照
+ */
+export function feedbackOf(result: unknown): ActFeedback {
+  if (result === null || result === undefined) return { ok: true, notices: [] }
+  const box = result as Record<string, unknown>
+  const transportError = str(box.error)
+  if (transportError !== '') return { ok: false, message: transportError, notices: [] }
+
+  const payload = (box.data ?? box) as Record<string, unknown>
+  if (payload === null || typeof payload !== 'object') return { ok: true, notices: [] }
+
+  const notices = Array.isArray(payload.notices)
+    ? payload.notices.filter((item): item is string => typeof item === 'string')
+    : []
+
+  const rejected = payload.rejected as Record<string, unknown> | undefined
+  if (rejected !== undefined && rejected !== null && typeof rejected === 'object') {
+    const message = str(rejected.message).trim()
+    const code = str(rejected.code).trim()
+    return { ok: false, message: message !== '' ? message : code !== '' ? code : '动作被拒绝', notices }
+  }
+
+  return { ok: true, notices }
+}
+
+/** 错误的展示文案（空字符串一律换成一句能读懂的话，避免「点了没反应」）。 */
+export function hintOf(feedback: ActFeedback): string | undefined {
+  if (feedback.ok) return feedback.notices.length > 0 ? feedback.notices.join(' · ') : undefined
+  const message = (feedback.message ?? '').trim()
+  return message === '' ? '动作未生效（宿主未说明原因）' : message
+}
+
+/**
+ * 发一个动作并**保证**拿到一句能给用户看的话。
+ *
+ * 为什么要包一层：`act` 可能 reject（宿主路由未注册、网络中断、宿主侧抛异常）。
+ * 直接 `await act(...)` 而不 try/catch 的后果是按钮永远停在 busy 态且界面毫无反应 ——
+ * 这正是本项目历史上「点了没反应」那一族 bug 的成因之一，所以在客户端唯一入口处兜住。
+ */
+export async function actFeedback<A>(
+  act: (action: A) => Promise<unknown>,
+  action: A,
+): Promise<ActFeedback> {
+  try {
+    return feedbackOf(await act(action))
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err), notices: [] }
+  }
+}

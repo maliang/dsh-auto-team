@@ -1,0 +1,7 @@
+{
+  "reqId": "req-1",
+  "runId": "tf-mvv49icd-0axwfe",
+  "title": "编写一个自动agent多智能体协作插件，让当前 DeepSeek Harness 会话成为队长，创建可续聊的子 Agent、把目标拆成有依赖的任务，并通过直达消",
+  "mode": "full",
+  "createdAt": 1793373476331
+}

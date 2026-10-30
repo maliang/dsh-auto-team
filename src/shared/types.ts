@@ -1,0 +1,327 @@
+/**
+ * host 半与 client 半**共享的纯类型**（本文件不含任何运行时代码、不做任何宿主调用）。
+ *
+ * 为什么全部集中在一个文件：两侧字段名一旦不一致，桥就会「返回了数据、界面读不到」——
+ * 这是本项目的历史 bug 族（整包赋值 / 字段名漂移 / 状态枚举两套）。约定：
+ *   1. 新增契约字段先落在本文件，两侧再按它实现；
+ *   2. client 只允许 `import type`，不允许 import host 半的任何模块；
+ *   3. 状态枚举只在这里定义一次（宿主 4 态 → 面板 7 态的映射在 host 侧唯一一处）。
+ */
+
+/** 任务状态（AC-30 的计划条目 / AC-18 的存活对账 / AC-19 的返工都会读它）。 */
+export type TaskStatus =
+  | 'pending'
+  | 'blocked'
+  | 'ready'
+  | 'running'
+  | 'gate'
+  | 'done'
+  | 'rework'
+  | 'failed'
+  /**
+   * 成员进程已死但上下文仍在（AC-18）：既不是失败也不能冒充运行中，必须能被用户看见，
+   * 且只允许通过 resume 动作恢复（不能自动重派，否则可能重复执行副作用）。
+   */
+  | 'interrupted'
+
+/** 一次运行的总体状态。 */
+export type PlanStatus = 'draft' | 'dispatching' | 'paused' | 'terminated' | 'cancelled'
+
+/**
+ * 面板成员 7 态（AC-18 的「状态必须可核验」）。
+ *
+ * interrupted 专指「成员上下文仍在、但当前轮被中断」——可续聊，不算失败。
+ * 宿主实体只有 4 态（running / inactive / provisioning / failed），映射只在
+ * `src/host/team/watcher.ts` 里做一次，组件里禁止再写映射表。
+ */
+export type MemberStatus =
+  | 'running'
+  | 'idle'
+  | 'blocked'
+  | 'rework'
+  | 'done'
+  | 'failed'
+  | 'interrupted'
+
+/**
+ * 逐角色模型路由（AC-22）。provider/model 是**原样透传**的字面值，不做别名归一：
+ * 面板展示必须与用户填写逐字一致，实际下发值另由 RouteAudit.actual 记录。
+ */
+export interface RoleModelRoute {
+  provider: string
+  model: string
+  reasoningEffort?: 'low' | 'medium' | 'high'
+}
+
+/** 计划中的单个任务（依赖图的一个节点）。 */
+export interface PlanTask {
+  id: string
+  title: string
+  /** 执行该任务的角色 id（派发时据此创建成员）。 */
+  roleId: string
+  /** 必须先完成的任务 id（空数组 = 可立即派发）。 */
+  dependsOn: string[]
+  /** 验收命令；为空时门禁直接判失败并拒绝完成（AC-19）。 */
+  acceptance: string
+  status: TaskStatus
+  /** 已创建的成员（派发后才有；与 bindings 的 memberId 一致）。 */
+  memberId?: string
+  /** 最近一次门禁证据（AC-19：命令、退出码、输出尾部、全量日志路径）。 */
+  evidence?: GateEvidence
+  /** 已返工次数（AC-19）：达到 MAX_ATTEMPTS 后转 failed 并需人工处理。 */
+  attempts?: number
+  /** 上一次 resume 的时间（AC-17 幂等去抖，见 RESUME_DEBOUNCE_MS）。 */
+  lastResumeAt?: number
+  /** 上一次 resume 时任务的状态（与 lastResumeAt 一起构成幂等判据）。 */
+  lastResumeStatus?: TaskStatus
+}
+
+/** 一份计划（落盘时包在 RunState 里，见 src/host/store.ts）。 */
+export interface Plan {
+  runId: string
+  sessionId: string
+  createdAt: number
+  status: PlanStatus
+  tasks: PlanTask[]
+  maxConcurrent: number
+}
+
+/** 角色（内置 + 用户自建，持久化在 roles.json）。 */
+export interface Role {
+  id: string
+  name: string
+  /** 职责描述，作为成员提示词的一部分。 */
+  duty: string
+  /** 引用的技能 id（内置技能种子在 src/host/roles/builtin.ts）。 */
+  skillIds: string[]
+  /** 该角色的模型路由；缺省 = 跟随会话默认（不静默回退到队长模型，AC-22）。 */
+  model?: RoleModelRoute
+  /** 内置角色（可改可删前需用户确认；seed 幂等依赖它）。 */
+  builtin: boolean
+  updatedAt: number
+}
+
+/** 面板上的成员行（由 RunState.bindings × Plan.tasks 组装，见 bridge.membersOf）。 */
+export interface MemberView {
+  memberId: string
+  name: string
+  roleId: string
+  /** 该成员正在执行的任务（无绑定任务的成员没有此字段）。 */
+  taskId?: string
+  status: MemberStatus
+  /** 最近一次活动时间（消息 / 证据 / 派发时间取最大），用于「多久没动静」。 */
+  lastEventAt: number
+  /**
+   * 角色声明的模型路由文本（**逐字**：`provider/model #effort` 或「会话默认」）。
+   * 实际生效值与它的差异见 RouteAudit / formatModelRoute。
+   */
+  modelRoute: string
+  /** 失败 / 中断后可续聊（done 的成员不需要再 resume）。 */
+  canResume: boolean
+}
+
+/** 记忆双轨（AC-24）：公共轨跨会话共享，项目轨跟随当前工作目录。 */
+export type MemoryTrack = 'public' | 'project'
+
+/** 记忆文件条目（面板记忆页列表用）。 */
+export interface MemoryFileInfo {
+  track: MemoryTrack
+  name: string
+  chars: number
+  updatedAt: number
+}
+
+/** 门禁证据（AC-19）：命令行退出码 + 输出尾部 + 全量日志路径，三者都要可核验。 */
+export interface GateEvidence {
+  taskId: string
+  command: string
+  /** 退出码；null = 超时 / 被信号杀掉（与「命令返回非 0」必须区分）。 */
+  exitCode: number | null
+  /** 输出尾部（默认 GATE_TAIL_CHARS 字符），面板证据抽屉直接显示。 */
+  tail: string
+  /**
+   * 全量日志落盘路径（artifacts/ 下，可能多份：命令日志 + 产物文件）。
+   * 空数组 = 没有落盘（例如 acceptance 为空、根本没执行命令）。
+   */
+  artifacts: string[]
+  at: number
+}
+
+/* ─────────────────────────── 运行账本（RunState v2 的组成部分） ─────────────────────────── */
+
+/**
+ * 一条直达消息（AC-16）：`from / to / taskId / at` 四项必须可核验。
+ *
+ * 落盘在 RunState.messages（上限 200 条，超出丢最旧），恢复运行后仍可回看。
+ * `from` 用普通 string：队长固定 'captain'，成员侧为成员名——成员名是运行期拼出来的，
+ * 若收窄成 'captain'|'member' 反而会丢信息（bridge 的账本入口也按 string 传递）。
+ */
+export interface MessageRecord {
+  at: number
+  /** 发送方：队长固定 'captain'；成员侧为成员名。 */
+  from: string
+  /** 展示用接收方：成员名，或 'captain'。 */
+  to: string
+  /** 接收方 memberId（宿主侧寻址用；发给队长时缺省）。 */
+  toMemberId?: string
+  /** 该消息属于哪个任务（AC-16 按任务可检索）。 */
+  taskId?: string
+  body: string
+  /** 账本内唯一 id（`msg-<at>-<seq>`），便于核对与去重。 */
+  messageId?: string
+}
+
+/**
+ * 任务 → 成员的绑定（AC-17 恢复幂等的唯一判据）。
+ *
+ * `name` 是**确定性**成员名（`${roleId}-${taskId}` normalize 后），所以「同一任务重复派发」
+ * 能靠名字 + bindings 判断出「已经起过人」，不会重复建成员。
+ */
+export interface MemberBinding {
+  taskId: string
+  roleId: string
+  memberId: string
+  name: string
+  spawnedAt: number
+  /** 成员已退出（被 interrupted / done 后释放），绑定保留以便续聊与审计。 */
+  retired?: boolean
+}
+
+/**
+ * 逐角色模型的路由审计（AC-22）。
+ *
+ * 宿主 `spawnTeammate` 目前没有 `model` 字段（限制 L1），因此本项目的诚实口径是：
+ *   - 派发前 preflightRoutes 预校验，解析不到就**拒绝派发**；
+ *   - 派发后记录实际值（能拿到时），与声明不一致记 `drift`；拿不到实际值记 `unverified`；
+ *   - 面板对 unverified 显式标「未下发」，**绝不假装生效、也绝不静默回退队长模型**。
+ */
+export interface RouteAudit {
+  taskId: string
+  roleId: string
+  /** 角色声明的路由；null = 跟随会话默认（此时不存在漂移问题）。 */
+  declared: RoleModelRoute | null
+  /** 实际生效的路由；宿主未回传时为 null / 缺省（verdict 应为 unverified）。 */
+  actual?: RoleModelRoute | null
+  at: number
+  verdict: 'ok' | 'drift' | 'unverified'
+}
+
+/** 并发三元组（AC-15）：上限、运行中、来源必须同时可见（QA 可断言 running ≤ limit）。 */
+export interface ConcurrencyView {
+  limit: number
+  running: number
+  /** host = 宿主给出了并发上限；default = 用插件默认值（MAX_CONCURRENT_LIMIT）。 */
+  source: 'host' | 'default'
+}
+
+/* ─────────────────────────────── 面板快照（HTTP / 工具共用） ─────────────────────────────── */
+
+/** 面板快照：`GET {BRIDGE_ROUTE}/snapshot` 的载荷，也是每个动作返回的同一份形状。 */
+export interface PanelSnapshot {
+  /** 本会话是否已启用（AC-12：默认关，按会话持久化）。 */
+  enabled: boolean
+  runId?: string
+  planStatus?: PlanStatus
+  /** 计划条目写入时间（AC-30 证据）：必须早于首个成员的 spawnedAt。 */
+  plannedAt?: number
+  tasks: PlanTask[]
+  members: MemberView[]
+  /** 直达消息账本（AC-16），最多 200 条。 */
+  messages: MessageRecord[]
+  /** 逐角色模型审计（AC-22），按时间升序。 */
+  routeAudits: RouteAudit[]
+  concurrency: ConcurrencyView
+  memory: {
+    /** 按预算挑出的注入字符数（AC-25：≤ budget）。 */
+    injectedChars: number
+    budget: number
+    truncated: boolean
+    files: MemoryFileInfo[]
+  }
+  roles: Role[]
+  activity: ActivityEvent[]
+}
+
+/** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
+export interface ActivityEvent {
+  at: number
+  memberId?: string
+  taskId?: string
+  kind:
+    | 'plan'
+    | 'spawn'
+    | 'message'
+    | 'tool'
+    | 'gate'
+    | 'status'
+    | 'interrupt'
+    | 'route_drift'
+    | 'rework'
+  text: string
+}
+
+/* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
+
+/**
+ * 面板动作全集（11 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
+ */
+export type PanelAction =
+  /** 只改开关，绝不派发（反面目标 1：打开开关不该自动起人）。 */
+  | { type: 'toggle'; enabled: boolean }
+  /**
+   * 派发就绪任务。`runId` 可选：面板从快照里带（防止对着过期计划派发）；
+   * 模型工具 `auto_team_dispatch` 强制必填——这是 AC-30「先计划、后派发」的机械保证。
+   */
+  | { type: 'dispatch'; runId?: string }
+  | { type: 'cancel' }
+  /** 派发前替换某任务的角色（AC-14）；派发后拒绝。 */
+  | { type: 'setTaskRole'; taskId: string; roleId: string }
+  /** 直达消息：按 memberId 或 taskId 定位成员（AC-16）。 */
+  | { type: 'message'; memberId?: string; taskId?: string; text: string }
+  /**
+   * 续聊被中断的成员（AC-17）：可按 taskId 或 memberId 定位（面板成员行用 memberId）。
+   * 两者都缺省 = 恢复所有需要恢复的任务（幂等：窗口内重复调用必须 resumed=0）。
+   */
+  | { type: 'resume'; taskId?: string; memberId?: string }
+  /** 成员自述完成 → 跑门禁 → 判定（AC-19）；note 写入证据说明。 */
+  | { type: 'receipt'; taskId: string; note?: string }
+  | { type: 'saveMemory'; track: MemoryTrack; name: string; body: string }
+  | { type: 'deleteMemory'; track: MemoryTrack; name: string }
+  | { type: 'saveRole'; role: Role }
+  | { type: 'deleteRole'; roleId: string }
+
+/**
+ * 拒绝码（10 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
+ * 新增码要同时补文案与面板展示，否则界面会出现「点了没反应」。
+ */
+export type RejectionCode =
+  | 'NOT_ENABLED'
+  | 'NO_PLAN'
+  | 'PLAN_ALREADY_DISPATCHED'
+  | 'ROLE_UNAVAILABLE'
+  | 'MODEL_UNRESOLVABLE'
+  | 'ROUTE_DRIFT'
+  | 'CONCURRENCY_FULL'
+  | 'NOT_FOUND'
+  | 'NO_CALLER'
+  | 'BAD_REQUEST'
+
+/** 一次动作的结果：无论成功失败都带可读快照（界面不会因为没有数据而白屏）。 */
+export interface ActResult {
+  snapshot: PanelSnapshot
+  /** 成功时的人话提示（如「已派发 2 个任务」），面板提示条直接显示。 */
+  notices?: string[]
+  /** 被拒绝时同时给码与文案；码供断言，文案供界面。 */
+  rejected?: { code: RejectionCode; message: string }
+}
+
+/* ───────────────────────────────── 通用返回包装 ───────────────────────────────── */
+
+/**
+ * 统一返回包装（AC-13：本项目历史高频 bug 族是「整包赋值导致界面点了没反应」）。
+ *
+ * 契约：**恰好一个**字段有值；client 侧只允许 `src/client/api.ts` 解一次包，
+ * 组件里禁止再解第二遍。传输层永远是 200，业务失败放在 data.rejected 里。
+ */
+export type Result<T> = { data: T; error?: undefined } | { data?: undefined; error: string }

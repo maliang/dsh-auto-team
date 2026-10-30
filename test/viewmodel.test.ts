@@ -1,0 +1,422 @@
+/**
+ * viewmodel 的单测。
+ *
+ * 存在理由（AC-18 / AC-22 / AC-30 的**可核验性**）：这几个月最容易出的事故是
+ * 「界面文案和真实状态不一致」——面板写"运行中"而成员进程早死了（AC-18 反面目标）、
+ * 逐角色模型显示得像生效了却没下发（AC-22）、计划还没生成就派发了（AC-30）。
+ * 这些都是文本级事实，必须能被 `node --test` 断言，而不是靠 QA 眼看。
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import {
+  actFeedback,
+  capsuleOf,
+  feedbackOf,
+  formatClock,
+  formatModelRoute,
+  formatRelative,
+  formatStamp,
+  hintOf,
+  memberRouteText,
+  parseRouteText,
+  routeAuditFor,
+  routeTextOf,
+  statusBadge,
+  tailLines,
+  viewExtras,
+} from '../src/client/viewmodel.ts'
+import type { MemberView, PanelSnapshot, PlanTask, RoleModelRoute, TaskStatus } from '../src/shared/types.ts'
+
+/* ────────────────────────── 夹具 ────────────────────────── */
+
+function taskOf(id: string, status: TaskStatus, extra: Partial<PlanTask> = {}): PlanTask {
+  return {
+    id,
+    title: `任务${id}`,
+    roleId: 'dev',
+    dependsOn: [],
+    acceptance: '能跑通',
+    status,
+    ...extra,
+  }
+}
+
+function memberOf(id: string, status: MemberView['status'], extra: Partial<MemberView> = {}): MemberView {
+  return {
+    memberId: id,
+    name: `成员${id}`,
+    roleId: 'dev',
+    status,
+    lastEventAt: 1_760_000_000_000,
+    modelRoute: '',
+    canResume: true,
+    ...extra,
+  }
+}
+
+function snapshotOf(patch: Record<string, unknown> = {}): PanelSnapshot {
+  return {
+    enabled: true,
+    tasks: [],
+    members: [],
+    memory: { injectedChars: 0, budget: 4000, truncated: false, files: [] },
+    roles: [],
+    activity: [],
+    ...patch,
+  } as unknown as PanelSnapshot
+}
+
+/* ────────────────────────── 胶囊：5 种 tone（DESIGN §2） ────────────────────────── */
+
+test('胶囊：未启用显示"已关闭"，且与任何运行态都不同', () => {
+  const off = capsuleOf(false, snapshotOf({ tasks: [taskOf('t1', 'running')] }))
+  assert.equal(off.tone, 'idle')
+  assert.equal(off.text, '已关闭')
+  // 未启用时绝不能被计划/运行态覆盖（开关关着却显示运行中，是最吓人的假象）
+  assert.equal(capsuleOf(false, snapshotOf({ tasks: [taskOf('t1', 'done')] })).text, '已关闭')
+  assert.equal(capsuleOf(false, null).text, '已关闭')
+})
+
+test('胶囊：无计划时是"待派发"', () => {
+  assert.deepEqual(capsuleOf(true, null), { tone: 'idle', text: '待派发' })
+  assert.deepEqual(capsuleOf(true, snapshotOf()), { tone: 'idle', text: '待派发' })
+})
+
+test('胶囊：AC-30 —— 有计划但零成员才是"计划就绪"，且 tone 为 plan', () => {
+  const cap = capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'pending'), taskOf('t2', 'blocked'), taskOf('t3', 'ready')] }))
+  assert.equal(cap.tone, 'plan')
+  assert.equal(cap.text, '计划就绪 · 3 任务')
+})
+
+test('胶囊：运行中带并发三元组的分子分母', () => {
+  const cap = capsuleOf(
+    true,
+    snapshotOf({
+      tasks: [taskOf('t1', 'running'), taskOf('t2', 'gate'), taskOf('t3', 'pending')],
+      members: [memberOf('m1', 'running'), memberOf('m2', 'running')],
+    }),
+  )
+  assert.equal(cap.tone, 'run')
+  assert.equal(cap.text, '运行中 2/3')
+})
+
+test('胶囊：失败与中断优先冒头（坏消息在前）', () => {
+  const failed = capsuleOf(
+    true,
+    snapshotOf({ tasks: [taskOf('t1', 'failed'), taskOf('t2', 'running')], members: [memberOf('m1', 'running')] }),
+  )
+  assert.equal(failed.tone, 'fail')
+  assert.equal(failed.text, '有失败 · 1')
+
+  const interrupted = capsuleOf(true, snapshotOf({ members: [memberOf('m1', 'interrupted')] }))
+  assert.equal(interrupted.tone, 'fail')
+  assert.equal(interrupted.text, '已中断 · 1')
+})
+
+test('胶囊：全部通过是 done', () => {
+  const cap = capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'done'), taskOf('t2', 'done')], members: [memberOf('m1', 'done')] }))
+  assert.equal(cap.tone, 'done')
+  assert.equal(cap.text, '已完成 · 2 任务')
+})
+
+test('胶囊：取消/终止/暂停都要说出来，不能显示成"运行中"', () => {
+  const tasks = [taskOf('t1', 'running')]
+  const members = [memberOf('m1', 'running')]
+  assert.equal(capsuleOf(true, snapshotOf({ tasks, members, planStatus: 'cancelled' })).text, '已取消')
+  assert.equal(capsuleOf(true, snapshotOf({ tasks, members, planStatus: 'terminated' })).text, '已终止')
+  assert.equal(capsuleOf(true, snapshotOf({ tasks, members, planStatus: 'paused' })).text, '已暂停')
+})
+
+test('胶囊 5 种 tone 全覆盖且文案互不重复（DESIGN 只允许 5 种）', () => {
+  const cases = [
+    capsuleOf(false, null),
+    capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'pending')] })),
+    capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'running')], members: [memberOf('m1', 'running')] })),
+    capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'failed')], members: [memberOf('m1', 'failed')] })),
+    capsuleOf(true, snapshotOf({ tasks: [taskOf('t1', 'done')], members: [memberOf('m1', 'done')] })),
+  ]
+  assert.equal(new Set(cases.map((c) => c.tone)).size, 5)
+  assert.equal(new Set(cases.map((c) => c.text)).size, cases.length)
+  for (const cap of cases) assert.ok(cap.text.trim() !== '', '胶囊文案不能为空')
+})
+
+/* ────────────────────────── 7 态徽标 ────────────────────────── */
+
+test('徽标：成员 7 态各有独立图标与文案（色弱也要能区分）', () => {
+  const statuses = ['running', 'idle', 'blocked', 'rework', 'done', 'failed', 'interrupted'] as const
+  const badges = statuses.map((status) => statusBadge(status))
+  assert.equal(new Set(badges.map((b) => b.text)).size, 7, '7 态文案必须互不重复')
+  assert.equal(new Set(badges.map((b) => b.icon)).size, 7, '7 态图标必须互不重复')
+  for (const badge of badges) {
+    assert.ok(badge.text.trim() !== '')
+    assert.ok(badge.icon.trim() !== '')
+  }
+  assert.equal(statusBadge('running').text, '运行中')
+  assert.equal(statusBadge('interrupted').text, '已中断')
+})
+
+test('徽标：任务专属态也有文案，未知状态回显原文而不是空白', () => {
+  assert.equal(statusBadge('pending').text, '待派发')
+  assert.equal(statusBadge('ready').text, '就绪')
+  assert.equal(statusBadge('gate').text, '门禁中')
+  // 宿主将来加了新状态：宁可显示原文，也不要空白（空白=用户以为坏了）
+  assert.equal(statusBadge('weird_state').text, 'weird_state')
+  assert.equal(statusBadge('').text, '未知')
+})
+
+/* ────────────────────────── 逐角色模型（AC-22） ────────────────────────── */
+
+const ROUTE: RoleModelRoute = { provider: 'anthropic', model: 'claude-sonnet-4', reasoningEffort: 'high' }
+
+test('模型路由：未配置时说"会话默认模型"，不假装有模型', () => {
+  assert.equal(formatModelRoute(null), '会话默认模型')
+  assert.equal(formatModelRoute({ provider: '  ', model: '' }), '会话默认模型')
+})
+
+test('AC-22：已配置但无审计时必须显式标"未下发"（禁止静默回退）', () => {
+  const text = formatModelRoute(ROUTE)
+  assert.ok(text.includes('anthropic/claude-sonnet-4 #high'), `路由要逐字展示，实际：${text}`)
+  assert.ok(text.includes('未下发'), `缺审计必须标未下发，实际：${text}`)
+})
+
+test('AC-22：审计 ok / drift / unverified 三档文案各不相同', () => {
+  const ok = formatModelRoute(ROUTE, { taskId: 't1', roleId: 'dev', declared: ROUTE, actual: ROUTE, at: 1, verdict: 'ok' })
+  const drift = formatModelRoute(ROUTE, {
+    taskId: 't1',
+    roleId: 'dev',
+    declared: ROUTE,
+    actual: { provider: 'openai', model: 'gpt-x' },
+    at: 2,
+    verdict: 'drift',
+  })
+  const unverified = formatModelRoute(ROUTE, { taskId: 't1', roleId: 'dev', declared: ROUTE, actual: null, at: 3, verdict: 'unverified' })
+  assert.ok(ok.includes('已核对'), ok)
+  assert.ok(drift.includes('路由漂移'), drift)
+  assert.ok(drift.includes('openai/gpt-x'), `漂移要带上实际路由，实际：${drift}`)
+  assert.ok(unverified.includes('未下发'), unverified)
+  assert.equal(new Set([ok, drift, unverified]).size, 3)
+})
+
+test('模型路由：文本与结构互转一致（老字段 modelRoute 是字符串）', () => {
+  assert.equal(routeTextOf(ROUTE), 'anthropic/claude-sonnet-4 #high')
+  assert.deepEqual(parseRouteText('anthropic/claude-sonnet-4 #high'), ROUTE)
+  assert.deepEqual(parseRouteText('openai/gpt-x'), { provider: 'openai', model: 'gpt-x' })
+  assert.equal(parseRouteText(''), null)
+  assert.equal(parseRouteText('   '), null)
+  assert.equal(routeTextOf(null), '')
+})
+
+test('AC-22：成员行路由走审计表，取最近一条', () => {
+  const audits = [
+    { taskId: 't1', roleId: 'dev', declared: ROUTE, actual: null, at: 10, verdict: 'unverified' as const },
+    {
+      taskId: 't1',
+      roleId: 'dev',
+      declared: ROUTE,
+      actual: ROUTE,
+      at: 20,
+      verdict: 'ok' as const,
+    },
+  ]
+  assert.equal(routeAuditFor(audits, { taskId: 't1' })?.at, 20)
+  assert.equal(routeAuditFor(audits, { roleId: 'qa' }), undefined)
+  const member = memberOf('m1', 'running', { taskId: 't1', modelRoute: 'anthropic/claude-sonnet-4 #high' })
+  assert.ok(memberRouteText(member, audits).includes('已核对'), memberRouteText(member, audits))
+  assert.ok(memberRouteText(member).includes('未下发'), '没有审计时必须标未下发')
+})
+
+/* ────────────────────────── 时间与尾部 ────────────────────────── */
+
+test('时间格式：非法值给"—"，正确值给本地秒级时钟', () => {
+  assert.equal(formatClock(undefined), '—')
+  assert.equal(formatClock(0), '—')
+  assert.equal(formatClock(Number.NaN), '—')
+  const at = new Date(2026, 9, 30, 1, 2, 3).getTime()
+  assert.equal(formatClock(at), '01:02:03')
+  assert.equal(formatStamp(at), '10-30 01:02:03')
+  assert.equal(formatStamp(undefined), '—')
+})
+
+test('相对时间：按秒/分/时/天分档，未来时间不出现负数', () => {
+  const now = 1_760_000_000_000
+  assert.equal(formatRelative(now - 1_000, now), '刚刚')
+  assert.equal(formatRelative(now - 30_000, now), '30 秒前')
+  assert.equal(formatRelative(now - 5 * 60_000, now), '5 分钟前')
+  assert.equal(formatRelative(now - 3 * 3_600_000, now), '3 小时前')
+  assert.equal(formatRelative(now - 2 * 86_400_000, now), '2 天前')
+  assert.equal(formatRelative(now + 60_000, now), '刚刚')
+  assert.equal(formatRelative(undefined, now), '—')
+})
+
+test('尾部截取：取末 n 行、忽略结尾空行、n 非法给空数组', () => {
+  const text = Array.from({ length: 10 }, (_, index) => `line${index + 1}`).join('\n') + '\n\n'
+  assert.deepEqual(tailLines(text, 3), ['line8', 'line9', 'line10'])
+  assert.deepEqual(tailLines(text, 100).length, 10)
+  assert.deepEqual(tailLines(text, 0), [])
+  assert.deepEqual(tailLines('', 5), [])
+  assert.deepEqual(tailLines(null, 5), [])
+  assert.deepEqual(tailLines('a\r\nb\r\n', 2), ['a', 'b'])
+})
+
+/* ────────────────────────── 运行时投影（容忍新字段缺席） ────────────────────────── */
+
+test('投影：老快照缺新字段时降级而不是崩（消息空、并发给默认 3、plannedAt 缺省）', () => {
+  const extras = viewExtras(snapshotOf({ tasks: [taskOf('t1', 'running'), taskOf('t2', 'gate')] }))
+  assert.deepEqual(extras.messages, [])
+  assert.deepEqual(extras.routeAudits, [])
+  assert.equal(extras.concurrency.limit, 3)
+  assert.equal(extras.concurrency.running, 2)
+  assert.equal(extras.concurrency.source, 'default')
+  assert.equal(extras.plannedAt, undefined)
+})
+
+test('投影：新字段齐全时逐字保留（消息账本是 AC-16 的证据）', () => {
+  const extras = viewExtras(
+    snapshotOf({
+      plannedAt: 1_760_000_000_000,
+      messages: [{ at: 1_760_000_000_001, from: 'captain', to: 'member:m1', toMemberId: 'm1', taskId: 't1', body: '开始吧' }],
+      routeAudits: [{ taskId: 't1', roleId: 'dev', declared: ROUTE, at: 5, verdict: 'ok' }],
+      concurrency: { limit: 5, running: 2, source: 'host' },
+    }),
+  )
+  assert.equal(extras.plannedAt, 1_760_000_000_000)
+  assert.equal(extras.messages.length, 1)
+  assert.equal(extras.messages[0]?.from, 'captain')
+  assert.equal(extras.messages[0]?.taskId, 't1')
+  assert.equal(extras.routeAudits[0]?.verdict, 'ok')
+  assert.deepEqual(extras.concurrency, { limit: 5, running: 2, source: 'host' })
+})
+
+/* ────────────────────────── 动作回执（唯一解包口） ────────────────────────── */
+
+test('回执：成功、业务拒绝、传输失败三种都要有话可说', () => {
+  const okResult = feedbackOf({ data: { snapshot: snapshotOf(), notices: ['已派发 2 个任务'] } })
+  assert.equal(okResult.ok, true)
+  assert.deepEqual(okResult.notices, ['已派发 2 个任务'])
+  assert.equal(hintOf(okResult), '已派发 2 个任务')
+
+  const rejected = feedbackOf({ data: { snapshot: snapshotOf(), rejected: { code: 'NO_PLAN', message: '还没有计划' } } })
+  assert.equal(rejected.ok, false)
+  assert.equal(rejected.message, '还没有计划')
+  assert.equal(hintOf(rejected), '还没有计划')
+
+  const transport = feedbackOf({ error: '网络断了' })
+  assert.equal(transport.ok, false)
+  assert.equal(hintOf(transport), '网络断了')
+
+  const empty = feedbackOf({})
+  assert.equal(empty.ok, true)
+  assert.equal(hintOf(empty), undefined)
+})
+
+test('回执：脚手架的裸快照返回也要认（兼容期不出现"点了没反应"）', () => {
+  const feedback = feedbackOf({ data: snapshotOf({ tasks: [taskOf('t1', 'pending')] }) })
+  assert.equal(feedback.ok, true)
+  assert.deepEqual(feedback.notices, [])
+})
+
+test('回执：拒绝但宿主没给原因时给一句能读的话', () => {
+  const feedback = feedbackOf({ data: { rejected: { code: 'CONCURRENCY_FULL' } } })
+  assert.equal(feedback.ok, false)
+  assert.equal(hintOf(feedback), 'CONCURRENCY_FULL')
+  const blank = feedbackOf({ data: { rejected: {} } })
+  assert.equal(hintOf(blank), '动作被拒绝')
+})
+
+test('回执：act 抛错也要变成一句能读的话（否则按钮永远停在 busy，表现为"点了没反应"）', async () => {
+  const thrown = await actFeedback(async () => {
+    throw new Error('宿主动作路由未注册')
+  }, { type: 'cancel' })
+  assert.equal(thrown.ok, false)
+  assert.equal(hintOf(thrown), '宿主动作路由未注册')
+
+  const okFeedback = await actFeedback(async () => ({ data: { snapshot: snapshotOf(), notices: ['已取消'] } }), { type: 'cancel' })
+  assert.equal(okFeedback.ok, true)
+  assert.equal(hintOf(okFeedback), '已取消')
+})
+
+/* ────────────────────────── 端到端：一次完整运行的状态机 ────────────────────────── */
+
+test('端到端：计划→派发→门禁→失败→返工→重跑→全绿，每一态的胶囊/徽标/账本都可核验', () => {
+  const t0 = 1_760_000_000_000
+  const ledger: Array<Record<string, unknown>> = []
+  const push = (patch: Record<string, unknown>) => {
+    const snap = snapshotOf({ messages: [...ledger], ...patch })
+    return { snap, cap: capsuleOf(true, snap), extras: viewExtras(snap) }
+  }
+
+  // ① 计划就绪：有计划、零成员 —— AC-30 的可视证据（此时绝不该显示"运行中"）
+  const planned = push({
+    plannedAt: t0,
+    planStatus: 'draft',
+    tasks: [taskOf('t1', 'pending'), taskOf('t2', 'blocked', { dependsOn: ['t1'] })],
+  })
+  assert.equal(planned.cap.text, '计划就绪 · 2 任务')
+  assert.equal(planned.cap.tone, 'plan')
+  assert.equal(planned.extras.plannedAt, t0)
+  assert.equal(planned.snap.members.length, 0, 'AC-30：计划条目必须早于首个成员创建')
+
+  // ② 派发中：t1 开跑、下游 t2 仍阻塞
+  ledger.push({ at: t0 + 1_000, from: 'captain', to: 'member:m1', toMemberId: 'm1', taskId: 't1', body: '执行 t1' })
+  const dispatched = push({
+    plannedAt: t0,
+    planStatus: 'dispatching',
+    tasks: [taskOf('t1', 'running', { memberId: 'm1' }), taskOf('t2', 'blocked', { dependsOn: ['t1'] })],
+    members: [memberOf('m1', 'running', { taskId: 't1', lastEventAt: t0 + 1_000 })],
+    concurrency: { limit: 2, running: 1, source: 'host' },
+  })
+  assert.equal(dispatched.cap.text, '运行中 1/2')
+  assert.equal(dispatched.cap.tone, 'run')
+  assert.equal(dispatched.extras.concurrency.source, 'host')
+  assert.equal(dispatched.extras.messages.length, 1, 'AC-16：直达消息进账本')
+
+  // ③ 门禁中：任务进 gate，徽标是"门禁中"而不是"运行中"
+  assert.equal(statusBadge('gate').text, '门禁中')
+  assert.equal(statusBadge('gate').tone, 'warn')
+
+  // ④ 首次失败：胶囊转为 fail，返工消息带 taskId 可追溯
+  ledger.push({ at: t0 + 2_000, from: 'captain', to: 'member:m1', toMemberId: 'm1', taskId: 't1', body: '返工：测试未过' })
+  const failed = push({
+    plannedAt: t0,
+    tasks: [taskOf('t1', 'failed', { memberId: 'm1' }), taskOf('t2', 'blocked', { dependsOn: ['t1'] })],
+    members: [memberOf('m1', 'failed', { taskId: 't1' })],
+    routeAudits: [{ taskId: 't1', roleId: 'dev', declared: ROUTE, actual: ROUTE, at: t0 + 2_000, verdict: 'ok' }],
+  })
+  assert.equal(failed.cap.text, '有失败 · 1')
+  assert.equal(failed.cap.tone, 'fail')
+  assert.equal(failed.extras.messages.length, 2)
+  assert.equal(failed.extras.messages[1]?.taskId, 't1')
+  // AC-19：下游任务保持阻塞，绝不因为上游失败而放行
+  assert.equal(failed.snap.tasks[1]?.status, 'blocked', '上游失败时下游必须仍是 blocked')
+
+  // ⑤ 成员进程死掉：面板必须说"已中断"（AC-18 反面目标：不能显示运行中）
+  const interrupted = push({
+    tasks: [taskOf('t1', 'rework', { memberId: 'm1' }), taskOf('t2', 'blocked', { dependsOn: ['t1'] })],
+    members: [memberOf('m1', 'interrupted', { taskId: 't1' })],
+  })
+  assert.equal(interrupted.cap.text, '已中断 · 1')
+  assert.equal(interrupted.cap.tone, 'fail')
+  assert.equal(statusBadge('interrupted').text, '已中断')
+
+  // ⑥ 续聊后两条并行跑起来
+  const running = push({
+    tasks: [taskOf('t1', 'running', { memberId: 'm1' }), taskOf('t2', 'running', { memberId: 'm2' })],
+    members: [memberOf('m1', 'running', { taskId: 't1' }), memberOf('m2', 'running', { taskId: 't2' })],
+    concurrency: { limit: 3, running: 2, source: 'default' },
+  })
+  assert.equal(running.cap.text, '运行中 2/3')
+
+  // ⑦ 终态：全部通过
+  const done = push({
+    tasks: [taskOf('t1', 'done'), taskOf('t2', 'done')],
+    members: [memberOf('m1', 'done'), memberOf('m2', 'done')],
+  })
+  assert.equal(done.cap.text, '已完成 · 2 任务')
+  assert.equal(done.cap.tone, 'done')
+
+  // 整个流程的胶囊文案互不相同（没有两态混成一句话）
+  const texts = [planned, dispatched, failed, interrupted, running, done].map((step) => step.cap.text)
+  assert.equal(new Set(texts).size, texts.length, `不同状态不能共用文案：${texts.join(' | ')}`)
+})
+

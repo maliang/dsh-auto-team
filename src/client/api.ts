@@ -1,0 +1,103 @@
+/**
+ * 面板数据访问层 —— client 半**唯一**的 HTTP 出口。
+ *
+ * 契约与 host/http.ts 一一对应（改一边必须改另一边）：
+ *   GET  {BRIDGE_ROUTE}/snapshot?sessionId=…                    → PanelSnapshot
+ *   GET  {BRIDGE_ROUTE}/memory?track=&name=[&sessionId=]         → {track,name,body,chars}（新增，修 D7）
+ *   POST {BRIDGE_ROUTE}/act  { sessionId, action }              → ActResult
+ *
+ * 纪律（本项目历史踩坑）：
+ *  1. 返回一定是 `{ data }` 或 `{ error }` 的**包装**，调用方必须解构 —— 整包赋值就是
+ *     「点了没反应 / 永远空」那一族 bug 的成因；
+ *  2. **解包只允许发生在 `request()` 这一个函数里**（组件、store 都不许再解第二次）。
+ *     新增接口也必须复用 `request()`，禁止自己写一套 fetch + json + 判空。
+ */
+import type {
+  ActResult,
+  MemoryTrack,
+  PanelAction,
+  PanelSnapshot,
+  Result,
+} from '../shared/types.ts'
+// 前缀是 host/client 两半的共同契约，单一定义在 shared（client 不允许 import host 半，见 D6）。
+import { BRIDGE_ROUTE } from '../shared/const.ts'
+
+/** `GET /memory` 的 data 载荷（面板记忆页「先读正文再编辑」，修 D7）。 */
+export interface MemoryBodyPayload {
+  track: MemoryTrack
+  name: string
+  body: string
+  chars: number
+}
+
+export interface PanelApi {
+  snapshot(sessionId: string): Promise<Result<PanelSnapshot>>
+  /**
+   * 发一个面板动作。
+   *
+   * 注意返回类型是 **Result<ActResult>** 而不是 ActResult：传输层失败（路由未注册 / 宿主没起）
+   * 与业务拒绝（`data.rejected`）是两种事，前者必须能被界面说出来，否则按钮看起来「点了没反应」。
+   */
+  act(sessionId: string, action: PanelAction): Promise<Result<ActResult>>
+  /** 读记忆正文：编辑已有文件前必须先读，否则保存会把已有内容清空（D7）。 */
+  readMemory(sessionId: string, track: MemoryTrack, name: string): Promise<Result<MemoryBodyPayload>>
+}
+
+export interface ApiOptions {
+  /** 缺省同源；测试或非标准部署时可注入。 */
+  baseUrl?: string
+  fetchImpl?: typeof fetch
+}
+
+export function createPanelApi(options: ApiOptions = {}): PanelApi {
+  const base = (options.baseUrl ?? '').replace(/\/+$/, '')
+  const doFetch = options.fetchImpl ?? (typeof fetch === 'function' ? fetch.bind(globalThis) : undefined)
+
+  /** 全项目唯一解包点：HTTP 响应 → `{ data }` / `{ error }`。 */
+  async function request<T>(path: string, init?: RequestInit): Promise<Result<T>> {
+    if (!doFetch) return { error: '当前环境没有 fetch，无法读取自动团队面板数据' }
+    try {
+      const response = await doFetch(`${base}${path}`, {
+        ...init,
+        headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+      })
+      if (!response.ok) return { error: `面板接口失败：HTTP ${response.status}` }
+
+      let payload: { data?: T; error?: string } | null
+      try {
+        payload = (await response.json()) as { data?: T; error?: string } | null
+      } catch {
+        return { error: '面板接口返回的不是合法 JSON（宿主版本可能不一致）' }
+      }
+      if (payload === null || typeof payload !== 'object') {
+        return { error: '面板接口返回了空数据（契约不一致）' }
+      }
+      const failure = (payload as { error?: unknown }).error
+      if (typeof failure === 'string' && failure !== '') return { error: failure }
+      const data = (payload as { data?: unknown }).data
+      if (data === undefined) return { error: '面板接口返回了空数据（契约不一致）' }
+      return { data: data as T }
+    } catch (error) {
+      return { error: `面板接口不可达：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  return {
+    snapshot(sessionId: string) {
+      return request<PanelSnapshot>(`${BRIDGE_ROUTE}/snapshot?sessionId=${encodeURIComponent(sessionId)}`)
+    },
+    act(sessionId: string, action: PanelAction) {
+      return request<ActResult>(`${BRIDGE_ROUTE}/act`, {
+        method: 'POST',
+        body: JSON.stringify({ sessionId, action }),
+      })
+    },
+    readMemory(sessionId: string, track: MemoryTrack, name: string) {
+      const query = `track=${encodeURIComponent(track)}&name=${encodeURIComponent(name)}&sessionId=${encodeURIComponent(sessionId)}`
+      return request<MemoryBodyPayload>(`${BRIDGE_ROUTE}/memory?${query}`)
+    },
+  }
+}
+
+/** 单例：两个挂载面（开关行与面板）必须共享同一实例，否则开关状态会两处不同步。 */
+export const panelApi: PanelApi = createPanelApi()
