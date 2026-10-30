@@ -20,14 +20,14 @@
 - `cordis.patch.yml` 的 `name` 必须是包根名 `dsh-auto-team`（写子路径会让 clientModules 扫描跳过，症状：工具在、面板不出现）。
 - 前端样式只用宿主 token；字号写 `font: var(--dsw-font-xs-13, …)`，**不许写 `font-size: var(...)`**（该 token 是 font 简写复合值，写 font-size 是无效声明且静默继承父级）。
 - 前端读接口必须解构 `{data,error}` 包装（历史高频 bug 族：整包赋值 → 界面"点了没反应"）。
-- 成员名是身份契约：同一角色多任务时成员名必须**两两唯一**且可辨认任务（`<roleId>-<taskId>` 不够——归一化会把 `登录流程` 折成角色名、把 `Login_Flow` 与 `login-flow` 折成同一串）。身份段必须**先编码再归一**（保序映射或短序号），且 `dispatchReady` 要断言归一后唯一；单任务视角的「符合宿主字符集」测试看不到这类塌缩。
-- 验证命令：`pnpm typecheck && pnpm test && pnpm build`，外加两条 `node --input-type=module -e "await import('./lib/…')"` 与 `npm pack --dry-run`（须含 `lib/index.js`、`lib/client.js`、`cordis.patch.yml`）。实测基线（2026-10-31）：typecheck exit 0、**146 tests 全绿**、产物 `lib/index.js` 132.1 kB + `lib/client.js` 92.2 kB、单测跑 TS 源约 3.0s。
+- 成员名是身份契约（20261031-r2 已落地）：`<slug(roleId)>-<slug(taskId)>-<6 位身份哈希>`，哈希输入是**原始** `roleId\0taskId` 的 FNV-1a 32 → base36 末 6（`dispatch.ts` `shortIdentityHash`），截断只裁可读段、**永不裁哈希**（`NAME_BUDGET = HOST_MEMBER_NAME_MAX 48 - 6 - 1`，48 只在 `config.ts` 定义一次）。`dispatchReady` 循环前先算 `memberNameCollisions`（含未退役 binding 占名），撞名任务 `push {code:'MEMBER_NAME_COLLISION'}` 后 `continue`——不 spawn、不写 binding、不改 status，**不自动改名**（改名会让 AC-17 的重绑不可信）。新增同类能力时照此办理：单任务视角的「符合宿主字符集」测试看不到塌缩，必须断言「同角色多任务两两唯一」。
+- 验证命令：`pnpm typecheck && pnpm test && pnpm build`，外加两条 `node --input-type=module -e "await import('./lib/…')"` 与 `npm pack --dry-run`（须含 `lib/index.js`、`lib/client.js`、`cordis.patch.yml`）。实测基线（2026-10-31）：typecheck exit 0、**155 tests 全绿**、产物 `lib/index.js` 136.3 kB + `lib/client.js` 92.2 kB、单测跑 TS 源约 3.0s。**注意**：AC-8 往 `peerDependencies` 补了 7 个未发布的 `@deepseek-ai/*` 后，本仓 `pnpm install` 会因 `pnpm-lock.yaml` 的 `settings.autoInstallPeers: true` 报 `ERR_PNPM_OUTDATED_LOCKFILE` / `ERR_PNPM_FETCH_404`；可行解是 `.npmrc` 写 `auto-install-peers=false`（peer 由宿主 profile 提供）后 `pnpm install --lockfile-only` 重生成，再用五项门禁复验。
 
 ## 待办 / 已知约束
 - `lib/` 必须入库（`pnpm add file:` 的安装源即产物）；`.gitignore` 不忽略 `lib/`。
 - 宿主 API 形状未全部核实（`src/host/adapters.ts` 内 6 处 `[待核]`：工具定义字段、prompt section 形状、route 形状、`spawnTeammate` 返回 `memberId`/`id`、`sendMessage` 入参名、`resolveCallConfig` 返回结构）；**装一次到 profile 并刷新 GUI 即可一次消掉**，见 ARCHITECTURE §8.2。
 - 两个挂载面尚未在真实 GUI 渲染验证（目前只有 mock loader 冒烟：注册出 `conversation.composer.dock|dsh-auto-team-toggle|10` 与 `sidebar.right.pane.tab|dsh-auto-team-panel|60`）。
-- 开放缺陷 `R2-1`（P2，20261030-r1 验收）：成员名唯一性，检测命令 `node logs/…/scripts/qa-collision-probe.mjs` 当前 1/5；另欠 ① `@deepseek-ai/*` 的 optional peer 声明（样本有 13 条，本包只有 `react`）② 收口提交（HEAD 仍为 `150eb5b` 基线，63 项未提交）③ 5 个已修 bug 在 backlog 镜像里仍 `open`。
+- 缺陷 `R2-1`（P2，20261030-r1 提出）→ **已修复，20261031-r2 验收判「⚠️ 有条件通过」**：`qa-collision-probe.mjs` 5/5、`qa-reverify-probe.mjs` 9/9（项数不变）、新增 `qa-skill-prompt-probe.mjs` 2/2、`check-peer-decls.mjs` 5/5，155 tests 全绿。遗留 ① **P2 交付卫生**：本仓 `pnpm install` 因上述 `autoInstallPeers` + 7 个未发布 peer 不可解析（CI 首步必红，当前无 remote 未触发），收口前加 `.npmrc` 并重生成 lockfile ② 收口单笔提交由 host 执行 ③ 5 个已修 bug 在 backlog 镜像里仍 `open`。
 - ~~本会话 `cordis_inspect_query` 不可用~~ **已证伪（2026-10-31 主 agent 实测）**：工具可用，报错是调用形态错误 —— 必须传 `input` 且是**对象**（至少 `input: {}`）；省略 `input` 或传非对象时，宿主返回 `Host Cordis inspect Service.listService rejected input: "input" must be an object`，看起来像环境不可用。核对 Service schema 一律先 `cordis_inspect_list` 取 provider/method，再 `cordis_inspect_query({platform, provider, method, input: {}})`。
 
 ## 工具与流程坑（踩过就去掉一次重试成本）

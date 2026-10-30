@@ -292,7 +292,7 @@ export type PanelAction =
   | { type: 'deleteRole'; roleId: string }
 
 /**
- * 拒绝码（10 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
+ * 拒绝码（11 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
  * 新增码要同时补文案与面板展示，否则界面会出现「点了没反应」。
  */
 export type RejectionCode =
@@ -306,6 +306,15 @@ export type RejectionCode =
   | 'NOT_FOUND'
   | 'NO_CALLER'
   | 'BAD_REQUEST'
+  /**
+   * 成员名冲突：≥2 个任务名撞成同一个，本次不派发（R2-1 / AC-4）。
+   *
+   * 只作为 `errors[].code` 与 `ActResult.rejected.code` 出现，**不落盘** RunState；
+   * bridge 的 `act('dispatch')` 已把 `errors[0].code` 原样透传成 `rejected.code`
+   * （`reject(first.code ?? 'BAD_REQUEST')`），所以这里扩联合类型就够了 ——
+   * 不要在 bridge 里为它加分支，那等于维护第二份码表。
+   */
+  | 'MEMBER_NAME_COLLISION'
 
 /** 一次动作的结果：无论成功失败都带可读快照（界面不会因为没有数据而白屏）。 */
 export interface ActResult {

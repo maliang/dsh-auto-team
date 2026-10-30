@@ -13,3 +13,8 @@ dist/
 
 # 明确不忽略 lib/：lib/index.js 与 lib/client.js 是分发与 `pnpm add file:` 的安装源
 # （AC-4 / AC-7），必须入库。
+
+# 打包与 pnpm 噪声（`npm pack --dry-run` 会在根目录留 .tgz、pnpm 偶发写 debug log）：
+# 都是本机命令产物而非交付物；注意这里的规则不得连带忽略 lib/（上面的约定优先）。
+*.tgz
+pnpm-debug.log*

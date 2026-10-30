@@ -19,6 +19,7 @@ import {
   memberNameFor,
   resumeRun,
   runningCount,
+  shortIdentityHash,
   type DispatchDeps,
   type ResumeDeps,
   type SpawnInput,
@@ -191,7 +192,11 @@ test('dispatch：被标 interrupted 的任务可用同一个确定性名字重�
 
     assert.deepEqual(result.started, ['t2'], 'interrupted 且依赖已 done 的任务必须可重新派发')
     assert.equal(spawned.length, 1)
-    assert.equal(spawned[0]?.name, 'dev-t2', '重建必须沿用确定性名字，否则绑定与审计认不回同一个任务')
+    assert.equal(
+      spawned[0]?.name,
+      memberNameFor(makeTask('t2')),
+      '重建必须沿用确定性名字（同一 roleId+taskId 恒得同名），否则绑定与审计认不回同一个任务',
+    )
     const rebuilt = result.state.plan.tasks.find((task) => task.id === 't2')
     assert.equal(rebuilt?.status, 'running')
     assert.equal(
@@ -374,15 +379,25 @@ test('端到端：派发→回执 done→解锁下游→再派发→全部完成
 test('memberNameFor：确定性且归一为宿主 memberName() 的硬契约（HOST_MEMBER_NAME）', () => {
   const task = makeTask('t 1', { roleId: 'Architect X' })
   const name = memberNameFor(task)
-  assert.equal(name, 'architect-x-t-1', '大写与空格都必须折成 lower-kebab')
+  assert.match(name, /^architect-x-t-1-[0-9a-z]{6}$/, '大写与空格都必须折成 lower-kebab（可读段），再拼 6 位身份哈希')
+  assert.equal(name.slice(0, -7), 'architect-x-t-1', '去掉 -<哈希 6 位> 后必须是与旧实现一致的可读段')
   assert.equal(memberNameFor(task), name, '同一任务反复派发必须得到同一个名字')
   assert.match(name, HOST_MEMBER_NAME)
 
   const long = memberNameFor(makeTask('x'.repeat(80), { roleId: 'r'.repeat(40) }))
-  assert.equal(long.length, HOST_MEMBER_NAME_MAX)
+  assert.equal(long.length, HOST_MEMBER_NAME_MAX, '两段各顶到 20 + 分隔符 + 哈希应恰好是上限 48')
   assert.match(long, HOST_MEMBER_NAME, '截断不得留下结尾分隔符')
+  assert.equal(
+    long.slice(-6),
+    shortIdentityHash(`${'r'.repeat(40)}\u0000${'x'.repeat(80)}`),
+    '末 6 位必须是原始 roleId\\0taskId 的哈希——截断不允许裁到它',
+  )
+  // 与上一个长 id 只差最后两个字符：可读段截断后完全相同，名字必须仍然不同（反面目标 ③ 的正面覆盖）。
+  const other = memberNameFor(makeTask(`${'x'.repeat(78)}yy`, { roleId: 'r'.repeat(40) }))
+  assert.notEqual(other, long, '截断不得吃掉唯一性')
+  assert.equal(other.slice(0, -7), long.slice(0, -7), '两个长 id 的可读段相同，差异只能来自身份哈希')
 
-  assert.equal(memberNameFor(makeTask('###', { roleId: '###' })), 'member', '归一后为空要有兜底名')
+  assert.match(memberNameFor(makeTask('###', { roleId: '###' })), /^member-[0-9a-z]{6}$/, '归一后为空要有兜底名（仍带身份哈希）')
 })
 
 /**
@@ -416,8 +431,138 @@ test('memberNameFor：任何模型自填 id 都归一为宿主合法名（HOST_M
       assert.equal(name, memberNameFor(makeTask(id, { roleId })), '归一必须确定（AC-17 幂等）')
     }
   }
-  // 差分对照：小写 id 的既有名字不因归一化而漂移（防止规则被改成恒过/恒变）。
-  assert.equal(memberNameFor(makeTask('t1', { roleId: 'dev' })), 'dev-t1')
+  // 差分对照：小写 id 的可读段不因归一化而漂移（防止规则被改成恒过/恒变）。
+  // 形态变成 `<roleId>-<taskId>-<h6>`，所以断言「可读段 + 字符集 + 同输入恒等」，不放宽成「只要合法就算过」。
+  const plain = memberNameFor(makeTask('t1', { roleId: 'dev' }))
+  assert.ok(plain.startsWith('dev-t1-'), `可读段必须保持 dev-t1：${plain}`)
+  assert.match(plain, /^dev-t1-[0-9a-z]{6}$/)
+  assert.equal(memberNameFor(makeTask('t1', { roleId: 'dev' })), plain, '同输入必须恒等（AC-17 幂等）')
+})
+
+/* ------------------------------------------------------------------ *
+ * 成员名唯一性（R2-1 缺陷的正向覆盖）
+ *
+ * 旧实现只做归一化：`dev/登录流程` 与 `dev/注册接口` 都塌成 `dev`，同角色第二个就绪任务的
+ * spawn 被宿主以重名拒绝，错误被吞成「永久 pending」。以下用例逐个复现该塌缩面。
+ * ------------------------------------------------------------------ */
+
+test('memberNameFor：同角色的两个中文 id 必须得到不同名字（缺陷本体）', () => {
+  const left = memberNameFor(makeTask('登录流程'))
+  const right = memberNameFor(makeTask('注册接口'))
+
+  assert.notEqual(left, right, '两个中文 taskId 归一后可读段同为空，只剩身份哈希能区分')
+  assert.notEqual(left, 'dev', '名字绝不能塌缩回角色名')
+  assert.notEqual(right, 'dev')
+  for (const name of [left, right]) {
+    assert.match(name, HOST_MEMBER_NAME)
+    assert.ok(name.length <= HOST_MEMBER_NAME_MAX, `名字超长：${name}`)
+    assert.match(name, /^dev-[0-9a-z]{6}$/, `纯中文 id 的可读段为空，名字应形如 dev-<h6>：${name}`)
+  }
+})
+
+test('memberNameFor：仅大小写/分隔符不同的 id 必须得到不同名字（可读段相同、哈希不同）', () => {
+  const pairs: Array<[string, string]> = [
+    ['Login_Flow', 'login-flow'],
+    ['t1', 'T1'],
+  ]
+  for (const [a, b] of pairs) {
+    const left = memberNameFor(makeTask(a))
+    const right = memberNameFor(makeTask(b))
+    assert.notEqual(left, right, `${a} 与 ${b} 不得同名`)
+    // 去掉 `-<哈希 6 位>` 后可读段相同 —— 差异全部来自「原始串」哈希，证明确实先编码身份再归一。
+    assert.equal(left.slice(0, -7), right.slice(0, -7), `${a}/${b} 的可读段应当相同（只差哈希）`)
+    assert.match(left, HOST_MEMBER_NAME)
+    assert.match(right, HOST_MEMBER_NAME)
+  }
+})
+
+test('memberNameFor：同角色 5 个任务（中文/拉丁/长 id 混合）两两唯一', () => {
+  const ids = ['login', '登录流程', 'x'.repeat(40), 'T1', 'Login_Flow']
+  const names = ids.map((id) => memberNameFor(makeTask(id)))
+
+  assert.equal(new Set(names).size, ids.length, `名字必须两两唯一：${names.join(', ')}`)
+  for (const name of names) {
+    assert.match(name, HOST_MEMBER_NAME, `非法名字：${name}`)
+    assert.ok(name.length <= HOST_MEMBER_NAME_MAX, `名字超长：${name}`)
+  }
+})
+
+test('memberNameFor：48 上限边界 + 字符集 + 确定性（截断只裁可读段，永不裁哈希）', () => {
+  const roleId = 'r'.repeat(40)
+  const id = 'x'.repeat(40)
+  const name = memberNameFor(makeTask(id, { roleId }))
+
+  assert.equal(name.length, HOST_MEMBER_NAME_MAX, '可读段 20+1+20 加分隔符与 6 位哈希应恰好顶到上限')
+  assert.match(name, HOST_MEMBER_NAME)
+  assert.equal(name.slice(-6), shortIdentityHash(`${roleId}\u0000${id}`), '末 6 位必须是原始 roleId\\0taskId 的哈希')
+  assert.equal(memberNameFor(makeTask(id, { roleId })), name, '同输入必须恒等（AC-3 确定性）')
+})
+
+/* ------------------------------------------------------------------ *
+ * 派发前唯一性断言（AC-4）
+ *
+ * 生产算法不该撞名，断言是**兜底层**：只有注入 `deps.memberNameFor` 才触发。
+ * 判据三件套：不 spawn、错误可见（含冲突名与全部冲突任务 id）、任务留 pending 且不写 binding。
+ * ------------------------------------------------------------------ */
+
+test('dispatch：注入的取名端口撞名 → 两个就绪任务都不派发、各写一条 MEMBER_NAME_COLLISION', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [makeTask('t1'), makeTask('t2')]
+    const { deps, spawned } = makeDeps(store)
+    // 刻意把所有任务映射成同一个名字：若断言缺失，第二个任务会被宿主以重名拒绝并静默 pending。
+    deps.memberNameFor = () => 'dev-dup'
+    const result = await dispatchReady(makeState(tasks), deps)
+
+    assert.deepEqual(result.started, [], '撞名任务一个都不许启动')
+    assert.equal(spawned.length, 0, '撞名任务不许调用 spawn')
+    assert.equal(result.errors.length, 2, '两个任务各留一条错误，不许吞掉')
+    for (const error of result.errors) {
+      assert.equal(error.code, 'MEMBER_NAME_COLLISION')
+      assert.ok(error.error.includes('dev-dup'), `错误必须含冲突名：${error.error}`)
+      assert.ok(
+        error.error.includes('t1') && error.error.includes('t2'),
+        `错误必须含全部冲突任务 id：${error.error}`,
+      )
+    }
+    assert.deepEqual(
+      result.state.plan.tasks.map((task) => task.status),
+      ['pending', 'pending'],
+      '任务必须留在 pending（错误可见，但不是静默 pending）',
+    )
+    assert.equal(result.state.bindings.length, 0, '冲突任务不许写 binding')
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：与既有未退役 binding 同名 → 只拦该任务，既有成员与任务不受影响', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    // t0 已完成、binding 仍在（名字被占用）；t2 算出的名字与之相同。
+    const tasks = [makeTask('t0', { status: 'done' }), makeTask('t2')]
+    const state = makeState(tasks, { bindings: [bindingOf('t0', 'dev-dup')] })
+    const { deps, spawned } = makeDeps(store)
+    deps.memberNameFor = () => 'dev-dup'
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, [])
+    assert.equal(spawned.length, 0)
+    assert.equal(result.errors.length, 1, '只有冲突的那个就绪任务报错（t0 已 done，不在派发切片里）')
+    assert.equal(result.errors[0]?.taskId, 't2')
+    assert.equal(result.errors[0]?.code, 'MEMBER_NAME_COLLISION')
+    assert.ok(result.errors[0]?.error.includes('dev-dup'), '错误必须指出被占用的名字')
+    assert.ok(
+      (result.errors[0]?.error ?? '').includes('t0') && (result.errors[0]?.error ?? '').includes('t2'),
+      '错误必须列全冲突任务 id（既有占位者 + 本次被拦者）',
+    )
+    assert.equal(result.state.plan.tasks.find((task) => task.id === 't2')?.status, 'pending')
+    const kept = result.state.bindings.find((item) => item.taskId === 't0')
+    assert.equal(kept?.name, 'dev-dup', '既有 binding 必须原样保留')
+    assert.equal(kept?.retired, undefined, '既有 binding 不得被退役（名字仍被它占用）')
+  } finally {
+    cleanup()
+  }
 })
 
 /* ------------------------------------------------------------------ *

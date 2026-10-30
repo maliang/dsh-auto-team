@@ -275,7 +275,10 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   const dispatched = await act(h.routes, { type: 'dispatch', runId })
   assert.ok(dispatched.snapshot, 'dispatch 必须返回快照')
   assert.equal(h.spawned.length, 1, '只有无依赖的 t1 可以被派发')
-  assert.equal(h.spawned[0]?.name, 'dev-t1', '成员名必须是 <roleId>-<taskId>（幂等恢复的判据）')
+  // 名字形态是 `<roleId>-<taskId>-<身份哈希>`（R2-1）：不写死具体哈希，改为从本次 spawn 派生，
+  // 再与落盘 binding 交叉核对——这样探针/断言不会因为哈希值变化而假红，也不会因为「派生自同一处」而假绿。
+  const t1Name = h.spawned[0]?.name ?? ''
+  assert.match(t1Name, /^dev-t1-[0-9a-z]{6}$/, '成员名必须是 <roleId>-<taskId>-<身份哈希>（幂等恢复的判据）')
 
   const afterDispatch = store.load(runId) as RunState
   const t1 = afterDispatch.plan.tasks.find((task) => task.id === 't1')
@@ -283,6 +286,8 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(t1?.status, 'running')
   assert.equal(t2?.status, 'pending', '下游任务在依赖完成前不得进入 running')
   assert.equal(afterDispatch.bindings.length, 1)
+  assert.equal(afterDispatch.bindings[0]?.name, t1Name, '落盘 binding 的名字必须就是派发时用的那个名字')
+  assert.equal(afterDispatch.bindings[0]?.taskId, 't1', '恢复按 taskId 绑定，不解析名字')
   const dispatchMessage = afterDispatch.messages.find((message) => message.taskId === 't1' && message.from === 'captain')
   assert.ok(dispatchMessage, '派发必须落一条直达消息（AC-16 的证据）')
   assert.equal(dispatchMessage?.toMemberId, h.spawned[0]?.id)
@@ -300,8 +305,11 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   const redispatched = await act(h.routes, { type: 'dispatch', runId })
   assert.ok(redispatched.snapshot)
   assert.equal(h.spawned.length, 2, '下游任务在依赖 done 之后必须可以派发')
-  assert.equal(h.spawned[1]?.name, 'dev-t2')
+  const t2Name = h.spawned[1]?.name ?? ''
+  assert.match(t2Name, /^dev-t2-[0-9a-z]{6}$/)
+  assert.notEqual(t2Name, t1Name, '同角色的两个任务必须拿到不同名字（R2-1 的缺陷不得回归）')
   const afterSecond = store.load(runId) as RunState
+  assert.equal(afterSecond.bindings.find((item) => item.taskId === 't2')?.name, t2Name)
   assert.equal(afterSecond.plan.tasks.find((task) => task.id === 't2')?.status, 'running')
 
   // ---- ⑧ watcher 真的在对账：成员全死掉后，运行中的任务必须被标记为 interrupted
@@ -322,7 +330,7 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   // ---- ⑨ agent/created 的实际模型与声明不一致 → drift 审计（AC-22，绝不静默回退）
   assert.equal(h.listeners.length, 1, '必须订阅 agent/created 才能审计实际下发模型')
   const firstId = h.spawned[0]?.id ?? ''
-  h.listeners[0]?.({ member: { id: firstId, name: 'dev-t1' }, model: { provider: 'other', model: 'other-model' } })
+  h.listeners[0]?.({ member: { id: firstId, name: t1Name }, model: { provider: 'other', model: 'other-model' } })
   const afterAudit = store.load(runId) as RunState
   const audit = afterAudit.routeAudits.find((item) => item.taskId === 't1')
   assert.equal(audit?.verdict, 'drift', '声明与实际不一致必须落 drift')

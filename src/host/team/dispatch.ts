@@ -63,6 +63,13 @@ export interface DispatchDeps {
   sendMessage?: SendPort
   /** 可选：宿主实际并发上限（缺省用 DEFAULT_MAX_CONCURRENT）。 */
   hostConcurrency?(): { limit: number; source: 'host' | 'default' }
+  /**
+   * 可选：成员名算法注入点（缺省即本文件的 `memberNameFor`）。
+   *
+   * 只为**证明兜底断言真的会停派**而存在：生产装配不传，默认算法本身不产生冲突；
+   * 测试注入一个「撞名」的算法，验证 dispatchReady 会报 MEMBER_NAME_COLLISION 而不是 spawn（AC-4）。
+   */
+  memberNameFor?: (task: PlanTask) => string
   now?(): number
 }
 
@@ -87,29 +94,108 @@ export interface ResumeResult {
   unchanged: boolean
 }
 
+/** 可读段每段字符上限（只服务可读性，身份由哈希承担）。 */
+const READABLE_MAX = 20
+
+/** 身份短哈希位数（base36 末 6 位）。 */
+const HASH_LEN = 6
+
 /**
- * 成员名：`<roleId>-<taskId>`，归一为宿主 `memberName()` 的硬契约
- * `HOST_MEMBER_NAME`（lower-kebab，见 config.ts）。
+ * 可读段总预算 = 48(上限) - 6(哈希) - 1(连接符) = 41。
  *
- * 确定性是 AC-17 的地基——同一任务无论第几次派发都得到同一个名字，
- * 宿主重启后能靠名字把任务重新绑回成员。
- *
- * 为什么必须**小写 + 折叠下划线**：`roleId` / `taskId` 是模型自填的（`Login_Flow`、`t 1`、
- * `重构-登录` 都可能出现），旧实现只把非法字符换成 `-` 并保留大小写，于是生成
- * `dev-Login_Flow`，宿主 `spawnTeammate` 直接抛 `TEAM_INVALID_MEMBER_NAME`，成员一个也建不出来、
- * 任务永远停在 pending（面板只留一条 error notice，看起来像「点了没反应」）。
- * 归一化后任何输入都映射到合法名字：大写折成小写、非 `[a-z0-9]` 连续段折成单个 `-`。
+ * 截断**只裁可读段，永不裁哈希** —— 否则两个 40 字长的 id 截断后会重新撞成同名（缺陷复发）。
+ * 上限引用 `HOST_MEMBER_NAME_MAX` 字面量，不在本文件重写 48（config.ts 的注释要求同源）。
  */
-export function memberNameFor(task: PlanTask): string {
-  const raw = `${task.roleId}-${task.id}`
-  const normalized = raw
+const NAME_BUDGET = HOST_MEMBER_NAME_MAX - HASH_LEN - 1
+
+/**
+ * 归一化：**只用于可读段**，不承担身份编码。
+ *
+ * 宿主 `memberName()` 的硬契约是 lower-kebab（`HOST_MEMBER_NAME`，见 config.ts），而
+ * `roleId` / `taskId` 是模型自填的（`Login_Flow`、`t 1`、`重构-登录` 都可能出现），
+ * 所以可读段必须折叠成 `[a-z0-9-]`：大写折小写、非字符连续段折单个 `-`、去掉首尾 `-`。
+ */
+function slugify(raw: string): string {
+  return raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-  if (normalized === '') return 'member'
+    .slice(0, READABLE_MAX)
+    .replace(/-+$/g, '')
+}
+
+/**
+ * 身份短哈希：FNV-1a 32 位 → base36 末 `len` 位。
+ *
+ * 输入是**原始**（未归一、未截断）字符串，因此两个只差大小写/分隔符、或只差末尾若干字符的
+ * id 也必然得到不同哈希 —— 这是「两个中文 id 归一后同为空」不再塌缩的全部原因。
+ * 纯 `charCodeAt` + `Math.imul` 算术：无 locale、无 `Intl`、无 `crypto`、无随机/时间输入，
+ * 跨进程跨平台确定（AC-3）。
+ */
+export function shortIdentityHash(raw: string, len: number = HASH_LEN): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < raw.length; i += 1) {
+    h ^= raw.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(36).padStart(len, '0').slice(-len)
+}
+
+/**
+ * 成员名 = `<可读 role>-<可读 task>-<身份短哈希>`（可读段为空时用 `member` 兜底）。
+ *
+ * 确定性是 AC-17 的地基——同一 `(roleId, taskId)` 无论第几次派发、在哪个进程里都得到同一个名字，
+ * 宿主重启后能靠它把任务重新绑回成员；签名与原实现一致，调用方零改动。
+ *
+ * 为什么**先编码身份段再归一化**（而不是旧实现的「整体归一化」）：`dev/登录流程` 与
+ * `dev/注册接口` 归一后都是 `dev`，第二个就绪任务被宿主当成重名拒绝、永久 pending。
+ * 身份段取原始串哈希，与可读段是否被截断无关，故名字两两不等（AC-1/AC-2）。
+ *
+ * 代价（如实记录）：纯中文 id 的可读段必然为空，名字形如 `dev-4k2m9a`，肉眼认不出是哪个任务；
+ * 可读性由面板/消息里始终携带的 `taskId` + 标题承担，不靠名字自解释。
+ */
+export function memberNameFor(task: PlanTask): string {
+  const hash = shortIdentityHash(`${task.roleId}\u0000${task.id}`)
+  const head = [slugify(task.roleId), slugify(task.id)].filter((part) => part !== '').join('-')
+  const base = head === '' ? 'member' : head
   // 截断后可能落在分隔符上（`dev-t1-xxxxx-`），结尾的 `-` 同样违约，二次归一。
-  const truncated = normalized.slice(0, HOST_MEMBER_NAME_MAX).replace(/-+$/g, '')
-  return truncated === '' ? 'member' : truncated
+  const trimmed = base.length > NAME_BUDGET ? base.slice(0, NAME_BUDGET).replace(/-+$/g, '') : base
+  return `${trimmed === '' ? 'member' : trimmed}-${hash}`
+}
+
+/** 一处成员名冲突：同名被 ≥2 个不同 task 占用。 */
+export interface NameCollision {
+  name: string
+  taskIds: string[]
+}
+
+/**
+ * 全计划任务名的两两唯一性断言（AC-4）。
+ *
+ * `reserved` 是「未退役 binding 的名字」：它们已经占着宿主里的成员名，新派发的任务不能撞上去，
+ * 但**同 taskId 自占不算冲突**（幂等续跑必须继续可用）。已退役 binding 的名字可回收，不参与。
+ *
+ * 只在「≥2 个**不同** taskId 共享同一 name」时判冲突：同一任务重复出现不是冲突。
+ */
+export function memberNameCollisions(
+  tasks: PlanTask[],
+  options: { nameOf?: (task: PlanTask) => string; reserved?: Array<{ taskId: string; name: string }> } = {},
+): NameCollision[] {
+  const nameOf = options.nameOf ?? memberNameFor
+  const byName = new Map<string, string[]>()
+  const remember = (name: string, taskId: string): void => {
+    const taskIds = byName.get(name)
+    if (!taskIds) {
+      byName.set(name, [taskId])
+      return
+    }
+    if (!taskIds.includes(taskId)) taskIds.push(taskId)
+  }
+  for (const task of tasks) remember(nameOf(task), task.id)
+  for (const item of options.reserved ?? []) remember(item.name, item.taskId)
+  return [...byName.entries()]
+    .filter(([, taskIds]) => taskIds.length > 1)
+    .map(([name, taskIds]) => ({ name, taskIds }))
 }
 
 /** 在飞任务数：running + gate（gate 期间成员仍占着一个并发位）。 */
@@ -168,6 +254,18 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     for (const taskId of ready) skipped.push({ taskId, reason: 'CONCURRENCY_FULL' })
     return { state: next, started, skipped, errors }
   }
+
+  // 派发前唯一性断言（AC-4）：**一次**算完全计划任务名 ∪ 未退役 binding 名的冲突集。
+  //
+  // 必须在循环之前算完，不能在循环里边派边算：边派边算会让「谁先被派」决定谁撞名，
+  // 于是名字的可用性取决于任务顺序（恢复后顺序可能变，重绑就会翻倍）。
+  // 注意冲突任务**不 spawn、不写 binding、不改 status**，错误通过 errors 暴露给面板/工具，
+  // 而不是让宿主重名失败后把它吞成静默 pending（R2-1 的原始症状）。
+  const nameOf = deps.memberNameFor ?? memberNameFor
+  const reserved = next.bindings
+    .filter((binding) => binding.retired !== true)
+    .map((binding) => ({ taskId: binding.taskId, name: binding.name }))
+  const collisions = memberNameCollisions(next.plan.tasks, { nameOf, reserved })
 
   for (const taskId of ready) {
     const task = next.plan.tasks.find((item) => item.id === taskId)
@@ -241,8 +339,22 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
       }
     }
 
+    // 步 d：成员名唯一性（AC-4）——撞名就**停派**，不自动改名。
+    // 位置在角色/模型预校验之后、`buildPrompt` 之前：名字算不出来就没有拼提示词的意义，
+    // 而预校验仍排在更前面，保证「角色缺失」这类更有信息量的原因优先暴露。
+    // 静默加 `-2` 消歧是禁止项：改名会让 AC-17 的「按名字重绑成员」变得不可信。
+    const name = nameOf(task)
+    const collision = collisions.find((item) => item.taskIds.includes(taskId))
+    if (collision) {
+      errors.push({
+        taskId,
+        code: 'MEMBER_NAME_COLLISION',
+        error: `成员名冲突：${collision.name} 同时属于任务 ${collision.taskIds.join('、')}；本次不派发（请修改任务 id 或角色，系统不会自动改名）`,
+      })
+      continue
+    }
+
     // 步 e：创建成员。
-    const name = memberNameFor(task)
     let prompt = ''
     try {
       prompt = deps.buildPrompt({ plan: next.plan, task, role, name })

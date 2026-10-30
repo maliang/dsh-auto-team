@@ -17,7 +17,6 @@ import { RunsStore, type RunState } from './store.ts'
 import { createRoleRepo } from './roles/repo.ts'
 import {
   createBridge,
-  describeRoute,
   type ApplyReceiptPort,
   type DispatchPort,
   type ResumePort,
@@ -44,7 +43,7 @@ import {
 } from './team/dispatch.ts'
 import { createMemberWatcher } from './team/watcher.ts'
 import { auditRoute } from './team/route.ts'
-import { composeSkillPrompt } from './roles/builtin.ts'
+import { buildMemberPrompt } from './team/member-prompt.ts'
 
 export const name = 'auto-team'
 
@@ -87,31 +86,13 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     return resolveConcurrencyLimit(ctx)
   }
 
+  /**
+   * 成员 prompt 的拼装本体已搬到纯模块 `team/member-prompt.ts`（AC-10 的独立探针必须
+   * import 到**真实**实现才能证明「技能正文真的进了 spawn prompt」）；装配层只留这一行委托，
+   * 旧的拼装片段整段删除，避免同一份文案出现两个来源。
+   */
   function buildPrompt(input: PromptInput): string {
-    const role = input.role
-    const skills = role ? composeSkillPrompt(role) : { text: '', missing: [] }
-    const memory = bridge.memoryFor(input.task.title)
-    const lines = [
-      `# 角色：${role?.name ?? input.task.roleId}`,
-      role?.duty ? `职责：${role.duty}` : '',
-      `模型路由：${describeRoute(role)}`,
-      '',
-      `## 本次任务（${input.task.id}）`,
-      input.task.title,
-      input.task.dependsOn.length > 0 ? `前置任务（已完成）：${input.task.dependsOn.join('、')}` : '',
-      '',
-      '## 验收判定（必须实际执行并回报退出码）',
-      input.task.acceptance === '' ? '（未声明；视为需要人工确认，不得自称完成）' : `\`${input.task.acceptance}\``,
-      '',
-      '## 团队记忆（截断策略：总预算固定，超出部分不进上下文）',
-      memory.text === '' ? '（暂无相关记忆）' : memory.text,
-      memory.truncated ? '\n（注意：记忆已截断，完整内容请用 auto_team_memory 读取）' : '',
-      '',
-      '## 技能',
-      skills.text === '' ? '（无）' : skills.text,
-      skills.missing.length > 0 ? `\n（缺失技能定义：${skills.missing.join('、')}）` : '',
-    ]
-    return lines.filter((line) => line !== '').join('\n')
+    return buildMemberPrompt(input, { memoryFor: (goal: string) => bridge.memoryFor(goal) })
   }
 
   // 成员名由 dispatch 决定（`<roleId>-<taskId>`，确定性，AC-17 的幂等地基）；

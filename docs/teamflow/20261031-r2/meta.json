@@ -1,0 +1,7 @@
+{
+  "reqId": "req-2",
+  "runId": "tf-mvvjakqn-xhhc7s",
+  "title": "修复 R2-1 成员名塌缩缺陷：同角色多个中文任务 id 归一后重名导致第二个就绪任务永久 pending（dispatch.ts 的 memberNameFo",
+  "mode": "full",
+  "createdAt": 1793398720135
+}
