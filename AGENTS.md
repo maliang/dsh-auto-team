@@ -59,6 +59,9 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 **与宿主联调的常识**
 - 本机 `dsh` 不在 PATH：安装走 `cd ~/.dsh/profiles/desktop && pnpm add file:<repo>`，并同步 `dsh.profile.bundles`；安装只能由主 agent 执行。
 - 宿主实际 API 形状（工具定义、prompt section、route、`spawnTeammate` 返回值、`resolveCallConfig`）**尚未全部核实**，见 ARCHITECTURE §8.2；任何"已验证"声明必须附命令与返回值，不得凭记忆断言。
+- **`cordis_inspect_query` 的 `input` 必须是对象**（主 agent 2026-11-01 实测）：列全部用 `input: {}`；查单个事件/服务用 `input: {"event": "<name>"}` / `input: {"service": "<name>"}`。传字符串、数组或省略成非对象时会返回 `rejected input: "input" must be an object`——**这是调用姿势错误，不是环境不可用**，不要把阶段判成 env-unavailable 然后反复重试（已有两轮因此烧穿阶段 token 预算）。
+- **观测工具调用要订阅 `tools/result`，不要订阅 `tools/execute`**：`tools/result` 是 `emit`（签名 `(exec: Readonly<ToolExecution>, result)`，监听器异常会被隔离），`tools/execute` 是 `waterfall`（必须 `next()`，漏调就吞掉工具执行、改错信号会破坏取消链）。宿主文档原文：`tools/result` 的 scope 过滤 **keyed by `exec.agent`**——在 `agent.ctx` 上注册的监听器**只收到该 agent 的调用**，`src/host/adapters.ts` 的 `agentContextOf(agent)` 可直接复用，不必按 id 过滤、不必装全局监听。
+- `exec` 形状（宿主 `ToolExecutionInput` + `rootCallId` + `token`）：`callId` / `rootCallId?` / `name` / `schema?` / `arguments` / `agent?: Agent { readonly id: SessionId }` / `parent?: ToolExecutionToken` / `signal`。嵌套子调用 `parent` 非空、`agent` 仍指向所属成员。
 
 <!-- teamflow:begin -->
 ## TeamFlow 托管区（本块由 TeamFlow 自动维护，团队请勿手改）
