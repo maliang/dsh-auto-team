@@ -260,7 +260,7 @@ export function allocateMemberNames(
     order.push(task.id)
   }
 
-  // 2. 已占用集合：未退役 binding 名 ∪ 宿主现存成员名（不可得时退化为空，与 liveness 同策略）。
+  // 2. 已占用集合：未退役 binding 名 ∪ 宿主现存成员名（名单不可得时退化为空，见下方名字分配处的取舍说明）。
   const bindingOfTask = new Map<string, string>()
   const taken = new Set<string>()
   for (const item of options.reserved ?? []) {
@@ -381,8 +381,10 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   //
   // 必须在循环之前算完，不能在循环里边派边算：边派边算会让「谁先被派」决定谁撞名，
   // 于是名字的可用性取决于任务顺序（恢复后顺序可能变，重绑就会翻倍）。
-  // 宿主名单不可得（listMembers 抛错）时 `hostNames` 退化为空 —— 与既有 liveness 判断同一个
-  // 保守策略：只依赖 binding 名 + 计划名，宁可多算一个序号，也不假装「宿主里没人」。
+  // 宿主名单不可得（listMembers 抛错）时 `hostNames` 退化为空：这里**刻意不做保守预留**。
+  // 预留会让重试拿到新序号，破坏 AC-3 的名字恒定与恢复幂等；真撞名交给宿主 spawn 失败、以
+  // `errors` 显式暴露（可观测，不会静默卡在 pending）。注意这与上方成员 liveness 的保守策略
+  // 方向**相反**，是刻意取舍：那边宁可少派一个，这边宁可先按「没人占名」算。
   const nameOf = deps.memberNameFor ?? memberNameFor
   const reserved = next.bindings
     .filter((binding) => binding.retired !== true)
