@@ -49,12 +49,15 @@
 **验证命令（提交前必须全绿）**
 ```bash
 pnpm typecheck   # tsc --noEmit
-pnpm test        # node --test test/*.test.ts（27 例，实测 <0.2s）
+pnpm test        # node --test test/*.test.ts（当前 216 例）
 pnpm build       # 双产物
 node --input-type=module -e "await import('./lib/index.js')"
 node --input-type=module -e "await import('./lib/client.js')"
 npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 ```
+
+**探针脚本的可重跑前提**
+- `logs/teamflow/<runId>/scripts/*.mjs` 里的探针一律用 `new URL('../../../../', import.meta.url)` 锚定**仓库根**。run 结束后 host 会把 `logs/` 归档到 `$DSH_HOME/teamflow/<workspace>/logs/<runId>/`；从归档位置直接 `node` 跑这些脚本，相对根会解析成 `~/.dsh/teamflow/` → 报 `依赖模块未落盘 / ERR_MODULE_NOT_FOUND`，**看起来像交付坏了，其实只是位置变了**（r4 验收复核时实测：归档位置 9 个探针 6 个红）。要复跑必须先 `cp -r` 回 `<repo>/logs/teamflow/<runId>/scripts/`，跑完删掉（`logs/teamflow/` 已在 `.gitignore`）。报告任何「探针红」之前，先确认脚本是不是从归档位置跑的。
 
 **与宿主联调的常识**
 - 本机 `dsh` 不在 PATH：安装走 `cd ~/.dsh/profiles/desktop && pnpm add file:<repo>`，并同步 `dsh.profile.bundles`；安装只能由主 agent 执行。
