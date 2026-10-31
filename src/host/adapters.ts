@@ -632,6 +632,97 @@ export function agentContextOf(agent: unknown): AgentEventContext | null {
   return typeof candidate.on === 'function' ? (candidate as AgentEventContext) : null
 }
 
+/** payload 里的对象是否「像个 agent」：有非空 id / name，或挂着 ctx（宿主 Agent 的最小可辨认特征）。 */
+function isAgentLike(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as { id?: unknown; name?: unknown; ctx?: unknown }
+  if (typeof candidate.id === 'string' && candidate.id !== '') return true
+  if (typeof candidate.name === 'string' && candidate.name !== '') return true
+  return candidate.ctx !== null && typeof candidate.ctx === 'object'
+}
+
+/**
+ * 从工具事件 payload 里尽力取一个「发起调用的 agent」；取不到返回 `undefined`。
+ *
+ * 只认**已实测**的三种形状（AGENTS §4 / commit 5b47746）：
+ *  1. `exec` 本身（`exec.agent?: Agent { readonly id }`）；
+ *  2. `{ exec }` 包装（监听器签名 `(exec, result)` 被我们自己包了一层时）；
+ *  3. `{ agent }`（宿主别的 emit 事件把 agent 直接挂在根上时）。
+ *
+ * **不猜字段名**：宿主形状里没有 `sender` / `owner` 这类同义词，猜错会把推进记到别人头上，
+ * 表现是「A 的调用救了 B 的停滞」——比漏记一次更糟。
+ */
+export function agentOfToolEvent(payload: unknown): unknown {
+  if (!payload || typeof payload !== 'object') return undefined
+  const root = payload as Record<string, unknown>
+  const candidates: unknown[] = [root.agent]
+  const exec = root.exec
+  if (exec && typeof exec === 'object') candidates.push((exec as Record<string, unknown>).agent)
+  for (const candidate of candidates) {
+    if (isAgentLike(candidate)) return candidate
+  }
+  return undefined
+}
+
+/**
+ * 订阅「成员有实质产出」的信号，回调里带 agent 与时刻（AC-9 的第二个数据来源）。
+ *
+ * 事件选择：只用 **emit** 类事件，绝不订阅 waterfall（`tools/execute` 必须调 `next()`，
+ * 漏调会吞掉工具执行、改错信号会破坏取消链 —— AGENTS §4 的硬约定）。
+ *  - L1 `tools/result`：`(exec, result)`，`exec.agent` 是发起者，宿主在 agent 作用域注册时
+ *    按 `exec.agent` 过滤；
+ *  - L2 `agent/status`：兜底。万一宿主把 `tools/result` 过滤在本成员作用域内、根作用域收不到，
+ *    状态变化仍能给出推进信号（两者都注册，去重交给 `touchProgress`：同一时刻多记一次无副作用）。
+ *
+ * 降级：宿主没有 `ctx.on` 时 **warn 并返回空 stop**，绝不抛错 —— 停滞判定会退化成
+ * 「以 `binding.spawnedAt` 为基线」，仍然会在成员真的不动时告警（L3 的语义）。
+ */
+export function onMemberProgress(
+  ctx: HostContext,
+  handler: (info: { agent: unknown; at: number }) => void,
+): { stop: () => void } {
+  if (typeof ctx.on !== 'function') {
+    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：停滞判定降级为「以派发时间为基线」')
+    return { stop() {} }
+  }
+  const on = ctx.on.bind(ctx)
+  const disposers: Array<() => void> = []
+
+  const subscribe = (event: string, agentOf: (args: unknown[]) => unknown): void => {
+    try {
+      const dispose = on(event, (...args: unknown[]) => {
+        try {
+          const agent = agentOf(args)
+          if (agent === undefined) return
+          handler({ agent, at: Date.now() })
+        } catch (error) {
+          // 监听器异常会被宿主隔离，但我们的 handler 里还有 store 写入，自己兜一层更清楚。
+          ctx.logger?.warn?.(`[auto-team] 推进事件处理失败（${messageOf(error)}）`)
+        }
+      })
+      if (typeof dispose === 'function') disposers.push(dispose)
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] 订阅 ${event} 失败（${messageOf(error)}）`)
+    }
+  }
+
+  subscribe('tools/result', (args) => agentOfToolEvent(args.length > 1 ? { exec: args[0] } : args[0]))
+  subscribe('agent/status', (args) => agentOfToolEvent(args[0] ?? args))
+
+  return {
+    stop() {
+      while (disposers.length > 0) {
+        const dispose = disposers.pop()
+        try {
+          dispose?.()
+        } catch {
+          /* 单个 disposer 失败不影响其余清理 */
+        }
+      }
+    },
+  }
+}
+
 /**
  * 把角色声明的模型路由装到**该成员自己的** `agent.ctx` 上（AC-22 的真正下发点）。
  *

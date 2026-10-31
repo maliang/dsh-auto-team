@@ -25,6 +25,7 @@ import {
   RESUME_DEBOUNCE_MS,
 } from '../config.ts'
 import { readyTasks } from '../plan/graph.ts'
+import { handoffBodiesFor, handoffMessages } from './handoff.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { auditRoute, preflightRoutes, type RoutePort } from './route.ts'
 
@@ -36,6 +37,12 @@ export interface SpawnInput {
   /** 成员名（= memberNameFor(task)，同一任务反复重试也是同一个名字）。 */
   name: string
   prompt: string
+  /**
+   * 上游交接正文（AC-4b）：本任务的上游直投内容，原样进成员首条提示词。
+   * 加在 `SpawnInput`（基类型）上而不是 `PromptInput` 上 —— `PromptInput` 是
+   * `Omit<SpawnInput, 'prompt'>`，自动继承；反向重建类型层级只会多一处要维护的地方。
+   */
+  handoffs?: string[]
 }
 
 /** 提示词构造入参（不含 prompt 本身，prompt 由它产出）。 */
@@ -486,7 +493,15 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     // 步 e：创建成员。
     let prompt = ''
     try {
-      prompt = deps.buildPrompt({ plan: next.plan, task, role, name })
+      prompt = deps.buildPrompt({
+        plan: next.plan,
+        task,
+        role,
+        name,
+        // AC-4(b)：上游直投的正文在这里（唯一注入点）进成员首条提示词。只读账本、不重新拼装，
+        // 所以成员看到的与面板里逐字相同。resumeRun 不注入（续跑成员已经有上下文了）。
+        handoffs: handoffBodiesFor(next.messages, taskId),
+      })
     } catch (error) {
       errors.push({ taskId, error: `生成提示词失败：${messageOf(error)}` })
       continue
@@ -698,6 +713,35 @@ export function applyReceipt(
           return allDone ? { ...item, status: 'pending' as const } : item
         }),
       },
+    }
+  }
+
+  // 直通投递（AC-1~AC-5）：done 且门禁 exitCode===0 → 给每个 dependsOn 含本任务的下游各一条
+  // `from: 'peer'` 的交接。放在「解锁下游」之后，让这段看到的是解锁后的同一份快照。
+  // **只落账、不实发**：applyReceipt 是纯函数（无 IO），把 body 送进成员会话的唯一入口是
+  // `bridge.act('receipt')` —— 两条投递路径是不可接受的（AC-4a 的逐字一致会立刻分叉）。
+  if (receipt.verdict === 'done' && evidence && evidence.exitCode === 0) {
+    const upstreamTask = next.plan.tasks.find((item) => item.id === taskId) ?? task
+    const existingIds = next.messages.flatMap((message) =>
+      message.messageId === undefined ? [] : [message.messageId],
+    )
+    const downstream = next.plan.tasks.filter((item) => item.dependsOn.includes(taskId))
+    for (const message of handoffMessages({
+      upstream: upstreamTask,
+      evidence,
+      upstreamVerdict: receipt.verdict,
+      downstream,
+      at,
+      existingIds,
+      // to 的口径：下游成员已经存在 → 用成员名（并带 toMemberId 供实发）；
+      // 尚未创建（常态：B 在 A 完成后才派发）→ `task:<id>`，等它创建时再注入提示词（AC-4b）。
+      targetOf: (downstreamTaskId) => {
+        const binding = liveBinding(next, downstreamTaskId)
+        if (binding) return { to: binding.name, toMemberId: binding.memberId }
+        return { to: `task:${downstreamTaskId}` }
+      },
+    })) {
+      next = appendMessage(next, message)
     }
   }
 

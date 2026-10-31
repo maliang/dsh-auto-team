@@ -8,10 +8,22 @@
  */
 import * as React from 'react'
 import type { TabProps } from '../Panel.tsx'
-import { actFeedback, formatClock, formatRelative, hintOf, memberRouteText, statusBadge, tailLines, viewExtras } from '../viewmodel.ts'
-
-/** 心跳阈值：超过它仍显示「运行中」，就在行内挂一个存疑标记（AC-18 的可见侧）。 */
-const STALE_MS = 15_000
+import {
+  actFeedback,
+  formatClock,
+  formatRelative,
+  hintOf,
+  ledgerBodyFoldable,
+  memberRouteText,
+  peerLabelOf,
+  stalledRowOf,
+  statusBadge,
+  tailLines,
+  viewExtras,
+  STALL_LEAD,
+  STALL_TAIL,
+  STALL_SUFFIX,
+} from '../viewmodel.ts'
 
 export function MembersTab(props: TabProps): React.ReactElement {
   const { snapshot, act } = props
@@ -19,6 +31,13 @@ export function MembersTab(props: TabProps): React.ReactElement {
   const [note, setNote] = React.useState<Record<string, string>>({})
   const [openEvidence, setOpenEvidence] = React.useState<string | undefined>(undefined)
   const [hint, setHint] = React.useState<string | undefined>(undefined)
+  /**
+   * 账本正文展开态：唯一新增的本地 state，键为 `messageId ?? at-index`。
+   *
+   * 只活在面板内存里——不写宿主、不新增 PanelAction。宿主每 2000ms 推新快照，
+   * 存到服务端反而会让「展开」变成一条需要落盘、需要审计的用户动作。
+   */
+  const [expanded, setExpanded] = React.useState<Record<string, boolean>>({})
 
   const members = snapshot?.members ?? []
   const tasks = snapshot?.tasks ?? []
@@ -67,14 +86,14 @@ export function MembersTab(props: TabProps): React.ReactElement {
         const badge = statusBadge(member.status)
         const route = memberRouteText(member, extras.routeAudits)
         const lastEvent = member.lastEventAt
-        const stale = member.status === 'running' && lastEvent > 0 && now - lastEvent > STALE_MS
+        const stall = stalledRowOf(member)
         return (
           <div
             key={member.memberId}
             data-auto-team-member
             data-member-id={member.memberId}
             data-status={member.status}
-            data-stale={stale ? 'true' : 'false'}
+            data-stalled={stall.show ? 'true' : 'false'}
           >
             <span data-member-name title={member.name}>
               {member.name}
@@ -94,9 +113,27 @@ export function MembersTab(props: TabProps): React.ReactElement {
             <span data-model-route data-model-route-value={route}>
               {route}
             </span>
-            {stale ? (
-              <span data-member-stale-hint role="status">
-                心跳已超过 {Math.floor(STALE_MS / 1000)} 秒，宿主正在对账（成员进程可能已退出）
+            {stall.show ? (
+              /*
+               * 停滞条（AC-12 / AC-14）：跨全宽插槽，不参与 76/96/64/44 四列的宽度竞争。
+               *
+               * 给 role="status" 但**不做 aria-live**：面板 2000ms 轮询会让含秒数的 live region
+               * 每 2 秒播报一次，等于骚扰。文案里必须写明「成员还活着」——它与 interrupted
+               * （已中断）的差别不是颜色，是事实本身。
+               */
+              <span
+                data-member-stall
+                role="status"
+                data-stalled-for={member.stalledForMs}
+                title={STALL_SUFFIX}
+              >
+                <span data-stall-icon aria-hidden="true">
+                  ⏳
+                </span>
+                <span data-stall-lead>{STALL_LEAD}</span>{' '}
+                {/* 秒数原样渲染宿主下发的文本，客户端不做任何换算 */}
+                <span data-stall-seconds>{stall.secondsText}</span>{' '}
+                <span data-stall-tail>{STALL_TAIL}</span>
               </span>
             ) : null}
 
@@ -198,30 +235,51 @@ export function MembersTab(props: TabProps): React.ReactElement {
           <span data-ledger-meta>共 {extras.messages.length} 条（上限 200，超出丢最旧）</span>
         </div>
         {extras.messages.length === 0 ? (
-          <div data-empty>还没有直达消息。队长给成员的任务交接与返工意见都会记在这里。</div>
+          <div data-empty>还没有消息。队长派发、成员回执、上游任务的门禁证据直投都会记在这里。</div>
         ) : (
           <ol data-ledger-list>
-            {extras.messages.map((message, index) => (
-              <li
-                key={message.messageId ?? `${message.at}-${index}`}
-                data-message
-                data-from={message.from}
-                data-to={message.to}
-                data-task-id={message.taskId ?? ''}
-                data-at={message.at}
-              >
-                <span data-message-route>
-                  {message.from} → {message.to}
-                </span>
-                {message.taskId !== undefined ? (
-                  <span data-message-task>{message.taskId}</span>
-                ) : null}
-                <time data-message-at dateTime={new Date(message.at).toISOString()}>
-                  {formatClock(message.at)}
-                </time>
-                <span data-message-body>{message.body}</span>
-              </li>
-            ))}
+            {extras.messages.map((message, index) => {
+              const key = message.messageId ?? `${message.at}-${index}`
+              const foldable = ledgerBodyFoldable(message.body)
+              const isOpen = expanded[key] === true
+              return (
+                <li
+                  key={key}
+                  data-message
+                  data-from={message.from}
+                  data-to={message.to}
+                  data-task-id={message.taskId ?? ''}
+                  data-at={message.at}
+                  /* 只有「可折叠」的行才带展开态，短正文行不加属性 → CSS 也就不会去裁它 */
+                  data-message-expanded={foldable ? (isOpen ? 'true' : 'false') : undefined}
+                >
+                  <span data-message-route>
+                    {peerLabelOf(message.from)} → {message.to}
+                  </span>
+                  {message.taskId !== undefined ? (
+                    <span data-message-task>{message.taskId}</span>
+                  ) : null}
+                  <time data-message-at dateTime={new Date(message.at).toISOString()}>
+                    {formatClock(message.at)}
+                  </time>
+                  {foldable ? (
+                    <button
+                      type="button"
+                      data-message-toggle
+                      aria-expanded={isOpen}
+                      title={isOpen ? '收起正文' : '展开完整正文'}
+                      onClick={() =>
+                        setExpanded((current) => ({ ...current, [key]: !isOpen }))
+                      }
+                    >
+                      {isOpen ? '收起' : '展开'}
+                    </button>
+                  ) : null}
+                  {/* body 整行独占：直投正文最长 800 字，塞进列里会变成 80+ 行（DESIGN §0.7） */}
+                  <span data-message-body>{message.body}</span>
+                </li>
+              )
+            })}
           </ol>
         )}
       </div>

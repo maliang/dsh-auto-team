@@ -40,6 +40,7 @@ import {
   MAX_CONCURRENT_LIMIT,
   MEMORY_INJECT_BUDGET,
   MEMORY_LINES_PER_TASK,
+  STALL_MS,
 } from './config.ts'
 import { runGate } from './gate/gate.ts'
 import { selectMemory } from './memory/inject.ts'
@@ -48,12 +49,16 @@ import { blockedTasks, readyTasks } from './plan/graph.ts'
 import { progressOf } from './plan/plan.ts'
 import type { RoleRepo } from './roles/repo.ts'
 import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
+import { secondsText, stallOf } from './team/stall.ts'
 
 /** 门禁串行队列上限（TECHNICAL §5.3：避免一次 receipt 风暴炸出多个 shell）。 */
 const GATE_QUEUE_LIMIT = 8
 
 /** 活动流最多保留的条数（面板只显示最近 50 条，避免快照无限膨胀）。 */
 const ACTIVITY_LIMIT = 50
+
+/** peer 交接消息的 messageId 前缀（`handoff:<上游>-><下游>`，AC-5 的幂等键，由 team/handoff.ts 生成）。 */
+const HANDOFF_MESSAGE_PREFIX = 'handoff:'
 
 /** 回执：门禁判定结果（done 的唯一写点在 team/dispatch.ts 的 applyReceipt）。 */
 export interface ReceiptInput {
@@ -118,6 +123,13 @@ export interface BridgeDeps {
   gate: { cwd: string; artifactsDir: string; timeoutMs?: number }
   /** 宿主并发上限（adapters.resolveConcurrencyLimit）；缺省按 MAX_CONCURRENT_LIMIT 且标注 default。 */
   hostConcurrency?: () => { limit: number; source: 'host' | 'default' }
+  /**
+   * 停滞判定阈值（毫秒）。缺省 `STALL_MS`。
+   *
+   * AC-13：常量只在 `config.ts` 定义一次，这里**只接收参数**——`stallOf` 也因此收参数而不自己读常量，
+   * 否则单测无法注入不同阈值，「阈值单一定义」这条 AC 会退化成两处各写一遍。
+   */
+  stallMs?: number
   now?: () => number
 }
 
@@ -146,6 +158,7 @@ const NOT_ENABLED_TEXT = '自动团队未启用：请先在输入框下方的「
 
 export function createBridge(deps: BridgeDeps): Bridge {
   const now = deps.now ?? (() => Date.now())
+  const stallMs = deps.stallMs ?? STALL_MS
   const flags = loadFlags()
   let messageSeq = 0
   let gateQueueDepth = 0
@@ -238,6 +251,43 @@ export function createBridge(deps: BridgeDeps): Bridge {
     })
   }
 
+  // ---------- 直通投递的实发 ----------
+
+  /**
+   * peer 交接的**唯一实发点**（AC-4(a)）。`applyReceipt` 是纯函数、只落账；`deps.sendMessage`
+   * 只在这个作用域可用，所以「把 body 真送进成员会话」全仓只有这一处。
+   *
+   * 只发「本次新增 + `from==='peer'` + `toMemberId` 有值」的条目：
+   *   - `toMemberId` 有值 ⇒ 下游成员已经存在，可以实发；
+   *   - 缺省 ⇒ B 尚未创建（常规路径），body 留在账本里，等 B 创建时由 `buildMemberPrompt`
+   *     经 `handoffBodiesFor` 注入首条提示词（AC-4(b)），此处**不得**硬塞一条消息。
+   * 失败只回 notice：绝不补一条 `from:'captain'` 的账本消息（AC-3 反面目标 3）——那会把
+   * 「信息其实还是过了一遍队长」写成账本事实。
+   */
+  async function deliverPeerHandoffs(before: RunState, after: RunState): Promise<string[]> {
+    const known = new Set(before.messages.map((message) => message.messageId))
+    const notices: string[] = []
+    for (const message of after.messages) {
+      const id = message.messageId
+      if (id === undefined || !id.startsWith(HANDOFF_MESSAGE_PREFIX) || known.has(id)) continue
+      if (message.from !== 'peer' || message.toMemberId === undefined) continue
+      const target = message.to
+      try {
+        const sent = await deps.sendMessage(message.toMemberId, message.body)
+        notices.push(
+          sent.ok
+            ? `上游交接已直投给 ${target}${message.taskId === undefined ? '' : `（${message.taskId}）`}`
+            : `上游交接直投 ${target} 失败：${sent.error ?? '未知原因'}（记录已在账本里，成员创建时仍会注入）`,
+        )
+      } catch (error) {
+        notices.push(
+          `上游交接直投 ${target} 失败：${error instanceof Error ? error.message : String(error)}（记录已在账本里）`,
+        )
+      }
+    }
+    return notices
+  }
+
   // ---------- 快照 ----------
 
   function activityOf(state: RunState | null): ActivityEvent[] {
@@ -276,8 +326,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       })
     }
     for (const task of state.plan.tasks) {
-      if (task.evidence) {
-        events.push({
+      if (task.evidence) {        events.push({
           at: task.evidence.at,
           memberId: task.memberId,
           taskId: task.id,
@@ -295,6 +344,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
         })
       }
     }
+    // 停滞告警由 watcher.tick 落盘（一个 episode 恰好一条，AC-8），这里**只读合并**：
+    // 绝不在这里比较阈值 —— 判定只剩 watcher.tick 一个出口，否则同一次停滞会被算出两条告警。
+    for (const alert of state.stallAlerts ?? []) events.push(alert)
     return events.sort((a, b) => b.at - a.at).slice(0, ACTIVITY_LIMIT)
   }
 
@@ -316,6 +368,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         roleId: binding.roleId,
         taskId: binding.taskId,
         status,
+        ...stallFieldsOf(state, binding.memberId, status, binding.spawnedAt),
         lastEventAt: lastEventAtOf(state, binding.memberId, binding.spawnedAt),
         modelRoute: describeRoute(roleById.get(binding.roleId)),
         canResume: status !== 'done',
@@ -333,12 +386,37 @@ export function createBridge(deps: BridgeDeps): Bridge {
         roleId: task.roleId,
         taskId: task.id,
         status,
+        ...stallFieldsOf(state, task.memberId, status, state.plannedAt),
         lastEventAt: lastEventAtOf(state, task.memberId, state.plannedAt),
         modelRoute: describeRoute(roleById.get(task.roleId)),
         canResume: status !== 'done',
       })
     }
     return views
+  }
+
+  /**
+   * 停滞三字段（AC-14 的数据源，客户端因此零阈值零格式化）。
+   *
+   * **只有 `running` 才可能 `stalled`**：done/failed/interrupted 的成员本来就不会再产出，
+   * 把它们标成「停滞」等于让面板永远挂一片黄色（PRD 反面目标 4）。判定只调 `stall.stallOf`
+   * （与 watcher.tick 同一份实现，阈值只作参数传入），秒数文案只调 `stall.secondsText`。
+   */
+  function stallFieldsOf(
+    state: RunState,
+    memberId: string,
+    status: MemberStatus,
+    fallbackAt: number,
+  ): { stalled: boolean; stalledForMs: number; stalledSecondsText: string } {
+    if (status !== 'running') return { stalled: false, stalledForMs: 0, stalledSecondsText: '' }
+    const progressAt = state.progress?.[memberId]?.at
+    const baseline = progressAt ?? fallbackAt
+    const judge = stallOf(progressAt, baseline, now(), stallMs)
+    return {
+      stalled: judge.stalled,
+      stalledForMs: judge.stalledForMs,
+      stalledSecondsText: judge.stalled ? secondsText(judge.stalledForMs) : '',
+    }
   }
 
   function lastEventAtOf(state: RunState, memberId: string, fallback: number): number {
@@ -662,6 +740,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
               notices.push('该任务没有成员：证据只落在面板与日志里')
             }
           }
+
+          // 直通投递实发（AC-4(a)）：放在 applyReceipt 之后、saveState 之前，失败不影响落账。
+          notices.push(...(await deliverPeerHandoffs(gateState, next)))
 
           const updated = next.plan.tasks.find((item) => item.id === action.taskId)
           if (updated?.status === 'failed') {

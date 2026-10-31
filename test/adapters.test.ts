@@ -7,7 +7,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  agentOfToolEvent,
   listHostMembers,
+  onMemberProgress,
   registerAgentCreated,
   registerEffect,
   registerHttpRoutes,
@@ -16,6 +18,7 @@ import {
   resolveConcurrencyLimit,
   spawnMember,
   toHostToolDefinition,
+  type HostContext,
   type HttpRoute,
 } from '../src/host/adapters.ts'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from '../src/host/config.ts'
@@ -342,4 +345,112 @@ test('spawnMember：返回 memberId + 我们声明的名字（恢复靠名字重
   assert.equal(requests[0]?.name, 'dev-t1')
   assert.equal(requests[0]?.provider, 'session-default', '未声明模型时 provider 回落会话默认')
   assert.deepEqual(requests[0]?.prompt, [{ type: 'text', text: '去做 t1' }])
+})
+
+/** 假宿主 ctx：只实现事件订阅与 warn（够测 onMemberProgress 的全部降级分支）。 */
+function fakeCtx() {
+  const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
+  const warnings: string[] = []
+  const ctx = {
+    logger: {
+      warn: (message: string) => {
+        warnings.push(message)
+      },
+    },
+    on: (event: string, listener: (...args: unknown[]) => unknown) => {
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
+      return () => {
+        const index = list.indexOf(listener)
+        if (index >= 0) list.splice(index, 1)
+      }
+    },
+  }
+  return {
+    ctx: ctx as unknown as HostContext,
+    listeners,
+    warnings,
+    emit(event: string, ...args: unknown[]): void {
+      for (const listener of [...(listeners.get(event) ?? [])]) listener(...args)
+    },
+  }
+}
+
+test('agentOfToolEvent：只认已实测的三种形状（exec / {exec} / {agent}），不猜同义字段', () => {
+  const agent = { id: 'session-agent-1' }
+  assert.equal(agentOfToolEvent({ callId: 'c1', agent }), agent, 'exec 本身（tools/result 的第一个入参）')
+  assert.equal(agentOfToolEvent({ exec: { agent }, result: {} }), agent, '被我们包成 { exec } 的形态')
+  assert.equal(agentOfToolEvent({ agent }), agent, 'agent 直接挂在根上（其它 emit 事件）')
+  assert.equal(agentOfToolEvent({ callId: 'c1' }), undefined, '没有 agent 字段 → undefined')
+  assert.equal(agentOfToolEvent({ sender: agent }), undefined, '不猜 sender 这类同义词')
+  assert.equal(agentOfToolEvent({ agent: { id: '' } }), undefined, '空 id 不是 agent')
+  assert.equal(agentOfToolEvent(null), undefined)
+  assert.equal(agentOfToolEvent('exec'), undefined)
+})
+
+test('onMemberProgress：宿主没有 ctx.on 时 warn + 返回空 stop，绝不抛错', () => {
+  const warnings: string[] = []
+  const sub = onMemberProgress({ logger: { warn: (message: string) => warnings.push(message) } }, () => {})
+  assert.equal(typeof sub.stop, 'function')
+  sub.stop() // 空 stop 可重复调用
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0] ?? '', /ctx\.on/)
+})
+
+test('onMemberProgress：tools/result 的 (exec,result) 能取出成员 agent 并回调', () => {
+  const fake = fakeCtx()
+  const seen: Array<{ agent: unknown; at: number }> = []
+  const sub = onMemberProgress(fake.ctx, (info) => seen.push(info))
+
+  fake.emit('tools/result', { callId: 'c1', agent: { id: 'member-1' } }, { ok: true })
+  assert.equal(seen.length, 1)
+  assert.deepEqual(seen[0]?.agent, { id: 'member-1' })
+  assert.equal(typeof seen[0]?.at, 'number')
+
+  fake.emit('tools/result', { callId: 'c2' }, { ok: true }) // 无 agent：不回调（不猜是哪个成员）
+  assert.equal(seen.length, 1)
+  sub.stop()
+})
+
+test('onMemberProgress：agent/status 兜底事件同样能给出推进信号（两条都注册）', () => {
+  const fake = fakeCtx()
+  const seen: unknown[] = []
+  const sub = onMemberProgress(fake.ctx, (info) => seen.push(info.agent))
+  assert.deepEqual([...fake.listeners.keys()].sort(), ['agent/status', 'tools/result'])
+
+  fake.emit('agent/status', { agent: { id: 'member-2' } })
+  assert.deepEqual(seen, [{ id: 'member-2' }])
+  sub.stop()
+})
+
+test('onMemberProgress：只用 emit 类事件（不订阅 waterfall 的 tools/execute）', () => {
+  const fake = fakeCtx()
+  onMemberProgress(fake.ctx, () => {}).stop()
+  assert.equal(fake.listeners.has('tools/execute'), false, 'tools/execute 是 waterfall，漏调 next() 会吞掉工具执行')
+})
+
+test('onMemberProgress：handler 抛错不外溢（store 写盘异常不能打断宿主工具执行链）', () => {
+  const fake = fakeCtx()
+  const sub = onMemberProgress(fake.ctx, () => {
+    throw new Error('disk full')
+  })
+  assert.doesNotThrow(() => fake.emit('tools/result', { agent: { id: 'member-1' } }))
+  assert.match(fake.warnings.at(-1) ?? '', /disk full/)
+  sub.stop()
+})
+
+test('onMemberProgress：stop 后不再回调，且 disposer 全部被调用', () => {
+  const fake = fakeCtx()
+  let calls = 0
+  const sub = onMemberProgress(fake.ctx, () => {
+    calls += 1
+  })
+  fake.emit('tools/result', { agent: { id: 'member-1' } })
+  sub.stop()
+  assert.equal(fake.listeners.get('tools/result')?.length, 0)
+  assert.equal(fake.listeners.get('agent/status')?.length, 0)
+  fake.emit('tools/result', { agent: { id: 'member-1' } })
+  sub.stop() // 幂等
+  assert.equal(calls, 1)
 })

@@ -7,7 +7,15 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from '../src/host/config.ts'
-import { MESSAGES_LIMIT, RUN_STATE_VERSION, RunsStore, makeRunId, uniqueRunId, wrapLegacy } from '../src/host/store.ts'
+import {
+  MESSAGES_LIMIT,
+  RUN_STATE_VERSION,
+  RunsStore,
+  STALL_ALERTS_LIMIT,
+  makeRunId,
+  uniqueRunId,
+  wrapLegacy,
+} from '../src/host/store.ts'
 
 const now = 1_700_000_000_000
 
@@ -109,6 +117,89 @@ test('消息账本上限 200 条：超出丢最旧，保留最后 200 条且顺�
   assert.equal(state.messages.length, MESSAGES_LIMIT)
   assert.equal(state.messages[0].body, 'm50')
   assert.equal(state.messages.at(-1)?.body, `m${MESSAGES_LIMIT + 49}`)
+})
+
+test('wrapLegacy：progress 只留 at 为有限数字的键，alertedAt 非法则删（AC-13 数据源的可信度）', () => {
+  const state = wrapLegacy({
+    ...legacyPlan(),
+    version: 2,
+    plannedAt: now,
+    progress: {
+      'member-1': { at: now, alertedAt: now + 1 },
+      'member-2': { at: now }, // 无 alertedAt：正常
+      'member-3': { at: Number.NaN }, // at 非法 → 整条丢
+      'member-4': { at: 'oops' }, // at 类型不对 → 整条丢
+      'member-5': { alertedAt: now }, // 缺 at → 整条丢
+      'member-6': { at: now, alertedAt: 'oops' }, // only alertedAt 非法 → 保留 at
+      'member-7': 'not-an-object',
+    },
+  })
+  assert.ok(state)
+  assert.deepEqual(Object.keys(state.progress ?? {}).sort(), ['member-1', 'member-2', 'member-6'])
+  assert.deepEqual(state.progress?.['member-1'], { at: now, alertedAt: now + 1 })
+  assert.deepEqual(state.progress?.['member-6'], { at: now }, 'alertedAt 非法只删该字段，不丢记录')
+  const bare = wrapLegacy({ ...legacyPlan(), version: 2 })
+  assert.ok(bare)
+  assert.deepEqual(bare.progress, {}, '缺省补空对象，不是 undefined')
+})
+
+test('wrapLegacy：stallAlerts 只留 kind=tool 且 at/text 有效的条目，超出上限截尾', () => {
+  const tooMany = Array.from({ length: STALL_ALERTS_LIMIT + 7 }, (_, index) => ({
+    at: now + index,
+    kind: 'tool' as const,
+    text: `告警 ${index}`,
+  }))
+  const state = wrapLegacy({
+    ...legacyPlan(),
+    version: 2,
+    plannedAt: now,
+    stallAlerts: [
+      { at: now, kind: 'spawn', text: '别的 kind 不许混进来' },
+      { at: 'oops', kind: 'tool', text: 'at 非法' },
+      { at: now, kind: 'tool', text: '' },
+      ...tooMany,
+    ],
+  })
+  assert.ok(state)
+  assert.equal(state.stallAlerts?.length, STALL_ALERTS_LIMIT)
+  assert.equal(state.stallAlerts?.[0]?.text, `告警 ${7}`, '丢最旧，保留最新一段')
+  assert.ok(state.stallAlerts?.every((alert) => alert.kind === 'tool'))
+})
+
+test('save：progress 裁剪到 live bindings、stallAlerts 截尾（落盘文件不无限增长）', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const state = wrapLegacy({
+      ...legacyPlan(),
+      version: 2,
+      plannedAt: now,
+      bindings: [
+        { taskId: 't1', roleId: 'dev', memberId: 'member-1', name: 'dev-t1', spawnedAt: now },
+        { taskId: 't2', roleId: 'dev', memberId: 'member-2', name: 'dev-t2', spawnedAt: now, retired: true },
+        { taskId: 't3', roleId: 'dev', memberId: 'member-3', name: 'dev-t3', spawnedAt: now },
+      ],
+      progress: {
+        'member-1': { at: now },
+        'member-2': { at: now }, // retired：不再对账，落盘时丢掉
+        'member-3': { at: now },
+        'member-9': { at: now }, // 没有 binding：丢掉
+      },
+      stallAlerts: Array.from({ length: STALL_ALERTS_LIMIT + 3 }, (_, index) => ({
+        at: now + index,
+        kind: 'tool' as const,
+        text: `告警 ${index}`,
+      })),
+    })
+    assert.ok(state)
+    store.save(state)
+
+    const loaded = store.load('run-legacy')
+    assert.ok(loaded)
+    assert.deepEqual(Object.keys(loaded.progress ?? {}).sort(), ['member-1', 'member-3'])
+    assert.equal(loaded.stallAlerts?.length, STALL_ALERTS_LIMIT)
+    assert.equal(loaded.stallAlerts?.at(-1)?.text, `告警 ${STALL_ALERTS_LIMIT + 2}`)
+    assert.equal(loaded.version, RUN_STATE_VERSION, '新增字段是可选增量：版本号不变')
+  })
 })
 
 test('RunsStore.save/load 往返一致，原子写不留 .tmp', () => {

@@ -50,6 +50,16 @@ export const GATE_FLUSH_TIMEOUT_MS = 1000
 /** 成员存活对账轮询间隔（毫秒）。AC-18：1500 + 前端 2000 = 3500 ≤ 5000 刷新预算。 */
 export const WATCHER_INTERVAL_MS = 1500
 
+/**
+ * 停滞判定阈值（毫秒）：成员「活着但持续没有实质工具调用」多久算停滞（AC-13）。
+ *
+ * **全仓唯一定义处**：`team/stall.ts` 的 `stallOf()` 只接收参数、不自读常量，
+ * `watcher.tick`（告警出口）与 `bridge.membersOf`（展示出口）都从这里取阈值传入 ——
+ * 两处共用同一份判定实现 + 同一个阈值，才不会出现「面板说没停、日志说停了」的分叉。
+ * 判据：全仓 `STALL_MS` 的 `export const` 定义只允许出现在本文件（别处必须 import 或收参数）。
+ */
+export const STALL_MS = 90_000
+
 /** resume 幂等去抖窗口（毫秒）。AC-17：窗口内重复 resume 必须 resumed=0 且 unchanged。 */
 export const RESUME_DEBOUNCE_MS = 3000
 

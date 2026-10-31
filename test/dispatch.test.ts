@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { MemberBinding, Plan, PlanTask, Role, RoleModelRoute } from '../src/shared/types.ts'
+import type { GateEvidence, MemberBinding, Plan, PlanTask, Role, RoleModelRoute } from '../src/shared/types.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import type { RoleRepo } from '../src/host/roles/repo.ts'
 import type { HostMember } from '../src/host/team/watcher.ts'
@@ -24,6 +24,7 @@ import {
   shortIdentityHash,
   withNameSuffix,
   type DispatchDeps,
+  type PromptInput,
   type ResumeDeps,
   type SpawnInput,
 } from '../src/host/team/dispatch.ts'
@@ -964,6 +965,100 @@ test('dispatch：角色未声明模型 → 不落审计（面板应显示「会�
     const result = await dispatchReady(makeState([makeTask('t1')]), makeAuditDeps(store, undefined, null))
     assert.deepEqual(result.state.routeAudits, [])
     assert.equal(result.state.plan.tasks[0]?.status, 'running')
+  } finally {
+    cleanup()
+  }
+})
+
+function evidenceOf(taskId: string, overrides: Partial<GateEvidence> = {}): GateEvidence {
+  return { taskId, command: 'pnpm -s test', exitCode: 0, tail: 'ok 164 tests', artifacts: ['lib/index.js'], at: now, ...overrides }
+}
+
+const peerCount = (state: RunState): number => state.messages.filter((item) => item.from === 'peer').length
+const captainCount = (state: RunState): number => state.messages.filter((item) => item.from === 'captain').length
+
+test('applyReceipt：done 且门禁 exit 0 → 每个下游一条 from:peer 交接（AC-1/2/3）', async () => {
+  const tasks = [
+    makeTask('t1', { status: 'running', memberId: 'm-dev-t1' }),
+    makeTask('t2', { status: 'blocked', dependsOn: ['t1'] }),
+    makeTask('t3', { status: 'pending', dependsOn: ['t1'] }),
+  ]
+  const state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1'), bindingOf('t3', 'dev-t3')] })
+  const next = applyReceipt(state, 't1', { verdict: 'done', evidence: evidenceOf('t1') }, now + 1)
+
+  const peers = next.messages.filter((item) => item.from === 'peer')
+  assert.deepEqual(peers.map((item) => item.messageId), ['handoff:t1->t2', 'handoff:t1->t3'], '幂等键必须是 handoff:<上游>-><下游>')
+  assert.deepEqual(peers.map((item) => item.taskId), ['t2', 't3'])
+  // to 的两档：下游尚未创建 → task:<id>；已创建 → 成员名 + toMemberId（实发靠它定位）。
+  assert.deepEqual(peers.map((item) => item.to), ['task:t2', 'dev-t3'])
+  assert.equal(peers[1]?.toMemberId, 'm-dev-t3')
+  assert.equal(peers[0]?.toMemberId, undefined)
+  assert.ok(peers[0]?.body.includes('【上游直投】t1 任务t1 已通过门禁'), peers[0]?.body)
+  assert.ok(peers[0]?.body.includes('命令：pnpm -s test'))
+  assert.ok(peers[0]?.body.includes('产物：lib/index.js'))
+  assert.ok(!peers[0]?.body.includes('captain'), 'PEER 正文不许出现 captain')
+
+  // AC-3：投递前后 from:'captain' 条数不变；member→captain 回执照旧只有 1 条。
+  assert.equal(captainCount(next), captainCount(state))
+  assert.equal(next.messages.filter((item) => item.from === 'member').length, 1)
+})
+
+test('applyReceipt：重复 done 不新增 peer 交接（AC-5），rework/failed 一条都不投（AC-1）', async () => {
+  const tasks = [
+    makeTask('t1', { status: 'running', memberId: 'm-dev-t1' }),
+    makeTask('t2', { status: 'blocked', dependsOn: ['t1'] }),
+  ]
+  const state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1')] })
+
+  const once = applyReceipt(state, 't1', { verdict: 'done', evidence: evidenceOf('t1') }, now + 1)
+  assert.equal(peerCount(once), 1)
+  const twice = applyReceipt(once, 't1', { verdict: 'done', evidence: evidenceOf('t1') }, now + 2)
+  assert.equal(peerCount(twice), 1, '重复回执必须幂等：(A,B) 至多一条')
+
+  assert.equal(peerCount(applyReceipt(state, 't1', { verdict: 'rework', evidence: evidenceOf('t1') }, now + 3)), 0)
+  assert.equal(peerCount(applyReceipt(state, 't1', { verdict: 'failed', evidence: evidenceOf('t1') }, now + 4)), 0)
+})
+
+test('applyReceipt：done 但证据缺失 / exitCode=null（超时被杀）/ 非 0 → 都不投递', async () => {
+  const tasks = [
+    makeTask('t1', { status: 'running', memberId: 'm-dev-t1' }),
+    makeTask('t2', { status: 'blocked', dependsOn: ['t1'] }),
+  ]
+  const state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1')] })
+
+  assert.equal(peerCount(applyReceipt(state, 't1', { verdict: 'done' }, now + 1)), 0, '没跑过门禁就没有「已通过」')
+  assert.equal(peerCount(applyReceipt(state, 't1', { verdict: 'done', evidence: evidenceOf('t1', { exitCode: null }) }, now + 2)), 0)
+  assert.equal(peerCount(applyReceipt(state, 't1', { verdict: 'done', evidence: evidenceOf('t1', { exitCode: 1 }) }, now + 3)), 0)
+})
+
+test('dispatchReady：下游创建时把上游交接注入首条提示词（AC-4b 的唯一注入点）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [
+      makeTask('t1', { status: 'running', memberId: 'm-dev-t1' }),
+      makeTask('t2', { status: 'blocked', dependsOn: ['t1'] }),
+    ]
+    let state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1')] })
+    state = applyReceipt(state, 't1', { verdict: 'done', evidence: evidenceOf('t1') }, now + 1)
+
+    const { deps, spawned } = makeDeps(store)
+    const seen: PromptInput[] = []
+    const build = deps.buildPrompt
+    deps.buildPrompt = (input) => {
+      seen.push(input)
+      return build(input)
+    }
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(seen.length, 1)
+    const body = result.state.messages.find((item) => item.messageId === 'handoff:t1->t2')?.body
+    assert.ok(body, '账本里必须有这条交接')
+    // 账本与提示词必须是同一个字符串（AC-4 的「逐字一致」在注入侧的判据）。
+    assert.deepEqual(seen[0]?.handoffs, [body])
+    assert.ok(seen[0]?.handoffs?.[0]?.includes('产物：lib/index.js'))
+    // 只有首条提示词走 handoffs：spawn 的 prompt 本身不是这里拼的，但仍要确认成员真的被创建。
+    assert.equal(spawned.length, 1)
   } finally {
     cleanup()
   }

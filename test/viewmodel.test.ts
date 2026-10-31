@@ -18,13 +18,19 @@ import {
   formatRelative,
   formatStamp,
   hintOf,
+  ledgerBodyFoldable,
   memberRouteText,
   parseRouteText,
+  peerLabelOf,
   routeAuditFor,
   routeTextOf,
+  stalledRowOf,
   statusBadge,
   tailLines,
   viewExtras,
+  STALL_LEAD,
+  STALL_SUFFIX,
+  STALL_TAIL,
 } from '../src/client/viewmodel.ts'
 import type { MemberView, PanelSnapshot, PlanTask, RoleModelRoute, TaskStatus } from '../src/shared/types.ts'
 
@@ -51,6 +57,10 @@ function memberOf(id: string, status: MemberView['status'], extra: Partial<Membe
     lastEventAt: 1_760_000_000_000,
     modelRoute: '',
     canResume: true,
+    // 停滞三字段（TECHNICAL §4 冻结）：夹具缺省「健康且运行中」，个别用例用 extra 覆盖。
+    stalled: false,
+    stalledForMs: 0,
+    stalledSecondsText: '',
     ...extra,
   }
 }
@@ -419,4 +429,101 @@ test('端到端：计划→派发→门禁→失败→返工→重跑→全绿�
   const texts = [planned, dispatched, failed, interrupted, running, done].map((step) => step.cap.text)
   assert.equal(new Set(texts).size, texts.length, `不同状态不能共用文案：${texts.join(' | ')}`)
 })
+
+/* ──────────────── 停滞条：AC-12 / AC-14 的文本级事实 ──────────────── */
+
+test('停滞条：运行中 + 宿主判 stalled 才渲染，秒数原样用宿主下发的文本', () => {
+  const row = stalledRowOf(
+    memberOf('m1', 'running', { stalled: true, stalledForMs: 92_000, stalledSecondsText: '92 秒' }),
+  )
+  assert.equal(row.show, true, 'running 且 stalled=true 必须渲染停滞条')
+  assert.equal(row.secondsText, '92 秒', '秒数只放宿主下发的字符串，客户端不做换算')
+  // 逐字来自 DESIGN §7.5：必须同时写清「还活着」与「没有实质产出」，否则会被读成「已中断」
+  assert.equal(row.text, `⏳ ${STALL_LEAD} 92 秒 ${STALL_TAIL}`)
+  assert.ok(row.text.includes('活着'), `文案必须点明成员还活着：${row.text}`)
+  assert.ok(row.text.includes('没有实质产出'), `文案必须点明没有实质产出：${row.text}`)
+  assert.ok(row.text.includes('92 秒'), `文案必须带距上次产出的秒数：${row.text}`)
+})
+
+test('停滞条：interrupted / failed 永不渲染，哪怕宿主误标 stalled', () => {
+  // AC-12 / PRD 反面目标 4：停滞是「活着但没产出」，已中断是「已经出事」——两者不能互相顶替
+  for (const status of ['interrupted', 'failed'] as const) {
+    const row = stalledRowOf(
+      memberOf('m1', status, { stalled: true, stalledForMs: 100_000, stalledSecondsText: '100 秒' }),
+    )
+    assert.equal(row.show, false, `${status} 不得渲染停滞条`)
+    assert.equal(row.text, '', `${status} 不得带停滞文案`)
+  }
+  // 文案本身不能与「已中断」共用一句话（AC-14 的可区分性）
+  assert.notEqual(statusBadge('interrupted').text, STALL_SUFFIX)
+  const running = stalledRowOf(
+    memberOf('m1', 'running', { stalled: true, stalledForMs: 92_000, stalledSecondsText: '92 秒' }),
+  )
+  assert.ok(!running.text.includes('中断'), `停滞文案不得含「中断」：${running.text}`)
+})
+
+test('停滞条：判定只认 stalled 字段，不看 stalledForMs（阈值只有一个出口）', () => {
+  // 若客户端拿 stalledForMs > 0 自己判，watcher 改阈值就会与面板分叉
+  const noFlag = stalledRowOf(
+    memberOf('m1', 'running', { stalled: false, stalledForMs: 999_000, stalledSecondsText: '999 秒' }),
+  )
+  assert.equal(noFlag.show, false, 'stalled=false 时哪怕毫秒数很大也不许自己判停滞')
+  const flagged = stalledRowOf(
+    memberOf('m1', 'running', { stalled: true, stalledForMs: 0, stalledSecondsText: '90 秒' }),
+  )
+  assert.equal(flagged.show, true, 'stalled=true 时毫秒数再小也照宿主判定渲染')
+})
+
+test('停滞条：旧快照缺三字段按未停滞处理，不抛错（向后兼容）', () => {
+  const legacy = {
+    memberId: 'm1',
+    name: '成员m1',
+    roleId: 'dev',
+    status: 'running',
+    lastEventAt: 1_760_000_000_000,
+    modelRoute: '',
+    canResume: true,
+  } as unknown as MemberView
+  const row = stalledRowOf(legacy)
+  assert.equal(row.show, false, '缺 stalled 字段时不得渲染停滞条')
+  assert.equal(row.text, '')
+})
+
+test('停滞条：秒数缺失时显示占位符，客户端绝不自己从毫秒格式化', () => {
+  const row = stalledRowOf(
+    memberOf('m1', 'running', { stalled: true, stalledForMs: 92_000, stalledSecondsText: '   ' }),
+  )
+  assert.equal(row.show, true)
+  assert.equal(row.secondsText, '—', '没有宿主文本就用占位符，不造第二份格式化实现')
+  assert.ok(!row.text.includes('92'), `不得由 92000ms 反推秒数：${row.text}`)
+})
+
+/* ──────────────── 账本：来源标签与正文折叠（AC-14 可见侧） ──────────────── */
+
+test('账本来源：captain→队长、peer→上游直投，成员名原样保留', () => {
+  assert.equal(peerLabelOf('captain'), '队长')
+  assert.equal(peerLabelOf('peer'), '上游直投', '直投记录必须与队长转述可区分')
+  assert.equal(peerLabelOf('测试-2'), '测试-2', '成员名原样显示，不要套标签')
+  assert.equal(peerLabelOf('  peer  '), '上游直投', '宿主值带空白也要认')
+  assert.equal(peerLabelOf(undefined), '')
+})
+
+test('账本折叠：≤120 字且 ≤3 行不折叠，超出任一阈值就折叠', () => {
+  assert.equal(ledgerBodyFoldable('回到主线，先补门禁证据。'), false)
+  // 边界：正好 120 字 / 3 行都还在阈值内
+  assert.equal(ledgerBodyFoldable('字'.repeat(120)), false)
+  assert.equal(ledgerBodyFoldable('第一行\n第二行\n第三行'), false)
+  // 超一个字符就折叠
+  assert.equal(ledgerBodyFoldable('字'.repeat(121)), true)
+  assert.equal(ledgerBodyFoldable('一\n二\n三\n四'), true, '超过 3 行必须折叠')
+  // 直投正文（800 字 + 多行）一定折叠
+  const handoff = [
+    '【上游直投】t1 worker 已完成',
+    '命令：pnpm test',
+    `证据尾部：${'证'.repeat(800)}`,
+    '产物：lib/index.js',
+  ].join('\n')
+  assert.equal(ledgerBodyFoldable(handoff), true)
+})
+
 

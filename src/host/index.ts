@@ -11,7 +11,7 @@
  * `bridge.act`，所以「工具能用、面板不能」这类历史缺陷不会从装配层长出来。
  */
 import { homedir } from 'node:os'
-import { GATE_TIMEOUT_MS } from './config.ts'
+import { GATE_TIMEOUT_MS, STALL_MS } from './config.ts'
 import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, skillsDir } from './paths.ts'
 import { RunsStore, type RunState } from './store.ts'
 import { createRoleRepo } from './roles/repo.ts'
@@ -26,6 +26,8 @@ import {
   createRoutePorts,
   createSpawnPorts,
   listHostMembers,
+  memberIdentityOf,
+  onMemberProgress,
   registerAgentCreated,
   registerEffect,
   resolveConcurrencyLimit,
@@ -42,6 +44,7 @@ import {
   type SpawnPort,
 } from './team/dispatch.ts'
 import { createMemberWatcher } from './team/watcher.ts'
+import { touchProgress } from './team/stall.ts'
 import { auditRoute } from './team/route.ts'
 import { buildMemberPrompt } from './team/member-prompt.ts'
 
@@ -150,6 +153,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     sendMessage,
     gate: { cwd: workspace, artifactsDir, timeoutMs: GATE_TIMEOUT_MS },
     hostConcurrency,
+    // 停滞阈值唯一来源是 config.STALL_MS；bridge 只 receive（快照三字段即由此推导）。
+    stallMs: STALL_MS,
     now,
   })
 
@@ -175,9 +180,37 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     warn(ctx, `面板桥注册失败：${messageOf(error)}`)
   }
 
-  // ④ 运行时对账：成员存活轮询（AC-18 的反面目标只能由 host 侧发现）+ 实际路由回填（AC-22）
+  // ④ 事件 → 推进时间：宿主事件**只记录** lastProgress，不做任何判定。
+  //    判定只剩 watcher.tick 一个出口（AC-8 的结构保证：事件一条 + 轮询一条这种叠加从结构上不可能发生）。
   try {
-    const watcher = createMemberWatcher({ store, listMembers, now })
+    const progressSub = onMemberProgress(ctx, ({ agent, at }) => {
+      try {
+        // 宿主形状解析只在 adapters 里（AGENTS §4）：这里只拿 id/name，不摸 exec/status 字段。
+        const identity = agent === undefined ? undefined : memberIdentityOf(ctx, agent)
+        if (!identity) return
+        for (const summary of store.list()) {
+          const state = store.load(summary.runId)
+          if (!state) continue
+          const hit = state.bindings.find(
+            (binding) => binding.retired !== true && (binding.memberId === identity.id || binding.name === identity.name),
+          )
+          if (!hit) continue
+          store.save({ ...state, progress: touchProgress(state.progress, hit.memberId, at) })
+        }
+      } catch (error) {
+        // 事件处理异常绝不能冒泡到宿主工具执行链（AC-9）：记一条 warn 就够。
+        warn(ctx, `推进记录失败：${messageOf(error)}`)
+      }
+    })
+    registerEffect(ctx, () => progressSub.stop())
+  } catch (error) {
+    warn(ctx, `成员推进事件订阅失败：${messageOf(error)}`)
+  }
+
+  // ⑤ 运行时对账：成员存活轮询（AC-18 的反面目标只能由 host 侧发现）+ 实际路由回填（AC-22）
+  try {
+    // stallMs 只在这里传入（AC-13：阈值常量只在 config.ts 定义，watcher 不自读常量）。
+    const watcher = createMemberWatcher({ store, listMembers, now, stallMs: STALL_MS })
     watcher.start()
     // 插件卸载/宿主关闭时必须停表，否则定时器会在 ctx 已经失效后继续摸 store。
     registerEffect(ctx, () => watcher.stop())

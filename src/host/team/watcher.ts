@@ -11,9 +11,11 @@
  */
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
-import type { PlanTask } from '../../shared/types.ts'
-import { MAX_ATTEMPTS, WATCHER_INTERVAL_MS } from '../config.ts'
+import { STALL_ALERTS_LIMIT } from '../store.ts'
+import type { ActivityEvent, PlanTask } from '../../shared/types.ts'
+import { MAX_ATTEMPTS, STALL_MS, WATCHER_INTERVAL_MS } from '../config.ts'
 import { appendMessage, makeMessage } from './messages.ts'
+import { clearAlerted, stallOf, stallSentence } from './stall.ts'
 
 /** 宿主成员行：只信任这三个字段，其余一律不读（宿主形状可能变，见 adapters）。 */
 export interface HostMember {
@@ -27,6 +29,11 @@ export interface WatcherDeps {
   listMembers(): Promise<HostMember[]>
   now?(): number
   intervalMs?: number
+  /**
+   * 停滞阈值（毫秒）。缺省取 `config.STALL_MS`；装配层显式传参便于演练/演练阈值，
+   * 判定本身不读常量（AC-13：判定实现只有一个，阈值只做参数）。
+   */
+  stallMs?: number
   /** 对账发生变更时的回调（宿主装配层用它刷新快照/打点，不在这里硬编码）。 */
   onReconciled?(state: RunState): void
 }
@@ -118,10 +125,76 @@ export function reconcileMembers(state: RunState, members: HostMember[], now?: n
   return { state: next, changed }
 }
 
+/**
+ * 停滞告警的**唯一判定出口**（AC-8）。
+ *
+ * 事件订阅（`adapters.onMemberProgress`）只负责 `touchProgress` 推进 `at`，从不产生告警；
+ * 告警只在 watcher 的 tick 里、对着落盘状态算一次。这样「事件一条 + 轮询一条」的重复
+ * 告警在结构上不可能发生 —— 不是靠纪律，是因为只有这一个地方会 push。
+ *
+ * 幂等：`progress[memberId].alertedAt` 存在即表示本 episode 已告警过；成员恢复产出后
+ * `clearAlerted` 清掉标记，下一轮卡住才允许再响一次。
+ *
+ * @returns `state` 换了新引用即表示有变更（调用方据此决定是否 save）；未停滞时**不碰** plan，
+ *          所以 `plan.tasks` 与入参深相等（AC-13）。
+ */
+export function stallAlertsOf(
+  state: RunState,
+  now: number,
+  stallMs: number,
+): { state: RunState; raised: ActivityEvent[] } {
+  const raised: ActivityEvent[] = []
+  let progress = state.progress ?? {}
+  let mutated = false
+
+  for (const task of state.plan.tasks) {
+    // 终态任务不再产出，判它停滞只会制造假告警（成员 done 后本来就该安静）。
+    if (task.status !== 'running') continue
+    const binding = state.bindings.find((item) => !item.retired && item.taskId === task.id)
+    if (!binding) continue
+    const memberId = binding.memberId
+    const record = progress[memberId]
+    const judge = stallOf(record?.at, binding.spawnedAt, now, stallMs)
+
+    if (!judge.stalled) {
+      if (record?.alertedAt !== undefined) {
+        progress = clearAlerted(progress, memberId)
+        mutated = true
+      }
+      continue
+    }
+
+    if (record?.alertedAt !== undefined) continue // 本 episode 已告警：静默（一次 episode 一条）
+
+    const at = record?.at ?? binding.spawnedAt
+    progress = { ...progress, [memberId]: { at, alertedAt: now } }
+    mutated = true
+    raised.push({
+      at: now,
+      kind: 'tool',
+      memberId,
+      taskId: task.id,
+      text: stallSentence(binding.name, judge.stalledForMs),
+    })
+  }
+
+  if (raised.length === 0) return { state: mutated ? { ...state, progress } : state, raised }
+  const stallAlerts = [...(state.stallAlerts ?? []), ...raised]
+  return {
+    state: {
+      ...state,
+      progress,
+      stallAlerts: stallAlerts.length > STALL_ALERTS_LIMIT ? stallAlerts.slice(-STALL_ALERTS_LIMIT) : stallAlerts,
+    },
+    raised,
+  }
+}
+
 /** 轮询器：一个 run 一次 listMembers（不是一任务一次），只在存在非终态任务时才查。 */
 export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
   const now = deps.now ?? Date.now
   const intervalMs = deps.intervalMs ?? WATCHER_INTERVAL_MS
+  const stallMs = deps.stallMs ?? STALL_MS
   let timer: ReturnType<typeof setInterval> | null = null
   let busy = false
 
@@ -150,11 +223,14 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
           }
         }
 
-        const result = reconcileMembers(state, members, now())
-        if (result.changed > 0) {
-          deps.store.save(result.state)
-          deps.onReconciled?.(result.state)
-          changed += result.changed
+        // 顺序固定：先对账存活，再判停滞（对账把任务判成 interrupted 后就不该再报停滞）。
+        const at = now()
+        const reconciled = reconcileMembers(state, members, at)
+        const judged = stallAlertsOf(reconciled.state, at, stallMs)
+        if (reconciled.changed > 0 || judged.state !== reconciled.state) {
+          deps.store.save(judged.state)
+          deps.onReconciled?.(judged.state)
+          changed += reconciled.changed + judged.raised.length
         }
       }
 

@@ -346,10 +346,45 @@ export const AUTO_TEAM_CSS = `
   white-space: pre-wrap;
   word-break: break-all;
 }
-[data-auto-team-member] [data-member-stale-hint] {
+/*
+ * 停滞条：跨全宽插槽（grid-column 1/-1），不参与 76/96/64/44 四列的宽度竞争。
+ *
+ * 颜色分工是被对比度逼出来的：琥珀 #b58900 落在 bg-layer-1 上约 3.2:1，11px 正文不达标，
+ * 所以琥珀只承担「非文本」部分（左竖条 / 图标 / 描边 / 8% 底），正文一律 label-secondary。
+ * 与 interrupted 的差别是**实线 vs 虚线 + 琥珀 vs 红 + 文案完全不同**，去掉颜色仍可分辨。
+ */
+[data-auto-team-member] [data-member-stall] {
   grid-column: 1 / -1;
-  color: var(--dsw-alias-state-error-primary, #d33);
-  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 2px;
+  margin: 2px 0;
+  padding: 2px 6px 2px 6px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, #b58900);
+  border: 1px solid var(--dsw-alias-state-warn-primary, #b58900);
+  border-left-width: 2px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 8%, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px inherit);
+  /* 秒数是判断依据，绝不 ellipsis，允许折到第二行 */
+  white-space: normal;
+  animation: auto-team-stall-in 120ms var(--ds-ease-in-out, ease-out) both;
+}
+[data-auto-team-member] [data-member-stall] [data-stall-icon] {
+  color: var(--dsw-alias-state-warn-primary, #b58900);
+}
+[data-auto-team-member] [data-member-stall] [data-stall-seconds] {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+@keyframes auto-team-stall-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-auto-team-member] [data-member-stall] { animation: none; }
 }
 [data-auto-team-member] [data-member-actions],
 [data-auto-team-member] [data-member-message-row] {
@@ -425,14 +460,25 @@ export const AUTO_TEAM_CSS = `
   max-height: 220px;
   overflow: auto;
 }
+/*
+ * 账本行：行头一行 + 正文整行独占。
+ *
+ * 旧布局是「auto auto auto minmax(0,1fr)」四列，正文只捞到约 115px（12px 字 ≈ 9 汉字/行），
+ * 而直投正文最长是「上游 id/title + 命令 + 退出码 + 800 字证据尾部 + 产物路径」，
+ * 照旧布局要 80+ 行，账本直接废掉。改 flex 后正文拿到整行 ≈ 28 汉字/行。
+ */
 [data-message-ledger] [data-message] {
-  display: grid;
-  grid-template-columns: auto auto auto minmax(0, 1fr);
-  gap: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: baseline;
-  padding: 4px 0;
+  padding: 4px 4px 4px 0;
   border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
   font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  transition: background-color 100ms var(--ds-ease-in-out, ease-out);
+}
+[data-message-ledger] [data-message]:hover {
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
 }
 [data-message-ledger] [data-message-route] { color: var(--dsw-alias-label-secondary, inherit); white-space: nowrap; }
 [data-message-ledger] [data-message-task],
@@ -441,7 +487,54 @@ export const AUTO_TEAM_CSS = `
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
   white-space: nowrap;
 }
-[data-message-ledger] [data-message-body] { overflow-wrap: anywhere; }
+/*
+ * peer 行（上游直投）：左侧中性竖条。用 border-l3 而不是琥珀——
+ * 来源不是状态，给它上状态色会让「谁发的」和「有没有问题」混成一件事。
+ */
+[data-message-ledger] [data-message][data-from="peer"] {
+  border-left: 2px solid var(--dsw-alias-border-l3, currentColor);
+  padding-left: 6px;
+}
+[data-message-ledger] [data-message-body] {
+  flex: 1 0 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  font: var(--dsw-font-xxs-12, 12px/18px inherit);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* 折叠：54px = 3 行；展开 324px = 18 行 + 内部滚动。用 max-height 不用 line-clamp——
+ * body 是 pre-wrap 多行结构且含无空格长路径，line-clamp 的 -webkit-box 会把换行算坏。 */
+[data-message-ledger] [data-message][data-message-expanded="false"] [data-message-body] {
+  max-height: 54px;
+  overflow: hidden;
+}
+[data-message-ledger] [data-message][data-message-expanded="true"] [data-message-body] {
+  max-height: 324px;
+  overflow: auto;
+}
+[data-message-ledger] [data-message-toggle] {
+  flex: 0 0 auto;
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  padding: 2px 6px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  cursor: pointer;
+  color: var(--dsw-alias-state-business-primary, #2f6feb);
+  font: var(--dsw-font-xxxs-11, 11px/16px inherit);
+  transition: background-color 100ms var(--ds-ease-in-out, ease-out);
+}
+[data-message-ledger] [data-message-toggle]:hover {
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
+}
+[data-message-ledger] [data-message-toggle]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #2f6feb);
+  outline-offset: 1px;
+}
 
 /* ───────────────── 记忆页 ───────────────── */
 [data-auto-team-memory] { display: flex; flex-direction: column; gap: 8px; }

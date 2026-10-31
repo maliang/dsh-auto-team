@@ -27,6 +27,9 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
   const role: Role | undefined = input.role
   const skills = role ? composeSkillPrompt(role) : { text: '', missing: [] }
   const memory = deps.memoryFor(input.task.title)
+  // AC-4(b)：上游直投内容原样进首条提示词。段落位置是刻意的 —— 在「本次任务」之后
+  // （成员已经知道自己要干什么）、「验收判定」之前（读验收命令前先拿到上游证据与产物路径）。
+  const handoffs = input.handoffs ?? []
   const lines = [
     `# 角色：${role?.name ?? input.task.roleId}`,
     role?.duty ? `职责：${role.duty}` : '',
@@ -36,6 +39,9 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
     input.task.title,
     input.task.dependsOn.length > 0 ? `前置任务（已完成）：${input.task.dependsOn.join('、')}` : '',
     '',
+    ...(handoffs.length > 0
+      ? ['## 上游交接', '以下内容由上游任务的门禁证据直接投递，不需要再问队长：', ...handoffs, '']
+      : []),
     '## 验收判定（必须实际执行并回报退出码）',
     input.task.acceptance === '' ? '（未声明；视为需要人工确认，不得自称完成）' : `\`${input.task.acceptance}\``,
     '',

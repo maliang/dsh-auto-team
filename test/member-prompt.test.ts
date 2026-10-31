@@ -125,3 +125,59 @@ test('buildMemberPrompt：任务身份/验收命令/角色职责都在 prompt �
   )
   assert.ok(noAcceptance.includes('（未声明；视为需要人工确认，不得自称完成）'), '验收命令为空时必须显式警示')
 })
+
+const peerBody = '【上游直投】t1 把面板拆成三列 已通过门禁\n命令：pnpm -s test\n退出码：0\n产物：lib/index.js'
+
+test('buildMemberPrompt：上游交接原样进 prompt，且排在「本次任务」之后、「验收判定」之前（AC-4b）', () => {
+  const prompt = buildMemberPrompt(
+    {
+      plan,
+      task: makeTask('t2', { dependsOn: ['t1'] }),
+      role: makeRole([]),
+      name: 'dev-t2',
+      handoffs: [peerBody],
+    },
+    noMemory,
+  )
+
+  assert.ok(prompt.includes(peerBody), '交接正文必须逐字进 prompt（与账本同一字符串）')
+  assert.ok(prompt.includes('## 上游交接'), '必须有小节标题，成员才知道这段不是队长转述')
+  assert.ok(prompt.includes('以下内容由上游任务的门禁证据直接投递，不需要再问队长：'), '必须说明不用再问队长')
+  assert.ok(!prompt.includes('captain'), 'prompt 里不许出现 captain（否则等于又绕回队长）')
+
+  const taskAt = prompt.indexOf('## 本次任务（t2）')
+  const handoffAt = prompt.indexOf('## 上游交接')
+  const acceptanceAt = prompt.indexOf('## 验收判定')
+  assert.ok(taskAt >= 0 && handoffAt > taskAt, '交接段必须在「本次任务」之后（先知道自己干什么，再读上游证据）')
+  assert.ok(acceptanceAt > handoffAt, '交接段必须在「验收判定」之前（读验收命令前先拿到上游产物路径）')
+})
+
+test('buildMemberPrompt：没有 handoffs（空数组或未传）时不许出现「上游交接」段', () => {
+  const empty = buildMemberPrompt(
+    { plan, task: makeTask('t2'), role: makeRole([]), name: 'dev-t2', handoffs: [] },
+    noMemory,
+  )
+  assert.ok(!empty.includes('## 上游交接'), '空数组不许造一个空小节')
+  assert.ok(!empty.includes('以下内容由上游任务的门禁证据直接投递'), '引导句也不许出现')
+
+  const absent = buildMemberPrompt({ plan, task: makeTask('t2'), role: makeRole([]), name: 'dev-t2' }, noMemory)
+  assert.equal(empty, absent, 'handoffs 未传与空数组必须产出完全相同的 prompt（可选字段语义）')
+})
+
+test('buildMemberPrompt：多个上游按传入顺序排列，且不破坏空行过滤契约', () => {
+  const second = '【上游直投】t3 另一个上游 已通过门禁\n命令：pnpm -s build\n退出码：0\n产物：无落盘产物'
+  const prompt = buildMemberPrompt(
+    {
+      plan,
+      task: makeTask('t4', { dependsOn: ['t1', 't3'] }),
+      role: makeRole([]),
+      name: 'dev-t4',
+      handoffs: [peerBody, second],
+    },
+    noMemory,
+  )
+  assert.ok(prompt.indexOf(peerBody) < prompt.indexOf(second), '多个上游必须保持传入（时间正序）顺序')
+  assert.ok(prompt.includes(second), '第二个上游正文也必须完整进 prompt')
+  // 既有契约：lines.filter(l => l !== '') 之后不许出现连续空行（段落间恰好一个空行）。
+  assert.ok(!prompt.includes('\n\n\n'), '不许出现连续空行，否则渲染成松散的空段落')
+})

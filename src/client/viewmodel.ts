@@ -317,6 +317,74 @@ export function memberRouteText(
   return formatModelRoute(declared, audit)
 }
 
+/* ─────────────────── 停滞条与账本（r4：第二层停滞检测） ─────────────────── */
+
+/**
+ * 停滞短标签（TECHNICAL §5.1 冻结的文案，逐字）。
+ *
+ * 面板正文用的是更好读、且写明「成员还活着」的整句（`STALL_LEAD` + 秒数 + `STALL_TAIL`，
+ * 逐字来自 DESIGN §7.5）；这句只作为停滞条的悬停说明，交代判定口径是「无实质工具调用」，
+ * 而不是「成员已退出」——`interrupted` 才是那个意思。
+ */
+export const STALL_SUFFIX = '无实质工具调用，疑似停滞'
+
+/** 停滞整句的前半段（不含秒数，秒数由渲染处用宿主下发的文本插入）。 */
+export const STALL_LEAD = '疑似停滞 · 成员还活着，但已'
+
+/** 停滞整句的后半段。 */
+export const STALL_TAIL = '没有实质产出'
+
+/** 账本正文超过这个字符数就要折叠（DESIGN §0.7）。 */
+export const LEDGER_FOLD_CHARS = 120
+
+/** 账本正文超过这个行数就要折叠（DESIGN §0.7）。 */
+export const LEDGER_FOLD_LINES = 3
+
+export interface StallRow {
+  /** 是否渲染停滞条：`running` 且宿主判定的 `stalled` 为真。 */
+  show: boolean
+  /** 只放宿主下发的 `stalledSecondsText`，客户端绝不自己从毫秒算。 */
+  secondsText: string
+  /** 整句（含 ⏳ 与秒数），供单测与无障碍文案复用，渲染处按段拆。 */
+  text: string
+}
+
+/**
+ * 成员行停滞条（AC-12 / AC-14）。
+ *
+ * 判定只用宿主下发的 `stalled`，**不看 `stalledForMs > 0`**——阈值只有一个出口（watcher），
+ * 客户端再有第二个比较就等于把判定分叉。`interrupted` / `failed` 永不渲染停滞条：
+ * 那两种是「已经出事」，与「活着但没产出」是两回事（PRD 反面目标 4）。
+ */
+export function stalledRowOf(member: MemberView): StallRow {
+  // 旧快照没有这三个字段：按「未停滞」处理，不得抛错（AC-12 的向后兼容）
+  const stalled = (member as { stalled?: unknown }).stalled === true
+  if (member.status !== 'running' || !stalled) return { show: false, secondsText: '', text: '' }
+  const raw = typeof member.stalledSecondsText === 'string' ? member.stalledSecondsText.trim() : ''
+  // 宿主理论上总会给秒数；万一没给，宁可显示占位符也不在客户端造一份格式化（零格式化铁律）
+  const secondsText = raw === '' ? '—' : raw
+  return { show: true, secondsText, text: `⏳ ${STALL_LEAD} ${secondsText} ${STALL_TAIL}` }
+}
+
+/** 账本 `from` 的显示名：captain→队长、peer→上游直投，其余（成员名）原样。 */
+const PEER_LABELS: Readonly<Record<string, string>> = { captain: '队长', peer: '上游直投' }
+
+export function peerLabelOf(from: string | null | undefined): string {
+  const raw = typeof from === 'string' ? from.trim() : ''
+  return PEER_LABELS[raw] ?? raw
+}
+
+/**
+ * 账本正文是否需要折叠（AC-14 的可见侧：直投 body 最长 800 字，整段平铺会把账本撑爆）。
+ *
+ * 阈值是「字符数 > 120 或 行数 > 3」而不是纯行数：peer body 有 `white-space: pre-wrap`
+ * 的多行结构，也可能是一行超长路径。
+ */
+export function ledgerBodyFoldable(body: string | null | undefined): boolean {
+  const text = typeof body === 'string' ? body : ''
+  return text.length > LEDGER_FOLD_CHARS || text.split('\n').length > LEDGER_FOLD_LINES
+}
+
 /**
  * dock 胶囊文案（DESIGN §2 的 5 种 tone）。
  *

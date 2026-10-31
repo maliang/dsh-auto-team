@@ -28,6 +28,9 @@
 | V4 | 事件 `agent/disposed` 存在，emit | `'agent/disposed'(this: Scoped<Agent>, payload: { agent: Agent }): void` |
 | V5 | 订阅形态是 `ctx.on(event, listener)`，profile 级插件可用 | `src/host/adapters.ts:70` 声明 `on?: (event: string, listener: (...args: unknown[]) => void) => (() => void) | void`；已在 `:530`（`'agent/created'`）与 `:741` 实际订阅 |
 | V6 | 「agent → 成员」的解析函数已存在，无需新写 | `src/host/adapters.ts:699` `export function memberIdentityOf(ctx: HostContext, agent: unknown): { id: string; name: string }`（内部走 `agentTeams.tryMembership`） |
+| V7 | `exec` 字段体已实测（不再是猜测）：必带 `agent?: Agent { readonly id: SessionId }` | AGENTS.md §4「与宿主联调的常识」第 3 段（commit `5b47746` 实测记录）：`exec` = 宿主 `ToolExecutionInput` + `rootCallId` + `token`，字段为 `callId` / `rootCallId?` / `name` / `schema?` / `arguments` / `agent?` / `parent?` / `signal` |
+| V8 | `tools/result` 的作用域过滤 **keyed by `exec.agent`**，且解析入口已存在 | 同上：宿主文档原文「scope 过滤 keyed by exec.agent」；`src/host/adapters.ts:628` `export function agentContextOf(agent: unknown): AgentEventContext \| null` 可直接复用 |
+| V9 | 嵌套子调用的归属不会串人 | 同上：`parent` 非空表示嵌套子调用，而 `agent` 仍指向所属成员 —— 因此同一成员的多层调用只会推进它自己 |
 
 **结论（据此定契约）**：主订阅 `tools/result`（emit，安全）+ 辅助订阅 `agent/status`（emit，带 agent 对象）；**不订阅 `tools/execute`/`tools/pre-execute`/`tools/post-execute`（waterfall）**——瀑布流监听器必须 `return next()`，一旦我们抛错或漏调 `next()` 会把宿主的工具执行熔断，风险与收益完全不对称。
 
@@ -35,8 +38,8 @@
 
 | # | 未知项 | 为什么必须实测 | T0 判据 |
 |---|---|---|---|
-| U1 | `ToolExecution` / `ToolDispatchExecution` 的字段体（是否含 `agent` / `agentId` / `sessionId`） | `listEvents` 只给类型名不给类型体；本次补查类型体被工具输入校验拒绝（原文：`Error: Host Cordis inspect Event.listEvents rejected input: "input" must be an object`），故按未验证处理 | 探针里 `console.log(Object.keys(exec))` + `JSON.stringify(exec).slice(0,500)` 实跑一行 |
-| U2 | 成员（`spawnTeammate` 起的子 Agent）的工具调用是否会到达 profile 级 `tools/result` 监听器 | 签名带 `this: Scoped<ToolRuntime>`，作用域可能在 dispatch 所属 scope 内广播 | 起 1 个真成员让它调 1 次工具，看监听器是否收到且能解析到该成员 |
+| U1 | 成员调用里 `exec.agent` 是否**非空**（字段体已由 V7 给出，只剩「有没有值」这一问） | V7 说明字段存在，但没说成员子会话的调用一定带 agent；空值会让 `memberIdentityOf` 返回 null、推进永远不触发（且沉默失败） | 探针先 `console.log(Object.keys(exec), exec.agent?.id ?? null, exec.name)` 实跑一行，打印「收到 N 次 tools/result、其中 agent 非空 M 次」 |
+| U2 | **根作用域**（插件 profile 级 `ctx`，非 `agent.ctx`）注册的 `tools/result` 监听器是否收到成员的调用 | V8 说过滤 keyed by `exec.agent`，但没说根监听器是否被过滤掉；若收不到，必须改注册到 `agentContextOf(agent)` 上（此时需要在 spawn 后拿到 agent 对象——`SpawnPort` 目前只回 `memberId`，会成为真实约束） | 起 1 个真成员让它调 1 次工具：根监听器收到 → L1；收不到但 `agent.ctx` 收到 → L1'（T2 改用 per-agent 订阅，须在笔记里写明如何拿到 agent）；都收不到 → L2/L3 |
 | U3 | 成员自身是否 emit `agent/status` | 若成员跑在独立 agent 上应当会，但未实测 | 同一探针记录 `agent/status` 次数与 `payload.agent.id` |
 | U4 | `ctx.on` 返回的 disposer 是否可用于 `registerEffect` 清理 | 现有代码调用后忽略返回值 | 探针里打印返回值类型；不可用则忽略（宿主退出时随插件卸载） |
 
@@ -44,11 +47,12 @@
 
 | 级别 | 触发条件 | 主信号 | AC-9 可分辨性为何仍成立 |
 |---|---|---|---|
-| L1（首选） | U2 成立 | `tools/result` → `touchProgress` | 假成员从不调工具 → 0 次推进；对照成员每轮调工具 → 推进密集 |
+| L1（首选） | U2 成立（根监听器收到） | `ctx.on('tools/result')` 根级订阅 → `touchProgress` | 假成员从不调工具 → 0 次推进；对照成员每轮调工具 → 推进密集 |
+| L1' | U2 不成立、但 `agent.ctx` 收到（V8 的 scope 过滤） | 每成员在 `agentContextOf(agent)` 上订阅 `tools/result` | 同上；代价：需在 spawn 后拿到 agent 对象（`SpawnPort` 现只回 `memberId`），T0 必须给出取得方式，否则 L1' 不可用 |
 | L2 | U2 不成立、U3 成立 | `agent/status`（`running`/`idle` 翻转） | 假成员 `running` 恒定不翻转；对照成员每轮结束都翻转 |
 | L3（兜底） | 事件都到不了插件监听器 | 在既有 `watcher.tick()`（1500ms）里复用 `listMembers()`，按成员 `HostMember.status` 变化推进 `lastProgressAt` | 假成员 `status` 恒定 → 0 次变化；对照成员反复 running/idle |
 
-三级共用 `stall.stallOf` 与 `ticks` 单出口，**AC-8/AC-12/AC-13 在三级下都成立**；L3 不新增 `setInterval`（AC-11 预算不破）。T0 必须把选定级别与实跑输出写进 `logs/teamflow/<runId>/notes/ac7-event-probe.md`，并在 T6 自查时把该级别抄进最终交付说明。
+四条路径共用 `stall.stallOf` 与 `tick` 单出口，**AC-8/AC-12/AC-13 在任一路径下都成立**；L3 不新增 `setInterval`（AC-11 预算不破）。T0 必须把选定级别与实跑输出写进 `logs/teamflow/tf-mvwnm3d9-l8db12/notes/ac7-event-probe.md`，并在 T5 自查时把该级别抄进最终交付说明。**选型只影响 `adapters.onMemberProgress` 内部实现，§4 的其余签名一字不改**（这正是把信号源收在 adapters 一层的原因）。
 
 ---
 
@@ -100,6 +104,7 @@ export interface RunState {
 - `wrapLegacy`：新增 `normalizeProgress()`（只留 `at` 为有限数字的键，`alertedAt` 非法则删）与 `normalizeStallAlerts()`（只留 `kind==='tool'` 且 `at` 有效的条目，截断至 `STALL_ALERTS_LIMIT`）。
 - `save()`：落盘前把 `progress` **裁剪到当前 live bindings 的 memberId 集合**（成员死亡后不无限增长），`stallAlerts` 截尾至上限。
 - **幂等键**：peer 交接消息用既有 `MessageRecord.messageId` 字段，值恒为 `handoff:<上游 taskId>-><下游 taskId>`；停滞告警不产生 message，只产生一条 `stallAlerts` 条目。
+- ⚠️ **不要用 `makeMessage()` 造 peer 消息**：`src/host/team/messages.ts:31` 的 `makeMessage` 无条件写 `messageId: 'msg-<at>-<seq>'`，会覆盖我们预置的幂等键 —— 于是 AC-5 在重复 `applyReceipt` 时**照样新增一条**，且症状是「测试只有连跑才红」。正确写法是 `handoffMessages()` 直接构造 `MessageRecord`（`{ at, from:'peer', to, toMemberId?, taskId, body, messageId: handoffId(a,b) }`），再由 `appendMessage` 落账 —— `src/host/team/messages.ts:44` 的实现是「`messageId` 已有则沿用，缺省才生成」，所以预置键能存活。
 
 ---
 
@@ -151,7 +156,8 @@ export function handoffId(upstreamTaskId: string, downstreamTaskId: string): str
 /** 上游交付正文：id+title / 命令 / 退出码 / ≤800 字证据尾部 / 产物路径（空则显式「无落盘产物」）。 */
 export function handoffBody(upstream: PlanTask, evidence: GateEvidence): string
 
-/** AC-1/AC-5：只有 (done 且 exitCode===0) 才产出；同 id 已存在则 0 条。 */
+/** AC-1/AC-5：只有 (done 且 exitCode===0) 才产出；同 id 已存在则 0 条。
+ *  返回体每条都已带 `messageId: handoffId(a,b)`（不经 makeMessage，见 §3.2 警告）。 */
 export function handoffMessages(input: {
   upstream: PlanTask
   evidence: GateEvidence | undefined
@@ -180,15 +186,19 @@ export function handoffBodiesFor(messages: readonly MessageRecord[], downstreamT
 ### 4.4 `src/host/team/dispatch.ts`
 
 ```ts
-export interface PromptInput {
+// 现状（`src/host/team/dispatch.ts:32-45`）：SpawnInput 是基类型，PromptInput 由它派生。
+// 新字段加在 SpawnInput 上，PromptInput 自动继承；**不要**反向重声明 PromptInput
+// （那会改掉 Omit 关系，buildPrompt 的既有窄参数实现与 SpawnPort 都得跟着动 —— 无收益的回归面）。
+export interface SpawnInput {
   plan: Plan
   task: PlanTask
   role: Role | undefined
   name: string
+  prompt: string
   /** AC-4(b)：上游交接正文，未创建的下游成员在首条提示词里读到它。 */
   handoffs?: string[]
 }
-export interface SpawnInput extends PromptInput { prompt: string }
+export type PromptInput = Omit<SpawnInput, 'prompt'>   // 既有定义一字不改
 ```
 
 - `applyReceipt()`：在既有 done 分支（`patchTask(done) + 解锁 blocked→pending + 终态判定`）之后新增一段——`verdict==='done' && evidence?.exitCode === 0` 时调用 `handoffMessages(...)`，`existingIds` 取 `state.messages` 里所有 `messageId`，`targetOf` 用 `liveBinding(state, depId)`（未退役且有 `name` → `{to: binding.name, toMemberId: binding.memberId}`；否则 `{to: 'task:' + depId}`），把返回的 peer 消息 `append` 到 `messages`。**不新增任何 `from:'captain'` 消息**（AC-3）。
@@ -272,7 +282,7 @@ export interface BridgeDeps { /* 既有字段不动 */ stallMs?: number }
 ```ts
 // 1) 事件 → 推进：在 bridge 装配后、watcher.start 前
 const progressSub = onMemberProgress(ctx, ({ agent, at }) => {
-  const identity = agent === undefined ? undefined : tryMemberIdentity(ctx, agent)  // adapters.memberIdentityOf
+  const identity = agent === undefined ? undefined : memberIdentityOf(ctx, agent)  // adapters:699
   if (!identity) return
   for (const summary of store.list()) {
     const state = store.load(summary.runId)
@@ -331,7 +341,7 @@ createBridge({ /* … */ stallMs: STALL_MS })
 
 ## 6. 关键实现点与边界（开发逐条对照）
 
-1. **幂等三处**：`handoffId`（消息级）、`alertedAt`（episode 级）、`progress` 按 memberId 覆盖写。`applyReceipt` 重复调用、`resume` 重复执行都不得新增 peer 消息（AC-5）。
+1. **幂等三处**：`handoffId`（消息级，且必须绕过 `makeMessage` 的 id 生成，见 §3.2）、`alertedAt`（episode 级）、`progress` 按 memberId 覆盖写。`applyReceipt` 重复调用、`resume` 重复执行都不得新增 peer 消息（AC-5）。
 2. **不要在 `applyReceipt` 里做 IO**：它是纯函数，被 `dispatchReady`/`resumeRun`/`bridge.act` 三处调用；任何 `sendMessage` 混进去都会让重放路径发两遍消息。
 3. **peer 消息的 `to`**：下游已有未退役 binding 时取 `binding.name`（与既有 captain 消息口径一致），否则 `task:<id>`；`toMemberId` 仅在已存在成员时填。
 4. **AC-1 触发口径**：`verdict !== 'done'` 或 `evidence === undefined` 或 `evidence.exitCode !== 0` → 0 条。`exitCode: null`（超时/被信号杀）**不是 0**，必须 0 条。
@@ -355,7 +365,7 @@ createBridge({ /* … */ stallMs: STALL_MS })
 |---|---|---|---|
 | `test/handoff.test.ts`（新） | 纯函数 | AC-1、AC-2、AC-5（幂等 key）、AC-6（不产出 captain 消息） | 6 |
 | `test/stall.test.ts`（新） | 纯函数 + `stallAlertsOf` | AC-8（一次 episode 一条）、AC-9（假/对照）、AC-13（tasks 深相等）、AC-14（秒数文案） | 6 |
-| `test/dispatch.test.ts`（扩展） | `applyReceipt` peer 分支、`PromptInput.handoffs` | AC-1、AC-2、AC-3、AC-4(b)、AC-5、AC-6 | 4 |
+| `test/dispatch.test.ts`（扩展） | `applyReceipt` peer 分支、`SpawnInput.handoffs` | AC-1、AC-2、AC-3、AC-4(b)、AC-5、AC-6 | 4 |
 | `test/member-prompt.test.ts`（扩展） | 交接段渲染 | AC-4(b) | 2 |
 | `test/store.test.ts`（扩展） | `progress`/`stallAlerts` 规范化与裁剪 | AC-13、落盘健壮性 | 2 |
 | `test/viewmodel.test.ts`（扩展） | `stalledRowOf`、`peerLabelOf` | AC-12、AC-14 | 2 |
@@ -383,7 +393,8 @@ pnpm build                                       # 双产物
 node --input-type=module -e "await import('./lib/index.js')"   # exit 0
 node --input-type=module -e "await import('./lib/client.js')"  # exit 0
 npm pack --dry-run                               # 含 lib/index.js、lib/client.js、cordis.patch.yml
-grep -rn "STALL_MS" src/host/config.ts          # 定义仅此 1 处
+grep -rn "STALL_MS = " src | wc -l                # 必须为 1（AC-13：全仓定义只此一处）
+grep -n "export const STALL_MS" src/host/config.ts  # 该唯一定义落在 config.ts
 grep -rn "STALE_MS\|data-member-stale-hint\|data-stale" src  # 0 命中
 grep -rn "setInterval" src                      # 计数与基线相同
 node logs/teamflow/tf-mvwnm3d9-l8db12/scripts/qa-peer-probe.mjs

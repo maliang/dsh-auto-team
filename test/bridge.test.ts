@@ -14,7 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { MemberBinding, PanelAction, Plan, PlanTask, Role } from '../src/shared/types.ts'
+import type { MemberBinding, MessageRecord, PanelAction, Plan, PlanTask, Role } from '../src/shared/types.ts'
 import { createBridge, type Bridge, type BridgeDeps, type ReceiptInput } from '../src/host/bridge.ts'
 import { buildHttpRoutes } from '../src/host/http.ts'
 import { createRoleRepo } from '../src/host/roles/repo.ts'
@@ -559,4 +559,157 @@ test('snapshot 契约：plannedAt / concurrency 三元组 / messages / routeAudi
   assert.equal(snapshot.members.length, 1)
   assert.equal(snapshot.members[0].status, 'running')
   assert.equal(snapshot.members[0].taskId, 't1')
+})
+
+/* ─────────────── r4 第一期：停滞三字段 / activity 合并 / peer 交接实发 ─────────────── */
+
+/** peer 交接的账本条目（messageId 是 AC-5 的幂等键：`handoff:<上游>-><下游>`）。 */
+function peerMessageOf(over: Partial<MessageRecord> = {}): MessageRecord {
+  return {
+    at: NOW,
+    from: 'peer',
+    to: '测试-2',
+    toMemberId: 'member-2',
+    taskId: 't2',
+    body: '【上游直投】t1 任务 t1 已通过门禁\n命令：exit 0\n退出码：0\n无落盘产物',
+    messageId: 'handoff:t1->t2',
+    ...over,
+  }
+}
+
+/** 模拟 dispatch.applyReceipt 的 done 分支：落 done + 追加一条 peer 交接（同 id 不重复追加）。 */
+function receiptWithPeer(state: RunState, taskId: string, receipt: ReceiptInput): RunState {
+  const tasks = state.plan.tasks.map((task) =>
+    task.id === taskId ? { ...task, status: 'done' as const, evidence: receipt.evidence } : task,
+  )
+  const peer = peerMessageOf()
+  const exists = state.messages.some((message) => message.messageId === peer.messageId)
+  return {
+    ...state,
+    plan: { ...state.plan, tasks },
+    messages: exists ? state.messages : [...state.messages, peer],
+  }
+}
+
+test('membersOf：running 且进度落后 → stalled 三字段齐；终态成员恒 false（AC-14 数据源）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [
+          taskOf('t1', { status: 'running', memberId: 'member-1' }),
+          taskOf('t2', { status: 'done', memberId: 'member-2' }),
+        ],
+      }),
+      bindings: [bindingOf(), bindingOf({ taskId: 't2', memberId: 'member-2', name: '开发-2' })],
+      // member-1 最后一次实质调用在 100 秒前（阈值 90 秒）；member-2 早完成，不该被判停滞。
+      progress: { 'member-1': { at: NOW - 100_000 }, 'member-2': { at: NOW - 600_000 } },
+    }),
+  )
+
+  const members = bridge.snapshot(SESSION).members
+  const running = members.find((member) => member.memberId === 'member-1')
+  assert.equal(running?.stalled, true)
+  assert.equal(running?.stalledForMs, 100_000, '毫秒数由宿主算好，客户端零阈值比较')
+  assert.match(running?.stalledSecondsText ?? '', /秒/, '秒数文案由宿主下发，客户端零格式化')
+
+  const finished = members.find((member) => member.memberId === 'member-2')
+  assert.equal(finished?.stalled, false, 'done 的成员不再产出，不算停滞')
+  assert.equal(finished?.stalledForMs, 0)
+  assert.equal(finished?.stalledSecondsText, '')
+})
+
+test('activityOf：只读合并落盘的 stallAlerts，同一次停滞不得被重算出第二条（AC-8）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  const alert = {
+    at: NOW,
+    kind: 'tool' as const,
+    memberId: 'member-1',
+    taskId: 't1',
+    text: '开发-1 已 100 秒无实质工具调用，疑似停滞',
+  }
+  store.save(
+    stateOf({
+      plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'running', memberId: 'member-1' })] }),
+      bindings: [bindingOf()],
+      progress: { 'member-1': { at: NOW - 100_000, alertedAt: NOW } },
+      stallAlerts: [alert],
+    }),
+  )
+
+  const toolEvents = bridge.snapshot(SESSION).activity.filter((event) => event.kind === 'tool')
+  assert.equal(toolEvents.length, 1, '快照只读合并，不得按当前进度再算一条')
+  assert.equal(toolEvents[0].text, alert.text)
+  assert.equal(toolEvents[0].memberId, 'member-1')
+})
+
+test('receipt：done 后新增 peer 交接 → 按 toMemberId 实发，且不补 captain 转述（AC-4a/AC-3）', async () => {
+  const { bridge, store, calls } = setup({ applyReceipt: receiptWithPeer })
+  await enable(bridge)
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [taskOf('t1', { status: 'running', memberId: 'member-1', acceptance: 'exit 0' })],
+      }),
+      bindings: [bindingOf()],
+    }),
+  )
+
+  const result = await bridge.act(SESSION, { type: 'receipt', taskId: 't1' })
+  assert.equal(result.rejected, undefined)
+
+  const peerSent = calls.sent.filter((item) => item.memberId === 'member-2')
+  assert.equal(peerSent.length, 1, '下游成员已存在时必须实发（body 与账本同源）')
+  assert.match(peerSent[0].text, /【上游直投】/)
+  assert.equal(peerSent[0].text, peerMessageOf().body, '实发正文必须与账本条目逐字一致')
+
+  assert.equal(result.snapshot.messages.filter((m) => m.from === 'peer').length, 1)
+  assert.equal(result.snapshot.messages.filter((m) => m.from === 'captain').length, 0, '不得补 captain 转述消息')
+  assert.ok(result.notices?.some((notice) => notice.includes('上游交接已直投')), '实发结果必须可观测')
+})
+
+test('receipt：peer 实发失败只给 notice，不补 captain、不重复落账；重放不重发（AC-3/AC-5 发送侧）', async () => {
+  const { bridge, store, calls } = setup({
+    applyReceipt: receiptWithPeer,
+    sendMessage: async (memberId: string, text: string) => {
+      calls.sent.push({ memberId, text })
+      return { ok: false, error: '成员不在' }
+    },
+  })
+  await enable(bridge)
+
+  const seeded = stateOf({
+    plan: planOf({
+      status: 'dispatching',
+      tasks: [taskOf('t1', { status: 'running', memberId: 'member-1', acceptance: 'exit 0' })],
+    }),
+    bindings: [bindingOf()],
+  })
+  store.save(seeded)
+
+  const result = await bridge.act(SESSION, { type: 'receipt', taskId: 't1' })
+  assert.equal(result.rejected, undefined)
+  assert.equal(calls.sent.length, 1, '失败也要尝试一次，失败本身不能静默')
+  assert.equal(result.snapshot.messages.filter((m) => m.from === 'peer').length, 1, '失败也只留一条账本记录')
+  assert.equal(result.snapshot.messages.filter((m) => m.from === 'captain').length, 0, '不得补 captain 转述消息')
+  assert.ok(
+    result.notices?.some((notice) => notice.includes('失败') && notice.includes('成员不在')),
+    '失败原因必须进 notice',
+  )
+
+  // 重放：peer 条目已在账本里 → 本次没有「新增」，不得再发一遍（AC-5 的发送侧）。
+  const replay = setup({ applyReceipt: receiptWithPeer })
+  await enable(replay.bridge)
+  replay.store.save({
+    ...seeded,
+    messages: [peerMessageOf()],
+  })
+  const replayResult = await replay.bridge.act(SESSION, { type: 'receipt', taskId: 't1' })
+  assert.equal(replayResult.rejected, undefined)
+  assert.equal(replay.calls.sent.length, 0, '同一 (A,B) 不重复实发')
+  assert.equal(replayResult.snapshot.messages.filter((m) => m.from === 'peer').length, 1)
 })

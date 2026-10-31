@@ -12,11 +12,13 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import type {
+  ActivityEvent,
   MemberBinding,
   MessageRecord,
   Plan,
   PlanStatus,
   PlanTask,
+  ProgressRecord,
   RouteAudit,
   TaskStatus,
 } from '../shared/types.ts'
@@ -27,6 +29,14 @@ export const RUN_STATE_VERSION = 2
 
 /** 消息账本上限（AC-16）：超出丢最旧，保证落盘文件不会无限增长。 */
 export const MESSAGES_LIMIT = 200
+
+/**
+ * 停滞告警上限：一次运行里最多保留最近多少条 `stallAlerts`。
+ *
+ * 告警由 `watcher.tick` 追加（每 episode 一条），成员反复卡住也能涨到几百条；
+ * 落盘文件是对账与面板的唯一数据源，必须像消息账本一样有上限，否则单个 run 文件会无限变大。
+ */
+export const STALL_ALERTS_LIMIT = 50
 
 /**
  * 一次运行的完整落盘状态（v2）。
@@ -41,6 +51,16 @@ export interface RunState {
   messages: MessageRecord[]
   bindings: MemberBinding[]
   routeAudits: RouteAudit[]
+  /**
+   * 成员推进记录（key = memberId）：最近一次实质工具调用时间 + 本轮告警标记。
+   * 缺省 = 还没有任何推进信号，停滞判定的基线回落到 `binding.spawnedAt`。
+   */
+  progress?: Record<string, ProgressRecord>
+  /**
+   * 停滞告警事件（`kind` 恒为 `'tool'`），由 watcher.tick 追加、`bridge.activityOf` 只读合并。
+   * 必须落盘：只有落盘才能跨重启保持「一次 episode 一条告警」的幂等。
+   */
+  stallAlerts?: ActivityEvent[]
 }
 
 /** 运行列表的一行（面板/恢复入口用，不含消息账本等大字段）。 */
@@ -72,17 +92,21 @@ export class RunsStore {
     }
   }
 
-  /** 整体原子写（tmp + rename）；消息账本按上限裁剪后再落盘。 */
+  /** 整体原子写（tmp + rename）；消息账本 / 停滞记录 / 告警都按上限裁剪后再落盘。 */
   save(state: RunState): void {
     const path = this.fileFor(state.plan.runId)
     if (path === null) throw new Error(`非法 runId：${state.plan.runId}`)
     mkdirSync(this.dir, { recursive: true })
+    const bindings = state.bindings ?? []
     const normalized: RunState = {
       ...state,
       version: RUN_STATE_VERSION,
       messages: capMessages(state.messages),
-      bindings: state.bindings ?? [],
+      bindings,
       routeAudits: state.routeAudits ?? [],
+      // 成员死后其推进记录不再有任何用处：只留 live bindings 的 memberId，避免文件无限增长。
+      progress: capProgress(state.progress, bindings),
+      stallAlerts: capStallAlerts(state.stallAlerts ?? []),
     }
     const tmp = `${path}.tmp`
     writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
@@ -135,6 +159,9 @@ export class RunsStore {
  * - v2（`{ version: 2, plan, ... }`）：规范化数组字段，缺失补空；
  * - v1（裸 `Plan`）：包成 v2，`plannedAt` 取 `plan.createdAt`，其余三个集合为空；
  * - 其它（null / 非对象 / 缺 runId·sessionId·tasks）：返回 null，由调用方当成「没有这次运行」。
+ *
+ * `progress` / `stallAlerts` 是 v2 之后**追加的可选字段**：旧 v2 文件没有它们时补空对象/空数组，
+ * 因此 `version` 不变（不需要迁移脚本，也不会让旧文件被判成坏文件）。
  */
 export function wrapLegacy(raw: unknown): RunState | null {
   if (!isRecord(raw)) return null
@@ -147,6 +174,8 @@ export function wrapLegacy(raw: unknown): RunState | null {
     messages: capMessages(asArray<MessageRecord>(raw.messages)),
     bindings: asArray<MemberBinding>(raw.bindings),
     routeAudits: asArray<RouteAudit>(raw.routeAudits),
+    progress: normalizeProgress(raw.progress),
+    stallAlerts: normalizeStallAlerts(raw.stallAlerts),
   }
 }
 
@@ -210,6 +239,65 @@ const TASK_STATUSES: readonly TaskStatus[] = [
 /** 消息账本裁剪：只保留最新 `MESSAGES_LIMIT` 条（顺序不变）。 */
 function capMessages(messages: MessageRecord[]): MessageRecord[] {
   return messages.length <= MESSAGES_LIMIT ? messages : messages.slice(-MESSAGES_LIMIT)
+}
+
+/** 停滞告警裁剪：只保留最新 `STALL_ALERTS_LIMIT` 条（顺序不变）。 */
+function capStallAlerts(alerts: ActivityEvent[]): ActivityEvent[] {
+  return alerts.length <= STALL_ALERTS_LIMIT ? alerts : alerts.slice(-STALL_ALERTS_LIMIT)
+}
+
+/**
+ * 推进记录裁剪：只保留 live bindings（`!retired`）的 memberId。
+ *
+ * 为什么在 `save()` 里做而不是在判定里做：判定需要历史记录（否则成员一退休就把基线丢了），
+ * 而落盘只需要「对账用得上的那些」——成员死了它的推进记录再也不会被读。
+ * 传入的 bindings 为空时返回空对象（不是 undefined）：落盘形态稳定，读取端不必判两种空。
+ */
+function capProgress(
+  progress: Record<string, ProgressRecord> | undefined,
+  bindings: MemberBinding[],
+): Record<string, ProgressRecord> {
+  const out: Record<string, ProgressRecord> = {}
+  if (!progress) return out
+  const live = new Set(bindings.filter((binding) => !binding.retired).map((binding) => binding.memberId))
+  for (const [memberId, record] of Object.entries(progress)) {
+    if (live.has(memberId)) out[memberId] = record
+  }
+  return out
+}
+
+/** `progress` 规范化：`at` 必须是有限数字，否则整条丢；`alertedAt` 非法则删（不影响 `at` 的有效性）。 */
+function normalizeProgress(raw: unknown): Record<string, ProgressRecord> {
+  const out: Record<string, ProgressRecord> = {}
+  if (!isRecord(raw)) return out
+  for (const [memberId, value] of Object.entries(raw)) {
+    if (!isRecord(value)) continue
+    const at = value.at
+    if (typeof at !== 'number' || !Number.isFinite(at)) continue
+    const record: ProgressRecord = { at }
+    const alertedAt = value.alertedAt
+    if (typeof alertedAt === 'number' && Number.isFinite(alertedAt)) record.alertedAt = alertedAt
+    out[memberId] = record
+  }
+  return out
+}
+
+/**
+ * 停滞告警规范化：只留 `kind === 'tool'` 且 `at`/`text` 有效的条目（上限截尾）。
+ *
+ * 为什么不接受别的 kind：`stallAlerts` 只承载停滞告警，混进其它 kind 会让面板活动流
+ * 出现两条来源不同、措辞却相似的行——正是 PRD 反面目标 1 要消灭的重复告警。
+ */
+function normalizeStallAlerts(raw: unknown): ActivityEvent[] {
+  const kept: ActivityEvent[] = []
+  for (const value of asArray<unknown>(raw)) {
+    if (!isRecord(value)) continue
+    if (value.kind !== 'tool') continue
+    if (typeof value.at !== 'number' || !Number.isFinite(value.at)) continue
+    if (typeof value.text !== 'string' || value.text === '') continue
+    kept.push(value as unknown as ActivityEvent)
+  }
+  return capStallAlerts(kept)
 }
 
 function normalizePlan(raw: Record<string, unknown>): Plan | null {

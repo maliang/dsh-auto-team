@@ -118,6 +118,30 @@ export interface MemberView {
   modelRoute: string
   /** 失败 / 中断后可续聊（done 的成员不需要再 resume）。 */
   canResume: boolean
+  /**
+   * 是否停滞（活着但长时间没有实质工具调用）。
+   * 只有 `running` 的成员可能为 true：终态成员本来就不再产出，判停滞只会制造假告警。
+   */
+  stalled: boolean
+  /**
+   * 已停滞的毫秒数（由宿主 `stall.stallOf` 在快照时刻算好，未停滞恒 0）。
+   * 客户端**只渲染不比较**：任何阈值比较出现在 client 都意味着两套判定会分叉。
+   */
+  stalledForMs: number
+  /** 已停滞时长的展示文案（如「92 秒」/「20 分 34 秒」）；未停滞为空串。客户端零格式化。 */
+  stalledSecondsText: string
+}
+
+/**
+ * 成员推进记录（`RunState.progress` 的值，key = memberId）。
+ *
+ * `at` = 最近一次**实质工具调用**的时间戳；`alertedAt` = 本停滞 episode 的告警时间
+ * （存在即表示「这一轮已经告警过」，是「一次 episode 恰好一条告警」的幂等键）。
+ * 放在 shared 而不是 store：`team/stall.ts` 是纯逻辑模块，不能 import 非纯的 store。
+ */
+export interface ProgressRecord {
+  at: number
+  alertedAt?: number
 }
 
 /** 记忆双轨（AC-24）：公共轨跨会话共享，项目轨跟随当前工作目录。 */

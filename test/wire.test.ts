@@ -102,7 +102,12 @@ function makeHarness(): Harness {
     llm: { resolveCallConfig: (config: unknown) => config },
     agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) },
     effect: (dispose: () => void | Promise<void>) => void disposers.push(dispose),
-    on: (_event: string, listener: (payload: unknown) => void) => void listeners.push(listener),
+    // 只收集 agent/created：它在用例里由测试**手动触发**来制造路由漂移。
+    // 其余根作用域订阅（T2 的 tools/result + agent/status 推进信号）不该混进这个数组，
+    // 否则 `listeners[0]` 会指错人，把推进信号当路由事件喂进去。
+    on: (event: string, listener: (payload: unknown) => void) => {
+      if (event === 'agent/created') listeners.push(listener)
+    },
     logger: { warn: (text: string) => void warnings.push(text), info: () => {} },
   }
 
@@ -214,7 +219,8 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(h.routes.length, 1, '宿主 WebRoute 没有 method 字段，四条能力合并成一条 prefix 路由')
   assert.equal(h.routes[0]?.path, '/api/auto-team')
   assert.equal(h.routes[0]?.kind, 'prefix')
-  assert.equal(h.disposers.length, 1, 'watcher 必须挂 ctx.effect 清理')
+  // 两份清理：watcher 的 setInterval + 成员推进事件订阅（T2 的 onMemberProgress）都必须在卸载时停掉。
+  assert.equal(h.disposers.length, 2, 'watcher 与进度订阅都必须挂 ctx.effect 清理')
 
   // 三条面板接口都在（第 4 条未知路径必须是 404，证明分发真的在路由表里查）
   const snapshotReply = await panel(h.routes, 'GET', `/api/auto-team/snapshot?sessionId=${SESSION}`)
