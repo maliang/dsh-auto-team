@@ -16,6 +16,7 @@
 | 产品入口 | README.md | 安装/使用/开发命令速览 |
 | 任务产物 | docs/teamflow/<yyyyMMdd-rN-slug>/ | 每个需求一个自包含任务夹：PRD/设计/技术方案/QA 报告/验收报告（按日期倒序即迭代史） |
 | 架构总览 | docs/teamflow/architecture/ARCHITECTURE.md | 技术栈权衡、模块契约、目录树、构建/测试/CI、**未完成清单** |
+| 架构参考 | docs/teamflow/architecture/SUPER-AGENT-MAPPING.md | Super-agent（DeepSeek 原型仓）→ 本插件的映射：能搬 / 需改造 / 不搬 + 分期 + 证据索引 |
 | 产品记忆 | docs/teamflow/memory.md | 团队约定/技术栈/已知待办（低频更新） |
 | 运行日志 | logs/teamflow/<runId>/ → $DSH_HOME/teamflow/<workspace>/logs/<runId>/ | 只放**要留存**的东西（一次性检查脚本 scripts/、不可重跑的命令载荷 captures.json、结论笔记 .md）——**不制造命令输出 dump**；run 期间在项目内暂存，run 结束由 host 归档到 $DSH_HOME 并从项目删除 |
 
