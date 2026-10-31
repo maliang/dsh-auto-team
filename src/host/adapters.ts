@@ -11,6 +11,7 @@
  */
 import type { RejectionCode, Role, RoleModelRoute } from '../shared/types.ts'
 import type { HostMember } from './team/watcher.ts'
+import type { GuardVerdict } from './team/guard.ts'
 import type { SpawnInput } from './team/dispatch.ts'
 import { normalizeModel } from './roles/repo.ts'
 import { BRIDGE_ROUTE, DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from './config.ts'
@@ -910,4 +911,257 @@ export async function spawnMember(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/* ------------------------------------------------------------------ *
+ * r5 增量：四个新宿主触点（AGENTS §4：宿主形状只允许出现在本文件）
+ *
+ *   registerToolGuard    `tools/execute`（**waterfall**）—— 队长 noWait 守卫的唯一绑定点
+ *   onHostTriggerEvents  `agent/status` / `subagent/end` / `agent/error` / `tools/result`（emit）
+ *                        —— Trigger 侧**唯一**读取宿主 payload 的地方（team/trigger.ts 只收归一化量）
+ *   captainAgentScopeOf  主 session 的事件作用域（拿不到就 fail-closed，绝不假称可用）
+ *   installCaptainRoute  队长模型路由下发（复用 installMemberRoute 的两条事件，不写第二套）
+ *
+ * 判定全部在纯模块（`team/guard.ts`）里；这里只做「宿主形状 → 纯函数入参」的翻译，
+ * 因此本文件的新增部分没有任何可被 AC-4/AC-6 误判的业务规则。
+ * ------------------------------------------------------------------ */
+
+/** 守卫判定入参：宿主 `exec` 里只取这三样（`ToolExecutionInput` 形状见 AGENTS §4 实测）。 */
+export interface ToolGuardRequest {
+  toolName: string
+  args: unknown
+  /** `exec.agent?.id`；主 session **可能不给**（U4）→ `null`，调用方据此按「队长」判。 */
+  agentId: string | null
+}
+
+/**
+ * 守卫短路返回（U1 的 L1 形状）。
+ *
+ * 只保证两件可读的事：`code`（机器可判）与 `message`（模型可读的下一步）。
+ * 不臆造宿主的 tool-result 结构 —— 那正是 U1 未实测的部分。
+ */
+export interface ToolGuardRejection {
+  ok: false
+  code: string
+  message: string
+  command?: string
+}
+
+/**
+ * 队长 noWait 守卫的宿主绑定（AC-4 的唯一执行点）。
+ *
+ * **放行分支必须 `next()`**：`tools/execute` 是 waterfall，漏调就把这次工具执行吞掉
+ * （模型看到「什么都没发生」，比被拒绝更难排查）。因此这里只有两条出口：
+ *   - 放行 → `next()`（原样交回下游）；
+ *   - 拒绝 → **不调** `next()`，直接返回拒绝对象（waterfall 短路）。
+ *
+ * 三级降级写死在这里（U1：短路返回形状未在真实宿主实测）：
+ *   - L1（本实现）：返回 `ToolGuardRejection`，命令不执行，模型收到 code + message；
+ *   - L2（L1 形状若被宿主拒收时的退路）：把拒绝分支改成 `throw new Error(verdict.message)`，
+ *     命令同样不执行，模型看到的是错误而不是结果对象；
+ *   - L3（`ctx.on` 不存在 / 订阅直接抛错）：不注册守卫，warn 一次，降级为提示词自律
+ *     —— QA-REPORT 必须记为「未验证」，**不得**算 AC-4 通过。
+ *
+ * 失败模式一律 fail-open：判定异常、入参形状不认识、非 bash 工具都**放行**。
+ * 守卫的误杀代价（拦住队长正常工作）远高于漏拦一次（anti-goal 1）。
+ */
+export function registerToolGuard(
+  ctx: HostContext,
+  decide: (request: ToolGuardRequest) => GuardVerdict,
+): () => void {
+  const on = ctx.on
+  if (typeof on !== 'function') {
+    // L3：宿主没有事件订阅能力 → 守卫装不上，只剩提示词里的硬约束。
+    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：noWait 守卫未装配，队长仍可能前台同步长等待')
+    return () => {}
+  }
+
+  const listener = (...args: unknown[]): unknown => {
+    const next = args[args.length - 1]
+    const nextFn = typeof next === 'function' ? (next as (...rest: unknown[]) => unknown) : null
+    const request = guardRequestOf(args[0])
+
+    // ⚠️ 形状不认识 → 放行。注意 `next()` **不能**包在下面那个 try 里：
+    // 下游工具自身的异常会被当成「判定异常」再调一次 next，于是同一条命令执行两次。
+    if (request === null) return nextFn === null ? undefined : nextFn()
+
+    let verdict: GuardVerdict | undefined
+    try {
+      verdict = decide(request)
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] noWait 守卫判定异常，本次放行（${messageOf(error)}）`)
+      return nextFn === null ? undefined : nextFn()
+    }
+    if (verdict === undefined || verdict.allow !== false) {
+      return nextFn === null ? undefined : nextFn()
+    }
+
+    // L1 短路：不调 next()。命令不执行，模型拿到可读原因码 + 下一步建议。
+    const rejection: ToolGuardRejection = {
+      ok: false,
+      code: verdict.code,
+      message: verdict.message,
+      command: verdict.command,
+    }
+    return rejection
+  }
+
+  try {
+    const dispose = on.call(ctx, 'tools/execute', listener)
+    return typeof dispose === 'function'
+      ? () => {
+          try {
+            dispose()
+          } catch {
+            /* 已释放 */
+          }
+        }
+      : () => {}
+  } catch (error) {
+    // L3：订阅本身失败（宿主不认这个事件）→ 不假装守卫存在。
+    ctx.logger?.warn?.(`[auto-team] noWait 守卫订阅失败，队长仍可能前台同步长等待（${messageOf(error)}）`)
+    return () => {}
+  }
+}
+
+/** 从 `tools/execute` 的第一个入参取 `{name, arguments, agent}`；形状不认识返回 `null`（→ 放行）。 */
+function guardRequestOf(payload: unknown): ToolGuardRequest | null {
+  const exec = toolExecutionOf(payload)
+  if (exec === null) return null
+  const name = (exec as { name?: unknown }).name
+  if (typeof name !== 'string' || name === '') return null
+  const agent = (exec as { agent?: unknown }).agent
+  const id = agent !== null && typeof agent === 'object' ? (agent as { id?: unknown }).id : undefined
+  return {
+    toolName: name,
+    args: (exec as { arguments?: unknown }).arguments,
+    // U4：主 session 的 `exec.agent` 是否为 undefined 未实测 —— 拿不到就当 `null`（= 队长）。
+    agentId: typeof id === 'string' && id !== '' ? id : null,
+  }
+}
+
+/** 工具执行对象：`exec` 本身，或被我们自己包成 `{ exec }` 的形态（与 agentOfToolEvent 同一口径）。 */
+function toolExecutionOf(payload: unknown): unknown | null {
+  if (payload === null || typeof payload !== 'object') return null
+  const wrapped = (payload as { exec?: unknown }).exec
+  if (wrapped !== null && wrapped !== undefined && typeof wrapped === 'object') return wrapped
+  return payload
+}
+
+/** 订阅的四类宿主事件（顺序即订阅顺序，测试按此断言）。 */
+export const TRIGGER_EVENT_NAMES = ['agent/status', 'subagent/end', 'agent/error', 'tools/result'] as const
+
+export type TriggerEventName = (typeof TRIGGER_EVENT_NAMES)[number]
+
+/** 事件订阅结果：`degraded` 供装配层调 `bus.setEventSource(false)`（AC-18 的可读降级）。 */
+export interface TriggerEventSubscription {
+  stop(): void
+  degraded: boolean
+}
+
+/**
+ * 订阅四类宿主事件 → Trigger 归一化（AC-12 的唯一 payload 读取点）。
+ *
+ * 与 `onMemberProgress` 的分工：那个只管「成员有实质产出」（停滞判定的基线），
+ * 这个只把**事件原样**交给 handler，判定口径（去重/幂等/该不该推进）在 `team/trigger.ts`。
+ *
+ * 语义：`tools/result` 的监听签名是 `(exec, result)`，这里统一包成 `{ exec, result }`
+ * 具名对象再交出去 —— 消费侧不必再记参数位序；其余三类单参事件原样传 payload。
+ *
+ * 降级（U2：四个事件的名字/payload 形状未在真实宿主实测）：
+ *   - 任一事件订阅抛错 → `degraded: true` + warn，其余事件照常订阅（少一路不等于全废）；
+ *   - `ctx.on` 完全不存在 → `degraded: true`，四类推进全部退回 `watcher.tick` 的 poll 通路，
+ *     因此「事件源关闭后四类各有一次推进」仍成立（AC-18）。
+ */
+export function onHostTriggerEvents(
+  ctx: HostContext,
+  handler: (name: TriggerEventName, payload: unknown) => void,
+): TriggerEventSubscription {
+  if (typeof ctx.on !== 'function') {
+    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：Trigger 事件源不可用，四类推进退回轮询兜底')
+    return { stop() {}, degraded: true }
+  }
+  const subscribe = ctx.on.bind(ctx)
+  const disposers: Array<() => void> = []
+  let failed = 0
+
+  for (const name of TRIGGER_EVENT_NAMES) {
+    try {
+      const dispose = subscribe(name, (...args: unknown[]) => {
+        try {
+          handler(name, payloadOfEvent(name, args))
+        } catch (error) {
+          // handler 里还有 store/bridge 写入；宿主虽会隔离监听器异常，自己兜一层才看得到原因。
+          ctx.logger?.warn?.(`[auto-team] Trigger 事件处理失败（${name}：${messageOf(error)}）`)
+        }
+      })
+      if (typeof dispose === 'function') disposers.push(dispose)
+    } catch (error) {
+      failed += 1
+      ctx.logger?.warn?.(`[auto-team] 订阅 ${name} 失败：该类 Trigger 退回轮询兜底（${messageOf(error)}）`)
+    }
+  }
+
+  return {
+    degraded: failed > 0,
+    stop() {
+      while (disposers.length > 0) {
+        const dispose = disposers.pop()
+        try {
+          dispose?.()
+        } catch {
+          /* 单个 disposer 失败不影响其余清理 */
+        }
+      }
+    },
+  }
+}
+
+/** 事件 payload 归一化：只做「参数位序 → 具名对象」，不解析业务字段（U2 未实测，读字段等于猜）。 */
+function payloadOfEvent(name: TriggerEventName, args: unknown[]): unknown {
+  if (name === 'tools/result') return { exec: args[0], result: args[1] }
+  if (args.length === 1) return args[0]
+  if (args.length === 0) return undefined
+  return args
+}
+
+/**
+ * 主 session（队长）的 agent：只走**已实测**通道 `ctx.agents.currentInitiator()`。
+ *
+ * apply 期这个值通常是 `undefined`（它只在工具执行期有值），所以队长模型能力位
+ * 今天几乎必然是 `unsupported` —— 这正是 U3 未验证时的诚实结果（anti-goal 5：不假称生效）。
+ * 任何宿主侧异常都吞掉返回 `null`：能力位缺失只能让「模型没生效」显示出来，不能拖垮装配。
+ */
+function captainAgentOf(ctx: HostContext): unknown | null {
+  try {
+    const agent = ctx.agents?.currentInitiator?.()
+    return agent ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 主 session 的事件作用域（`agent.ctx` 形状）。
+ *
+ * 与 `installCaptainRoute` 必须同源（同一个 `captainAgentOf`）：先探测后安装，
+ * 否则会出现「探测说能装、安装拿不到」的自相矛盾状态。
+ */
+export function captainAgentScopeOf(ctx: HostContext): unknown | null {
+  return agentContextOf(captainAgentOf(ctx))
+}
+
+/**
+ * 把队长模型路由装到主 session 的 `agent.ctx` 上（AC-2 / AC-3 的唯一生效路径）。
+ *
+ * 语义与成员路由**完全一致**（`system-prompt/assemble` 记录本轮生效值 + `agent/request`
+ * 改写调用配置并剔除继承的 `reasoningEffort`），因此直接复用 `installMemberRoute`，
+ * 不再写第二套改写实现（同一类风险只留一道实现）。
+ *
+ * 返回 `null` = 拿不到主 session 作用域 → 调用方落 `unsupported` 并回显配置，**不假装生效**。
+ */
+export function installCaptainRoute(ctx: HostContext, route: RoleModelRoute): (() => void) | null {
+  const agent = captainAgentOf(ctx)
+  if (agent === null) return null
+  return installMemberRoute(agent, route)
 }

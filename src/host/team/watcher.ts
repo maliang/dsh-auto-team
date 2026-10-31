@@ -36,6 +36,14 @@ export interface WatcherDeps {
   stallMs?: number
   /** 对账发生变更时的回调（宿主装配层用它刷新快照/打点，不在这里硬编码）。 */
   onReconciled?(state: RunState): void
+  /**
+   * 每轮对账之后的 Trigger 轮询兜底（AC-18 / r5）。
+   *
+   * 挂在**既有的 1500ms tick** 上，不新增 `setInterval`（AC-20：定时器仍只有本文件一处）；
+   * 判定口径在 `team/trigger-bus.ts`，这里只是「有节奏地叫它一次」，不做任何判定。
+   * 抛错必须被吞掉：轮询失败不能打断成员存活对账（那会让「成员死了」永远报不出来）。
+   */
+  onPoll?(state: RunState): Promise<void>
 }
 
 export interface ReconcileResult {
@@ -231,6 +239,16 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
           deps.store.save(judged.state)
           deps.onReconciled?.(judged.state)
           changed += reconciled.changed + judged.raised.length
+        }
+
+        // Trigger 轮询兜底（AC-18）：紧跟在「对账 → 停滞判定」之后，喂的是同一份已落盘状态，
+        // 所以 poll 看到的世界与刚写下去的一致（不会基于旧状态重复推导同一条 Trigger）。
+        if (deps.onPoll !== undefined) {
+          try {
+            await deps.onPoll(judged.state)
+          } catch {
+            // 兜底失败只影响本轮少一次推进，绝不能连累存活对账（下一轮 tick 会补上）。
+          }
         }
       }
 

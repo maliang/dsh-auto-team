@@ -261,9 +261,31 @@ export interface PanelSnapshot {
     budget: number
     truncated: boolean
     files: MemoryFileInfo[]
+    /**
+     * 内联进上下文的记忆索引（AC-7）：每条带 `mem://<track>/<stem>` ID + 标题 + 首句。
+     *
+     * 与 `files` 的差别：`files` 是「哪些文件参与注入」，`inline` 是「各自压成了什么」。
+     * 可选是为了让 T0 契约先行不必同时改 `bridge.ts`（T8 负责填），运行期 T8 之后恒有值；
+     * 消费端必须把 `undefined` 当作「旧快照 / 未投影」而不是「没有记忆」。
+     */
+    inline?: MemoryInlineEntry[]
+    /** 未内联但可按 ID 展开的条目（AC-8：`truncated` 的语义 = 本数组非空）。 */
+    omitted?: MemoryInlineEntry[]
   }
   roles: Role[]
   activity: ActivityEvent[]
+  /**
+   * 队长模型投影（AC-2）：`value` + 三态来源必须同时可见，`unsupported` 不得伪装成 `configured`。
+   *
+   * 可选的同一条理由：字段由 T8 的集成层填充，T0 只落契约。
+   */
+  captainModel?: CaptainModelView
+  /** AC-18：事件订阅不可用时为 true —— 面板必须看得见，不得静默降级。 */
+  degraded?: boolean
+  /** 降级原因（`degraded === true` 时给一句中文），面板直接显示。 */
+  degradeReason?: string
+  /** 最近 N 条 Trigger 记录（含 dropped），供「为什么推进 / 为什么没推进」排查。 */
+  triggers?: TriggerRecord[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -282,6 +304,117 @@ export interface ActivityEvent {
     | 'route_drift'
     | 'rework'
   text: string
+  /**
+   * 这条活动是「自动推进产生」还是「用户动作产生」（AC-17：面板要能区分）。
+   *
+   * 缺省 = 历史事件，按用户动作对待（老数据没有来源，不能倒推成自动 —— 那会让面板
+   * 把用户自己点出来的动作说成「系统自动推进」）。
+   */
+  source?: 'trigger' | 'user'
+}
+
+/* ───────────────────────── r5：队长分层 / Inline & Spill / Trigger 总线 ───────────────────────── */
+
+/**
+ * 队长模型投影（AC-2）：`value` 与三态来源必须同时可见。
+ *
+ * `unsupported` 是 fail-closed 出口：宿主能否给主 session 指定模型尚未验证时，
+ * 面板必须显示「宿主不支持」而不是假装配置已生效（anti-goal 5：不假称）。
+ */
+export interface CaptainModelView {
+  /** `provider/model #effort` 或 null（未配置）。 */
+  value: string | null
+  route: RoleModelRoute | null
+  source: 'configured' | 'host-default' | 'unsupported'
+  /** 一句中文说明（配置生效 / 未配置 / 宿主不支持），面板直接显示。 */
+  note: string
+}
+
+/** Trigger 种类（AC-13）：**恰 4 个**，新增种类必须同时补归一化、Fast 层判据与面板文案。 */
+export type TriggerKind = 'gate_failed' | 'member_exit' | 'dep_ready' | 'stall_timeout'
+
+/** 来源：`event` = 宿主事件即时触发，`poll` = watcher tick 兜底（AC-18 的降级通路）。 */
+export type TriggerSource = 'event' | 'poll'
+
+/**
+ * Fast 层原因码（AC-14）：**恰 7 个**，全部落在「事件类型 / 任务状态 / 门禁退出码 /
+ * 成员存在性 / 去重窗口」这五类**程序判据**上 —— 这里出现任何一个需要语义理解才能判的码，
+ * 就说明 Fast 层偷偷变成了模型调用（AC-14 的机械上限）。
+ */
+export type FastReason =
+  /** 放行。 */
+  | 'ok'
+  /** 会话开关关闭。 */
+  | 'not_enabled'
+  /** 不属于四类监听集合。 */
+  | 'not_listened'
+  /** taskId / memberId 在当前 run 里找不到。 */
+  | 'unknown_entity'
+  /** 任务状态不允许该推进（如已 done 又收到 dep_ready）。 */
+  | 'task_state'
+  /** 门禁退出码为 0，不该报「失败」。 */
+  | 'gate_exit_zero'
+  /** 去重窗口内已推进过。 */
+  | 'duplicate'
+
+/** 一条 Trigger 的落盘记录：accepted / dropped 都留，否则「为什么没推进」无从排查。 */
+export interface TriggerRecord {
+  at: number
+  kind: TriggerKind
+  source: TriggerSource
+  runId: string
+  taskId?: string
+  memberId?: string
+  /** 去重键（`kind:runId:entityId`），与 `fastOf` 注入的窗口共同构成幂等。 */
+  dedupeKey: string
+  accepted: boolean
+  reason: FastReason
+  /** 中文可读原因（AC-17）：含短语 + 实体 id + 结果；未推进时写成「未推进：<为什么>」。 */
+  text: string
+  /** accepted 时实际调用的 action 类型（`dispatch` / `resume` / `message`…），未推进时缺省。 */
+  action?: PanelAction['type']
+  /** `bridge.act` 的拒绝码（并发已满等）：动作发出但被业务拒绝时记录。 */
+  rejected?: RejectionCode
+}
+
+/** 内联索引条目（AC-7）：面板与测试都能看到「内联了哪几条、各自多长」。 */
+export interface MemoryInlineEntry {
+  /** `mem://<track>/<stem>`（由 `memoryIdOf` 单点生成）。 */
+  id: string
+  track: MemoryTrack
+  name: string
+  title: string
+  /** 首句摘要（不是全文；全文走 expand）。 */
+  summary: string
+  /** ≥1 个关联 id（同轨相邻条目），供模型顺着展开下一层。 */
+  related: string[]
+  /** 该条内联文本长度（≤ `MEMORY_INLINE_ITEM_MAX`）。 */
+  chars: number
+}
+
+/** 记忆展开结果码（AC-9/AC-10）：失败一律降级成码，**不抛异常**（工具调用面不能崩）。 */
+export type ExpandCode =
+  | 'OK'
+  | 'EXPAND_BAD_ID'
+  | 'EXPAND_PATH_ESCAPE'
+  | 'EXPAND_NOT_FOUND'
+  | 'EXPAND_DEPTH_EXCEEDED'
+
+/** 按 ID 展开一条记忆的载荷（`auto_team_memory` 的 `expand` 动作返回它）。 */
+export interface ExpandPayload {
+  code: ExpandCode
+  id: string
+  track: MemoryTrack | null
+  name: string | null
+  /** `code === 'OK'` 时是正文；超 `MEMORY_EXPAND_MAX_CHARS` 截断并置 `truncated`。 */
+  body: string
+  chars: number
+  truncated: boolean
+  /** 本次展开的跳数（1 起）。 */
+  depth: number
+  related: string[]
+  /** 每个码一句可读中文（面板/工具结果直接显示）。 */
+  message: string
 }
 
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */

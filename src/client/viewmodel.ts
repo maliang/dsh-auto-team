@@ -12,6 +12,7 @@
  *  3. 纯函数 —— 同样的输入永远同样的输出，时间由调用方传入（便于单测固定）。
  */
 import type {
+  CaptainModelView,
   MemberStatus,
   MemberView,
   PanelAction,
@@ -500,4 +501,88 @@ export async function actFeedback<A>(
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err), notices: [] }
   }
+}
+
+/* ─────────────────── r5：队长模型与「最近推进」（AC-2 / AC-17） ─────────────────── */
+
+/** 「最近推进」默认条数（DESIGN §3：计划页顶部一行，最多 3 条）。 */
+export const TRIGGER_ROW_LIMIT = 3
+
+/** 一行「最近推进」：来源徽标 + 时钟 + 已由 host 侧写好的中文原因。 */
+export interface TriggerRowView {
+  at: number
+  /** `HH:MM:SS`（客户端不自己算阈值，只用既有 formatClock 同源格式）。 */
+  clock: string
+  text: string
+  sourceLabel: '自动' | '用户'
+  /** 活动事件 kind（9 个既有值之一），渲染成 `data-auto-team-trigger`。 */
+  kind: string
+}
+
+/**
+ * 快照 → 「最近推进」行（**最新在前**）。
+ *
+ * 只读 `activity`，不读 `triggers`：`activity` 是面板既有数据源，`triggers` 是排查用的原始账本
+ * （含 dropped）。两条都渲染会出现「同一次推进显示两遍」，也会让面板看起来在讲内部实现。
+ *
+ * 只取**带 `source`** 的事件：缺省 = 历史事件（老数据没有来源，不能倒推成自动，
+ * 那会把用户自己点出来的动作说成「系统自动推进」）。
+ */
+export function recentTriggersOf(
+  snapshot: PanelSnapshot | null | undefined,
+  limit: number = TRIGGER_ROW_LIMIT,
+): TriggerRowView[] {
+  const activity = Array.isArray(snapshot?.activity) ? (snapshot as PanelSnapshot).activity : []
+  const count = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : TRIGGER_ROW_LIMIT
+  if (count === 0) return []
+
+  const rows: TriggerRowView[] = []
+  for (let index = activity.length - 1; index >= 0 && rows.length < count; index -= 1) {
+    const event = activity[index]
+    if (event === undefined || event === null || typeof event !== 'object') continue
+    const source = event.source
+    // 缺省/未知来源 = 历史事件：不渲染，避免把用户动作标成自动
+    if (source !== 'trigger' && source !== 'user') continue
+    const text = str(event.text).trim()
+    if (text === '') continue
+    rows.push({
+      at: typeof event.at === 'number' ? event.at : 0,
+      clock: formatClock(event.at),
+      text,
+      sourceLabel: source === 'trigger' ? '自动' : '用户',
+      kind: str(event.kind) === '' ? 'status' : str(event.kind),
+    })
+  }
+  return rows
+}
+
+/** 队长模型三态标签（AC-2）：`unsupported` 必须看起来就是「没生效」，不能像已配置。 */
+export interface CaptainModelLabel {
+  label: string
+  tone: 'ok' | 'warn' | 'muted'
+}
+
+/**
+ * 队长模型 → 头部一行标签。
+ *
+ * 三态语义（与 `CaptainModelView.source` 一一对应，不在这里重新推断）：
+ *  - `configured`：宿主已按配置指定了主 session 模型 → 展示具体路由，tone=ok；
+ *  - `host-default`：没有队长专用配置，跟随宿主默认 → tone=muted（不是错，但也不是「生效」）；
+ *  - `unsupported`：宿主给主 session 指定模型的能力未验证/不可用 → tone=warn，文案必须说「未生效」。
+ */
+export function captainModelLabelOf(
+  view: CaptainModelView | null | undefined,
+): CaptainModelLabel {
+  if (view === null || view === undefined || typeof view !== 'object') {
+    return { label: '队长模型 · 未投影', tone: 'muted' }
+  }
+  const value = str(view.value).trim()
+  if (view.source === 'configured') {
+    return { label: `队长模型 ${value !== '' ? value : '已配置'}`, tone: 'ok' }
+  }
+  if (view.source === 'host-default') {
+    return { label: '队长模型 跟随宿主默认', tone: 'muted' }
+  }
+  // unsupported 之外的未知取值也走这条：宁可显示「未生效」也不要假装生效
+  return { label: '队长模型 宿主不支持 · 未生效', tone: 'warn' }
 }

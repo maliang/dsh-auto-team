@@ -22,8 +22,11 @@ import {
 } from '../src/host/memory/repo.ts'
 import {
   keywords,
+  memoryIdOf,
+  memoryIndexOf,
   relevance,
   selectMemory,
+  summaryOf,
   titleHits,
   titleOf,
 } from '../src/host/memory/inject.ts'
@@ -194,43 +197,112 @@ test('标题命中权重高于正文多次命中（排序先看标题）', () =>
 
   const selection = selectMemory(goal, [bodyHit, titleHit], 4000)
   assert.ok(
-    selection.text.indexOf('a.md') < selection.text.indexOf('b.md'),
-    '标题命中的 a.md 必须排在正文命中的 b.md 之前',
+    selection.text.indexOf('mem://public/a') < selection.text.indexOf('mem://public/b'),
+    '标题命中的 a 必须排在正文命中的 b 之前',
   )
 })
 
-test('注入预算硬上限：任何输入都不超过 budget，且超限时给出截断尾行', () => {
-  const budget = 4000
-  const body = Array.from({ length: 400 }, (_, index) => `第 ${index + 1} 行：很长的记忆内容，用来撑爆预算`).join('\n')
-  const selection = selectMemory('目标', [{ track: 'project', name: 'big.md', body }], budget)
-  assert.ok(selection.chars <= budget, `实际 ${selection.chars} 超过预算 ${budget}`)
-  assert.equal(selection.chars, selection.text.length, 'chars 必须是最终注入文本长度')
-  assert.equal(selection.truncated, true)
-  assert.equal(selection.included.length, 1)
+/* ---------------------------------------------------------------- 内联索引（AC-7 / AC-8） */
 
-  const matched = /（记忆已截断：注入 (\d+)\/(\d+) 字符，省略 (\d+) 行）/.exec(selection.text)
-  assert.ok(matched, '超预算必须带固定格式的截断尾行')
-  assert.equal(Number(matched[1]), selection.chars, '尾行里的 N 必须等于实际注入字符数')
-  assert.equal(Number(matched[2]), budget)
-  assert.ok(Number(matched[3]) > 0, '省略行数必须大于 0')
-  assert.equal(Number(matched[3]), selection.omitted)
+test('memoryIdOf 是 ID 拼装唯一出处，且 ID 的 stem 能与 safeMemoryName 逐字往返', () => {
+  assert.equal(memoryIdOf('project', 'conventions.md'), 'mem://project/conventions')
+  assert.equal(memoryIdOf('public', '  log.md  '), 'mem://public/log')
+  for (const name of ['conventions.md', 'proj_2026-01.md', 'Log.md']) {
+    const id = memoryIdOf('project', name)
+    const stem = id.replace('mem://project/', '')
+    assert.equal(safeMemoryName(stem), name, 'ID 的 stem 必须能还原成磁盘文件名（大小写不丢）')
+    assert.equal(memoryIdOf('project', safeMemoryName(stem) ?? ''), id, 'ID 往返必须稳定')
+  }
 })
 
-test('小预算仍然不超限（含放不下尾行的极端预算）', () => {
+test('summaryOf 取首个非标题行的第一句并收敛长度', () => {
+  assert.equal(summaryOf({ track: 'project', name: 'a.md', body: '# 标题\n- 列表首句。第二句' }), '列表首句。')
+  assert.equal(summaryOf({ track: 'project', name: 'a.md', body: '无句号的一整行内容' }), '无句号的一整行内容')
+  assert.equal(summaryOf({ track: 'project', name: 'a.md', body: '# 只有标题' }), '')
+  const long = summaryOf({ track: 'project', name: 'a.md', body: '很'.repeat(200) })
+  assert.ok(long.length <= 60, `摘要应 ≤60，实际 ${long.length}`)
+  assert.ok(long.endsWith('…'))
+})
+
+test('AC-7：每条内联项 ≤200 字符，形如 mem:// ID + 轨道 + 标题 + 摘要，且带 ≥1 个关联 ID', () => {
+  const candidates = [
+    { track: 'project' as const, name: 'conventions.md', body: '# 团队约定\n提交前必须跑 pnpm build。第二段原文不该出现在注入里。' },
+    { track: 'project' as const, name: 'testing.md', body: '# 测试约定\nnode --test 直接跑 TS 源。' },
+    { track: 'public' as const, name: 'git.md', body: '# Git 纪律\n只在当前分支工作。' },
+  ]
+  const index = memoryIndexOf('提交前跑 build', candidates, 4000)
+  assert.equal(index.entries.length, 3)
+  assert.equal(index.omitted.length, 0)
+  for (const entry of index.entries) {
+    assert.ok(entry.chars <= 200, `内联项 ${entry.id} 长度 ${entry.chars} 超过 200`)
+    assert.match(entry.id, /^mem:\/\/(public|project)\/[A-Za-z0-9][A-Za-z0-9._-]*$/)
+    assert.ok(entry.related.length >= 1, `内联项 ${entry.id} 必须带 ≥1 个关联 ID`)
+    assert.ok(!entry.related.includes(entry.id), '关联 ID 不得指向自身')
+    assert.ok(entry.title.length > 0, '内联项必须带标题')
+    assert.ok(entry.summary.length > 0, '内联项必须带摘要')
+  }
+  const line = index.text.split('\n').find((row) => row.startsWith('mem://project/conventions')) ?? ''
+  assert.ok(line.length <= 200, `单行 ${line.length} 超过 200`)
+  assert.match(
+    line,
+    /^mem:\/\/project\/conventions · 项目记忆 · 团队约定 — 提交前必须跑 pnpm build。 ⇄ mem:\/\//,
+  )
+  assert.ok(line.endsWith(memoryIdOf('public', 'git.md')) || line.includes('mem://'), '关联 ID 必须可读')
+})
+
+test('AC-7：源文件深处正文在注入文本里 0 命中（只给首句摘要，全文走 expand）', () => {
+  const deep = 'DEEP-MARKER-正文深处的独有句子'
+  const body = `# 部署约定\n第一段首句。\n\n${deep}\n\n又一段 ${deep}`
+  const index = memoryIndexOf('部署', [{ track: 'project', name: 'deploy.md', body }], 4000)
+  assert.equal(index.entries.length, 1)
+  assert.ok(index.text.includes('mem://project/deploy'), '必须内联可展开 ID')
+  assert.equal(index.text.includes(deep), false, '正文深处的内容不得整段塞进注入文本')
+})
+
+test('AC-8：10KB 记忆库注入 ≤4000，0 命中旧截断标记，省略项仍可按 ID 展开取回', () => {
+  const budget = 4000
+  const candidates = Array.from({ length: 60 }, (_, index) => ({
+    track: (index % 3 === 0 ? 'public' : 'project') as 'public' | 'project',
+    name: `note-${String(index).padStart(2, '0')}.md`,
+    body: `# 记忆 ${index}\n${'内容'.repeat(90)}`,
+  }))
+  const libraryChars = candidates.reduce((sum, item) => sum + item.body.length, 0)
+  assert.ok(libraryChars >= 10_000, `夹具应 ≥10KB，实际 ${libraryChars}`)
+
+  const index = memoryIndexOf('内容', candidates, budget)
+  assert.ok(index.chars <= budget, `实际 ${index.chars} 超过预算 ${budget}`)
+  assert.equal(index.chars, index.text.length, 'chars 必须是最终注入文本长度')
+  assert.equal(index.entries.length + index.omitted.length, candidates.length, '未内联的条目不得丢失')
+  assert.ok(index.entries.length < candidates.length, '超预算时必须真的省略了条目（内联数 < 候选数）')
+  assert.equal(index.truncated, true, 'truncated 的语义 = 有未内联条目')
+  assert.equal(index.text.includes('记忆已截断'), false, '旧截断标注必须 0 命中')
+  assert.equal(index.text.includes('[截断]'), false, '旧截断标记必须 0 命中')
+  assert.match(index.text, /另有 \d+ 条未内联（可按 ID 展开）：mem:\/\//)
+
+  // 省略项仍可按 ID 取回：ID 必须能还原成磁盘文件名，且与内存期同源
+  for (const entry of index.omitted) {
+    assert.equal(safeMemoryName(entry.name), entry.name, '省略项文件名必须可还原')
+    assert.equal(memoryIdOf(entry.track, entry.name), entry.id)
+  }
+})
+
+test('小预算仍然不超限（含放不下任何一条的极端预算）', () => {
   const candidates = [
     { track: 'project' as const, name: 'a.md', body: '甲'.repeat(500) },
     { track: 'project' as const, name: 'b.md', body: '乙'.repeat(500) },
   ]
-  for (const budget of [300, 100]) {
-    const selection = selectMemory('目标', candidates, budget)
-    assert.ok(selection.chars <= budget, `budget=${budget} 实际 ${selection.chars}`)
-    assert.equal(selection.chars, selection.text.length)
-    assert.equal(selection.truncated, true)
+  for (const budget of [250, 100]) {
+    const index = memoryIndexOf('目标', candidates, budget)
+    assert.ok(index.chars <= budget, `budget=${budget} 实际 ${index.chars}`)
+    assert.equal(index.chars, index.text.length)
+    assert.equal(index.truncated, index.omitted.length > 0, 'truncated 必须等价于「有未内联条目」')
+    assert.ok(index.omitted.length > 0, `budget=${budget} 应当有条目放不下`)
+    assert.equal(index.entries.length + index.omitted.length, 2, '条目只能进 entries 或 omitted，不能凭空消失')
   }
 })
 
-test('多候选按项目轨优先，且省略行数随被丢弃文档增长', () => {
-  const selection = selectMemory(
+test('多候选按项目轨优先，全部放下时 truncated=false 且 omitted 为空', () => {
+  const index = memoryIndexOf(
     '约定',
     [
       { track: 'public', name: 'pub.md', body: '约定：公共\n第二行' },
@@ -238,23 +310,41 @@ test('多候选按项目轨优先，且省略行数随被丢弃文档增长', ()
     ],
     4000,
   )
-  assert.match(selection.text, /项目记忆 · proj\.md/)
-  assert.ok(selection.text.indexOf('proj.md') < selection.text.indexOf('pub.md'))
-  assert.equal(selection.truncated, false)
-  assert.equal(selection.omitted, 0)
+  assert.match(index.text, /mem:\/\/project\/proj/)
+  assert.ok(index.text.indexOf('mem://project/proj') < index.text.indexOf('mem://public/pub'))
+  assert.equal(index.truncated, false)
+  assert.equal(index.omitted.length, 0)
+  assert.equal(index.entries.length, 2)
+})
+
+test('selectMemory 是兼容壳：text 与 memoryIndexOf 同源，omitted 改为未内联条目数', () => {
+  const candidates = [
+    { track: 'project' as const, name: 'a.md', body: '甲'.repeat(500) },
+    { track: 'project' as const, name: 'b.md', body: '乙'.repeat(500) },
+  ]
+  const index = memoryIndexOf('目标', candidates, 300)
+  const selection = selectMemory('目标', candidates, 300)
+  assert.equal(selection.text, index.text)
+  assert.equal(selection.chars, index.chars)
+  assert.equal(selection.truncated, index.truncated)
+  assert.equal(selection.omitted, index.omitted.length)
+  assert.deepEqual(selection.included, index.entries.map((entry) => entry.name))
+  assert.deepEqual(selection.notInlined, index.omitted)
 })
 
 test('预算为 0 时不注入任何内容', () => {
-  const selection = selectMemory('目标', [{ track: 'project', name: 'a.md', body: 'x' }], 0)
-  assert.equal(selection.text, '')
-  assert.equal(selection.truncated, false)
-  assert.equal(selection.chars, 0)
+  const index = memoryIndexOf('目标', [{ track: 'project', name: 'a.md', body: 'x' }], 0)
+  assert.equal(index.text, '')
+  assert.equal(index.truncated, false)
+  assert.equal(index.chars, 0)
+  assert.equal(index.entries.length, 0)
 })
 
 test('空候选与空正文不产生注入文本', () => {
-  const selection = selectMemory('目标', [{ track: 'project', name: 'a.md', body: '   ' }], 4000)
-  assert.equal(selection.text, '')
-  assert.equal(selection.included.length, 0)
+  const index = memoryIndexOf('目标', [{ track: 'project', name: 'a.md', body: '   ' }], 4000)
+  assert.equal(index.text, '')
+  assert.equal(index.entries.length, 0)
+  assert.equal(index.truncated, false)
 })
 
 /* ---------------------------------------------------------------- 角色库（AC-21 / AC-22） */

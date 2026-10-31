@@ -21,8 +21,18 @@ import type {
   ProgressRecord,
   RouteAudit,
   TaskStatus,
+  TriggerKind,
+  TriggerRecord,
 } from '../shared/types.ts'
-import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from './config.ts'
+import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_LOG_LIMIT } from './config.ts'
+
+/**
+ * Trigger 账本上限（`TRIGGER_LOG_LIMIT = 100`）。
+ *
+ * **唯一定义在 `config.ts`**（配置单点；阈值/窗口/上限各只允许一处 `export const`），
+ * 这里只转出，让 `store.ts` 与 `MESSAGES_LIMIT` / `STALL_ALERTS_LIMIT` 同族拿到上限。
+ */
+export { TRIGGER_LOG_LIMIT }
 
 /** 落盘结构版本：2 是 RunState（1 = 历史的裸 Plan）。 */
 export const RUN_STATE_VERSION = 2
@@ -61,6 +71,13 @@ export interface RunState {
    * 必须落盘：只有落盘才能跨重启保持「一次 episode 一条告警」的幂等。
    */
   stallAlerts?: ActivityEvent[]
+  /**
+   * Trigger 账本（accepted / dropped 都留），由 `team/trigger-bus.ts` 追加。
+   *
+   * 为什么必须落盘：幂等（同一 `dedupeKey` 在窗口内只推进一次）与可解释性
+   * （「为什么没推进」）都要**跨重启**成立；只在内存里存的话重启后同一个事件会被再推一次。
+   */
+  triggers?: TriggerRecord[]
 }
 
 /** 运行列表的一行（面板/恢复入口用，不含消息账本等大字段）。 */
@@ -107,6 +124,7 @@ export class RunsStore {
       // 成员死后其推进记录不再有任何用处：只留 live bindings 的 memberId，避免文件无限增长。
       progress: capProgress(state.progress, bindings),
       stallAlerts: capStallAlerts(state.stallAlerts ?? []),
+      triggers: capTriggers(state.triggers ?? []),
     }
     const tmp = `${path}.tmp`
     writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
@@ -160,7 +178,7 @@ export class RunsStore {
  * - v1（裸 `Plan`）：包成 v2，`plannedAt` 取 `plan.createdAt`，其余三个集合为空；
  * - 其它（null / 非对象 / 缺 runId·sessionId·tasks）：返回 null，由调用方当成「没有这次运行」。
  *
- * `progress` / `stallAlerts` 是 v2 之后**追加的可选字段**：旧 v2 文件没有它们时补空对象/空数组，
+ * `progress` / `stallAlerts` / `triggers` 是 v2 之后**追加的可选字段**：旧 v2 文件没有它们时补空对象/空数组，
  * 因此 `version` 不变（不需要迁移脚本，也不会让旧文件被判成坏文件）。
  */
 export function wrapLegacy(raw: unknown): RunState | null {
@@ -176,6 +194,7 @@ export function wrapLegacy(raw: unknown): RunState | null {
     routeAudits: asArray<RouteAudit>(raw.routeAudits),
     progress: normalizeProgress(raw.progress),
     stallAlerts: normalizeStallAlerts(raw.stallAlerts),
+    triggers: normalizeTriggers(raw.triggers),
   }
 }
 
@@ -246,6 +265,11 @@ function capStallAlerts(alerts: ActivityEvent[]): ActivityEvent[] {
   return alerts.length <= STALL_ALERTS_LIMIT ? alerts : alerts.slice(-STALL_ALERTS_LIMIT)
 }
 
+/** Trigger 账本裁剪：只保留最新 `TRIGGER_LOG_LIMIT` 条（顺序不变，照 `capStallAlerts` 的形状）。 */
+function capTriggers(triggers: TriggerRecord[]): TriggerRecord[] {
+  return triggers.length <= TRIGGER_LOG_LIMIT ? triggers : triggers.slice(-TRIGGER_LOG_LIMIT)
+}
+
 /**
  * 推进记录裁剪：只保留 live bindings（`!retired`）的 memberId。
  *
@@ -298,6 +322,34 @@ function normalizeStallAlerts(raw: unknown): ActivityEvent[] {
     kept.push(value as unknown as ActivityEvent)
   }
   return capStallAlerts(kept)
+}
+
+/** 落盘 Trigger 的合法种类白名单（读盘时用来丢掉脏值，与 `types.ts` 的 `TriggerKind` 同源）。 */
+const TRIGGER_KINDS: readonly TriggerKind[] = ['gate_failed', 'member_exit', 'dep_ready', 'stall_timeout']
+
+/**
+ * Trigger 账本规范化：只留字段形状完整、`kind` 在白名单内的条目（上限截尾）。
+ *
+ * 为什么要逐字段校验而不是整体 `as TriggerRecord[]`：`triggers` 是**可解释性证据**，
+ * 一条缺 `dedupeKey` 的脏记录会让去重永久失效（同一事件反复推进），
+ * 一条 `at` 非数字的记录会让面板排序出现 `NaN` 行。宁可丢一条，不可留半条。
+ */
+function normalizeTriggers(raw: unknown): TriggerRecord[] {
+  const kept: TriggerRecord[] = []
+  for (const value of asArray<unknown>(raw)) {
+    if (!isRecord(value)) continue
+    if (typeof value.kind !== 'string') continue
+    if (!TRIGGER_KINDS.includes(value.kind as TriggerKind)) continue
+    if (value.source !== 'event' && value.source !== 'poll') continue
+    if (typeof value.at !== 'number' || !Number.isFinite(value.at)) continue
+    if (typeof value.runId !== 'string' || value.runId === '') continue
+    if (typeof value.dedupeKey !== 'string' || value.dedupeKey === '') continue
+    if (typeof value.reason !== 'string' || value.reason === '') continue
+    if (typeof value.text !== 'string' || value.text === '') continue
+    if (typeof value.accepted !== 'boolean') continue
+    kept.push(value as unknown as TriggerRecord)
+  }
+  return capTriggers(kept)
 }
 
 function normalizePlan(raw: Record<string, unknown>): Plan | null {

@@ -8,13 +8,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   agentOfToolEvent,
+  captainAgentScopeOf,
+  installCaptainRoute,
   listHostMembers,
+  onHostTriggerEvents,
   onMemberProgress,
   registerAgentCreated,
   registerEffect,
   registerHttpRoutes,
   registerPromptSection,
   registerTool,
+  registerToolGuard,
   resolveConcurrencyLimit,
   spawnMember,
   toHostToolDefinition,
@@ -453,4 +457,291 @@ test('onMemberProgress：stop 后不再回调，且 disposer 全部被调用', (
   fake.emit('tools/result', { agent: { id: 'member-1' } })
   sub.stop() // 幂等
   assert.equal(calls, 1)
+})
+
+/* ------------------------------------------------------------------ *
+ * r5 · T5：四个新宿主触点（守卫 / 四类事件 / 队长作用域 / 队长路由）
+ *
+ * 这些绑定的错法全是「静默」的：漏调 next() 会把工具执行吞掉、少订阅一路事件让推进
+ * 永远不触发、能力位假称生效让面板撒谎。所以每条都钉住可观察行为，而不是「能注册上」。
+ * ------------------------------------------------------------------ */
+
+/** 取某事件的唯一监听器（宿主 waterfall 的返回值只有直接调用监听器才拿得到）。 */
+function listenerOf(fake: ReturnType<typeof fakeCtx>, event: string): (...args: unknown[]) => unknown {
+  const list = fake.listeners.get(event) ?? []
+  assert.equal(list.length, 1, `${event} 应当恰好注册了一个监听器`)
+  return list[0] as (...args: unknown[]) => unknown
+}
+
+const BASH_SLEEP30 = { callId: 'c1', name: 'bash', arguments: { command: 'sleep 30' } }
+
+test('registerToolGuard：放行分支必须调 next()（漏调等于吞掉工具执行）', () => {
+  const fake = fakeCtx()
+  const seen: Array<{ toolName: string; agentId: string | null }> = []
+  registerToolGuard(fake.ctx, (request) => {
+    seen.push({ toolName: request.toolName, agentId: request.agentId })
+    return { allow: true }
+  })
+
+  let nextCalls = 0
+  const out = listenerOf(fake, 'tools/execute')({ name: 'bash', arguments: { command: 'git status' } }, () => {
+    nextCalls += 1
+    return { content: [] }
+  })
+
+  assert.equal(nextCalls, 1, '放行必须交回下游')
+  assert.deepEqual(seen, [{ toolName: 'bash', agentId: null }], '主 session 没有 exec.agent 时按队长（null）判（U4）')
+  assert.deepEqual(out, { content: [] }, '放行时原样返回 next() 的结果，不能包装')
+})
+
+test('registerToolGuard：拒绝分支短路——不调 next()，返回可读原因码', () => {
+  const fake = fakeCtx()
+  registerToolGuard(fake.ctx, () => ({
+    allow: false,
+    code: 'NOWAIT_FOREGROUND_WAIT',
+    message: '前台同步等待被拒绝（NOWAIT_FOREGROUND_WAIT）：下一步改成后台执行（命令末尾加 &）。',
+    command: 'sleep 30',
+  }))
+
+  let nextCalls = 0
+  const out = listenerOf(fake, 'tools/execute')(BASH_SLEEP30, () => {
+    nextCalls += 1
+  }) as { ok: boolean; code: string; message: string; command: string }
+
+  assert.equal(nextCalls, 0, '拒绝时绝不能调 next()，否则命令照样执行（AC-4 的「命令不真正执行」）')
+  assert.equal(out.ok, false)
+  assert.equal(out.code, 'NOWAIT_FOREGROUND_WAIT')
+  assert.equal(out.command, 'sleep 30')
+  assert.match(out.message, /下一步/, '模型要看到「下一步怎么做」，不只是被拒')
+})
+
+test('registerToolGuard：判定抛错必须 fail-open（少拦一次，不能拦住正常工作）', () => {
+  const fake = fakeCtx()
+  registerToolGuard(fake.ctx, () => {
+    throw new Error('guard blew up')
+  })
+
+  let nextCalls = 0
+  assert.doesNotThrow(() => {
+    listenerOf(fake, 'tools/execute')(BASH_SLEEP30, () => {
+      nextCalls += 1
+    })
+  })
+  assert.equal(nextCalls, 1, '判定异常时放行')
+  assert.match(fake.warnings.at(-1) ?? '', /guard blew up/, '异常要留痕，否则「守卫没生效」无人知晓')
+})
+
+test('registerToolGuard：形状不认识的 payload 一律放行（不猜宿主字段）', () => {
+  const fake = fakeCtx()
+  let decided = 0
+  registerToolGuard(fake.ctx, () => {
+    decided += 1
+    return { allow: false, code: 'NOWAIT_BLOCKING_TTY', message: 'blocked', command: 'wait' }
+  })
+  let nextCalls = 0
+  const next = () => {
+    nextCalls += 1
+  }
+  listenerOf(fake, 'tools/execute')(null, next)
+  listenerOf(fake, 'tools/execute')({ arguments: { command: 'sleep 30' } }, next)
+  listenerOf(fake, 'tools/execute')({ name: '' }, next)
+
+  assert.equal(nextCalls, 3)
+  assert.equal(decided, 0, '没有可判定的 name 就不该进入判定')
+})
+
+test('registerToolGuard：下游工具自己抛错不会被当成「判定异常」再调一次 next（命令不能执行两次）', () => {
+  const fake = fakeCtx()
+  registerToolGuard(fake.ctx, () => ({ allow: true }))
+
+  let nextCalls = 0
+  const next = () => {
+    nextCalls += 1
+    throw new Error('tool exploded')
+  }
+  assert.throws(() => listenerOf(fake, 'tools/execute')(BASH_SLEEP30, next), /tool exploded/)
+  assert.equal(nextCalls, 1, 'next() 必须包在判定 try 之外，否则下游异常会触发第二次执行')
+})
+
+test('registerToolGuard：宿主没有 ctx.on → 空 stop + warn（L3，QA 必须记未验证）', () => {
+  const warnings: string[] = []
+  const stop = registerToolGuard({ logger: { warn: (message: string) => warnings.push(message) } }, () => ({ allow: true }))
+  assert.equal(typeof stop, 'function')
+  stop()
+  stop() // 幂等
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0] ?? '', /ctx\.on/)
+})
+
+test('registerToolGuard：订阅 tools/execute 本身失败也不抛错（不假装守卫存在）', () => {
+  const warnings: string[] = []
+  const ctx = {
+    logger: {
+      warn: (message: string) => {
+        warnings.push(message)
+      },
+    },
+    on: () => {
+      throw new Error('unknown event tools/execute')
+    },
+  } as unknown as HostContext
+  const stop = registerToolGuard(ctx, () => ({ allow: true }))
+  assert.equal(typeof stop, 'function')
+  stop()
+  assert.match(warnings.at(-1) ?? '', /订阅失败/)
+})
+
+test('onHostTriggerEvents：四类事件全订阅，payload 归一化为具名对象', () => {
+  const fake = fakeCtx()
+  const seen: Array<{ name: string; payload: unknown }> = []
+  const sub = onHostTriggerEvents(fake.ctx, (name, payload) => {
+    seen.push({ name, payload })
+  })
+
+  assert.deepEqual(
+    [...fake.listeners.keys()].sort(),
+    ['agent/error', 'agent/status', 'subagent/end', 'tools/result'],
+    '四类事件缺一不可（少一路就等于少一条推进通路）',
+  )
+  assert.equal(sub.degraded, false)
+
+  fake.emit('tools/result', { name: 'bash' }, { ok: true })
+  assert.deepEqual(seen[0], {
+    name: 'tools/result',
+    payload: { exec: { name: 'bash' }, result: { ok: true } },
+    // tools/result 的签名是 (exec, result)：包成具名对象，消费侧不必再记参数位序
+  })
+
+  fake.emit('agent/status', { id: 'member-1', status: 'inactive' })
+  assert.deepEqual(seen[1], { name: 'agent/status', payload: { id: 'member-1', status: 'inactive' } })
+
+  sub.stop()
+  for (const event of ['agent/error', 'agent/status', 'subagent/end', 'tools/result']) {
+    assert.equal(fake.listeners.get(event)?.length, 0, `${event} 的监听器必须被 stop() 收回`)
+  }
+  sub.stop() // 幂等
+})
+
+test('onHostTriggerEvents：部分事件订阅失败 → degraded:true + warn，其余照常（AC-18）', () => {
+  const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
+  const warnings: string[] = []
+  const ctx = {
+    logger: {
+      warn: (message: string) => {
+        warnings.push(message)
+      },
+    },
+    on: (event: string, listener: (...args: unknown[]) => unknown) => {
+      if (event === 'subagent/end') throw new Error('unknown event subagent/end')
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
+      return () => {
+        const index = list.indexOf(listener)
+        if (index >= 0) list.splice(index, 1)
+      }
+    },
+  } as unknown as HostContext
+
+  const sub = onHostTriggerEvents(ctx, () => {})
+  assert.equal(sub.degraded, true, '降级必须如实上报（面板 header 靠它显示「事件源降级」）')
+  assert.match(warnings.join('\n'), /subagent\/end/)
+  assert.equal(listeners.get('tools/result')?.length, 1, '一路失败不影响其余三路')
+  sub.stop()
+})
+
+test('onHostTriggerEvents：宿主没有 ctx.on → degraded:true（四类推进退回 poll）', () => {
+  const warnings: string[] = []
+  const sub = onHostTriggerEvents(
+    { logger: { warn: (message: string) => warnings.push(message) } },
+    () => {},
+  )
+  assert.equal(sub.degraded, true)
+  sub.stop()
+  assert.match(warnings[0] ?? '', /ctx\.on/)
+})
+
+test('onHostTriggerEvents：handler 抛错不外溢（事件总线不能被我们打断）', () => {
+  const fake = fakeCtx()
+  onHostTriggerEvents(fake.ctx, () => {
+    throw new Error('store write failed')
+  })
+  assert.doesNotThrow(() => fake.emit('agent/error', { id: 'member-1' }))
+  assert.match(fake.warnings.at(-1) ?? '', /store write failed/)
+})
+
+test('captainAgentScopeOf：拿不到主 session agent 时返回 null（能力位 fail-closed）', () => {
+  assert.equal(captainAgentScopeOf({} as HostContext), null, '宿主不提供 agents 服务')
+  assert.equal(
+    captainAgentScopeOf({ agents: { currentInitiator: () => undefined } } as unknown as HostContext),
+    null,
+    'apply 期没有发起者（U3/U4 未实测时的常态）',
+  )
+  assert.equal(
+    captainAgentScopeOf({
+      agents: {
+        currentInitiator: () => {
+          throw new Error('no initiator')
+        },
+      },
+    } as unknown as HostContext),
+    null,
+    '宿主抛错也必须吞掉：能力位缺失只能让面板显示「未生效」，不能拖垮装配',
+  )
+  assert.equal(
+    captainAgentScopeOf({ agents: { currentInitiator: () => ({ id: 'root' }) } } as unknown as HostContext),
+    null,
+    'agent 没有 ctx.on 就不是可用作用域',
+  )
+})
+
+test('captainAgentScopeOf：主 session agent 带 ctx.on 时返回该事件作用域', () => {
+  const scope = { on: () => () => {} }
+  const ctx = { agents: { currentInitiator: () => ({ id: 'root', ctx: scope }) } } as unknown as HostContext
+  assert.equal(captainAgentScopeOf(ctx), scope, '探测与安装必须同源（同一个 captainAgentOf）')
+})
+
+test('installCaptainRoute：拿不到作用域 → null（绝不假装生效）', () => {
+  assert.equal(installCaptainRoute({} as HostContext, { provider: 'p', model: 'm' }), null)
+})
+
+test('installCaptainRoute：装在主 session 作用域上改写 provider/model 并剔除继承的 reasoningEffort', async () => {
+  const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
+  const scope = {
+    on: (event: string, listener: (...args: unknown[]) => unknown) => {
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
+      return () => {
+        const index = list.indexOf(listener)
+        if (index >= 0) list.splice(index, 1)
+      }
+    },
+  }
+  const ctx = { agents: { currentInitiator: () => ({ id: 'root', ctx: scope }) } } as unknown as HostContext
+
+  const undo = installCaptainRoute(ctx, { provider: 'captain-p', model: 'captain-m' })
+  assert.notEqual(undo, null, '有作用域时必须装上')
+  assert.equal(listeners.get('system-prompt/assemble')?.length, 1)
+  assert.equal(listeners.get('agent/request')?.length, 1)
+
+  const assemble = listeners.get('system-prompt/assemble')?.[0] as (...args: unknown[]) => Promise<unknown>
+  await assemble(async () => ({ sections: [] }))
+
+  const request = listeners.get('agent/request')?.[0] as (...args: unknown[]) => Promise<unknown>
+  const out = (await request(async () => ({
+    provider: 'session',
+    model: 'default',
+    reasoningEffort: 'high',
+    temperature: 0.2,
+  }))) as Record<string, unknown>
+
+  assert.equal(out.provider, 'captain-p')
+  assert.equal(out.model, 'captain-m')
+  assert.equal(out.reasoningEffort, undefined, '继承来的 effort 必须剔除（否则队长的档位会漏给主 session）')
+  assert.equal(out.temperature, 0.2, '其它字段原样透传')
+
+  undo?.()
+  assert.equal(listeners.get('agent/request')?.length, 0, 'disposer 必须能收回安装')
+  assert.equal(listeners.get('system-prompt/assemble')?.length, 0)
 })

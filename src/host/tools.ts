@@ -280,16 +280,22 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
     {
       name: `${TOOL_PREFIX}memory`,
       description:
-        '读写团队记忆（双轨 md）：track=public 为跨项目公共记忆，track=project 为当前项目记忆。写入自动限制行数并落来源标注。',
+        '读写团队记忆（双轨 md）：track=public 为跨项目公共记忆，track=project 为当前项目记忆。写入自动限制行数并落来源标注。'
+        + 'action=expand 按内联索引里的 ID（mem://<track>/<stem>）取回原文——上下文里只内联了 ID+标题+首句，'
+        + '要读完整内容必须显式展开，不要凭标题猜正文。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'read', 'write'] },
+          action: { type: 'string', enum: ['list', 'read', 'write', 'expand'] },
           track: { type: 'string', enum: ['public', 'project'] },
           name: { type: 'string', description: '文件名（单段，自动补 .md）' },
           body: { type: 'string' },
+          id: { type: 'string', description: 'action=expand 的记忆 ID（mem://<track>/<stem>，来自内联索引）' },
+          depth: { type: 'number', description: 'action=expand 顺着关联 ID 继续展开的跳数（1~2，缺省 1）' },
         },
-        required: ['action', 'track'],
+        // expand 只需要 id（track/name 由 ID 自带）：把它俩设成 required 会逼模型为展开动作编一个 track。
+        // read/write 缺 name 的情况下面按业务拒绝，原因文案反而更可读。
+        required: ['action'],
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
@@ -306,8 +312,37 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             injectedChars: snapshot.memory.injectedChars,
             truncated: snapshot.memory.truncated,
             files: snapshot.memory.files,
+            inline: snapshot.memory.inline ?? [],
+            omitted: snapshot.memory.omitted ?? [],
           }
         }
+
+        if (args.action === 'expand') {
+          const id = typeof args.id === 'string' ? args.id.trim() : ''
+          if (id === '') {
+            return { ok: false, code: 'EXPAND_BAD_ID', error: 'expand 需要 id（形如 mem://project/<文件名>）' }
+          }
+          const depth = typeof args.depth === 'number' ? args.depth : undefined
+          const expanded = deps.bridge.expandMemory(id, depth)
+          if (expanded.error !== undefined) return { ok: false, error: expanded.error }
+          // 失败码原样透出（AC-11）：模型要能区分「ID 写错 / 越权 / 不存在 / 跳数超限」，
+          // 压成一句「展开失败」它只会盲试。
+          const payload = expanded.data
+          return {
+            ok: payload.code === 'OK',
+            code: payload.code,
+            message: payload.message,
+            id: payload.id,
+            track: payload.track,
+            name: payload.name,
+            body: payload.body,
+            chars: payload.chars,
+            truncated: payload.truncated,
+            depth: payload.depth,
+            related: payload.related,
+          }
+        }
+
         if (name === '') return { ok: false, error: 'name 不能为空' }
 
         if (args.action === 'read') {

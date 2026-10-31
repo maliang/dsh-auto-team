@@ -9,7 +9,7 @@
 import * as React from 'react'
 import type { TabProps } from '../Panel.tsx'
 import type { PlanTask } from '../../shared/types.ts'
-import { actFeedback, formatStamp, hintOf, statusBadge, viewExtras } from '../viewmodel.ts'
+import { actFeedback, formatStamp, hintOf, recentTriggersOf, statusBadge, viewExtras } from '../viewmodel.ts'
 
 /** 任务未开跑时才允许换角色（AC-14 的窗口期）。 */
 function roleEditable(task: PlanTask): boolean {
@@ -62,9 +62,38 @@ export function PlanTab(props: TabProps): React.ReactElement {
 
   const dispatching = snapshot?.planStatus === 'dispatching'
   const done = tasks.filter((task) => task.status === 'done').length
+  // AC-17：最后 3 条带来源的活动事件（最新在前）。无数据时整块不渲染，不留空标题。
+  const triggers = recentTriggersOf(snapshot)
 
   return (
     <div data-auto-team-plan data-run-id={runId} data-plan-status={snapshot?.planStatus}>
+      {triggers.length > 0 ? (
+        <section data-plan-triggers data-trigger-count={triggers.length}>
+          <div data-plan-meta-row>
+            <span data-plan-triggers-label>最近推进</span>
+            <span data-plan-triggers-hint>自动 = 系统按事件推进，用户 = 你的动作</span>
+          </div>
+          {triggers.map((row, index) => (
+            <div
+              // 同一毫秒内可能有两件事（dep_ready 连着两次派发），index 参与 key 保证不撞
+              key={`${row.at}-${index}-${row.kind}`}
+              data-plan-meta-row
+              data-auto-team-trigger={row.kind}
+              data-trigger-source={row.sourceLabel === '自动' ? 'trigger' : 'user'}
+            >
+              <span
+                data-trigger-badge
+                data-tone={row.sourceLabel === '自动' ? 'business' : 'neutral'}
+              >
+                {row.sourceLabel}
+              </span>
+              <span data-trigger-clock>{row.clock}</span>
+              <span data-trigger-text>{row.text}</span>
+            </div>
+          ))}
+        </section>
+      ) : null}
+
       <div data-plan-meta-row>
         <span data-plan-planned-at title={formatStamp(extras.plannedAt)}>
           计划时间 {formatStamp(extras.plannedAt)}

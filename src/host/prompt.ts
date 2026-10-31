@@ -3,13 +3,26 @@
  *
  * 只描述「怎么当一个合格的队长」——具体角色、任务、记忆都按需由工具读取，
  * 不把整份计划塞进常驻上下文（那会随每次对话重复计费）。
+ *
+ * r5（AC-1）：队长分层靠两条腿——**提示词里的硬约束**（模型自己愿意守）与 **noWait 守卫**
+ * （机械拒绝，见 `team/guard.ts`）。提示词这一侧固化三条可 grep 的中文特征句；同时本函数
+ * **结构上只读** `snapshot.enabled / snapshot.memory / snapshot.captainModel`，从不触碰计划
+ * 任务列表 —— 「不把整份计划塞进常驻上下文」由不取那份数据来保证，而不是靠自律。
  */
 import type { Bridge } from './bridge.ts'
 import { registerPromptSection, type HostContext } from './adapters.ts'
+import type { CaptainModelView, PanelSnapshot } from '../shared/types.ts'
 
 export interface PromptDeps {
   bridge: Bridge
 }
+
+/** 三条硬约束（AC-1 的可 grep 特征句）：独立成段放在「工作方式」之前。 */
+export const CAPTAIN_CONSTRAINTS: readonly string[] = [
+  '- 你**不亲自干细活**：读文件、改代码、跑测试、修 bug 一律派给成员。',
+  '- 你**只做三件事**：拆解目标、分派任务、验收结果。',
+  '- **不要同步等长任务**：任何可能超过 5 秒的命令都必须后台执行（命令末尾加 `&`）或派给成员；前台 `sleep` 会被 noWait 守卫直接拒绝并返回错误码。',
+]
 
 export function captainSection(deps: PromptDeps, sessionId: string): string {
   const snapshot = deps.bridge.snapshot(sessionId)
@@ -17,6 +30,9 @@ export function captainSection(deps: PromptDeps, sessionId: string): string {
   const lines = [
     '## 自动团队（队长视角）',
     `当前会话的自动团队开关：${enabled}${snapshot.enabled ? '' : '——未启用时不得创建成员，先用一句话说明如何启用'}。`,
+    '',
+    '队长定位（硬约束，任何情况下都不得违反）：',
+    ...CAPTAIN_CONSTRAINTS,
     '',
     '工作方式（顺序不可颠倒）：',
     '1. **先 plan，再 dispatch**：把目标拆成有依赖的任务图用 `auto_team_plan`（每个任务必须指定 roleId 与可执行的 acceptance），**计划条目先落地**，用户确认（或明确说「开干」）后才用 `auto_team_dispatch` 派发。',
@@ -27,10 +43,39 @@ export function captainSection(deps: PromptDeps, sessionId: string): string {
     '6. 团队记忆分公共与项目两轨，都是 md：相关约定优先 `auto_team_memory` 读取，沉淀时才写入。',
     '7. 面板（输入框下方开关 + 右栏「自动团队」）是用户的可视入口与唯一状态来源；你的结论要与面板显示一致。',
   ]
-  if (snapshot.memory.truncated) {
-    lines.push('', `注意：团队记忆已超出注入预算（${snapshot.memory.injectedChars}/${snapshot.memory.budget} 字符），面板显示「已截断」。`)
-  }
+  // 两行都「有内容才出现」，避免常驻段随风膨胀（预算 ≤2600 字符，见 test/captain.test.ts）。
+  const notes = [captainModelLineOf(snapshot.captainModel), memoryLineOf(snapshot.memory)].filter(
+    (line) => line !== '',
+  )
+  if (notes.length > 0) lines.push('', ...notes)
   return lines.join('\n')
+}
+
+/**
+ * 队长模型一行（AC-2）：`host-default` 不写（未配置时不改变任何行为，也不占上下文）；
+ * `configured` 写逐字路由；`unsupported` 明说「未生效」——绝不把保留的配置说成已生效。
+ */
+export function captainModelLineOf(view: CaptainModelView | null | undefined): string {
+  if (!view || view.source === 'host-default') return ''
+  if (view.source === 'configured') return `队长模型：${view.value ?? ''}`.trim()
+  return '队长模型：宿主暂不支持单独指定（配置已保留，未生效）'
+}
+
+/**
+ * 记忆一行（AC-8）：`truncated` 的语义已改成「有未内联条目」，于是文案不再使用旧的
+ * 旧标注，而是告诉模型「另外还有几条、怎么按 ID 取回」——超预算的那部分从「丢掉」变成「可按需展开」。
+ */
+export function memoryLineOf(memory: PanelSnapshot['memory'] | undefined): string {
+  if (!memory) return ''
+  const omitted = memory.omitted?.length ?? 0
+  const usage = `已内联 ${memory.injectedChars}/${memory.budget} 字符`
+  if (omitted > 0) {
+    return `团队记忆另有 ${omitted} 条未内联（${usage}）：按 \`mem://\` ID 用 \`auto_team_memory\`（action=expand）展开全文。`
+  }
+  if (memory.truncated) {
+    return `团队记忆超出注入预算（${usage}）：按 \`mem://\` ID 用 \`auto_team_memory\`（action=expand）展开全文。`
+  }
+  return ''
 }
 
 export function registerCaptainPrompt(ctx: HostContext, deps: PromptDeps, sessionId: string): void {

@@ -24,6 +24,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import type {
   ActResult,
   ActivityEvent,
+  CaptainModelView,
+  ExpandPayload,
   GateEvidence,
   MemberStatus,
   MemberView,
@@ -131,6 +133,23 @@ export interface BridgeDeps {
    */
   stallMs?: number
   now?: () => number
+  /**
+   * 队长模型投影（AC-2）。**可选注入**：缺省时快照不带 `captainModel`，客户端显示「未投影」
+   * —— 这样装配层漏接线时面板说「不知道」，而不是假装「跟随宿主默认」。
+   */
+  captainModel?: () => CaptainModelView
+  /**
+   * 事件源健康度（AC-18）。只在装配层把四类事件订阅起来之后注入；缺省 = 未接事件源，
+   * 快照 `degraded: false` 且不解释（此时面板无降级可言，因为本来就没有事件通路）。
+   */
+  triggerHealth?: () => { degraded: boolean; reason?: string }
+  /**
+   * 记忆展开端口（AC-9/AC-11）：`createExpander({roots})` 的 `expand`。
+   *
+   * 依赖用可选注入而不是在这里 `import` 文件系统实现：缺省时 `expandMemory` 明确报「不可用」，
+   * 单测可以传一个只返回固定 payload 的桩，不必造临时目录。
+   */
+  expander?: (id: string, depth?: number) => ExpandPayload
 }
 
 export interface Bridge {
@@ -144,6 +163,14 @@ export interface Bridge {
   memoryFor(goal: string): { text: string; truncated: boolean; chars: number }
   /** 队长侧：写入一条记忆（可带 track），按 MEMORY_LINES_PER_TASK 裁剪。 */
   remember(track: MemoryTrack, name: string, body: string): Result<{ name: string }>
+  /**
+   * 按 `mem://<track>/<stem>` 展开记忆原文（AC-9/AC-11）。
+   *
+   * 成功与失败都包成 `Result`：`code !== 'OK'` 的 payload 也走 `data`，因为**码本身是结论**
+   * （`EXPAND_NOT_FOUND` / `EXPAND_PATH_ESCAPE` …），压成一句 `error` 字符串工具层就透不出码了。
+   * 只有「端口没装配」这一种装配期缺失才用 `error`（那不是展开语义的一部分）。
+   */
+  expandMemory(id: string, depth?: number): Result<ExpandPayload>
 }
 
 interface SessionFlag {
@@ -297,6 +324,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
       at: state.plannedAt,
       kind: 'plan',
       text: `计划就绪：${state.plan.tasks.length} 个任务（尚未创建成员）`,
+      // AC-17：计划是用户/队长发起的一步，标成 user；客户端「最近推进」条靠 source 分自动/用户。
+      source: 'user',
     })
     for (const binding of state.bindings) {
       events.push({
@@ -305,6 +334,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         taskId: binding.taskId,
         kind: 'spawn',
         text: `创建成员 ${binding.name}`,
+        source: 'user',
       })
     }
     for (const message of state.messages) {
@@ -314,6 +344,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         taskId: message.taskId,
         kind: 'message',
         text: `${message.from} → ${message.to}：${firstLine(message.body)}`,
+        source: 'user',
       })
     }
     for (const audit of state.routeAudits) {
@@ -347,6 +378,21 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 停滞告警由 watcher.tick 落盘（一个 episode 恰好一条，AC-8），这里**只读合并**：
     // 绝不在这里比较阈值 —— 判定只剩 watcher.tick 一个出口，否则同一次停滞会被算出两条告警。
     for (const alert of state.stallAlerts ?? []) events.push(alert)
+    // r5 Trigger 记录并入活动流（AC-17）：**只并 accepted 的**——活动流回答「发生了什么」，
+    // 「为什么没推进」留在 `snapshot.triggers` 的完整账本里，否则「最近推进」条会混进一堆未推进。
+    // kind 复用既有 9 个里的 `status`：新增 kind 会破 AC-16，而 Trigger 的类型信息在
+    // `snapshot.triggers[].kind` 里已经完整（四类），客户端要分类就读那一份。
+    for (const record of state.triggers ?? []) {
+      if (!record.accepted) continue
+      events.push({
+        at: record.at,
+        memberId: record.memberId,
+        taskId: record.taskId,
+        kind: 'status',
+        text: record.text,
+        source: 'trigger',
+      })
+    }
     return events.sort((a, b) => b.at - a.at).slice(0, ACTIVITY_LIMIT)
   }
 
@@ -461,6 +507,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
     const { files, candidates } = memoryFiles()
     const goal = state?.plan.tasks.map((task) => task.title).join(' ') ?? ''
     const selected = selectMemory(goal, candidates, MEMORY_INJECT_BUDGET)
+    // 事件源健康度与队长模型都由装配层注入（见 BridgeDeps 注释）：缺失就是「未投影」，
+    // 不能在这里编一个默认值假装正常——面板的职责是把「我不知道」显示出来（anti-goal 5）。
+    const health = deps.triggerHealth?.()
+    const captain = deps.captainModel?.()
 
     return {
       enabled: flags[sessionId]?.enabled === true,
@@ -477,9 +527,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
         budget: MEMORY_INJECT_BUDGET,
         truncated: selected.truncated,
         files,
+        // 内联索引明细（AC-7）与未内联条目（AC-8）：面板据此说「哪几条进了上下文 / 哪几条可展开」。
+        inline: selected.entries,
+        omitted: selected.notInlined,
       },
       roles,
       activity: activityOf(state),
+      ...(captain === undefined ? {} : { captainModel: captain }),
+      degraded: health?.degraded === true,
+      ...(health?.degraded === true
+        ? { degradeReason: health.reason ?? '事件源不可用，推进退回轮询兜底' }
+        : {}),
+      triggers: state?.triggers ?? [],
     }
   }
 
@@ -841,6 +900,21 @@ export function createBridge(deps: BridgeDeps): Bridge {
       const written = writeMemory(track, name, lines.join('\n'), deps.memoryRoots)
       if (!written.ok) return { error: written.error }
       return { data: { name: written.name } }
+    },
+
+    expandMemory(id: string, depth?: number): Result<ExpandPayload> {
+      const expander = deps.expander
+      // 装配期缺失（宿主没接端口）→ 明确的 error；展开本身的失败（坏 ID / 越权 / 不存在 /
+      // 跳数超限）走 data，因为码是结论，工具与模型都要看见（AC-11）。
+      if (expander === undefined) {
+        return { error: `记忆展开不可用：宿主未装配记忆目录（无法展开 ${id}）` }
+      }
+      try {
+        return { data: expander(id, depth) }
+      } catch (error) {
+        // createExpander 按契约不抛；真抛了也不能连累工具调用链（AC-9）。
+        return { error: `记忆展开失败：${error instanceof Error ? error.message : String(error)}` }
+      }
     },
   }
 }

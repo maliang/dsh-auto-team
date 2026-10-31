@@ -66,6 +66,50 @@ export const RESUME_DEBOUNCE_MS = 3000
 /** 同一任务允许的最大返工次数（AC-19）：达到后转 failed，不再自动重派。 */
 export const MAX_ATTEMPTS = 3
 
+/* ───────────────────────── r5：队长分层 / Inline & Spill / Trigger 总线 ───────────────────────── */
+
+/**
+ * noWait 守卫阈值（毫秒）：队长在**前台同步**等待超过这个时长即被拒（AC-4/AC-5）。
+ *
+ * 判据是「段首命令语义 + 时长」而不是字符串包含 `sleep` —— 误杀正常命令是这个守卫最大
+ * 的风险（守卫把队长自己的工作挡死，比不守卫更糟），所以只拦明确的等待语义：
+ * `sleep N`（N 超阈值）、`wait`、前台 `tail -f`、阻塞式 `read`。轮询式轮询 `for i in 1..10; do sleep 1; done`
+ * 由每段累计判定，见 `team/guard.ts` 的 `sleepMsOf`。
+ *
+ * **全仓唯一定义处**：`guard.ts` 只收参数、不自读常量（与 `STALL_MS` 同一纪律）。
+ */
+export const NOWAIT_THRESHOLD_MS = 5_000
+
+/**
+ * Trigger 去重窗口（毫秒）：同一 `dedupeKey` 在窗口内只允许推进一次（AC-15）。
+ *
+ * **全仓唯一定义处**（AC-15 的 grep 判据）：`team/trigger.ts` 的 `fastOf()` 只接收 `dedupeMs` 参数，
+ * 由 `trigger-bus.ts` 从这里取一次传进去——窗口在两处各写一份就会出现「单测窗口内、
+ * 运行期窗口外」的分叉，而这种分叉只能靠真实事件才暴露。
+ */
+export const TRIGGER_DEDUPE_MS = 60_000
+
+/**
+ * Trigger 账本上限：一次运行里最多保留最近多少条 `triggers`（AC-15/AC-17 的落盘证据）。
+ *
+ * 与 `store.ts` 的 `MESSAGES_LIMIT=200` / `STALL_ALERTS_LIMIT=50` 同族：落盘文件是幂等与
+ * 「为什么没推进」的唯一数据源，必须像消息账本一样有上限，否则事件密集时单 run 文件无限长大。
+ * 定义留在本文件（配置单点），`store.ts` 只 import 再转出，避免同一个数字两处 `export const`。
+ */
+export const TRIGGER_LOG_LIMIT = 100
+
+/** 单条内联记忆项字符上限（AC-7）：索引只放标题 + 首句，放不下就截这一条而不是砍整段。 */
+export const MEMORY_INLINE_ITEM_MAX = 200
+
+/** 每条内联记忆携带的关联 ID 个数上限（AC-7）：3 个足够提示「还有哪些可以展开」，再多挤占预算。 */
+export const MEMORY_RELATED_MAX = 3
+
+/** 单次记忆展开的字符上限（AC-9）：超出截断并置 `truncated`，绝不把 4000 预算一次吃光。 */
+export const MEMORY_EXPAND_MAX_CHARS = 4000
+
+/** 记忆展开的跳数上限（AC-9）：2 跳 = 「展开一条 + 顺着它的关联再展开一层」，防环形引用打转。 */
+export const MEMORY_EXPAND_MAX_DEPTH = 2
+
 /** 宿主工具名前缀（工具名全局唯一，必须带前缀防撞）。 */
 export const TOOL_PREFIX = 'auto_team_'
 

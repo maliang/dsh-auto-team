@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import {
   actFeedback,
   capsuleOf,
+  captainModelLabelOf,
   feedbackOf,
   formatClock,
   formatModelRoute,
@@ -22,6 +23,7 @@ import {
   memberRouteText,
   parseRouteText,
   peerLabelOf,
+  recentTriggersOf,
   routeAuditFor,
   routeTextOf,
   stalledRowOf,
@@ -524,6 +526,87 @@ test('账本折叠：≤120 字且 ≤3 行不折叠，超出任一阈值就折�
     '产物：lib/index.js',
   ].join('\n')
   assert.equal(ledgerBodyFoldable(handoff), true)
+})
+
+/* ──────────────── r5：最近推进条与队长模型三态（AC-2 / AC-17） ──────────────── */
+
+test('最近推进：取最后 3 条带 source 的事件，最新在前，缺省来源的历史事件不渲染', () => {
+  const activity = [
+    { at: 1, kind: 'plan', text: '计划已生成' }, // 无 source = 历史事件
+    { at: 2, kind: 'status', text: '因「依赖完成」推进：已派发 1 个任务', source: 'trigger' },
+    { at: 3, kind: 'message', text: '你把失败证据发回成员', source: 'user' },
+    { at: 4, kind: 'gate', text: '因「门禁失败」推进：任务转 rework', source: 'trigger' },
+    { at: 5, kind: 'rework', text: '因「超时无产出」推进：已派发 resume', source: 'trigger' },
+  ] as unknown as PanelSnapshot['activity']
+
+  const rows = recentTriggersOf(snapshotOf({ activity }))
+  assert.equal(rows.length, 3, '默认最多 3 条')
+  // 最新在前：5 → 4 → 3，且第 1 条（无 source）绝不出现
+  assert.deepEqual(
+    rows.map((row) => row.at),
+    [5, 4, 3],
+  )
+  assert.deepEqual(
+    rows.map((row) => row.sourceLabel),
+    ['自动', '自动', '用户'],
+  )
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ['rework', 'gate', 'message'],
+  )
+  assert.ok(
+    rows.every((row) => row.text !== ''),
+    '文案由 host 侧写成中文原因，客户端不重写',
+  )
+  // 客户端不自己算时钟：与既有 formatClock 同源逐字相等
+  assert.equal(rows[0]?.clock, formatClock(5))
+  assert.equal(recentTriggersOf(snapshotOf({ activity }), 0).length, 0, 'limit=0 → 空')
+  assert.equal(recentTriggersOf(null).length, 0)
+  assert.equal(recentTriggersOf(undefined).length, 0)
+})
+
+test('最近推进：只带 source 的才算「推进」，且空文案不留空行', () => {
+  const activity = [
+    { at: 1, kind: 'status', text: '自动推进了一次', source: 'trigger' },
+    { at: 2, kind: 'status', text: '   ', source: 'trigger' }, // 空文案跳过
+    { at: 3, kind: 'tool', text: '', source: 'user' },
+  ] as unknown as PanelSnapshot['activity']
+  const rows = recentTriggersOf(snapshotOf({ activity }))
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.text, '自动推进了一次')
+  assert.equal(rows[0]?.sourceLabel, '自动')
+})
+
+test('队长模型三态：configured 才显路由，host-default 是 muted，unsupported 必须说"未生效"', () => {
+  const configured = captainModelLabelOf({
+    value: 'anthropic/claude-sonnet-4 #high',
+    route: { provider: 'anthropic', model: 'claude-sonnet-4', reasoningEffort: 'high' },
+    source: 'configured',
+    note: '已生效',
+  })
+  assert.equal(configured.tone, 'ok')
+  assert.match(configured.label, /anthropic\/claude-sonnet-4/)
+
+  const hostDefault = captainModelLabelOf({ value: null, route: null, source: 'host-default', note: '未配置' })
+  assert.equal(hostDefault.tone, 'muted')
+  assert.doesNotMatch(hostDefault.label, /anthropic/, '跟随宿主默认不得暗示已指定模型')
+
+  const unsupported = captainModelLabelOf({
+    value: 'anthropic/claude-sonnet-4 #high',
+    route: { provider: 'anthropic', model: 'claude-sonnet-4', reasoningEffort: 'high' },
+    source: 'unsupported',
+    note: '宿主不支持',
+  })
+  assert.equal(unsupported.tone, 'warn')
+  assert.match(unsupported.label, /未生效/, 'unsupported 不得显示成已生效（anti-goal 5）')
+  assert.doesNotMatch(unsupported.label, /anthropic/, '不支持时不要回显一个用不上的路由')
+
+  // 三态文案必须互不相同——否则用户在面板上看不出模型到底有没有生效
+  assert.equal(new Set([configured.label, hostDefault.label, unsupported.label]).size, 3)
+
+  // 未投影（旧宿主）→ muted，且不能假装成 configured
+  assert.deepEqual(captainModelLabelOf(null), { label: '队长模型 · 未投影', tone: 'muted' })
+  assert.deepEqual(captainModelLabelOf(undefined), { label: '队长模型 · 未投影', tone: 'muted' })
 })
 
 

@@ -13,14 +13,26 @@ import * as React from 'react'
 import { useAutoTeamStyle } from './styles.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
 import { panelApi } from './api.ts'
-import { capsuleOf, viewExtras } from './viewmodel.ts'
+import { capsuleOf, captainModelLabelOf, viewExtras } from './viewmodel.ts'
 import type { ClientAction } from './viewmodel.ts'
 import { OPEN_PANEL_EVENT } from './Toggle.tsx'
 import { PlanTab } from './tabs/PlanTab.tsx'
 import { MembersTab } from './tabs/MembersTab.tsx'
 import { MemoryTab } from './tabs/MemoryTab.tsx'
 import { RolesTab } from './tabs/RolesTab.tsx'
-import type { MemoryTrack, PanelAction, PanelSnapshot, Result } from '../shared/types.ts'
+import type { CaptainModelView, MemoryTrack, PanelAction, PanelSnapshot, Result } from '../shared/types.ts'
+
+/**
+ * `CaptainModelLabel.tone`（ok/warn/muted）→ styles.ts 既有的 5 色 `data-tone`。
+ *
+ * 为什么不直接在 viewmodel 里产出 `data-tone` 的值：那是**宿主 token 的取值域**（组件层知识），
+ * 放进纯视图模型会把样式词表耦合进可单测的文案层。而这里只做一次机械改名，不是第二份状态映射。
+ */
+const TONE_DATA: Record<'ok' | 'warn' | 'muted', string> = {
+  ok: 'success',
+  warn: 'warn',
+  muted: 'neutral',
+}
 
 export interface PanelProps {
   sessionId?: string
@@ -87,6 +99,15 @@ export function Panel(props: PanelProps): React.ReactElement {
   const extras = viewExtras(snapshot)
   const capsule = capsuleOf(snapshot?.enabled === true, snapshot)
 
+  // r5：队长模型三态 + 事件源降级（AC-2 / AC-18）。两者都是**只读回显**，这里没有任何输入控件
+  // —— 本期不给队长模型写入口（新写入口只能是新 PanelAction 或新路由，两者都违反 AC-16）。
+  const captainView: CaptainModelView | undefined = snapshot?.captainModel
+  const captainLabel = captainModelLabelOf(captainView)
+  // 缺快照字段 = 宿主还没投影能力位 → fail-closed 按 `unsupported` 呈现，绝不假称「已配置」
+  const captainState = captainView?.source ?? 'unsupported'
+  const degraded = snapshot?.degraded === true
+  const degradeReason = (snapshot?.degradeReason ?? '').trim()
+
   // AC-30：计划一出现（还没有任何成员）就停在「计划」页，用户要立刻看见计划与「开始派发」
   const planReady = tasks.length > 0 && members.length === 0
   React.useEffect(() => {
@@ -113,6 +134,25 @@ export function Panel(props: PanelProps): React.ReactElement {
         <span data-head-meta>
           计划 {tasks.length} · 成员 {members.length} · 并发 {extras.concurrency.running}/
           {extras.concurrency.limit}
+        </span>
+        <span data-head-meta>
+          <span
+            data-captain-model={captainState}
+            data-tone={TONE_DATA[captainLabel.tone]}
+            title={(captainView?.note ?? '').trim()}
+          >
+            {captainLabel.label}
+          </span>
+          <span data-head-sep> · </span>
+          <span
+            data-auto-team-degraded={degraded ? 'true' : 'false'}
+            data-tone={degraded ? 'warn' : 'neutral'}
+            title={degraded ? degradeReason : '四个宿主事件源都已订阅，Trigger 由事件即时推进'}
+          >
+            {degraded
+              ? `事件源降级${degradeReason !== '' ? `：${degradeReason}` : ''}`
+              : '事件源正常'}
+          </span>
         </span>
         <button type="button" onClick={() => void view.refresh()} data-panel-refresh>
           刷新
