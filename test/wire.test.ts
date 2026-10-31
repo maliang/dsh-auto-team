@@ -15,13 +15,16 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, name } from '../src/host/index.ts'
-import { RunsStore, type RunState } from '../src/host/store.ts'
+import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { createRoleRepo } from '../src/host/roles/repo.ts'
+import { createBridge, type BridgeDeps } from '../src/host/bridge.ts'
+import { createExpander } from '../src/host/memory/expand.ts'
 import { TOOL_PREFIX } from '../src/host/config.ts'
+import type { CaptainModelView, Plan, PlanTask, TriggerRecord } from '../src/shared/types.ts'
 
 const NOW = 1_700_000_000_000
 const SESSION = 'sess-wire'
@@ -219,8 +222,15 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(h.routes.length, 1, '宿主 WebRoute 没有 method 字段，四条能力合并成一条 prefix 路由')
   assert.equal(h.routes[0]?.path, '/api/auto-team')
   assert.equal(h.routes[0]?.kind, 'prefix')
-  // 两份清理：watcher 的 setInterval + 成员推进事件订阅（T2 的 onMemberProgress）都必须在卸载时停掉。
-  assert.equal(h.disposers.length, 2, 'watcher 与进度订阅都必须挂 ctx.effect 清理')
+  // 四份清理：watcher 的 setInterval、成员推进事件订阅（T2 的 onMemberProgress）、
+  // noWait 守卫（T5 的 tools/pre-execute）、Trigger 事件订阅（T5 的事件流）都必须在卸载时停掉。
+  // 队长的模型撤销（registerEffect at index.ts:187）走不到这里：测试 harness 不提供
+  // 主 session 作用域，装配时走 capability='unsupported' 分支，不注册 disposer。
+  assert.equal(
+    h.disposers.length,
+    4,
+    `watcher / 进度订阅 / noWait 守卫 / Trigger 订阅 都必须挂 ctx.effect 清理，实际 ${h.disposers.length}`,
+  )
 
   // 三条面板接口都在（第 4 条未知路径必须是 404，证明分发真的在路由表里查）
   const snapshotReply = await panel(h.routes, 'GET', `/api/auto-team/snapshot?sessionId=${SESSION}`)
@@ -346,11 +356,163 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
     '漂移必须留下可核验的消息记录',
   )
 
-  // ---- ⑩ 卸载：disposer 必须停掉 watcher（再等也不会改变状态），且不抛错
+  // ---- ⑩ r5 快照新字段必须齐（少一个就是历史高频缺陷「后端返回了、界面读不到」）
+  const r5Reply = await panel(h.routes, 'GET', '/api/auto-team/snapshot')
+  assert.equal(r5Reply.status, 200)
+  const r5Snapshot = r5Reply.body.data as Record<string, unknown>
+  assert.ok('captainModel' in r5Snapshot, '快照必须带 captainModel（没有配置也该是 unsupported/default）')
+  assert.equal(r5Snapshot.degraded, false, '事件订阅装配成功时不得报降级')
+  assert.ok(Array.isArray(r5Snapshot.triggers), '快照必须带 Trigger 账本数组')
+  const r5Memory = r5Snapshot.memory as Record<string, unknown>
+  assert.ok(Array.isArray(r5Memory.inline), 'memory.inline 必须投影（undefined 会被当成「未投影」）')
+  assert.ok(Array.isArray(r5Memory.omitted), 'memory.omitted 必须投影')
+
+  // ---- ⑪ 卸载：disposer 必须停掉 watcher（再等也不会改变状态），且不抛错
   await h.disposers[0]?.()
   const beforeStop = JSON.stringify(store.load(runId))
   await new Promise((resolve) => setTimeout(resolve, 1200))
   assert.equal(JSON.stringify(store.load(runId)), beforeStop, 'disposer 之后 watcher 不得再改状态')
 
   assert.deepEqual(h.warnings, [], `装配过程不应有告警：${h.warnings.join(' | ')}`)
+})
+
+/* ────────────────────────────── r5（T8）：快照投影与展开端口 ────────────────────────────── */
+
+const R5_NOW = 1_700_000_500_000
+const R5_RUN = 'run-r5'
+
+function r5Task(id: string, over: Partial<PlanTask> = {}): PlanTask {
+  return { id, title: `任务 ${id}`, roleId: 'dev', dependsOn: [], acceptance: 'exit 0', status: 'pending', ...over }
+}
+
+function r5State(over: Partial<RunState> = {}): RunState {
+  const plan: Plan = {
+    runId: R5_RUN,
+    sessionId: SESSION,
+    createdAt: R5_NOW,
+    status: 'dispatching',
+    tasks: [r5Task('t1', { status: 'done' }), r5Task('t2')],
+    maxConcurrent: 3,
+  }
+  return { version: RUN_STATE_VERSION, plan, plannedAt: R5_NOW, messages: [], bindings: [], routeAudits: [], ...over }
+}
+
+function r5Setup(overrides: Partial<BridgeDeps> = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-r5-wire-'))
+  const skillsDir = join(dir, 'skills')
+  mkdirSync(skillsDir, { recursive: true })
+  const store = new RunsStore(join(dir, 'runs'))
+  const roles = createRoleRepo({ dir: join(dir, 'roles'), skillsDir, now: () => R5_NOW })
+  roles.seed()
+  const memoryRoots = { publicDir: join(dir, 'memory-public'), projectDir: join(dir, 'memory-project') }
+  const deps: BridgeDeps = {
+    store,
+    roles,
+    memoryRoots,
+    dataRoot: join(dir, 'data'),
+    dispatch: async () => ({ started: [], skipped: [], errors: [] }),
+    resume: async () => ({ resumed: 0, skipped: 0, unchanged: true }),
+    applyReceipt: (state) => state,
+    sendMessage: async () => ({ ok: true }),
+    gate: { cwd: dir, artifactsDir: join(dir, 'artifacts') },
+    now: () => R5_NOW,
+    ...overrides,
+  }
+  return { dir, store, memoryRoots, bridge: createBridge(deps) }
+}
+
+test('r5 快照：captainModel 三态原样投影 / degraded 可见 / Trigger 账本只把 accepted 并入活动流', () => {
+  const captain: CaptainModelView = {
+    value: null,
+    route: null,
+    source: 'unsupported',
+    note: '宿主未提供主会话作用域，队长模型未生效',
+  }
+  const accepted: TriggerRecord = {
+    at: R5_NOW + 500,
+    kind: 'dep_ready',
+    source: 'poll',
+    runId: R5_RUN,
+    taskId: 't2',
+    dedupeKey: `dep_ready:${R5_RUN}:t2`,
+    accepted: true,
+    reason: 'ok',
+    text: '因「依赖完成」（任务 t2）推进：已派发 1 个任务',
+    action: 'dispatch',
+  }
+  const refused: TriggerRecord = {
+    ...accepted,
+    at: R5_NOW + 900,
+    accepted: false,
+    reason: 'duplicate',
+    text: '未推进：去重窗口内已推进过一次（duplicate）',
+    action: undefined,
+  }
+
+  const h = r5Setup({
+    captainModel: () => captain,
+    triggerHealth: () => ({ degraded: true, reason: '部分宿主事件订阅失败' }),
+  })
+  h.store.save(r5State({ triggers: [refused, accepted] }))
+  const snapshot = h.bridge.snapshot(SESSION)
+
+  // ① 队长模型：装配层给什么就投影什么，bridge 不加工（三态判断在 captainModelView 里）
+  assert.deepEqual(snapshot.captainModel, captain, 'captainModel 必须原样进快照，不能在这里改写成 configured')
+  // ② 事件源降级必须可见（AC-18）：否则「四类事件不推进」在面板上看不出来
+  assert.equal(snapshot.degraded, true)
+  assert.equal(snapshot.degradeReason, '部分宿主事件订阅失败')
+  // ③ 账本完整（含未推进），但活动流只收 accepted —— 否则「最近推进」条会混进一堆「未推进」
+  assert.equal((snapshot.triggers ?? []).length, 2, '未推进的记录也必须留在账本里供排查')
+  const fromTrigger = snapshot.activity.filter((event) => event.source === 'trigger')
+  assert.equal(fromTrigger.length, 1, `活动流只并入 accepted 的 Trigger，实际 ${fromTrigger.length}`)
+  assert.equal(fromTrigger[0]?.text, accepted.text)
+  assert.equal(fromTrigger[0]?.kind, 'status', 'AC-16：不得新增 kind，Trigger 事件复用 status')
+  assert.equal(fromTrigger[0]?.source, 'trigger')
+  assert.ok(
+    snapshot.activity.some((event) => event.kind === 'plan' && event.source === 'user'),
+    '用户/队长动作产生的活动必须打 source=user（AC-17 要能区分自动与用户）',
+  )
+})
+
+test('r5 快照：记忆内联索引给出可展开 ID，展开端口原样透出正文与错误码', () => {
+  const h = r5Setup()
+  h.store.save(r5State())
+  const written = h.bridge.remember('project', 'r5-note', 'R5 记忆正文：内联索引要给出 ID，展开要能取回这一段。')
+  assert.equal(written.error, undefined, `记忆写入失败：${String(written.error)}`)
+
+  // 展开器指向同一对根目录：注入期给出的 ID 必须能被展开期解析（同一套 memoryIdOf/parseMemoryId）
+  const expander = createExpander({ roots: h.memoryRoots })
+  const withExpander = r5Setup({ expander: (id: string, depth?: number) => expander.expand(id, depth) })
+  withExpander.store.save(r5State())
+  withExpander.bridge.remember('project', 'r5-note', 'R5 记忆正文：内联索引要给出 ID，展开要能取回这一段。')
+
+  const inline = withExpander.bridge.snapshot(SESSION).memory.inline ?? []
+  assert.equal(inline.length, 1, `应当内联 1 条，实际 ${inline.length}`)
+  assert.match(inline[0]?.id ?? '', /^mem:\/\/project\//, '内联索引必须给出 mem://<track>/<stem> 形态的 ID')
+  assert.deepEqual(withExpander.bridge.snapshot(SESSION).memory.omitted, [], '没超预算时不应有条目被挤出')
+
+  const expanded = withExpander.bridge.expandMemory(inline[0]?.id ?? '')
+  assert.equal(expanded.error, undefined, `展开端口装配后不应报错：${String(expanded.error)}`)
+  assert.equal(expanded.data?.code, 'OK')
+  assert.ok((expanded.data?.body ?? '').includes('R5 记忆正文'), '展开必须给出原文正文')
+
+  // 失败码不抛异常、也不压成 error 字符串：码本身是结论（AC-11）
+  const bad = withExpander.bridge.expandMemory('mem://project/../etc/passwd')
+  assert.equal(bad.error, undefined)
+  assert.equal(bad.data?.code, 'EXPAND_PATH_ESCAPE')
+  assert.ok((bad.data?.message ?? '').length > 0, '失败必须带一句可读中文')
+})
+
+test('r5 缺省装配：没注入三个新端口时快照与今天完全一致（不假装配置过 / 不假装降级）', () => {
+  const h = r5Setup()
+  h.store.save(r5State())
+  const snapshot = h.bridge.snapshot(SESSION)
+  assert.equal(snapshot.captainModel, undefined, '无 captainModel 端口时不得编一个「跟随宿主默认」')
+  assert.equal(snapshot.degraded, false)
+  assert.equal(snapshot.degradeReason, undefined)
+  assert.deepEqual(snapshot.triggers, [])
+  assert.deepEqual(snapshot.memory.inline, [])
+  // 展开端口缺失必须明确报「不可用」，而不是静默返回空正文（那会让模型以为文件是空的）
+  const expanded = h.bridge.expandMemory('mem://project/r5-note.md')
+  assert.ok((expanded.error ?? '').includes('记忆展开不可用'))
 })

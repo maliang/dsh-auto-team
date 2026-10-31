@@ -17,6 +17,7 @@
 | 任务产物 | docs/teamflow/<yyyyMMdd-rN-slug>/ | 每个需求一个自包含任务夹：PRD/设计/技术方案/QA 报告/验收报告（按日期倒序即迭代史） |
 | 架构总览 | docs/teamflow/architecture/ARCHITECTURE.md | 技术栈权衡、模块契约、目录树、构建/测试/CI、**未完成清单** |
 | 架构参考 | docs/teamflow/architecture/SUPER-AGENT-MAPPING.md | Super-agent（DeepSeek 原型仓）→ 本插件的映射：能搬 / 需改造 / 不搬 + 分期 + 证据索引 |
+| 宿主事实 | docs/teamflow/architecture/HOST-EVENTS.md | 宿主事件目录、emit/waterfall 取舍、`ToolExecution` 形状、inspect 的正确调用姿势（**查事件先读它，别自己调 inspect**） |
 | 产品记忆 | docs/teamflow/memory.md | 团队约定/技术栈/已知待办（低频更新） |
 | 运行日志 | logs/teamflow/<runId>/ → $DSH_HOME/teamflow/<workspace>/logs/<runId>/ | 只放**要留存**的东西（一次性检查脚本 scripts/、不可重跑的命令载荷 captures.json、结论笔记 .md）——**不制造命令输出 dump**；run 期间在项目内暂存，run 结束由 host 归档到 $DSH_HOME 并从项目删除 |
 
@@ -62,7 +63,8 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 **与宿主联调的常识**
 - 本机 `dsh` 不在 PATH：安装走 `cd ~/.dsh/profiles/desktop && pnpm add file:<repo>`，并同步 `dsh.profile.bundles`；安装只能由主 agent 执行。
 - 宿主实际 API 形状（工具定义、prompt section、route、`spawnTeammate` 返回值、`resolveCallConfig`）**尚未全部核实**，见 ARCHITECTURE §8.2；任何"已验证"声明必须附命令与返回值，不得凭记忆断言。
-- **`cordis_inspect_query` 的 `input` 必须是对象**（主 agent 2026-11-01 实测）：列全部用 `input: {}`；查单个事件/服务用 `input: {"event": "<name>"}` / `input: {"service": "<name>"}`。传字符串、数组或省略成非对象时会返回 `rejected input: "input" must be an object`——**这是调用姿势错误，不是环境不可用**，不要把阶段判成 env-unavailable 然后反复重试（已有两轮因此烧穿阶段 token 预算）。
+- **`cordis_inspect_query` 的 `input` 必须是对象**（主 agent 2026-11-01 实测）：列全部用 `input: {}`；查单个事件/服务用 `input: {"event": "<name>"}` / `input: {"service": "<name>"}`。传字符串、数组或省略成非对象时会返回 `rejected input: "input" must be an object`——**这是调用姿势错误，不是环境不可用**，不要把阶段判成 env-unavailable 然后反复重试（已有**三轮**因此烧穿阶段 token 预算：r1 scaffold、r4 tech、r5 dev-T5，累计约 700k 新增 token）。
+- **查宿主事件先去读 `docs/teamflow/architecture/HOST-EVENTS.md`**（已核实的 76 条事件目录、emit/waterfall 取舍、`ToolExecution` 形状、作用域规则）。那里没有你需要的，再按上一节的姿势调 `cordis_inspect_query`；**一次调用取不到就换姿势或读源码 `/tmp/dsh-src/`，不要用同一形状重试**。
 - **观测工具调用要订阅 `tools/result`，不要订阅 `tools/execute`**：`tools/result` 是 `emit`（签名 `(exec: Readonly<ToolExecution>, result)`，监听器异常会被隔离），`tools/execute` 是 `waterfall`（必须 `next()`，漏调就吞掉工具执行、改错信号会破坏取消链）。宿主文档原文：`tools/result` 的 scope 过滤 **keyed by `exec.agent`**——在 `agent.ctx` 上注册的监听器**只收到该 agent 的调用**，`src/host/adapters.ts` 的 `agentContextOf(agent)` 可直接复用，不必按 id 过滤、不必装全局监听。
 - `exec` 形状（宿主 `ToolExecutionInput` + `rootCallId` + `token`）：`callId` / `rootCallId?` / `name` / `schema?` / `arguments` / `agent?: Agent { readonly id: SessionId }` / `parent?: ToolExecutionToken` / `signal`。嵌套子调用 `parent` 非空、`agent` 仍指向所属成员。
 
