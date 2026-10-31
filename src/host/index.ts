@@ -119,7 +119,13 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       hostConcurrency,
       now,
     })
-    return { started: result.started, skipped: result.skipped, errors: result.errors }
+    // renamed 必须显式投影：bridge 是编排接口层，漏了这一行会「编译通过但面板永远不提示改名」（TECHNICAL §2.5）。
+    return {
+      started: result.started,
+      skipped: result.skipped,
+      errors: result.errors,
+      renamed: result.renamed,
+    }
   }
 
   /** 恢复端口：只处理 running/gate/interrupted，重复调用必须幂等（AC-17）。 */

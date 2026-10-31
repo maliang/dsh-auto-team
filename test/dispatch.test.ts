@@ -14,12 +14,15 @@ import type { HostMember } from '../src/host/team/watcher.ts'
 import { createMemberWatcher, normalizeHostStatus, reconcileMembers } from '../src/host/team/watcher.ts'
 import type { RoutePort } from '../src/host/team/route.ts'
 import {
+  NAME_SUFFIX_MAX,
+  allocateMemberNames,
   applyReceipt,
   dispatchReady,
   memberNameFor,
   resumeRun,
   runningCount,
   shortIdentityHash,
+  withNameSuffix,
   type DispatchDeps,
   type ResumeDeps,
   type SpawnInput,
@@ -186,7 +189,7 @@ test('dispatch：被标 interrupted 的任务可用同一个确定性名字重�
       makeTask('t1', { status: 'done' }),
       makeTask('t2', { status: 'interrupted', memberId: 'm-dev-t2', dependsOn: ['t1'] }),
     ]
-    const state = makeState(tasks, { bindings: [bindingOf('t2', 'dev-t2')] })
+    const state = makeState(tasks, { bindings: [bindingOf('t2', memberNameFor(makeTask('t2')))] })
     const { deps, spawned } = makeDeps(store)
     const result = await dispatchReady(state, deps)
 
@@ -499,44 +502,47 @@ test('memberNameFor：48 上限边界 + 字符集 + 确定性（截断只裁可�
 })
 
 /* ------------------------------------------------------------------ *
- * 派发前唯一性断言（AC-4）
+ * 消歧（AC-4）：名字被占 → 确定性追加序号继续派发，不停派
  *
- * 生产算法不该撞名，断言是**兜底层**：只有注入 `deps.memberNameFor` 才触发。
- * 判据三件套：不 spawn、错误可见（含冲突名与全部冲突任务 id）、任务留 pending 且不写 binding。
+ * R3 取代了 R2 的「撞名=错误，停派并留 pending」契约：撞名只是名字冲突，不是任务错误。
+ * 生产算法本不该撞名，这些用例靠注入 `deps.memberNameFor` 造出撞名面。
+ * 判据：都 spawn、名字为 `base`/`base-2`、errors 空、任务 running、renamed 恰好一条。
  * ------------------------------------------------------------------ */
 
-test('dispatch：注入的取名端口撞名 → 两个就绪任务都不派发、各写一条 MEMBER_NAME_COLLISION', async () => {
+test('dispatch：注入的取名端口恒同名 → 两条任务以 dev-dup / dev-dup-2 都派出，只有第二条消歧', async () => {
   const { store, cleanup } = makeStore()
   try {
     const tasks = [makeTask('t1'), makeTask('t2')]
     const { deps, spawned } = makeDeps(store)
-    // 刻意把所有任务映射成同一个名字：若断言缺失，第二个任务会被宿主以重名拒绝并静默 pending。
+    // 刻意把所有任务映射成同一个名字：旧实现在这里停派，新契约必须照派只换名字。
     deps.memberNameFor = () => 'dev-dup'
     const result = await dispatchReady(makeState(tasks), deps)
 
-    assert.deepEqual(result.started, [], '撞名任务一个都不许启动')
-    assert.equal(spawned.length, 0, '撞名任务不许调用 spawn')
-    assert.equal(result.errors.length, 2, '两个任务各留一条错误，不许吞掉')
-    for (const error of result.errors) {
-      assert.equal(error.code, 'MEMBER_NAME_COLLISION')
-      assert.ok(error.error.includes('dev-dup'), `错误必须含冲突名：${error.error}`)
-      assert.ok(
-        error.error.includes('t1') && error.error.includes('t2'),
-        `错误必须含全部冲突任务 id：${error.error}`,
-      )
-    }
+    assert.deepEqual(result.started, ['t1', 't2'], '撞名不再停派：两条任务都必须启动')
+    assert.deepEqual(
+      spawned.map((input) => input.name),
+      ['dev-dup', 'dev-dup-2'],
+      '第一条用本名，第二条确定性追加序号',
+    )
+    assert.deepEqual(result.errors, [], '消歧是正常路径，不产生错误')
     assert.deepEqual(
       result.state.plan.tasks.map((task) => task.status),
-      ['pending', 'pending'],
-      '任务必须留在 pending（错误可见，但不是静默 pending）',
+      ['running', 'running'],
+      '两条任务都必须真的在跑（不许留 pending）',
     )
-    assert.equal(result.state.bindings.length, 0, '冲突任务不许写 binding')
+    assert.equal(result.state.bindings.length, 2, '两条任务各写一条 binding')
+    assert.deepEqual(
+      result.renamed.map((item) => item.taskId),
+      ['t2'],
+      '只有被改名的任务产生消歧记录（AC-5）',
+    )
+    assert.deepEqual(result.renamed[0], { taskId: 't2', base: 'dev-dup', final: 'dev-dup-2' })
   } finally {
     cleanup()
   }
 })
 
-test('dispatch：与既有未退役 binding 同名 → 只拦该任务，既有成员与任务不受影响', async () => {
+test('dispatch：与既有未退役 binding 同名 → 新任务以 -2 派发，既有成员与任务不受影响', async () => {
   const { store, cleanup } = makeStore()
   try {
     // t0 已完成、binding 仍在（名字被占用）；t2 算出的名字与之相同。
@@ -546,20 +552,216 @@ test('dispatch：与既有未退役 binding 同名 → 只拦该任务，既有�
     deps.memberNameFor = () => 'dev-dup'
     const result = await dispatchReady(state, deps)
 
-    assert.deepEqual(result.started, [])
-    assert.equal(spawned.length, 0)
-    assert.equal(result.errors.length, 1, '只有冲突的那个就绪任务报错（t0 已 done，不在派发切片里）')
-    assert.equal(result.errors[0]?.taskId, 't2')
-    assert.equal(result.errors[0]?.code, 'MEMBER_NAME_COLLISION')
-    assert.ok(result.errors[0]?.error.includes('dev-dup'), '错误必须指出被占用的名字')
-    assert.ok(
-      (result.errors[0]?.error ?? '').includes('t0') && (result.errors[0]?.error ?? '').includes('t2'),
-      '错误必须列全冲突任务 id（既有占位者 + 本次被拦者）',
+    assert.deepEqual(result.started, ['t2'], '被占名的是 t2，它必须改名后照派')
+    assert.deepEqual(
+      spawned.map((input) => input.name),
+      ['dev-dup-2'],
+      '未退役 binding 占着 dev-dup，新任务顺延到 -2',
     )
-    assert.equal(result.state.plan.tasks.find((task) => task.id === 't2')?.status, 'pending')
+    assert.deepEqual(result.errors, [], '名字被占不是错误')
+    assert.equal(result.state.plan.tasks.find((task) => task.id === 't2')?.status, 'running')
     const kept = result.state.bindings.find((item) => item.taskId === 't0')
     assert.equal(kept?.name, 'dev-dup', '既有 binding 必须原样保留')
-    assert.equal(kept?.retired, undefined, '既有 binding 不得被退役（名字仍被它占用）')
+    assert.equal(kept?.retired, undefined, '既有 binding 不得被退役（成员仍活着）')
+    assert.deepEqual(result.renamed, [{ taskId: 't2', base: 'dev-dup', final: 'dev-dup-2' }])
+  } finally {
+    cleanup()
+  }
+})
+
+test('withNameSuffix：短名直接拼接；超长只压可读段、6 位身份哈希逐字保留（AC-2）', () => {
+  assert.equal(withNameSuffix('dev-dup', 2), 'dev-dup-2', '不超上限时就是原样拼接')
+  assert.equal(withNameSuffix('dev-dup', 0), 'dev-dup', '非正序号不改名（防呆）')
+  assert.equal(withNameSuffix('dev-dup', -3), 'dev-dup')
+
+  // 真实算法产出的 48 字顶格名：追加 -2 时必须把可读段压掉 2 个字符，哈希一个字节都不能动。
+  const roleId = 'r'.repeat(30)
+  const id = 'x'.repeat(30)
+  const base = memberNameFor(makeTask(id, { roleId }))
+  const hash = shortIdentityHash(`${roleId}\u0000${id}`)
+  assert.equal(base.length, HOST_MEMBER_NAME_MAX, '前提：本名恰好顶到 48')
+
+  const two = withNameSuffix(base, 2)
+  assert.ok(two.length <= HOST_MEMBER_NAME_MAX, `消歧后仍不得超 48：${two.length}`)
+  assert.match(two, HOST_MEMBER_NAME, `消歧后必须仍合法：${two}`)
+  assert.ok(two.includes(hash), `6 位身份哈希必须逐字保留：${two}`)
+  assert.ok(two.endsWith('-2'))
+
+  const ninetyNine = withNameSuffix(base, NAME_SUFFIX_MAX)
+  assert.ok(ninetyNine.length <= HOST_MEMBER_NAME_MAX, `-99 也不得超 48：${ninetyNine.length}`)
+  assert.match(ninetyNine, HOST_MEMBER_NAME)
+  assert.ok(ninetyNine.includes(hash), '更长的序号只压可读段，哈希不动')
+  assert.ok(ninetyNine.endsWith('-99'))
+
+  // 可读段被压空时用 member 兜底，绝不能出现以分隔符开头的名字。
+  const degenerate = withNameSuffix(`${'-'.repeat(45)}-abcdef`, 2)
+  assert.equal(degenerate, 'member-abcdef-2')
+  assert.match(degenerate, HOST_MEMBER_NAME)
+})
+
+test('allocateMemberNames：同一输入重复调用结果完全相同（确定性，AC-3）', () => {
+  const tasks = [makeTask('t1'), makeTask('t2'), makeTask('t3')]
+  const options = { nameOf: () => 'dev-dup' }
+  const first = allocateMemberNames(tasks, options)
+  const second = allocateMemberNames(tasks, options)
+
+  assert.deepEqual([...first.entries()], [...second.entries()], '无时间无随机：两次调用必须逐字段相同')
+  assert.deepEqual(
+    tasks.map((task) => first.get(task.id)?.final),
+    ['dev-dup', 'dev-dup-2', 'dev-dup-3'],
+    '三个同名任务按计划顺序拿 base / -2 / -3',
+  )
+  // 交换任务顺序后「名字集合」不变（归属可以变）：名字可用性不许取决于任务顺序。
+  const reversed = allocateMemberNames([...tasks].reverse(), options)
+  assert.deepEqual(
+    [...reversed.values()].map((item) => item.final).sort(),
+    [...first.values()].map((item) => item.final).sort(),
+  )
+})
+
+test('allocateMemberNames：不抢他人本名（AC-4 的唯一正确实现）', () => {
+  const tasks = [makeTask('t1'), makeTask('t2')]
+  // t2 的本名就是 t1 的第一个候选号；t1 必须跳过 dev-2 去 dev-3。
+  const names = allocateMemberNames(tasks, {
+    nameOf: (task) => (task.id === 't2' ? 'dev-2' : 'dev'),
+    reserved: [{ taskId: 't0', name: 'dev' }],
+  })
+
+  assert.deepEqual(names.get('t1'), { taskId: 't1', base: 'dev', final: 'dev-3', suffix: 3, reused: false })
+  assert.deepEqual(names.get('t2'), { taskId: 't2', base: 'dev-2', final: 'dev-2', suffix: 0, reused: false })
+})
+
+test('allocateMemberNames：同任务未退役 binding 判 reused，名字不递增（恢复不翻倍）', () => {
+  const tasks = [makeTask('t1'), makeTask('t2')]
+  const names = allocateMemberNames(tasks, {
+    nameOf: () => 'dev-dup',
+    reserved: [
+      { taskId: 't1', name: 'dev-dup' },
+      { taskId: 't2', name: 'dev-dup-2' },
+    ],
+  })
+
+  assert.deepEqual(names.get('t1'), { taskId: 't1', base: 'dev-dup', final: 'dev-dup', suffix: 0, reused: true })
+  assert.deepEqual(names.get('t2'), { taskId: 't2', base: 'dev-dup', final: 'dev-dup-2', suffix: 0, reused: true })
+})
+
+test('allocateMemberNames：序号 -2…maxSuffix 全被占 → suffix=null（可观测，不静默）', () => {
+  const tasks = [makeTask('t1'), makeTask('t2'), makeTask('t3')]
+  const names = allocateMemberNames(tasks, { nameOf: () => 'dev-dup', maxSuffix: 2 })
+
+  assert.equal(names.get('t1')?.final, 'dev-dup')
+  assert.equal(names.get('t2')?.final, 'dev-dup-2')
+  assert.equal(names.get('t3')?.suffix, null, 'maxSuffix=2 时第三个同名任务无处可去')
+  assert.equal(names.get('t3')?.final, 'dev-dup', '耗尽时 final 回落本名，由调用方判错误')
+})
+
+test('dispatch：两个中文 id 的任务都真派出，名字两两唯一且不超 48（AC-10 派发侧）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [makeTask('登录流程'), makeTask('注册接口')]
+    const { deps, spawned } = makeDeps(store)
+    const result = await dispatchReady(makeState(tasks), deps)
+
+    assert.deepEqual(result.started, ['登录流程', '注册接口'], '归一后同为空的两条任务都必须派出')
+    assert.equal(spawned.length, 2)
+    const names = spawned.map((input) => input.name)
+    assert.equal(new Set(names).size, 2, `名字必须两两唯一：${names.join(', ')}`)
+    for (const name of names) {
+      assert.match(name, HOST_MEMBER_NAME)
+      assert.ok(name.length <= HOST_MEMBER_NAME_MAX)
+    }
+    assert.deepEqual(result.renamed, [], '真实算法不撞名，不该产生消歧记录')
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：重试不重复 notice —— 第二次派发全部 ALREADY_RUNNING，名字与 binding 不变', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [makeTask('t1'), makeTask('t2')]
+    const members: HostMember[] = []
+    const { deps, spawned } = makeDeps(store, { members })
+    deps.memberNameFor = () => 'dev-dup'
+
+    const first = await dispatchReady(makeState(tasks), deps)
+    assert.equal(first.renamed.length, 1, '第一轮确实改名了')
+    // 成员活着回到名单里：第二轮只能是 ALREADY_RUNNING，不许再造人、不许再提示改名。
+    for (const input of spawned) members.push({ id: `m-${input.name}`, name: input.name, status: 'active' })
+    const second = await dispatchReady(first.state, deps)
+
+    assert.deepEqual(second.started, [], '已在飞的任务不重复 spawn')
+    assert.equal(second.renamed.length, 0, '同一消歧只提示一次（AC-5 抑制条件）')
+    assert.equal(second.state.bindings.length, first.state.bindings.length, 'binding 数量不变')
+    assert.deepEqual(
+      second.state.bindings.map((item) => item.name),
+      ['dev-dup', 'dev-dup-2'],
+      '名字不递增（恢复后重绑不得翻倍）',
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：成员死亡后重建沿用 -2（不递增到 -3），且不重复提示改名', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    // 上一轮已消歧出 dev-dup-2，宿主重启后该成员不在名单里，任务被对账标成 interrupted。
+    const tasks = [
+      makeTask('t1', { status: 'running', memberId: 'm-dev-dup' }),
+      makeTask('t2', { status: 'interrupted', memberId: 'm-dev-dup-2' }),
+    ]
+    const state = makeState(tasks, {
+      bindings: [bindingOf('t1', 'dev-dup'), bindingOf('t2', 'dev-dup-2')],
+    })
+    const { deps, spawned } = makeDeps(store, {
+      members: [{ id: 'm-dev-dup', name: 'dev-dup', status: 'active' }],
+    })
+    deps.memberNameFor = () => 'dev-dup'
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t2'])
+    assert.deepEqual(spawned.map((input) => input.name), ['dev-dup-2'], '沿用自己老 binding 的名字，不升到 -3')
+    assert.deepEqual(result.renamed, [], '沿用旧名不算消歧，不产生 notice')
+    assert.deepEqual(
+      result.state.bindings.filter((item) => !item.retired).map((item) => item.name),
+      ['dev-dup', 'dev-dup-2'],
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：序号空间 -2…-99 全部被占 → 一条 MEMBER_NAME_COLLISION，不静默留 pending（AC-6）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    // 99 个未退役 binding 占满 dev-dup 与 dev-dup-2…-99（模拟宿主里已有一堆同名前缀成员）。
+    const occupied = ['dev-dup', ...Array.from({ length: NAME_SUFFIX_MAX - 1 }, (_, i) => `dev-dup-${i + 2}`)]
+    const state = makeState([makeTask('t1')], {
+      bindings: occupied.map((name, index) => bindingOf(`ghost-${index}`, name)),
+    })
+    const { deps, spawned } = makeDeps(store)
+    deps.memberNameFor = () => 'dev-dup'
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, [])
+    assert.equal(spawned.length, 0)
+    assert.equal(result.errors.length, 1, '恰好一条可观测错误')
+    assert.equal(result.errors[0]?.code, 'MEMBER_NAME_COLLISION')
+    assert.ok(result.errors[0]?.error.includes('dev-dup'), '错误必须指出被占满的候选名')
+    assert.ok(
+      (result.errors[0]?.error ?? '').includes(`-${NAME_SUFFIX_MAX}`),
+      '错误必须说明序号空间上限',
+    )
+    // 无静默滞留：每个就绪任务都必须落在 started ∪ skipped ∪ errors 里。
+    const accounted = new Set([
+      ...result.started,
+      ...result.skipped.map((item) => item.taskId),
+      ...result.errors.map((item) => item.taskId),
+    ])
+    const silent = result.state.plan.tasks.filter((task) => task.status === 'pending' && !accounted.has(task.id))
+    assert.deepEqual(silent.map((task) => task.id), [], 'pending 任务必须都有可观测归属')
+    assert.equal(result.state.bindings.length, occupied.length, '失败侧不写 binding')
   } finally {
     cleanup()
   }

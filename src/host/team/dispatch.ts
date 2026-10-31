@@ -66,8 +66,8 @@ export interface DispatchDeps {
   /**
    * 可选：成员名算法注入点（缺省即本文件的 `memberNameFor`）。
    *
-   * 只为**证明兜底断言真的会停派**而存在：生产装配不传，默认算法本身不产生冲突；
-   * 测试注入一个「撞名」的算法，验证 dispatchReady 会报 MEMBER_NAME_COLLISION 而不是 spawn（AC-4）。
+   * 生产装配不传；测试注入一个「恒同名」的算法，验证同名任务会被确定性追加序号继续派发
+   * （`dev-dup` / `dev-dup-2`），而不是停派（AC-4/AC-7）。
    */
   memberNameFor?: (task: PlanTask) => string
   now?(): number
@@ -78,6 +78,8 @@ export interface DispatchResult {
   started: string[]
   skipped: { taskId: string; reason: RejectionCode | 'ALREADY_RUNNING' }[]
   errors: { taskId: string; error: string; code?: RejectionCode }[]
+  /** 本轮真消歧的任务（`suffix > 0` 且非沿用旧名）；bridge 把它转成用户可读 notice（AC-5）。 */
+  renamed: RenameRecord[]
 }
 
 export interface ResumeDeps {
@@ -163,39 +165,158 @@ export function memberNameFor(task: PlanTask): string {
   return `${trimmed === '' ? 'member' : trimmed}-${hash}`
 }
 
-/** 一处成员名冲突：同名被 ≥2 个不同 task 占用。 */
-export interface NameCollision {
-  name: string
-  taskIds: string[]
+/**
+ * 消歧序号上限：`-2` … `-99`。
+ *
+ * 序号空间是「名字被占也照派」的最后一道兜底：全部耗尽才回退 `MEMBER_NAME_COLLISION`。
+ * 上限取 99（而非更大）是为了让 `-99` 仍能把可读段预算留在 38 个字符（见 `withNameSuffix`）。
+ */
+export const NAME_SUFFIX_MAX = 99
+
+/** 一次真实消歧的记录（AC-5 的 notice 数据源）。 */
+export interface RenameRecord {
+  taskId: string
+  /** 原候选名（未消歧前算出的名字）。 */
+  base: string
+  /** 最终派发用的名字。 */
+  final: string
+}
+
+/** 一个任务的名字分配结果（`suffix === null` 表示序号空间耗尽，不可派发）。 */
+export interface NameAssignment {
+  taskId: string
+  base: string
+  final: string
+  /** 0 = 本名；≥2 = 消歧序号；null = 序号耗尽。 */
+  suffix: number | null
+  /** 沿用它自己未退役 binding 的名字（恢复/重试不递增）。 */
+  reused: boolean
+}
+
+export interface AllocateOptions {
+  /** 取名端口，缺省 `memberNameFor`（测试注入桩用）。 */
+  nameOf?: (task: PlanTask) => string
+  /** 未退役 binding：`{ taskId, name }`。同 taskId 的项视为「沿用」。 */
+  reserved?: Array<{ taskId: string; name: string }>
+  /** 宿主现存成员名（含没有 binding 的同名成员）；不可得时传 `[]`。 */
+  hostNames?: string[]
+  /** 序号上限，缺省 `NAME_SUFFIX_MAX`(99)；仅在穷尽性测试里调小。 */
+  maxSuffix?: number
 }
 
 /**
- * 全计划任务名的两两唯一性断言（AC-4）。
+ * 给 base 追加消歧序号，**只压可读段、逐字保留身份哈希**（AC-2）。
  *
- * `reserved` 是「未退役 binding 的名字」：它们已经占着宿主里的成员名，新派发的任务不能撞上去，
- * 但**同 taskId 自占不算冲突**（幂等续跑必须继续可用）。已退役 binding 的名字可回收，不参与。
- *
- * 只在「≥2 个**不同** taskId 共享同一 name」时判冲突：同一任务重复出现不是冲突。
+ * 为什么不能简单 `base.slice(0, 48 - tail.length) + tail`：那会把 6 位身份哈希截掉一半，
+ * 两个长 id 消歧后重新撞成同名 —— 正是 R2-1 缺陷的复发路径。哈希是唯一身份，永远不动。
  */
-export function memberNameCollisions(
-  tasks: PlanTask[],
-  options: { nameOf?: (task: PlanTask) => string; reserved?: Array<{ taskId: string; name: string }> } = {},
-): NameCollision[] {
-  const nameOf = options.nameOf ?? memberNameFor
-  const byName = new Map<string, string[]>()
-  const remember = (name: string, taskId: string): void => {
-    const taskIds = byName.get(name)
-    if (!taskIds) {
-      byName.set(name, [taskId])
-      return
-    }
-    if (!taskIds.includes(taskId)) taskIds.push(taskId)
+/** 身份哈希段的样子（`-<HASH_LEN 位 36 进制>`）：长度只在 `HASH_LEN` 一处定义，不许两处各自演化。 */
+const HASH_TAIL = new RegExp(`-([a-z0-9]{${HASH_LEN}})$`)
+
+export function withNameSuffix(base: string, suffix: number): string {
+  if (!Number.isInteger(suffix) || suffix <= 0) return base
+  const tail = `-${suffix}`
+  if (base.length + tail.length <= HOST_MEMBER_NAME_MAX) return `${base}${tail}`
+
+  const match = HASH_TAIL.exec(base)
+  if (!match) {
+    // 测试注入的桩名（如 `dev-dup`）没有哈希段：无可保留的身份信息，只能截可读段。
+    return `${base.slice(0, HOST_MEMBER_NAME_MAX - tail.length).replace(/-+$/g, '')}${tail}`
   }
-  for (const task of tasks) remember(nameOf(task), task.id)
-  for (const item of options.reserved ?? []) remember(item.name, item.taskId)
-  return [...byName.entries()]
-    .filter(([, taskIds]) => taskIds.length > 1)
-    .map(([name, taskIds]) => ({ name, taskIds }))
+  const hash = match[1]
+  const readable = base.slice(0, base.length - hash.length - 1)
+  const budget = HOST_MEMBER_NAME_MAX - hash.length - 1 - tail.length
+  if (budget <= 0) return `${hash}${tail}`
+  // 截断后可能落在分隔符上（`dev-t1-xxxxx`），结尾的 `-` 违约，必须再归零一次。
+  const trimmed = readable.slice(0, budget).replace(/-+$/g, '')
+  // 可读段被压空时用 `member` 兜底，避免出现 `-abc123-2` 这种以分隔符开头的名字。
+  const word = trimmed === '' ? 'member'.slice(0, budget) : trimmed
+  return `${word}-${hash}${tail}`
+}
+
+/**
+ * 一次性算完全计划任务的名字分配（AC-1/AC-3/AC-4）。
+ *
+ * **纯函数**：不读状态、不看 `ready` 顺序、无时间无随机 —— 输入集合相同则输出相同。
+ * 这是「循环前一次算完」这条性质的落地形式：边派边算会让名字可用性取决于任务顺序，
+ * 恢复后顺序一变，重绑就会翻倍（R2-1 已确立的反面教材）。
+ *
+ * 候选可用 ⇔ 未被占用 **且** 不是别的任务的本名（AC-4 不抢名）：
+ * 只挑「第一个空号」的实现会把 `dev-2` 抢走，让本名就是 `dev-2` 的任务无处可去。
+ */
+export function allocateMemberNames(
+  tasks: PlanTask[],
+  options: AllocateOptions = {},
+): Map<string, NameAssignment> {
+  const nameOf = options.nameOf ?? memberNameFor
+  const maxSuffix = options.maxSuffix ?? NAME_SUFFIX_MAX
+
+  // 1. 本名：按 tasks 顺序，同 taskId 重复出现只算一次（防御，不让同一任务吃掉两个号）。
+  const order: string[] = []
+  const baseOf = new Map<string, string>()
+  for (const task of tasks) {
+    if (baseOf.has(task.id)) continue
+    baseOf.set(task.id, nameOf(task))
+    order.push(task.id)
+  }
+
+  // 2. 已占用集合：未退役 binding 名 ∪ 宿主现存成员名（不可得时退化为空，与 liveness 同策略）。
+  const bindingOfTask = new Map<string, string>()
+  const taken = new Set<string>()
+  for (const item of options.reserved ?? []) {
+    bindingOfTask.set(item.taskId, item.name)
+    taken.add(item.name)
+  }
+  for (const name of options.hostNames ?? []) taken.add(name)
+
+  // 3. 本名归属表：用于「候选是不是别人本名」的判定。
+  const byBase = new Map<string, string[]>()
+  for (const taskId of order) {
+    const base = baseOf.get(taskId) as string
+    const owners = byBase.get(base)
+    if (owners) owners.push(taskId)
+    else byBase.set(base, [taskId])
+  }
+
+  // 4. 逐个任务分配：binding 沿用优先，其次 base，最后 `-2..-maxSuffix`。
+  const result = new Map<string, NameAssignment>()
+  for (const taskId of order) {
+    const base = baseOf.get(taskId) as string
+    const reuse = bindingOfTask.get(taskId)
+    if (reuse !== undefined) {
+      // 该名已在 taken 里；沿用它自己的名字绝不消耗新号，恢复/重试名字恒定（AC-3②）。
+      result.set(taskId, { taskId, base, final: reuse, suffix: 0, reused: true })
+      continue
+    }
+
+    const usable = (candidate: string): boolean => {
+      if (taken.has(candidate)) return false
+      if (candidate === base) return true
+      const owners = byBase.get(candidate)
+      return !owners || owners.every((owner) => owner === taskId)
+    }
+
+    let final: string | null = usable(base) ? base : null
+    let suffix = 0
+    if (final === null) {
+      for (let n = 2; n <= maxSuffix; n += 1) {
+        const candidate = withNameSuffix(base, n)
+        if (!usable(candidate)) continue
+        final = candidate
+        suffix = n
+        break
+      }
+    }
+
+    if (final === null) {
+      // 序号空间耗尽：如实报告，不静默留 pending（AC-6）。
+      result.set(taskId, { taskId, base, final: base, suffix: null, reused: false })
+      continue
+    }
+    taken.add(final)
+    result.set(taskId, { taskId, base, final, suffix, reused: false })
+  }
+  return result
 }
 
 /** 在飞任务数：running + gate（gate 期间成员仍占着一个并发位）。 */
@@ -209,6 +330,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   const started: string[] = []
   const skipped: DispatchResult['skipped'] = []
   const errors: DispatchResult['errors'] = []
+  const renamed: RenameRecord[] = []
   let next = state
   let changed = false
 
@@ -218,7 +340,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     for (const task of next.plan.tasks) {
       if (task.status === 'pending' || task.status === 'ready') skipped.push({ taskId: task.id, reason: 'NO_PLAN' })
     }
-    return { state: next, started, skipped, errors }
+    return { state: next, started, skipped, errors, renamed }
   }
 
   // 成员名单：拿不到就**保守当作成员都还活着**，宁可少派一个，也不重复建人。
@@ -247,25 +369,26 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   const ready = [...new Set([...readyTasks(next.plan.tasks), ...recoverable])]
   if (ready.length === 0) {
     if (changed) deps.store.save(next)
-    return { state: next, started, skipped, errors }
+    return { state: next, started, skipped, errors, renamed }
   }
 
   if (slots <= 0) {
     for (const taskId of ready) skipped.push({ taskId, reason: 'CONCURRENCY_FULL' })
-    return { state: next, started, skipped, errors }
+    return { state: next, started, skipped, errors, renamed }
   }
 
-  // 派发前唯一性断言（AC-4）：**一次**算完全计划任务名 ∪ 未退役 binding 名的冲突集。
+  // 派发前一次性算完全计划的名字分配（AC-1/AC-4）：名字被占就追加确定性序号继续派发。
   //
   // 必须在循环之前算完，不能在循环里边派边算：边派边算会让「谁先被派」决定谁撞名，
   // 于是名字的可用性取决于任务顺序（恢复后顺序可能变，重绑就会翻倍）。
-  // 注意冲突任务**不 spawn、不写 binding、不改 status**，错误通过 errors 暴露给面板/工具，
-  // 而不是让宿主重名失败后把它吞成静默 pending（R2-1 的原始症状）。
+  // 宿主名单不可得（listMembers 抛错）时 `hostNames` 退化为空 —— 与既有 liveness 判断同一个
+  // 保守策略：只依赖 binding 名 + 计划名，宁可多算一个序号，也不假装「宿主里没人」。
   const nameOf = deps.memberNameFor ?? memberNameFor
   const reserved = next.bindings
     .filter((binding) => binding.retired !== true)
     .map((binding) => ({ taskId: binding.taskId, name: binding.name }))
-  const collisions = memberNameCollisions(next.plan.tasks, { nameOf, reserved })
+  const hostNames = members === null ? [] : members.map((member) => member.name)
+  const names = allocateMemberNames(next.plan.tasks, { nameOf, reserved, hostNames })
 
   for (const taskId of ready) {
     const task = next.plan.tasks.find((item) => item.id === taskId)
@@ -339,20 +462,24 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
       }
     }
 
-    // 步 d：成员名唯一性（AC-4）——撞名就**停派**，不自动改名。
-    // 位置在角色/模型预校验之后、`buildPrompt` 之前：名字算不出来就没有拼提示词的意义，
+    // 步 d：取本任务的分配结果（AC-4）——名字已在循环前算好，这里只做一次 Map 查表。
+    // 位置在角色/模型预校验之后、`buildPrompt` 之前：名字定不下来就没有拼提示词的意义，
     // 而预校验仍排在更前面，保证「角色缺失」这类更有信息量的原因优先暴露。
-    // 静默加 `-2` 消歧是禁止项：改名会让 AC-17 的「按名字重绑成员」变得不可信。
-    const name = nameOf(task)
-    const collision = collisions.find((item) => item.taskIds.includes(taskId))
-    if (collision) {
+    //
+    // 只有「序号 -2…-99 全被占」才会走到 errors：那是可观测的兜底，不是静默 pending。
+    const assignment = names.get(taskId)
+    if (!assignment || assignment.suffix === null) {
       errors.push({
         taskId,
         code: 'MEMBER_NAME_COLLISION',
-        error: `成员名冲突：${collision.name} 同时属于任务 ${collision.taskIds.join('、')}；本次不派发（请修改任务 id 或角色，系统不会自动改名）`,
+        error: `成员名冲突：${assignment?.base ?? nameOf(task)} 的序号候选（-2…-${NAME_SUFFIX_MAX}）全部被占用；本次不派发（请修改任务 id 或角色）`,
       })
       continue
     }
+    const name = assignment.final
+    // 沿用它自己已有的同名 binding（恢复/重试）不算「消歧」，不产生 notice；
+    // 在 `spawn` 之前取快照 —— 步 e 会把新 binding 追加进 `next.bindings`，之后查必然命中自己。
+    const reusedName = next.bindings.some((item) => item.taskId === taskId && item.name === name)
 
     // 步 e：创建成员。
     let prompt = ''
@@ -407,6 +534,11 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
         }),
       )
       started.push(taskId)
+      // 只在 spawn 成功后记录消歧（失败侧不产生 notice），且只记录**真消歧**：
+      // 本名不算（suffix=0）、沿用自己老 binding 的同名也不算（重试/重建不重复提示）。
+      if (assignment.suffix > 0 && !reusedName) {
+        renamed.push({ taskId, base: assignment.base, final: name })
+      }
       changed = true
       slots -= 1
     } catch (error) {
@@ -415,7 +547,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   }
 
   if (changed) deps.store.save(next)
-  return { state: next, started, skipped, errors }
+  return { state: next, started, skipped, errors, renamed }
 }
 
 /**

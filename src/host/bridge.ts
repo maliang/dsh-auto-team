@@ -67,6 +67,12 @@ export interface DispatchOutcome {
   started: string[]
   skipped: Array<{ taskId: string; reason: string }>
   errors: Array<{ taskId: string; error: string; code?: RejectionCode }>
+  /**
+   * 本轮因成员名被占用而改用带序号名字的任务（AC-5）。
+   * 结构化内联、不 import team/ 层的类型：bridge 是编排接口层，与 dispatch.ts 保持解耦。
+   * 缺省/空数组 = 没有改名（沿用既有 binding 名不重复提示）。
+   */
+  renamed?: Array<{ taskId: string; base: string; final: string }>
 }
 
 export type DispatchPort = (state: RunState) => Promise<DispatchOutcome>
@@ -458,6 +464,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
           const outcome = await deps.dispatch(state)
           const notices: string[] = []
+          // 消歧提示排在「已创建 N 个成员」之后、跳过/失败之前（TECHNICAL §2.4 的 notice 顺序）：
+          // 改名是「这条被创建了、只是名字不同」的补充说明，先读创建再看异常。
+          for (const rename of outcome.renamed ?? []) {
+            const title = state.plan.tasks.find((task) => task.id === rename.taskId)?.title
+            notices.push(
+              `任务「${title ?? rename.taskId}」(${rename.taskId}) 的成员名 ${rename.base} 已被占用，已改用 ${rename.final} 派发`,
+            )
+          }
           for (const skipped of outcome.skipped) {
             notices.push(`${skipped.taskId} 跳过：${skipText(skipped.reason)}`)
           }
