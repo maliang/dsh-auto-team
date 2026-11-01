@@ -306,7 +306,21 @@ test('投影：新字段齐全时逐字保留（消息账本是 AC-16 的证据�
   assert.equal(extras.messages[0]?.from, 'captain')
   assert.equal(extras.messages[0]?.taskId, 't1')
   assert.equal(extras.routeAudits[0]?.verdict, 'ok')
-  assert.deepEqual(extras.concurrency, { limit: 5, running: 2, source: 'host' })
+  assert.deepEqual(extras.concurrency, { limit: 5, running: 2, source: 'host', requested: 5, clamped: false })
+})
+
+test('并发：设置大于实际生效时必须标记 clamped 且保留用户填的值（R2 / QA-R7-03）', () => {
+  const clamped = viewExtras(
+    snapshotOf({ concurrency: { limit: 3, running: 0, source: 'host', requested: 6, clamped: true } }),
+  )
+  assert.equal(clamped.concurrency.limit, 3)
+  assert.equal(clamped.concurrency.requested, 6)
+  assert.equal(clamped.concurrency.clamped, true)
+
+  // 老快照（没有 requested/clamped）必须按「没被夹」降级，不能凭空报一句夹取说明。
+  const legacy = viewExtras(snapshotOf({ concurrency: { limit: 3, running: 0, source: 'host' } }))
+  assert.equal(legacy.concurrency.requested, 3)
+  assert.equal(legacy.concurrency.clamped, false)
 })
 
 /* ────────────────────────── 动作回执（唯一解包口） ────────────────────────── */

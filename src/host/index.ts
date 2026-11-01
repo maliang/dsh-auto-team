@@ -127,12 +127,21 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     return listHostMembers(ctx)
   }
 
-  function hostConcurrency(): { limit: number; source: 'host' | 'default' } {
+  function hostConcurrency(): {
+    limit: number
+    source: 'host' | 'default'
+    requested: number
+    clamped: boolean
+  } {
     const host = resolveConcurrencyLimit(ctx)
     // AC-13 生效点①：设置是**天花板**，不替代宿主约束 —— 宿主给的更小就以宿主为准，
     // 否则「设置 8」会让面板宣称能跑 8 个而宿主只肯给 3 个（并发越权 + 面板说谎）。
     const cap = settingsRepo.read().concurrencyLimit
-    return host.limit <= cap ? host : { limit: cap, source: host.source }
+    // R2（QA-R7-03）：夹取必须可解释 —— 把「用户填的值」与「是否被夹」一起下发，
+    // 界面就能显示「设置 6 · 实际生效 3（宿主上限更小）」，而不是让数字无声地不一样。
+    return host.limit <= cap
+      ? { limit: host.limit, source: host.source, requested: cap, clamped: false }
+      : { limit: cap, source: host.source, requested: cap, clamped: true }
   }
 
   /**

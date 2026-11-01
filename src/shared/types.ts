@@ -277,6 +277,15 @@ export interface ConcurrencyView {
   running: number
   /** host = 宿主给出了并发上限；default = 用插件默认值（MAX_CONCURRENT_LIMIT）。 */
   source: 'host' | 'default'
+  /**
+   * 用户在设置里填的上限（R2 修正：QA-R7-03）。
+   *
+   * 设置是**天花板**而不是命令：宿主只肯给 3 个时填 6 不会提升并发。界面上必须能看出
+   * 「填了 6、实际生效 3」，否则用户只会看到数字跟填的不一样而没有任何解释。
+   */
+  requested: number
+  /** true = `requested` 被更小的上限（宿主或计划）夹住了，`limit` 才是实际生效值。 */
+  clamped: boolean
 }
 
 /* ─────────────────────────────── 面板快照（HTTP / 工具共用） ─────────────────────────────── */

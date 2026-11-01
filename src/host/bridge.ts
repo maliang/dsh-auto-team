@@ -139,7 +139,7 @@ export interface BridgeDeps {
   /** 门禁执行上下文：cwd 用于跑验收命令，artifactsDir 落全量日志（AC-19）。 */
   gate: { cwd: string; artifactsDir: string; timeoutMs?: number }
   /** 宿主并发上限（adapters.resolveConcurrencyLimit）；缺省按 MAX_CONCURRENT_LIMIT 且标注 default。 */
-  hostConcurrency?: () => { limit: number; source: 'host' | 'default' }
+  hostConcurrency?: () => { limit: number; source: 'host' | 'default'; requested?: number; clamped?: boolean }
   /**
    * 停滞判定阈值（毫秒）。缺省 `STALL_MS`。
    *
@@ -565,7 +565,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
     const limit = state
       ? Math.min(state.plan.maxConcurrent, host.limit, MAX_CONCURRENT_LIMIT)
       : Math.min(host.limit, MAX_CONCURRENT_LIMIT)
-    return { limit, running, source: host.source }
+    // R2：`requested` 是用户/计划想跑的上限，`limit` 是真正生效的那个；两者不等就是被夹了。
+    const requested = Math.max(host.requested ?? host.limit, 1)
+    return { limit, running, source: host.source, requested, clamped: limit < requested }
   }
 
   function snapshot(sessionId: string): PanelSnapshot {

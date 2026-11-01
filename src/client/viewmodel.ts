@@ -137,6 +137,10 @@ export interface ConcurrencyView {
   limit: number
   running: number
   source: 'host' | 'default'
+  /** 用户设置里填的上限；缺省等于 `limit`（老快照没有这两个字段时按「没被夹」渲染）。 */
+  requested: number
+  /** true = 填的值被更小的上限夹住，界面必须给出可读说明（R2 / QA-R7-03）。 */
+  clamped: boolean
 }
 
 export interface ViewExtras {
@@ -213,10 +217,14 @@ function concurrencyOf(value: unknown, tasks: PlanTask[]): ConcurrencyView {
   const raw = (value ?? {}) as Record<string, unknown>
   const limit = num(raw.limit)
   const running = num(raw.running)
+  const effective = limit !== undefined && limit > 0 ? limit : FALLBACK_CONCURRENCY_LIMIT
+  const requested = num(raw.requested)
   return {
-    limit: limit !== undefined && limit > 0 ? limit : FALLBACK_CONCURRENCY_LIMIT,
+    limit: effective,
     running: running !== undefined && running >= 0 ? running : countRunning(tasks),
     source: raw.source === 'host' ? 'host' : 'default',
+    requested: requested !== undefined && requested > 0 ? requested : effective,
+    clamped: requested !== undefined && requested > effective,
   }
 }
 

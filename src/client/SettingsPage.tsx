@@ -165,6 +165,14 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
     }
   }
 
+  // R2（QA-R7-03）：设置是天花板，不是命令。填了比宿主更大的值时必须当场说清
+  // 「实际生效多少」，否则用户只会看到并发数跟自己填的不一样而不知道为什么。
+  const concurrency = state.snapshot?.concurrency
+  const clampNote =
+    concurrency && concurrency.clamped
+      ? `受更小的上限约束，实际生效 ${String(concurrency.limit)}（设置 ${String(concurrency.requested)}）`
+      : undefined
+
   const rows = settingsKeysView(settings)
 
   return (
@@ -227,8 +235,8 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
                   onChange={(event) => patch(numberKey, event.target.value)}
                 />
               </span>
-              <span data-setting-hint id={hintId}>
-                {errors[numberKey] ?? row.hint}
+              <span data-setting-hint id={hintId} data-setting-clamped={numberKey === 'concurrencyLimit' && clampNote ? 'true' : 'false'}>
+                {errors[numberKey] ?? (numberKey === 'concurrencyLimit' ? clampNote : undefined) ?? row.hint}
               </span>
             </div>
           )

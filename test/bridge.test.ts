@@ -555,7 +555,8 @@ test('snapshot 契约：plannedAt / concurrency 三元组 / messages / routeAudi
   const snapshot = bridge.snapshot(SESSION)
   assert.equal(snapshot.enabled, true)
   assert.equal(snapshot.plannedAt, NOW)
-  assert.deepEqual(snapshot.concurrency, { limit: 3, running: 1, source: 'host' })
+  // R2：计划上限（3）小于宿主给的（5）→ 实际生效 3，但用户一侧的意图 5 必须保留并可解释。
+  assert.deepEqual(snapshot.concurrency, { limit: 3, running: 1, source: 'host', requested: 5, clamped: true })
   assert.deepEqual(snapshot.messages, [])
   assert.deepEqual(snapshot.routeAudits, [])
   assert.equal(snapshot.members.length, 1)
