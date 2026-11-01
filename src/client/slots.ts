@@ -24,9 +24,9 @@
  * r10 把胶囊挪进输入框左侧的操作区 —— 留旧槽位会让同一个开关出现两份状态与两条点击链（AC-1）。
  * **旧槽位名在本文件里一个字都不留**，重复出现就是两处漂移的温床。
  *
- * 禁用槽位（`replaceRisk: shadows-shipped-ui`，占住会遮住宿主自带 UI）：
- * `conversation.composer.bar`、`conversation.input.activity`、
- * `conversation.session.header.corner`、`shell.leading`、`settings.header`。
+ * 禁用槽位（`replaceRisk: shadows-shipped-ui`，占住会遮住宿主自带 UI）：清单见
+ * `docs/teamflow/architecture/UI-SLOTS.md` §1 里标了 shadows 的五位。**本文件不复述槽名** ——
+ * 复述就是第二份真相，且 AC-2 要求在 `src/` 里零命中这些名字（含注释）。
  *
  * 硬约束（AC-1 / AC-2 / AC-11）：
  *   1. `slots.inject(A, cb)` 的 `A` 与 `cb` 内 `register({ name })` 的 `name` 逐字相同；

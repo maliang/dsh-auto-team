@@ -300,20 +300,31 @@ export function createBridge(deps: BridgeDeps): Bridge {
     }))
   }
 
-  /** 系统技能投影（r10 AC-19）：只下发 name/description，正文在保存时由宿主按 systemName 现读。 */
-  function systemSkillsOf(): { name: string; description: string }[] {
+  /**
+   * 系统技能扫描（r10 AC-19 / AC-18b）：**只扫一次盘**，投影与不可用原因一起带出去。
+   *
+   * 为什么连 reason 一起下发：「扫到 0 条」与「本机没有这个库」在界面上必须长得不一样。
+   * 只给空数组，用户看到的就是「弹层空着、也不说为什么」——验收 R2 卡的就是这一处。
+   */
+  function systemSkillScan(): { skills: { name: string; description: string }[]; reason?: string } {
     const source = deps.systemSkills
-    if (source === undefined) return []
+    if (source === undefined) return { skills: [], reason: '系统技能库未装配（宿主未注入扫描器）' }
     try {
-      return source
-        .scan()
-        .skills.map((skill: { name: string; description: string }) => ({ name: skill.name, description: skill.description }))
-    } catch {
+      const scan = source.scan()
+      return {
+        skills: scan.skills.map((skill: { name: string; description: string }) => ({
+          name: skill.name,
+          description: skill.description,
+        })),
+        ...(scan.reason === undefined ? {} : { reason: scan.reason }),
+      }
+    } catch (error) {
       // 扫描器自身已按「坏文件跳过 + reason」降级（roles/system-skills.ts）；这里只兜最后一道，
       // 绝不让一条坏 SKILL.md 把整个快照打成异常（面板会连角色一起读不出来）。
-      return []
+      return { skills: [], reason: `系统技能库扫描失败：${error instanceof Error ? error.message : String(error)}` }
     }
   }
+
   const flags = loadFlags()
   let messageSeq = 0
   let gateQueueDepth = 0
@@ -725,6 +736,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 不能在这里编一个默认值假装正常——面板的职责是把「我不知道」显示出来（anti-goal 5）。
     const health = deps.triggerHealth?.()
     const captain = deps.captainModel?.()
+    // 系统技能只扫一次盘：投影与「为什么是空」必须来自同一次扫描，否则会出现
+    // 「列表为空、reason 说库可用」这种自相矛盾的快照（同 settings 的理由）。
+    const systemSkillView = systemSkillScan()
     // 暂停态（AC-15）：`paused` 是布尔，按钮文案与 `data-paused` 都只看它；
     // `pausedAt` 只在真暂停时给。计划状态是权威判据（重启后 pause 记录可能被
     // store.normalizePause 丢掉，但 plan.status 一定还在）。
@@ -761,7 +775,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // r10 AC-16/AC-19：模型清单与系统技能库。两者都是「宿主能力」，缺省时必须把
       // 「为什么是空」一路带到面板（reason），不能只给一个空数组冒充「本来就没有」。
       modelCatalog: deps.modelCatalog?.() ?? { status: 'empty', options: [], reason: '宿主未提供模型清单' },
-      systemSkills: systemSkillsOf(),
+      systemSkills: systemSkillView.skills,
+      // 库不可用/未装配时把原因带下去（AC-18b）：`systemSkills: []` + 无 reason 会被界面
+      // 读成「本机就是没有技能」，用户面对空列表却看不到为什么（验收 R2）。
+      ...(systemSkillView.reason === undefined ? {} : { systemSkillsReason: systemSkillView.reason }),
       ...(captain === undefined ? {} : { captainModel: captain }),
       degraded: health?.degraded === true,
       ...(health?.degraded === true

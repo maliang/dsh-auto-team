@@ -284,6 +284,7 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
         busy={busy}
         modelCatalog={state.snapshot?.modelCatalog}
         systemSkills={state.snapshot?.systemSkills}
+        systemSkillsReason={state.snapshot?.systemSkillsReason}
         readSkill={(id: string): Promise<Result<SkillBodyPayload>> => panelApi.readSkill(sessionId ?? '', id)}
         onSave={(role?: Role, mutations?: SkillMutation[]) =>
           void roleAction(

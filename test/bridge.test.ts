@@ -1040,8 +1040,24 @@ test('r10：未装配技能仓储时明确拒绝（不假装保存成功），�
   assert.equal(snapshot.modelCatalog?.status, 'empty')
   assert.ok((snapshot.modelCatalog?.reason ?? '').length > 0, '没有模型清单必须给原因')
   assert.deepEqual(snapshot.systemSkills, [])
+  assert.match(snapshot.systemSkillsReason ?? '', /未装配/, '系统技能库不可用时必须把原因带下去（r10 验收 R2）')
   assert.ok((snapshot.skills ?? []).length > 0, '没装配仓储时回退内置技能投影，列表不能凭空空掉')
   assert.ok((snapshot.skills ?? []).every((skill) => skill.source === 'builtin' && skill.modified === false))
+})
+
+test('r10：系统技能库「扫了但没有」与「库不存在」在快照上可分（reason 只在不可用时出现）', async () => {
+  const ok = setup({ skills: fakeSkills().repo, systemSkills: fakeSystemSkills })
+  await enable(ok.bridge)
+  assert.equal(ok.bridge.snapshot(SESSION).systemSkillsReason, undefined, '库可用时不许编造原因')
+
+  const broken = {
+    scan: () => ({ skills: [], reason: '本机没有系统技能库（/tmp/none 不存在）' }),
+  } as unknown as NonNullable<BridgeDeps['systemSkills']>
+  const missing = setup({ skills: fakeSkills().repo, systemSkills: broken })
+  await enable(missing.bridge)
+  const snapshot = missing.bridge.snapshot(SESSION)
+  assert.deepEqual(snapshot.systemSkills, [])
+  assert.match(snapshot.systemSkillsReason ?? '', /本机没有系统技能库/, '库不存在时必须给出可读原因')
 })
 
 test('r10：装配后快照的技能投影与模型清单来自注入的仓储/缓存（不自行编造）', async () => {

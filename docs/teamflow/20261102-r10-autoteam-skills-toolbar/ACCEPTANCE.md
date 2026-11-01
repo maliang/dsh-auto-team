@@ -113,3 +113,48 @@
 > 回改只动 A1/A2/A3 三处（均在既有文件内，不新增模块、不改形状冻结的 15/9/3/1），因此回改后本报告的 PASS 结论无需重算，只需补 AC-2 与 A2 的证据行。
 
 验收结论：⚠️ 有条件通过
+
+## 6. 主 agent 收口记录（R1 + R2 已关闭，2026-11-02）
+
+> 只追加记录，不修改 §2 的原始判定与文末「⚠️ 有条件通过」——历史裁定保持可追溯。
+> 由用户拍板「我直接改 R1+R2，然后真机验」，执行人为主 agent（非流水线）。
+
+### R1（AC-2 字面未达）→ 已关闭
+
+改动：删掉注释里的旧/禁用槽名，改成指向仓库事实页，避免第二份真相。
+- `src/client/state.ts:5`：`开关行（conversation.composer.dock）` → `开关胶囊（工具条左侧）`
+- `src/client/slots.ts:27-29`：整行禁用槽位清单 → 「清单见 `docs/teamflow/architecture/UI-SLOTS.md` §1 里标了 shadows 的五位。**本文件不复述槽名**」
+
+复验（AC-2 判据原文命令）：
+```
+$ grep -rn "conversation\.composer\.\(bar\|dock\)\|conversation\.input\.activity\|shell\.leading" src | wc -l
+0
+```
+
+### R2（`systemSkillsReason` 死字段）→ 已关闭（选方案 ①：接线）
+
+改动（三处既有文件，未新增模块、未动形状冻结 15/9/3/1）：
+- `src/shared/types.ts:414-421`：`PanelSnapshot.systemSkillsReason?: string`，注释写明「空数组分不清『扫了但没有』与『库不存在』」；
+- `src/host/bridge.ts:303-326`：`systemSkillsOf()` → `systemSkillScan()`，**一次扫描**同时给出投影与 `reason`（未装配 / 扫描抛错 / 扫描器自带 reason 三条路径）；
+- `src/host/bridge.ts:742-745,779-783`：`snapshot()` 里只扫一次盘并条件下发 `systemSkillsReason`（可用时**不带**，不许编造原因）；
+- `src/client/tabs/RolesTab.tsx:53`、`src/client/SettingsPage.tsx:286`：透传 `systemSkillsReason` 给 `RoleEditorList`（该组件与 `SkillDialogs` 早已有 `reason` 入口，此前无人赋值）。
+
+新增判据（`test/bridge.test.ts`）：
+- 未装配时 `assert.match(snapshot.systemSkillsReason, /未装配/)`；
+- 新用例「扫了但没有 vs 库不存在可分」：可用时 `reason === undefined`，扫描器给 reason 时原样带出。
+
+复验：
+```
+$ pnpm -s typecheck                                  # exit 0
+$ pnpm -s test                                       # tests 483 / pass 483 / fail 0（r10 交付 482 + 本处 1 条新用例）
+$ pnpm -s build                                      # lib/index.js 303.49 kB / gzip 102.66 kB
+$ node --input-type=module -e "await import('./lib/index.js')"    # IDX_OK
+$ node --input-type=module -e "await import('./lib/client.js')"   # CLI_OK
+$ node logs/…/r10-qa-static.mjs                      # SUMMARY pass=94 fail=0
+$ node logs/…/r10-qa-e2e.mjs                         # SUMMARY pass=40 fail=0
+```
+
+### 仍未闭合（属于 §5 的 R4/R5 中未做部分）
+- R3（命名对齐 `AutoTeamSettingsSection` / 登记 r7 checker 冻结快照待办）：**未做**，仅记录。
+- R5 收口提交：本记录随之入仓（`git log` 见 r10 收口提交）。
+- R4 真机七项：按 §4.4 执行，结果另见 §7。

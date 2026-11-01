@@ -51,6 +51,7 @@ export function RolesTab(props: TabProps): React.ReactElement {
         busy={busy}
         modelCatalog={snapshot?.modelCatalog}
         systemSkills={snapshot?.systemSkills}
+        systemSkillsReason={snapshot?.systemSkillsReason}
         readSkill={readSkill}
         onSave={(role?: Role, mutations?: SkillMutation[]) =>
           void run(

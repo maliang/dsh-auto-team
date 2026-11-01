@@ -412,6 +412,13 @@ export interface PanelSnapshot {
   modelCatalog?: ModelCatalogView
   /** r10 AC-19：本机系统技能库投影（缺省 = 没扫描或本机没有该库，界面给可读说明）。 */
   systemSkills?: SystemSkillInfo[]
+  /**
+   * r10 AC-18b：系统技能库**不可用/未装配**时的可读原因（`systemSkills` 为空且本字段在时显示它）。
+   *
+   * 为什么要单独一个字段：空数组本身分不清「扫了但没有」与「库不存在」——不给原因，
+   * 用户看到的就是一个空列表外加零解释（验收 R2 的原始缺陷）。
+   */
+  systemSkillsReason?: string
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */

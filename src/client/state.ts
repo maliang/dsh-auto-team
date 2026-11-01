@@ -2,7 +2,7 @@
  * 面板状态：**模块级单例 store** + `useSyncExternalStore`。
  *
  * 为什么不再是「每个 hook 一份 useState + setInterval」（缺陷 D7 同族，TECHNICAL §7）：
- *  - 开关行（`conversation.composer.dock`）与面板（`sidebar.right.pane.tab`）各自 hook 一次，
+ *  - 开关胶囊（工具条左侧）与面板（右栏页签）各自 hook 一次，
  *    就是**两份状态 + 两个 timer**：请求翻倍，且两处显示可能不一致（"开关是开的、面板说没开"）。
  *    单例 store 让两个挂载面读同一份数据 —— ARCHITECTURE 声称的"唯一数据源"才真的成立；
  *  - 单 timer 才能按活跃度调档：有运行中任务 2s（`PANEL_ACTIVE_MS`），空闲 5s（`PANEL_IDLE_MS`），
