@@ -63,10 +63,17 @@ import type { CaptainModelView } from '../shared/types.ts'
 export const name = 'auto-team'
 
 /**
- * 只需要两个「一定存在」的服务做必需依赖；其余（agentTeams/llm/webServer）按可选访问，
- * 缺失时功能降级而不是整插件加载失败（AC-9）。
+ * 硬依赖声明（cordis 的 `inject` 数组 = 全部 required；写入入口才与宿主加载顺序对齐）。
+ *
+ * 铁律：每个名字都必须对应源码里的一处 `ctx.<name>` 裸访问。漏声明的后果**不是功能降级**，
+ * 而是整条 entry 不激活（`dsh: warning: 1 entry did not activate` +
+ * `cannot get property "x" without inject`），真机上表现为「工具在、面板永远不出现」。
+ * 名单的唯一判据是 `test/host-contract.test.ts`（刻意双写：这里实现、那里断言，不许第三处抄写）。
+ *
+ * 可选服务 `webServer` / `llm` / `agentDefaultModel` **不许**出现在这里：它们只能经
+ * `adapters.optionalService()` 走 `ctx.get` 读取（缺失时降级，不能拖垮整条 entry）。
  */
-export const inject = ['tools', 'systemPrompt']
+export const inject = ['tools', 'systemPrompt', 'agents', 'agentTeams']
 
 /** 队长提示词里的会话标识：单会话 profile 下用 'current' 与实际工具调用元信息对齐。 */
 const DEFAULT_SESSION = 'current'

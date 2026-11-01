@@ -85,6 +85,15 @@ function makeHarness(): Harness {
     systemPrompt: { section: (section: unknown) => void sections.push(section as Harness['sections'][number]) },
     webServer: { register: (route: unknown) => void routes.push(route as PanelRoute) },
     agents: { currentInitiator: () => ({ id: 'captain', name: 'captain' }) },
+    /**
+     * cordis 的可选服务读取口（r6 的根因修复）：宿主只把**硬依赖**挂成 `ctx.<name>`，
+     * 可选服务（webServer / llm / agentDefaultModel）必须经 `ctx.get("<name>")` 才能读到。
+     * 假 ctx 若只把它们写成普通字段，mock 永远测不出「真实宿主里读不到」——
+     * 所以这里照真宿主实现 get，让装配层走与真机相同的读取路径。
+     */
+    get(name: string): unknown {
+      return (ctx as Record<string, unknown>)[name]
+    },
     agentTeams: {
       listMembers: async () => {
         listCalls += 1
@@ -200,7 +209,9 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
 
   // ---- ① 注册面：三样东西都必须真的注册上（任一失败会被 try/catch 吞成 warn）
   assert.equal(name, 'auto-team')
-  assert.deepEqual(inject, ['tools', 'systemPrompt'])
+  // 硬依赖 = 源码里全部 `ctx.<service>` 裸访问（判据在 test/host-contract.test.ts 的扫描断言里）；
+  // r6 之前这里少了两项，真机因此整条 entry 不激活。
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'agents', 'agentTeams'])
   assert.deepEqual(
     h.tools.map((tool) => tool.name).sort(),
     [

@@ -15,6 +15,7 @@ cordis_inspect_query({ platform: "host", provider: "Event", method: "listEvents"
   `Host Cordis inspect Event.listEvents rejected input: "input" must be an object` ——
   **这是调用姿势错误，不是环境不可用**。见到这条错误，改姿势重试一次；再失败就去读 `/tmp/dsh-src/` 里的宿主源码，**不要重复同一形状的调用**。
 - 其他 provider 同理：`Service` / `Event` / `Config` / `Tool`（host 侧），方法名见 `cordis_inspect_list`。
+- **client 侧（`platform: "client"`）规则完全一样**：`Service` / `Event` / `Builtin` / `Slots` / `Theme` 五个 provider，同样必须传对象形式的 `input`。会话里已第四次踩同坑（r1 scaffold、r4 tech、r5 dev-T5、r6 QA 的 `Slots.listSubTree`，累计约 950k 新增 token），四次报错文字只差 provider 名。**只要看到 `rejected input: "input" must be an object`，先改调用姿势，绝不要判阶段 env-unavailable。**
 
 ## 2. 事件目录（实测，2026-11-01）
 

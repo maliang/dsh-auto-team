@@ -8,6 +8,17 @@
  * 本版形状于 2026-10-30 用 cordis_inspect_query（provider=Service, method=listService）
  * 对 tools / systemPrompt / webServer / agentTeams / llm / agentDefaultModel 逐个实测确认，
  * 证据与原始签名见 ARCHITECTURE.md §7。凡标 [已核] 的字段名都来自那次实测输出，不是猜测。
+ *
+ * ── 服务访问纪律（r6 T1，铁律，改前先读）────────────────────────────────────
+ * 1. 硬依赖（tools / systemPrompt / agents / agentTeams）只能通过 `ctx.<service>` 裸读，
+ *    且该服务名**必须**同时出现在 `src/host/index.ts` 的 `inject` 字面清单里。cordis 的
+ *    `inject` 语义是「数组 = 全部 required」：漏声明的后果不是功能降级，而是整条 entry
+ *    不激活（`dsh: warning: 1 entry did not activate` + `cannot get property "x" without inject`）。
+ * 2. 可选服务（名单见下面的 `OPTIONAL_SERVICES`）**只允许**经 `optionalService(ctx, name)`
+ *    走 `ctx.get` 读取。任何模块（包括本文件）都不许再写 `ctx.webServer` / `ctx.llm` /
+ *    `ctx.agentDefaultModel` 直读，也不许自己调 `ctx.get('<服务名>')` —— 单一登记处原则。
+ * 3. 宿主不提供可选服务（或 ctx 没有 `get`）时**降级为 undefined + warn，绝不回退裸读**：
+ *    回退就等于把 r6 之前的「真机不激活」缺陷重新种回来（mock 全绿、真机全灭）。
  */
 import type { RejectionCode, Role, RoleModelRoute } from '../shared/types.ts'
 import type { HostMember } from './team/watcher.ts'
@@ -37,6 +48,7 @@ export interface HostContext {
   /** [已核] `section(section: PromptSection): () => void`，PromptSection 用 `text` 字段。 */
   systemPrompt?: { section(section: unknown): (() => void) | void }
   /** [已核] `register(route: WebRoute)`，WebRoute = { kind: 'exact'|'prefix', path, handler(req,res) }。 */
+  /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'webServer') 读取，不要裸读本字段。 */
   webServer?: { register(route: unknown): (() => void) | void }
   /** [已核] 当前异步链上的发起 Agent。tools 执行期可用（ctx.agents.currentInitiator）。 */
   agents?: {
@@ -63,12 +75,70 @@ export interface HostContext {
    */
   effect?(dispose: () => void | Promise<void>): unknown
   /** [已核] `resolveCallConfig(config: LlmCallConfig, signal?)`，入参/返回值同为 { provider, model, ...controls }。 */
+  /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'llm') 读取，不要裸读本字段。 */
   llm?: { resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown> }
   /** 会话默认模型选择（provider/model）；用作 spawn 的 provider 兜底。 */
+  /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'agentDefaultModel') 读取，不要裸读本字段。 */
   agentDefaultModel?: { currentSelection?(): unknown }
+  /**
+   * [已核] Cordis 的可选服务读取口。可选服务**只能**经本文件的 optionalService() 走这里读；
+   * 缺 `get`（旧宿主 / 手搓 fake ctx）时一律按服务缺失降级，不回退裸读。
+   */
+  get?<T = unknown>(name: string): T | undefined
   logger?: { warn?: (message: string) => void; info?: (message: string) => void }
   /** Cordis 事件订阅形态（ctx.on(event, listener)）；事件名/payload 尚未实测，仅用于兜底。 */
   on?: (event: string, listener: (...args: unknown[]) => void) => (() => void) | void
+}
+
+/**
+ * 可选服务白名单 —— **唯一登记处**（纪律 §2）。
+ *
+ * 名词定义：可选服务 = 宿主缺它时插件仍要能激活（只是相关功能降级）的服务。
+ * 往这里加名字之前先确认两件事：① 宿主真实注册的服务名逐字一致；② `inject` 里**不**出现它
+ * （同时出现会让 cordis 把整条 entry 判为 required，可选语义立刻消失）。
+ * 测试 `test/host-contract.test.ts` 会断言 inject ∩ OPTIONAL_SERVICES === ∅。
+ */
+export const OPTIONAL_SERVICES = ['webServer', 'llm', 'agentDefaultModel'] as const
+
+/** 可选服务名（从白名单派生，不许另写一份字面量）。 */
+export type OptionalServiceName = (typeof OPTIONAL_SERVICES)[number]
+
+/** 各可选服务的最小形状（[已核] 字段名来自 ARCHITECTURE §7 的实测输出）。 */
+export interface OptionalServiceMap {
+  webServer: { register(route: unknown): (() => void) | void }
+  llm: { resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown> }
+  agentDefaultModel: { currentSelection?(): unknown }
+}
+
+/**
+ * 读一个**可选**服务：唯一入口，只走 `ctx.get`（纪律 §2/§3）。
+ *
+ * 三种降级路径各自 warn 并返回 undefined，**任何一条都不许回退裸读**：
+ *  - ctx 没有 get（旧宿主 / 手搓 fake ctx）→ 按缺失处理；
+ *  - 宿主没注册该服务（get 返回 undefined/null）→ 按缺失处理；
+ *  - get 抛错（服务加载失败等）→ 按缺失处理，异常不出本函数。
+ * 调用方拿到 undefined 后各自降级（不注册路由 / 不带模型覆盖 / 跳过预校验）。
+ */
+export function optionalService<K extends OptionalServiceName>(
+  ctx: HostContext,
+  name: K,
+): OptionalServiceMap[K] | undefined {
+  const getter = ctx.get
+  if (typeof getter !== 'function') {
+    ctx.logger?.warn?.(`[auto-team] 宿主 ctx 缺少 get()，可选服务 ${name} 按缺失降级`)
+    return undefined
+  }
+  try {
+    const service = getter.call(ctx, name) as OptionalServiceMap[K] | undefined | null
+    if (service === undefined || service === null) {
+      ctx.logger?.warn?.(`[auto-team] 宿主未提供可选服务 ${name}，相关功能降级`)
+      return undefined
+    }
+    return service
+  } catch (error) {
+    ctx.logger?.warn?.(`[auto-team] 读取可选服务 ${name} 失败（${messageOf(error)}），按缺失降级`)
+    return undefined
+  }
 }
 
 export interface ToolSpec {
@@ -178,9 +248,9 @@ export function registerHttpRoutes(
   routes: HttpRoute[],
   prefix: string = BRIDGE_ROUTE,
 ): boolean {
-  const sink = ctx.webServer
+  // 可选服务：只经 optionalService 走 ctx.get（缺失时它已 warn，这里只降级不重复告警）。
+  const sink = optionalService(ctx, 'webServer')
   if (!sink?.register) {
-    ctx.logger?.warn?.('[auto-team] 宿主未提供 webServer 服务，面板将只能看到空快照')
     return false
   }
   try {
@@ -393,7 +463,10 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
 
   function fallbackProvider(): string {
     try {
-      const selection = ctx.agentDefaultModel?.currentSelection?.() as { provider?: unknown } | undefined
+      // 可选服务：缺宿主默认模型选择时返回空串（spawn 侧给出明确报错），不回退裸读。
+      const selection = optionalService(ctx, 'agentDefaultModel')?.currentSelection?.() as
+        | { provider?: unknown }
+        | undefined
       if (typeof selection?.provider === 'string' && selection.provider !== '') return selection.provider
     } catch {
       /* 读不到就用空串，由宿主给出明确报错 */
@@ -500,13 +573,13 @@ export interface RoutePorts {
 export function createRoutePorts(ctx: HostContext): RoutePorts {
   return {
     async resolveRoute(route) {
-      const resolver = ctx.llm?.resolveCallConfig
-      if (!resolver) {
-        ctx.logger?.warn?.('[auto-team] 宿主未提供 llm.resolveCallConfig，跳过模型路由预校验')
+      // 可选服务：只经 optionalService 走 ctx.get（缺失时它已 warn：跳过模型路由预校验，放行声明值）。
+      const llm = optionalService(ctx, 'llm')
+      if (!llm?.resolveCallConfig) {
         return route
       }
       try {
-        const resolved = await resolver({ provider: route.provider, model: route.model })
+        const resolved = await llm.resolveCallConfig({ provider: route.provider, model: route.model })
         if (resolved === undefined || resolved === null) return null
         return route
       } catch (error) {

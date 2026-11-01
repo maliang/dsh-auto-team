@@ -9,10 +9,12 @@ import assert from 'node:assert/strict'
 import {
   agentOfToolEvent,
   captainAgentScopeOf,
+  createSpawnPorts,
   installCaptainRoute,
   listHostMembers,
   onHostTriggerEvents,
   onMemberProgress,
+  optionalService,
   registerAgentCreated,
   registerEffect,
   registerHttpRoutes,
@@ -65,7 +67,9 @@ test('prompt section 用 text 字段（不是 render/content）', () => {
 
 test('HTTP 桥注册单条 prefix 路由，并按 method + path 分发、自己写 res', async () => {
   const registered: Array<{ kind: string; path: string; handler: Function }> = []
-  const ctx = { webServer: { register: (route: unknown) => void registered.push(route as never) } }
+  // webServer 是**可选服务**：宿主只经 ctx.get('webServer') 交付，裸字段访问在真机上会被 cordis 拦掉。
+  const services: Record<string, unknown> = { webServer: { register: (route: unknown) => void registered.push(route as never) } }
+  const ctx = { get: (name: string) => services[name] } as unknown as HostContext
   const routes: HttpRoute[] = [
     {
       method: 'GET',
@@ -327,14 +331,16 @@ test('spawnMember：返回 memberId + 我们声明的名字（恢复靠名字重
   const requests: Array<Record<string, unknown>> = []
   const ctx = {
     agents: { currentInitiator: () => ({ id: 'captain' }) },
-    agentDefaultModel: { currentSelection: () => ({ provider: 'session-default' }) },
+    // agentDefaultModel 是可选服务：只经 ctx.get 交付（见 optionalService 的白名单纪律）。
+    get: (name: string) =>
+      name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'session-default' }) } : undefined,
     agentTeams: {
       spawnTeammate: async (_caller: unknown, request: unknown) => {
         requests.push(request as Record<string, unknown>)
         return { member: { id: 'm-1', name: 'dev-t1' } }
       },
     },
-  }
+  } as unknown as HostContext
   const plan = { runId: 'r1', sessionId: 's1', createdAt: 1, status: 'dispatching', tasks: [], maxConcurrent: 3 }
   const task = { id: 't1', title: '实现', roleId: 'dev', dependsOn: [], acceptance: 'x', status: 'pending' }
   const result = await spawnMember(ctx, {
@@ -744,4 +750,106 @@ test('installCaptainRoute：装在主 session 作用域上改写 provider/model 
   undo?.()
   assert.equal(listeners.get('agent/request')?.length, 0, 'disposer 必须能收回安装')
   assert.equal(listeners.get('system-prompt/assemble')?.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// r6：可选服务的降级路径（AC-5）
+// webServer / llm / agentDefaultModel 是**可选**服务：宿主缺它时必须降级，不能拖垮整条 entry。
+// 三条路径各自独立断言——否则「插件能激活」会掩盖「功能静默缺失」。
+// ---------------------------------------------------------------------------
+
+test('optionalService：ctx 没有 get 时按缺失降级（warn 且不抛，不回退裸读）', () => {
+  const warns: string[] = []
+  const ctx = {
+    // 旧宿主 / 手搓 fake ctx 的形态：服务字段存在，但没有 get 读取口。
+    webServer: { register: () => () => {} },
+    logger: { warn: (message: string) => void warns.push(message) },
+  } as unknown as HostContext
+
+  assert.equal(optionalService(ctx, 'webServer'), undefined, '没有 get 时必须返回 undefined')
+  assert.equal(warns.length, 1, `必须 warn 一次，实际 ${warns.length}`)
+  assert.match(warns[0] ?? '', /webServer/, 'warn 文案必须点名是哪个可选服务降级了')
+})
+
+test('optionalService：宿主未注册该服务时返回 undefined；get 抛错也被兜住', () => {
+  const warns: string[] = []
+  const logger = { warn: (message: string) => void warns.push(message) }
+
+  const missing = { get: () => undefined, logger } as unknown as HostContext
+  assert.equal(optionalService(missing, 'llm'), undefined, '服务缺失时返回 undefined')
+
+  const throwing = {
+    get: () => {
+      throw new Error('service load failed')
+    },
+    logger,
+  } as unknown as HostContext
+  assert.equal(optionalService(throwing, 'agentDefaultModel'), undefined, 'get 抛错必须兜住，异常不出本函数')
+  assert.equal(warns.length, 2, '两条降级路径各 warn 一次')
+  assert.match(warns[1] ?? '', /agentDefaultModel/, '异常路径的 warn 也要点名服务')
+})
+
+test('registerHttpRoutes：ctx.get 拿不到 webServer 时不注册路由并如实返回 false', () => {
+  let registered = 0
+  const ctx = {
+    // 有的宿主没有 webServer（纯 CLI profile）：此时面板不可用，但工具必须照常可用。
+    get: () => undefined,
+    logger: { warn: () => {} },
+  } as unknown as HostContext
+  const ok = registerHttpRoutes(ctx, [
+    { method: 'GET', path: '/api/auto-team/snapshot', handle: async () => ({ data: {} }) },
+  ])
+
+  assert.equal(ok, false, '没有 webServer 时必须返回 false（装配层据此告警，而不是假装注册成功）')
+  assert.equal(registered, 0)
+
+  // 反证：同一个 ctx 补上 webServer 后必须真注册——证明上面的 false 来自「服务缺失」而不是「根本没实现」。
+  const withSink = {
+    get: (name: string) => (name === 'webServer' ? { register: () => void (registered += 1) } : undefined),
+  } as unknown as HostContext
+  assert.equal(registerHttpRoutes(withSink, [{ method: 'GET', path: '/api/auto-team/snapshot', handle: async () => ({ data: {} }) }]), true)
+  assert.equal(registered, 1, '有 webServer 时必须注册一条 prefix 路由')
+})
+
+test('createSpawnPorts：缺 agentDefaultModel 时不带模型覆盖，并给出明确报错（不静默兜底）', async () => {
+  const requests: Array<Record<string, unknown>> = []
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: () => undefined, // 宿主没有默认模型选择
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async (_caller: unknown, request: unknown) => {
+        requests.push(request as Record<string, unknown>)
+        return { member: { id: 'm-1', name: 'dev-t1' } }
+      },
+    },
+  } as unknown as HostContext
+
+  const ports = createSpawnPorts(ctx)
+  const result = await ports.spawn({ prompt: '去做 t1', name: 'dev-t1', sessionId: 's1', taskId: 't1' })
+
+  assert.equal(result.ok, false, '既没声明模型也没有宿主默认模型时必须失败，不能凭空猜一个 provider')
+  assert.match(
+    (result as { error?: string }).error ?? '',
+    /无法确定成员的 provider/,
+    '报错必须说清缺的是什么（角色未声明模型 + 宿主无默认模型）',
+  )
+  assert.equal(requests.length, 0, '既然定不出 provider，就不该发出 spawn 请求')
+
+  // 反证：补上默认模型后同一条路径必须成功，且请求里带上该 provider（证明降级不是永久坏）。
+  const withDefault = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'host-default' }) } : undefined),
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async (_caller: unknown, request: unknown) => {
+        requests.push(request as Record<string, unknown>)
+        return { member: { id: 'm-2', name: 'dev-t2' } }
+      },
+    },
+  } as unknown as HostContext
+
+  const ok = await createSpawnPorts(withDefault).spawn({ prompt: '去做 t2', name: 'dev-t2', sessionId: 's1', taskId: 't2' })
+  assert.equal(ok.ok, true)
+  assert.equal(requests[0]?.provider, 'host-default', '有宿主默认模型时 provider 落成它')
 })
