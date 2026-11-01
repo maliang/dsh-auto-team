@@ -121,3 +121,37 @@ $ grep -c 'dsh-auto-team' ~/.dsh/profiles/desktop/package.json
 ```
 
 **结论**：R1 的验证判据全部满足（占位表述 0 命中、U1~U5 每行都有命令与返回值、「环境不可用」的两行都写明了原因与依据命令），**R1 关闭**。R2（`TRIGGER_KINDS` 双份字面量）本次未做，仍待整改；三条 P3 与真机补测清单同样未做。
+
+## 8. R2 收口记录（2026-11-01，主 agent 执行，用户拍板「我直接改」）
+
+**做了什么**：把 `TRIGGER_KINDS` 收敛为**跨文件单点**——定义移到 `src/host/config.ts:114`（配置单点，与 `TRIGGER_DEDUPE_MS`/`TRIGGER_LOG_LIMIT` 同族），`src/host/team/trigger.ts:84` 改为 re-export（保持既有 import 面：`test/trigger.test.ts:15` 与 `trigger-probe.mjs:89` 均仍从 trigger.ts 取），`src/host/store.ts:27` 直接 import。原 `src/host/store.ts:328` 那份重复字面量已删除。
+
+选 `config.ts` 而不是「让 store 反向 import team/trigger」的理由：`config.ts` 已经是全仓常量单点（`STALL_MS`/`NOWAIT_THRESHOLD_MS`/`TRIGGER_DEDUPE_MS` 的注释里都写着「全仓唯一定义处」），且它只 import `shared/const.ts`，`team/guard.ts` 已有「只 import config.ts（纯常量）」的先例；把白名单放这里，`store.ts`（读盘校验）与 `trigger.ts`（Fast 判据）都朝同一个方向依赖，不引入新的层次倒挂。
+
+**复验命令与返回值（实跑）**：
+
+```
+$ grep -rn "TRIGGER_KINDS: readonly" src | wc -l
+1
+$ pnpm -s typecheck
+typecheck exit=0
+$ pnpm -s test
+ℹ tests 311
+ℹ pass 311
+ℹ fail 0
+ℹ duration_ms 3231.982625
+$ pnpm -s build
+build exit=0   （lib/index.js 225.56 kB / gzip 75.57 kB）
+$ find src -newer lib/index.js -name '*.ts*' | wc -l
+0
+$ npm pack --dry-run
+total files: 5   （cordis.patch.yml 646B / lib/client.js 104.6kB / lib/index.js 225.6kB）
+```
+
+**回归探针（改后重跑，脚本从 host 归档目录拷回仓库内跑）**：
+
+- `trigger-probe.mjs` → `ALL PASS (33 asserts)`，含 `PASS [T8] Trigger 种类恰 4 个：gate_failed/member_exit/dep_ready/stall_timeout`、`PASS [T8] 四类的 action 全部落在既有 11 个 PanelAction 上`、`PASS [T8] AdmissionTable 全仓 0 命中（扫描 35 个 .ts）`
+- `trigger-event-probe.mjs` → `ALL PASS (16 asserts)`
+- `trigger-fast-mutation.mjs` → `ALL PASS`（Fast 层变异自检仍能打红）
+
+**结论**：R2 的验证判据全部满足（定义处 1 处、typecheck 0、311 例全绿、探针三件全 PASS），**R2 关闭**。`lib/client.js` 未变（本次只动 host 半），与「client 与 host 零直接 import」的分层一致。剩余未做：三条 P3（P3-3 `store.list()` 循环、P3-4 面板长文本截断、跨 run 同名 fallback）与真机补测清单。

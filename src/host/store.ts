@@ -24,7 +24,7 @@ import type {
   TriggerKind,
   TriggerRecord,
 } from '../shared/types.ts'
-import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_LOG_LIMIT } from './config.ts'
+import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_KINDS, TRIGGER_LOG_LIMIT } from './config.ts'
 
 /**
  * Trigger 账本上限（`TRIGGER_LOG_LIMIT = 100`）。
@@ -324,11 +324,11 @@ function normalizeStallAlerts(raw: unknown): ActivityEvent[] {
   return capStallAlerts(kept)
 }
 
-/** 落盘 Trigger 的合法种类白名单（读盘时用来丢掉脏值，与 `types.ts` 的 `TriggerKind` 同源）。 */
-const TRIGGER_KINDS: readonly TriggerKind[] = ['gate_failed', 'member_exit', 'dep_ready', 'stall_timeout']
-
 /**
  * Trigger 账本规范化：只留字段形状完整、`kind` 在白名单内的条目（上限截尾）。
+ *
+ * 白名单 `TRIGGER_KINDS` 从 `config.ts` 取（跨文件单点，`team/trigger.ts` 的 `fastOf` 用同一份）
+ * —— 两处各写一份字面量时，新增第 5 类会漏改一处，表现为「事件能进来、读盘被当脏值丢掉」。
  *
  * 为什么要逐字段校验而不是整体 `as TriggerRecord[]`：`triggers` 是**可解释性证据**，
  * 一条缺 `dedupeKey` 的脏记录会让去重永久失效（同一事件反复推进），

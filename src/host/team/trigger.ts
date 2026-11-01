@@ -21,6 +21,7 @@ import type {
   TriggerSource,
   TaskStatus,
 } from '../../shared/types.ts'
+import { TRIGGER_KINDS } from '../config.ts'
 
 /**
  * 一条待判定 / 已判定的 Trigger（归一化后的中间量）。
@@ -79,8 +80,9 @@ export interface FastVerdict {
   action: PanelAction | null
 }
 
-/** Trigger 种类：**恰 4 个**（AC-13）。新增种类必须同时补归一化、Fast 判据与面板文案。 */
-export const TRIGGER_KINDS: readonly TriggerKind[] = ['gate_failed', 'member_exit', 'dep_ready', 'stall_timeout']
+/** Trigger 种类：**恰 4 个**（AC-13）。定义在 `config.ts`（跨文件单点，`store.ts` 读盘校验同源）。 */
+export { TRIGGER_KINDS }
+
 
 /**
  * Slow 层（模型语义判定）默认关闭：本期零实现，切换判据见 TECHNICAL §7.8。

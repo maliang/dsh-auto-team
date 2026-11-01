@@ -10,6 +10,7 @@
 export { PLUGIN_ID, BRIDGE_ROUTE, PANEL_ACTIVE_MS, PANEL_IDLE_MS } from '../shared/const.ts'
 
 import { PANEL_ACTIVE_MS } from '../shared/const.ts'
+import type { TriggerKind } from '../shared/types.ts'
 
 /**
  * 面板轮询间隔的**兼容别名**（= 活跃档 2000ms）。
@@ -97,6 +98,25 @@ export const TRIGGER_DEDUPE_MS = 60_000
  * 定义留在本文件（配置单点），`store.ts` 只 import 再转出，避免同一个数字两处 `export const`。
  */
 export const TRIGGER_LOG_LIMIT = 100
+
+/**
+ * Trigger 合法种类白名单：**恰 4 个**（AC-13），定义只允许出现这一处。
+ *
+ * 为什么放在配置单点而不是 `team/trigger.ts`：宿主要**跨文件**用它两处——
+ * `team/trigger.ts:188` 的 `fastOf`（不认识的 kind 直接 drop）与 `store.ts` 的
+ * `normalizeTriggers`（读盘时丢掉脏值）。原先两处各写一份字面量，新增第 5 类时
+ * 只改一处就会出现「事件能进来、读盘就被当作脏值丢掉」的半失效（r5 验收 R2）。
+ * 放在这里后，`trigger.ts` 只 re-export（保持既有 import 面不变），`store.ts` 直接引用。
+ *
+ * 新增种类时必须同时补：归一化构造器（`team/trigger.ts`）、Fast 判据、面板文案、
+ * 以及 `test/trigger.test.ts` 的「四类各有构造器」扫描。
+ */
+export const TRIGGER_KINDS: readonly TriggerKind[] = [
+  'gate_failed',
+  'member_exit',
+  'dep_ready',
+  'stall_timeout',
+]
 
 /** 单条内联记忆项字符上限（AC-7）：索引只放标题 + 首句，放不下就截这一条而不是砍整段。 */
 export const MEMORY_INLINE_ITEM_MAX = 200
