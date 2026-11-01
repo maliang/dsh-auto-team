@@ -9,27 +9,32 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import type { Role, RoleModelRoute } from '../../shared/types.ts'
 import { ROLE_PROMPT_MAX } from '../config.ts'
-import { BUILTIN_ROLES, BUILTIN_SKILLS } from './builtin.ts'
+import { BUILTIN_ROLES } from './builtin.ts'
 
 const ROLE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/
 
 /**
  * 角色落盘模式版本（只服务于 seed() 的**一次性补齐**）：
  *  - 1 = r6 及以前：角色文件没有 `prompt` 字段；
- *  - 2 = r7：内置角色带 `prompt`。
+ *  - 2 = r7：内置角色带 `prompt`；
+ *  - 3 = r10：内置角色从 6 个扩到 11 个（多出来的 5 个由 seed 直接落地，老文件不动）。
  *
- * r7 之前 seed 出的文件里没有 prompt，`seed()` 又是「已存在的不写」，于是升级后
- * 六个内置角色的提示词全是空的，直到用户手动点一次「一键恢复默认」（QA-R7-01）。
+ * 版本号只升不降：`seed()` 在 `schemaOf() < ROLES_SCHEMA_VERSION` 时才走 backfill，
+ * 升到 3 就是为了让既有安装也补一次新字段/新角色，而不是只对全新安装生效。
  */
-const ROLES_SCHEMA_VERSION = 2
+const ROLES_SCHEMA_VERSION = 3
 
 /** 补齐标记文件名：**不带 .json**，避免被 list()/restoreDefaults() 的 `*.json` 扫描当成角色。 */
 const SEED_MARKER = '.seeded'
 
 export interface RoleRepoDeps {
   dir: string
-  skillsDir: string
   now: () => number
+  /**
+   * @deprecated r10 起技能 md 由 `roles/skills-repo.ts` 负责（四来源 + 覆盖层 + frontmatter），
+   * 角色库不再写任何技能文件。参数保留只为不打破既有调用方与单测签名。
+   */
+  skillsDir?: string
 }
 
 export interface RoleRepo {
@@ -39,14 +44,14 @@ export interface RoleRepo {
   remove(id: string): { ok: true } | { ok: false; error: string }
   seed(): void
   /**
-   * 一键恢复默认角色（r7 AC-8）：**只重写内置 6 个**，自建角色一个字节都不动。
+   * 一键恢复默认角色（r7 AC-8）：**只重写内置 11 个**，自建角色一个字节都不动。
    * 返回 `restored`（被复原的内置 id）与 `kept`（原样保留的自建 id，供界面回执说明）。
    */
   restoreDefaults(): { restored: string[]; kept: string[] }
 }
 
 export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
-  const { dir, skillsDir, now } = deps
+  const { dir, now } = deps
 
   const pathOf = (id: string): string => `${dir}/${id}.json`
 
@@ -219,15 +224,17 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
     },
 
     /**
-     * 首次启动把内置角色与技能 md 落盘（已存在的不覆盖，保护用户编辑）。
+     * 首次启动把内置角色落盘（已存在的不覆盖，保护用户编辑）。
      *
      * 升级路径（QA-R7-01）：老版本落盘的文件虽然存在，但可能缺本轮新增的字段
      * （r7 的 `prompt`）。这类文件**只补缺席的键**，且补齐只做一次 ——
      * 标记 `.seeded` 落盘后不再补，否则用户「清空提示词」会被下次启动悄悄复活。
+     *
+     * r10：技能 md 的 seed 已迁到 `roles/skills-repo.ts#seed`（那里还要处理
+     * 「老文件缺 frontmatter 只前置、正文零改动」），本函数**不再写任何技能文件**。
      */
     seed(): void {
       mkdirSync(dir, { recursive: true })
-      mkdirSync(skillsDir, { recursive: true })
       const migrate = schemaOf() < ROLES_SCHEMA_VERSION
       let migrated = true
       for (const role of BUILTIN_ROLES) {
@@ -237,10 +244,6 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
           continue
         }
         if (migrate && !backfill(path, role)) migrated = false
-      }
-      for (const skill of BUILTIN_SKILLS) {
-        const path = `${skillsDir}/${skill.id}.md`
-        if (!existsSync(path)) writeFileSync(path, `${skill.body}\n`, 'utf8')
       }
       // 有文件损坏时不落标记：下一轮启动重试，别把「没补上」记成「已补齐」。
       if (migrate && migrated) markSchema()

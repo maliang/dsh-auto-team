@@ -21,6 +21,7 @@
  *    回退就等于把 r6 之前的「真机不激活」缺陷重新种回来（mock 全绿、真机全灭）。
  */
 import type { RejectionCode, Role, RoleModelRoute } from '../shared/types.ts'
+import type { ModelCatalogRaw } from './model-catalog.ts'
 import type { HostMember } from './team/watcher.ts'
 import type { GuardVerdict } from './team/guard.ts'
 import type { SpawnInput } from './team/dispatch.ts'
@@ -76,7 +77,16 @@ export interface HostContext {
   effect?(dispose: () => void | Promise<void>): unknown
   /** [已核] `resolveCallConfig(config: LlmCallConfig, signal?)`，入参/返回值同为 { provider, model, ...controls }。 */
   /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'llm') 读取，不要裸读本字段。 */
-  llm?: { resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown> }
+  llm?: {
+    resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown>
+    /**
+     * [未核] r10 AC-16：模型清单的两个读口。宿主真实形状未实测，因此**逐层宽松归一**
+     * （`readModelCatalog` 接受数组 / `{models}` / `{data}` / `{items}` 多形态），
+     * 并在读取失败时降级成 `empty + reason`，绝不因为形状不符让插件抛错。
+     */
+    listProviders?(): unknown
+    listModels?(providerId: string): Promise<unknown>
+  }
   /** 会话默认模型选择（provider/model）；用作 spawn 的 provider 兜底。 */
   /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'agentDefaultModel') 读取，不要裸读本字段。 */
   agentDefaultModel?: { currentSelection?(): unknown }
@@ -114,7 +124,11 @@ export type OptionalServiceName = (typeof OPTIONAL_SERVICES)[number]
 /** 各可选服务的最小形状（[已核] 字段名来自 ARCHITECTURE §7 的实测输出）。 */
 export interface OptionalServiceMap {
   webServer: { register(route: unknown): (() => void) | void }
-  llm: { resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown> }
+  llm: {
+    resolveCallConfig?(input: unknown, signal?: AbortSignal): Promise<unknown>
+    listProviders?(): unknown
+    listModels?(providerId: string): Promise<unknown>
+  }
   agentDefaultModel: { currentSelection?(): unknown }
 }
 
@@ -167,6 +181,101 @@ function readServiceQuietly<K extends OptionalServiceName>(
   } catch {
     return undefined
   }
+}
+
+/**
+ * r10 AC-16：读一次宿主的模型清单（**唯一的 llm 清单读口**，缓存与 TTL 在 model-catalog.ts）。
+ *
+ * 三条纪律：
+ *  1. **绝不抛**：任何缺失/形状不符/调用异常都收敛成 `{ groups: [], failures: [], reason }`。
+ *     快照侧是同步 API，一次未捕获的 reject 会让整个面板轮询卡死（比没有清单严重得多）。
+ *  2. **逐层宽松归一**：宿主返回 `string[]` / `{ id, name }[]` / `{ models: [...] }` /
+ *     `{ data: [...] }` 都接受 —— 真实形状尚未实测（见 HostContext.llm 的 [未核] 注记）。
+ *  3. **单 provider 失败不整体失败**：某provider 的 `listModels` 抛错就把它的名字记进
+ *     `failures`，其余 provider 照常显示（面板会把这句写进 reason）。
+ */
+export async function readModelCatalog(ctx: HostContext): Promise<ModelCatalogRaw> {
+  const missing: ModelCatalogRaw = {
+    groups: [],
+    failures: [],
+    reason: '宿主未提供模型清单（llm 服务不可用）',
+  }
+  const llm = optionalService(ctx, 'llm')
+  if (llm === undefined || typeof llm.listProviders !== 'function') return missing
+
+  let providersRaw: unknown
+  try {
+    providersRaw = llm.listProviders()
+  } catch (error) {
+    return { groups: [], failures: [], reason: `宿主模型清单读取失败：${messageOf(error)}` }
+  }
+  const providers = normalizeCatalogEntries(providersRaw)
+  if (providers.length === 0) {
+    return { groups: [], failures: [], reason: '宿主未提供模型清单（llm 服务没有列出任何 provider）' }
+  }
+
+  const listModels = llm.listModels
+  const settled = await Promise.all(
+    providers.map(async (provider) => {
+      if (typeof listModels !== 'function') {
+        return { provider, models: [], message: '宿主不支持 listModels' }
+      }
+      try {
+        const modelsRaw = await listModels.call(llm, provider.id)
+        return { provider, models: normalizeCatalogEntries(modelsRaw), message: undefined }
+      } catch (error) {
+        return { provider, models: [], message: messageOf(error) }
+      }
+    }),
+  )
+
+  const groups: ModelCatalogRaw['groups'] = []
+  const failures: ModelCatalogRaw['failures'] = []
+  for (const item of settled) {
+    if (item.models.length > 0) {
+      groups.push({
+        id: item.provider.id,
+        name: item.provider.name,
+        models: item.models.map((model) => ({ id: model.id, name: model.name })),
+      })
+      continue
+    }
+    // 读到了 provider 但一个模型都没有：不静默跳过，否则「宿主里明明配了模型」无从排查
+    failures.push({ id: item.provider.id, name: item.provider.name, message: item.message ?? '未列出任何模型' })
+  }
+  return { groups, failures }
+}
+
+/** 把宿主五花八门的清单返回值压成 `{ id, name }[]`（`string[]` 也接受，name 缺省取 id）。 */
+function normalizeCatalogEntries(raw: unknown): { id: string; name: string }[] {
+  const list = Array.isArray(raw)
+    ? raw
+    : isRecord(raw) && Array.isArray(raw.models)
+      ? raw.models
+      : isRecord(raw) && Array.isArray(raw.data)
+        ? raw.data
+        : isRecord(raw) && Array.isArray(raw.items)
+          ? raw.items
+          : isRecord(raw) && Array.isArray(raw.providers)
+            ? raw.providers
+            : []
+  const entries: { id: string; name: string }[] = []
+  for (const item of list) {
+    if (typeof item === 'string') {
+      if (item !== '') entries.push({ id: item, name: item })
+      continue
+    }
+    if (!isRecord(item)) continue
+    const id = typeof item.id === 'string' ? item.id : typeof item.name === 'string' ? item.name : ''
+    if (id === '') continue
+    const name = typeof item.name === 'string' && item.name !== '' ? item.name : id
+    entries.push({ id, name })
+  }
+  return entries
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 export interface ToolSpec {

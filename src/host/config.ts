@@ -191,3 +191,21 @@ export const SETTINGS_LIMITS = {
  * 而且设计稿里提示词框是固定 96px 内滚，超长内容在界面上等于不可编辑。
  */
 export const ROLE_PROMPT_MAX = 8000
+
+/* ───────────────────────── r10：模型清单缓存（宿主策略，不属于 client 契约） ───────────────────────── */
+
+/**
+ * 模型清单条目上限（r10 AC-16）。
+ *
+ * 120 条足够覆盖「多 provider × 多模型」的日常形态；再多就截断并发一句可读说明 ——
+ * 面板的模型弹层是 296px 宽的滚动列表，一次塞上千条只会让用户滚到手酸而不是选中。
+ */
+export const MODEL_CATALOG_MAX = 120
+
+/**
+ * 模型清单缓存有效期（毫秒，stale-while-revalidate）。
+ *
+ * 60s 是「用户刚在宿主里加了模型，下一分钟面板就能看到」与「不因每次快照轮询都打宿主」
+ * 之间的折中：面板每 2s 取一次快照，没有缓存就是每 2s 一次 `listProviders/listModels`。
+ */
+export const MODEL_CATALOG_TTL_MS = 60_000

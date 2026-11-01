@@ -41,10 +41,14 @@ export function buildHttpRoutes(deps: HttpDeps): HttpRoute[] {
       path: `${BRIDGE_ROUTE}/memory`,
       async handle(request) {
         const query = parseQuery(request.url)
-        const track = query.get('track') === 'public' ? 'public' : query.get('track') === 'project' ? 'project' : null
-        if (track === null) return { error: 'track 必须是 public 或 project' }
         const name = query.get('name') ?? ''
         if (name.trim() === '') return { error: '非法文件名' }
+        // r10 AC-17：技能正文复用**同一条**正文读取口（track=skill，name=技能 id），
+        // 不新开第二条路由（路由数必须仍是 3，见 test/host-contract.test.ts）。
+        const raw = query.get('track')
+        if (raw === 'skill') return deps.bridge.readSkillBody(name)
+        const track = raw === 'public' ? 'public' : raw === 'project' ? 'project' : null
+        if (track === null) return { error: 'track 必须是 public、project 或 skill' }
         // 合法性判定与读写删共用 safeMemoryName（在 bridge.readMemoryFile 内部），这里不重复实现。
         return deps.bridge.readMemoryFile(track as MemoryTrack, name)
       },

@@ -11,10 +11,13 @@
  * `bridge.act`，所以「工具能用、面板不能」这类历史缺陷不会从装配层长出来。
  */
 import { homedir } from 'node:os'
-import { NOWAIT_THRESHOLD_MS } from './config.ts'
-import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, settingsPath, skillsDir } from './paths.ts'
+import { MODEL_CATALOG_TTL_MS, NOWAIT_THRESHOLD_MS } from './config.ts'
+import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, settingsPath, skillsDir, systemSkillsDir } from './paths.ts'
 import { RunsStore, type RunState } from './store.ts'
 import { createRoleRepo } from './roles/repo.ts'
+import { createSkillRepo } from './roles/skills-repo.ts'
+import { createSystemSkillSource } from './roles/system-skills.ts'
+import { createModelCatalogCache } from './model-catalog.ts'
 import { createSettingsRepo } from './settings.ts'
 import {
   createBridge,
@@ -33,6 +36,7 @@ import {
   memberIdentityOf,
   onHostTriggerEvents,
   onMemberProgress,
+  readModelCatalog,
   registerAgentCreated,
   registerEffect,
   registerToolGuard,
@@ -104,6 +108,35 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     warn(ctx, `角色库初始化失败：${messageOf(error)}`)
   }
 
+  /**
+   * 技能 md 仓储（r10 AC-17/AC-20）：`<home>/.dsh/auto-team/skills/<id>.md`。
+   *
+   * 与角色库**同一个 home 根**但独立目录、独立仓储：技能是四来源（内置/导入/系统/自建）
+   * 的可编辑实体，角色是 JSON。seed 只做「缺失的内置技能铺底 / 老 md 缺 frontmatter 只前置」，
+   * 因此重启永远不会覆盖用户改过的正文（AC-20 的唯一保证点）。失败只 warn，不阻断装配 ——
+   * 一条坏 md 不该让整个插件不激活。
+   */
+  const skills = createSkillRepo({ dir: skillsDir(home), now, warn: (text: string) => warn(ctx, text) })
+  try {
+    skills.seed()
+  } catch (error) {
+    warn(ctx, `技能库初始化失败（面板技能列表可能为空）：${messageOf(error)}`)
+  }
+
+  /** 宿主系统技能库（只读 `~/.agents/skills`，r10 AC-19）：只扫不写。 */
+  const systemSkills = createSystemSkillSource({ dir: systemSkillsDir(home), warn: (text: string) => warn(ctx, text) })
+
+  /**
+   * 模型清单缓存（r10 AC-16）：`PanelSnapshot` 是同步 API，宿主清单是异步的，这里握手。
+   * 立即预热一次（不 await：装配期不许等宿主），失败降级成 `empty + reason`。
+   */
+  const modelCatalog = createModelCatalogCache({
+    read: () => readModelCatalog(ctx),
+    now,
+    ttlMs: MODEL_CATALOG_TTL_MS,
+  })
+  void modelCatalog.refresh(true)
+
   const memoryRoots = { publicDir: publicMemoryDir(home), projectDir: projectMemoryDir(workspace) }
   const artifactsDir = projectArtifactsDir(workspace)
   const spawnPorts = createSpawnPorts(ctx)
@@ -150,7 +183,12 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    * 旧的拼装片段整段删除，避免同一份文案出现两个来源。
    */
   function buildPrompt(input: PromptInput): string {
-    return buildMemberPrompt(input, { memoryFor: (goal: string) => bridge.memoryFor(goal) })
+    return buildMemberPrompt(input, {
+      memoryFor: (goal: string) => bridge.memoryFor(goal),
+      // r10 AC-29：技能正文**读盘**（不是出厂常量）—— 用户改过的内置技能必须真的进成员提示词，
+      // 否则「界面上改了、成员还是老一套」是必然结果，而 AC-29 的「重启后读回」也会变成假象。
+      skillBodyOf: (skillId: string) => skills.get(skillId)?.body ?? '',
+    })
   }
 
   // 成员名由 dispatch 决定（`<roleId>-<taskId>`，确定性，AC-17 的幂等地基）；
@@ -307,6 +345,10 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     now,
     captainModel: () => captainView,
     settingsRepo,
+    // r10：技能仓储 / 系统技能库 / 模型清单缓存（三者都是「宿主能力」投影，缺省各有明确降级）。
+    skills,
+    systemSkills,
+    modelCatalog: () => modelCatalog.view(),
     // 保存设置后的两个重生效动作：队长路由重装 + watcher 按新阈值重建。
     // 回调在 bridge 里被 try/catch 包住 —— 保存已落盘，这里出错只降级成 notice。
     onSettingsSaved: () => {

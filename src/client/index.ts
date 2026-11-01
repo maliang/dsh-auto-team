@@ -5,11 +5,11 @@
  *   执行 lib/client.js → 它调用 window.__ModuleLoader__.load({ id, factory })
  *   → factory(require) 返回 { inject, apply } → 宿主调 apply(ctx)。
  *
- * r7 的四个挂载面（DESIGN §1.1，逐个逐字取自 UI-SLOTS.md）：
- *   conversation.input.dock              —— 输入框内「自动团队」胶囊（取代 composer.dock 开关行）
+ * r10 的四个挂载面（DESIGN §1.1，逐个逐字取自 UI-SLOTS.md）：
+ *   conversation.input.left              —— 输入框左侧「自动团队」胶囊（r10 从下方 dock 迁来）
  *   conversation.session.header.actions  —— 会话头「自动团队」按钮（点开右栏面板）
  *   sidebar.right.pane.tab / .title      —— 右栏面板 body + 标题（keyed，同 key）
- *   settings.section                     —— 设置页「自动团队」（6 参数 + 角色管理）
+ *   settings.section                     —— 设置页「自动团队」（6 参数 + 角色与技能管理）
  *
  * 本文件只做**薄接线**：slot 名/注册对象全部下沉到 `src/client/slots.ts`（那里不含 JSX，
  * 可被 node --test 直接驱动）。因此这里不出现任何 slot 字面量、也不出现 `slots.register(`

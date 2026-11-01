@@ -21,7 +21,7 @@ import * as ts from 'typescript'
 import {
   HEADER_ACTIONS_SLOT,
   HEADER_ID,
-  INPUT_DOCK_SLOT,
+  INPUT_LEFT_SLOT,
   OPTION_ID,
   PANEL_KEY,
   PANEL_SLOT,
@@ -32,6 +32,7 @@ import {
   SECTION_LABEL,
   SETTINGS_SECTION_SLOT,
   createOpenPanel,
+  createPanelCommands,
   panelTabDefinition,
   registerPanelTab,
   registerSlots,
@@ -161,7 +162,7 @@ function bagOf(h: Harness, name: string, sessionId = 'sess-1'): Record<string, u
 test('四个可见面的五个座位各注册一次，且 inject 名与 register 名逐字相同', () => {
   const h = runRegisterSlots()
   // E1 输入框内胶囊 / E2 会话头按钮 / E3 右栏面板 body + 标题 / E4 设置页分区
-  const expected = [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]
+  const expected = [INPUT_LEFT_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]
   assert.deepEqual(h.injected, expected, 'inject 的座位集合与顺序必须与 DESIGN §1.1 一致')
   assert.equal(h.metas.length, expected.length, '每个座位只许注册一次')
   for (const name of expected) {
@@ -192,12 +193,117 @@ test('撤除 composer.dock：client 半不许再出现旧开关行槽位（AC-12
     assert.equal(
       code.includes(RETIRED_SLOT),
       false,
-      `${relPath} 仍引用已撤除的旧开关行槽位（r7 起入口在 input.dock）`,
+      `${relPath} 仍引用已撤除的旧开关行槽位（r7 起入口在输入框左侧）`,
     )
   }
-  assert.equal(INPUT_DOCK_SLOT, 'conversation.input.dock', '输入框内选项必须挂 conversation.input.dock')
   assert.equal(HEADER_ACTIONS_SLOT, 'conversation.session.header.actions')
   assert.equal(SETTINGS_SECTION_SLOT, 'settings.section')
+})
+
+test('r10 挂载点迁移：INPUT_LEFT_SLOT 逐字、旧槽名连注释都不留（AC-1）', () => {
+  // 同样拼出来：AC-1 的门禁是「全 src/ 里旧槽名 0 命中（含注释）」，
+  // 本测试文件若写字面量会把它自己算成命中项（r4 实测过这个自伤式判据）。
+  const PREVIOUS_SLOT = ['conversation', 'input', 'dock'].join('.')
+  assert.equal(INPUT_LEFT_SLOT, 'conversation.input.left', '选项必须挂 conversation.input.left')
+  for (const relPath of [
+    'src/client/slots.ts',
+    'src/client/index.ts',
+    'src/client/styles.ts',
+    'src/client/Option.tsx',
+  ]) {
+    // 用原始源码（含注释）判：旧槽名留在注释里也是一处会被人照抄的漂移源
+    assert.equal(
+      sourceOf(relPath).includes(PREVIOUS_SLOT),
+      false,
+      `${relPath} 仍带着旧槽位名（注释里也算，AC-1 的计数含注释）`,
+    )
+  }
+  // 新名字只许有一个常量定义点（重复定义=两处漂移）
+  assert.equal(
+    sourceOf('src/client/slots.ts').split(`'${INPUT_LEFT_SLOT}'`).length - 1,
+    1,
+    'INPUT_LEFT_SLOT 的字面量只许出现一次（就是常量定义那一处）',
+  )
+})
+
+test('PanelCommands：close 三级回退各有可断言的返回值（AC-11/AC-13）', () => {
+  const tab = { id: 'tab-1', kind: PANEL_TAB_KIND }
+
+  /** 造一个最小 ctx：服务只能通过 `ctx.inject(['sidebarRight'], cb)` 捕获（client 半禁用 ctx.get）。 */
+  function ctxWith(sidebarRight: Record<string, unknown> | undefined): never {
+    return {
+      slots: { inject() {}, register() {} },
+      inject(_deps: readonly string[], fn: (scope: { sidebarRight?: Record<string, unknown> }) => void) {
+        if (sidebarRight !== undefined) fn({ sidebarRight })
+        return undefined
+      },
+    } as never
+  }
+
+  // 一级：tabDomain.occurrence(...).tabActions.close() 可用 → true，且走的是这一条
+  let closedByDomain = 0
+  let closedByCloseIn = 0
+  const first = createPanelCommands(
+    ctxWith({
+      openTab: () => tab,
+      tabsIn: () => [tab],
+      closeIn: () => { closedByCloseIn += 1; return true },
+      tabDomain: {
+        occurrence: () => ({
+          tabActions: { close: () => { closedByDomain += 1; return true } },
+        }),
+      },
+    }),
+  )
+  assert.equal(first.close('sess-1'), true, '一级回退可用时必须返回 true')
+  assert.equal(closedByDomain, 1, '一级回退要真的调到 tabActions.close()')
+  assert.equal(closedByCloseIn, 0, '一级成功时不该再走 closeIn')
+
+  // 二级：没有 tabDomain → closeIn
+  const second = createPanelCommands(
+    ctxWith({
+      openTab: () => tab,
+      tabsIn: () => [tab],
+      closeIn: () => true,
+    }),
+  )
+  assert.equal(second.close('sess-1'), true, '二级回退（closeIn）可用时也必须返回 true')
+
+  // 三级：宿主什么都没给 → false（组件据此**不翻转** aria-pressed）
+  const third = createPanelCommands(ctxWith({ openTab: () => tab, tabsIn: () => [tab] }))
+  assert.equal(third.close('sess-1'), false, '三级回退必须如实返回 false，不许假装收起成功')
+  assert.equal(third.isOpen('sess-1'), true, 'tabsIn 里还有本插件页签 → isOpen 为 true')
+
+  // 服务缺失：isOpen 返回 undefined（组件回落本地态），close 返回 false
+  const absent = createPanelCommands(ctxWith(undefined))
+  assert.equal(absent.isOpen('sess-1'), undefined, '没有 sidebarRight 服务时必须区分「未知」与「已关闭」')
+  assert.equal(absent.close('sess-1'), false)
+})
+
+test('面板头部结构：head 直系子节点恰好 3 个、meta 三段都在（AC-9/AC-10）', () => {
+  const text = sourceOf('src/client/Panel.tsx')
+  // 用开标签定位，不用裸 hook 名：注释里也会提到 hook，按裸名切会切出空块
+  const headStart = text.indexOf('<div data-panel-head>')
+  assert.ok(headStart > 0, 'Panel.tsx 里必须存在 [data-panel-head] 开标签')
+  const headEnd = text.indexOf('<div data-panel-meta>')
+  assert.ok(headEnd > headStart, '[data-panel-meta] 必须在 head 之后单独成段')
+  const headBlock = text.slice(headStart, headEnd)
+  // 三个可见块：标题 / 状态胶囊 / 刷新按钮
+  for (const marker of ['data-panel-title', 'data-head-capsule', 'data-panel-refresh']) {
+    assert.equal(headBlock.includes(marker), true, `head 里缺 ${marker}`)
+  }
+  // 直系子节点计数：head 块内以 < 开头的行（排除闭合标签与 JSX 注释）
+  const headChildren = headBlock
+    .split('\n')
+    .filter((line) => /^\s+<(?!\/|\!)/.test(line) && !/\{\/\*/.test(line))
+  assert.equal(headChildren.length, 3, `head 的直系子节点必须恰好 3 个，实测 ${headChildren.length} 个`)
+  assert.equal(headBlock.includes('data-head-meta'), false, '状态信息必须搬出 head（AC-9 要求分区）')
+  const metaBlock = text.slice(headEnd, text.indexOf('<', headEnd + '<div data-panel-meta>'.length))
+  for (const marker of ['data-meta-plan', 'data-captain-model', 'data-auto-team-degraded']) {
+    assert.equal(text.includes(marker), true, `[data-panel-meta] 缺 ${marker} 这一组`)
+  }
+  assert.equal((text.match(/data-meta-sep/g) ?? []).length, 2, '三组之间恰好两条分隔符')
+  assert.ok(metaBlock.length > 0)
 })
 
 test('keyed 座位（面板 body 与标题）带同一个 key，且 key === 页签类型 id', () => {
@@ -213,7 +319,7 @@ test('keyed 座位（面板 body 与标题）带同一个 key，且 key === 页�
 
 test('非 keyed 座位不许带 key，且字段都在宿主允许的集合内', () => {
   const h = runRegisterSlots()
-  for (const name of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
+  for (const name of [INPUT_LEFT_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
     const meta = h.metas.find((item) => item.name === name)
     assert.ok(meta)
     assert.equal(meta.key, undefined, `${name} 不是 keyed slot，带 key 等于对宿主撒谎`)
@@ -236,7 +342,7 @@ test('非 keyed 座位不许带 key，且字段都在宿主允许的集合内', 
 
 test('每个座位的 inject 都把宿主 sessionId 原样交给组件', () => {
   const h = runRegisterSlots()
-  for (const name of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+  for (const name of [INPUT_LEFT_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
     const bag = bagOf(h, name, 'sess-42')
     assert.equal(bag.sessionId, 'sess-42', `${name} 必须把 sessionId 原样传下去（否则四个面各读一份状态）`)
   }
@@ -246,7 +352,7 @@ test('openPanel 只下发给会话头按钮，胶囊与其它座位不许拿到'
   const openPanel = (): boolean => true
   const h = runRegisterSlots({}, openPanel)
   assert.equal(bagOf(h, HEADER_ACTIONS_SLOT).openPanel, openPanel, '头按钮点一下要能原生开页签')
-  for (const name of [INPUT_DOCK_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+  for (const name of [INPUT_LEFT_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
     assert.equal(bagOf(h, name).openPanel, undefined, `${name} 不该拿到 openPanel（胶囊的点击语义只有开关）`)
   }
 })
@@ -267,7 +373,7 @@ test('PLUGIN_ID 只进 id/key，不许进 name（写进 name 会静默不挂载�
 test('client 入口只做接线：零 slots.register(、零 slot 字面量', () => {
   const entry = codeOnlyOf('src/client/index.ts')
   assert.equal(/slots\.register\s*\(/.test(entry), false, '入口不许自己 register（注册细节必须留在 slots.ts）')
-  for (const literal of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+  for (const literal of [INPUT_LEFT_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
     assert.equal(entry.includes(literal), false, `入口里出现了 slot 字面量 ${literal}（两处漂移的起点）`)
   }
   // 组件文件同样不许自己注册座位
@@ -281,7 +387,7 @@ test('client 入口只做接线：零 slots.register(、零 slot 字面量', () 
   ]) {
     const code = codeFactsOf(relPath)
     assert.equal(code.calls.has('register'), false, `${relPath} 不许直接调用 register`)
-    for (const literal of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
+    for (const literal of [INPUT_LEFT_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
       assert.equal(code.literals.has(literal), false, `${relPath} 里出现了 slot 字面量 ${literal}`)
     }
   }
@@ -355,6 +461,17 @@ test('createOpenPanel 走宿主 sidebarRight.openTab(kind)，服务缺失时返�
   assert.equal(degraded.openPanel(), false, '服务不可用时必须返回 false，让组件回退窗口事件')
 })
 
+test('零红字：Option 的失败只进 title/aria，模板里没有失败文本节点（AC-6）', () => {
+  const code = codeOnlyOf('src/client/Option.tsx')
+  // 失败原因必须被贴到 title 上（否则用户没有任何途径看出为什么失败）
+  assert.match(code, /title=\{ui\.failure\s*\?\?/, 'title 必须优先用失败说明（AC-6：原因进 title）')
+  // 失败说明**不许**作为可见文本渲染：{ui.failure} 这种裸插值就是红字的入口
+  assert.equal(/\{ui\.failure\}/.test(code), false, '失败说明不许出现在可见文本里（零红字）')
+  // 唯一可见文本节点是 [data-option-label]，内容恒为 ui.label（逐字「自动团队」）
+  assert.match(code, /data-option-label[^>]*>\{ui\.label\}</, '唯一可见文案必须逐字绑定 ui.label')
+  assert.equal(code.includes('role="alert"'), false, '胶囊里不许再有 role=alert（红字节点已删）')
+})
+
 test('渲染描述层必须真的被组件调用（防「逻辑写完、模板没绑」）', () => {
   const pairs: Array<[string, string]> = [
     ['src/client/Option.tsx', 'optionView'],
@@ -407,6 +524,44 @@ test('样式层：四族新选择器都在，且字号只用 font 简写', () =>
   assert.match(css, /\[data-auto-team-option\]::after\s*\{[^}]*inset:\s*-8px -6px/, '胶囊必须用 ::after 把命中区扩到 44×40')
   // 提示词 textarea 固定内滚，不许 auto-grow（8000 字符会把卡撑爆）
   assert.match(css, /textarea\s*\{[^}]*height:\s*96px/, '提示词/正文 textarea 必须固定 96px 内滚')
+})
+
+test('样式层：面板 meta 三组都可见，不许用 display:none 假装分区（AC-10）', () => {
+  const css = sourceOf('src/client/styles.ts')
+  const start = css.indexOf('[data-auto-team-panel] [data-panel-meta] {')
+  assert.ok(start > 0, 'styles.ts 必须有 [data-panel-meta] 段')
+  const end = css.indexOf('[data-head-capsule]', start)
+  assert.ok(end > start, '[data-panel-meta] 段之后必须还有别的段（否则切块失败）')
+  const block = css.slice(start, end)
+  assert.equal(/display:\s*none/.test(block), false, 'meta 三组不许 display:none —— AC-10 明确禁止用隐藏冒充分区')
+  assert.match(block, /flex-wrap:\s*wrap/, '窄宽下允许折行，但不许隐藏（320px 最坏 374px，折两行三组都得在）')
+  // 三组的钩子必须仍然渲染在组件里（CSS 藏一组时这条不会红，所以上面那条 display 断言才是真守卫）
+  for (const hook of ['data-meta-plan', 'data-captain-model', 'data-auto-team-degraded']) {
+    assert.equal(sourceOf('src/client/Panel.tsx').includes(hook), true, `Panel.tsx 缺 ${hook}`)
+  }
+})
+
+test('样式层：r10 新增四族（技能行 / 模型气泡 / 弹层 / 恢复默认）都在', () => {
+  const css = sourceOf('src/client/styles.ts')
+  for (const selector of [
+    '[data-skill-row]',
+    '[data-skill-badge]',
+    '[data-skill-modified]',
+    '[data-role-model-picker]',
+    '[data-role-model-popover]',
+    '[data-skill-dialog]',
+    '[data-skill-body-input]',
+    '[data-skill-picker-row]',
+    '[data-roles-restore-confirm]',
+  ]) {
+    assert.equal(css.includes(selector), true, `styles.ts 缺少 ${selector} 段`)
+  }
+  // 技能列表 200px 内滚：12 条内置技能不许把角色卡撑到上千像素（DESIGN §0.2）
+  assert.match(css, /\[data-skill-list\]\s*\{[^}]*max-height:\s*200px/, '技能列表必须 200px 内滚')
+  // 正文 textarea 固定 200px（骨架加载完才出现，尺寸不跳）
+  assert.match(css, /\[data-skill-body-input\][^}]*height:\s*200px/, '技能正文框必须固定 200px')
+  // 恢复默认的确认键是琥珀不是红（红只留给不可恢复的失败）
+  assert.match(css, /\[data-roles-restore-ok\]\[data-confirm-tone="warn"\][^}]*warn/, '恢复默认确认键必须是琥珀')
 })
 
 test('client 半不许用 ctx.get 取可选服务（与 host 半同一纪律）', () => {

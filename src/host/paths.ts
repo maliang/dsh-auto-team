@@ -19,9 +19,19 @@ export function rolesDir(home: string): string {
   return `${globalDataRoot(home)}/roles`
 }
 
-/** 技能正文目录（内置角色的 skill md 由首次启动 seed 到这里）。 */
+/** 技能正文目录（r10 起是真正的 md 仓储：内置覆盖层 + 导入/系统/手写四来源都在这里）。 */
 export function skillsDir(home: string): string {
   return `${globalDataRoot(home)}/skills`
+}
+
+/**
+ * 宿主系统技能库（r10 AC-19）：`<home>/.agents/skills`。
+ *
+ * 为什么**不**在 `globalDataRoot` 下面：那是 DSH 自己的技能库约定（`skill_manage` 的默认目录），
+ * 我们只读不写——写进别人的库里等于污染宿主资产。放在这里只是为了集中派生、避免各处手拼。
+ */
+export function systemSkillsDir(home: string): string {
+  return `${trimSlash(home)}/.agents/skills`
 }
 
 /**

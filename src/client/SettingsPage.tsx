@@ -12,9 +12,11 @@
  * 这里只是换 `density="page"`（宽、大字号），行为完全一致。
  */
 import * as React from 'react'
-import type { AutoTeamSettings, Role, SkillInfo } from '../shared/types.ts'
+import type { AutoTeamSettings, Result, Role, SkillInfo, SkillMutation } from '../shared/types.ts'
 import { settingsKeysView } from './ui.ts'
 import { actFeedback, hintOf } from './viewmodel.ts'
+import { panelApi } from './api.ts'
+import type { SkillBodyPayload } from './api.ts'
 import { RoleEditorList } from './RoleEditor.tsx'
 import { usePanelState, sessionIdOf } from './state.ts'
 import { useAutoTeamStyle } from './styles.ts'
@@ -280,9 +282,19 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
         skills={skills}
         density="page"
         busy={busy}
-        onSave={(role) => void roleAction({ type: 'saveRole', role }, `已保存角色「${role.name}」`)}
+        modelCatalog={state.snapshot?.modelCatalog}
+        systemSkills={state.snapshot?.systemSkills}
+        readSkill={(id: string): Promise<Result<SkillBodyPayload>> => panelApi.readSkill(sessionId ?? '', id)}
+        onSave={(role?: Role, mutations?: SkillMutation[]) =>
+          void roleAction(
+            mutations === undefined ? { type: 'saveRole', role } : { type: 'saveRole', role, skills: mutations },
+            role === undefined ? '已保存技能变更' : `已保存角色「${role.name}」`,
+          )
+        }
         onDelete={(id) => void roleAction({ type: 'deleteRole', roleId: id }, `已删除角色 ${id}`)}
-        onRestoreDefaults={() => void roleAction({ type: 'restoreDefaultRoles' }, '已把内置角色恢复为出厂定义')}
+        onRestoreDefaults={() =>
+          void roleAction({ type: 'restoreDefaultRoles' }, '已把内置角色与内置技能恢复为出厂定义')
+        }
       />
     </section>
   )

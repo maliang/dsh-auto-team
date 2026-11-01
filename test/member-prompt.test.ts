@@ -216,3 +216,46 @@ test('buildMemberPrompt：自建角色改过的 prompt 立刻生效（面板/设
   const prompt = buildMemberPrompt({ plan, task: makeTask('t1'), role, name: 'dev-t1' }, noMemory)
   assert.ok(prompt.includes('提交前必须跑 pnpm build'), '自建/改写的 prompt 必须原样进提示词')
 })
+
+/* ─────────────────── r10：技能正文必须读盘上版本，而不是出厂常量 ─────────────────── */
+
+const EDITED_BODY = '# 实现（我改过的版本）\n\n盘上正文特写句：先跑一遍失败用例再动手。'
+
+function depsWithBodies(bodies: Record<string, string>): MemberPromptDeps {
+  return { ...noMemory, skillBodyOf: (skillId: string) => bodies[skillId] ?? '' }
+}
+
+test('buildMemberPrompt：skillBodyOf 提供的盘上正文优先于内置常量（AC-29 重启读回的前提）', () => {
+  const dev = BUILTIN_ROLES.find((role) => role.id === 'dev')
+  assert.ok(dev, '内置 dev 角色必须存在')
+  const builtinLine = signatureOf('implementation', '改动最小化')
+
+  const prompt = buildMemberPrompt(
+    { plan, task: makeTask('t1'), role: dev, name: 'dev-t1' },
+    depsWithBodies({ implementation: EDITED_BODY }),
+  )
+
+  assert.ok(prompt.includes('盘上正文特写句'), '用户改过的内置技能正文必须进 prompt')
+  assert.ok(!prompt.includes(builtinLine), '出厂正文不得覆盖盘上正文（否则「改了只在界面生效」的假象回来）')
+})
+
+test('buildMemberPrompt：skillBodyOf 对某技能返回空串时退回出厂正文，不许把技能正文变成空白段', () => {
+  const dev = BUILTIN_ROLES.find((role) => role.id === 'dev')
+  assert.ok(dev, '内置 dev 角色必须存在')
+  const builtinLine = signatureOf('implementation', '改动最小化')
+
+  const prompt = buildMemberPrompt(
+    { plan, task: makeTask('t1'), role: dev, name: 'dev-t1' },
+    depsWithBodies({ implementation: '' }),
+  )
+
+  assert.ok(prompt.includes(builtinLine), '盘上读不到时必须退回内置正文（不许静默变成空技能）')
+})
+
+test('buildMemberPrompt：未注入 skillBodyOf 时行为与 r9 一致（内置正文照旧）', () => {
+  const dev = BUILTIN_ROLES.find((role) => role.id === 'dev')
+  assert.ok(dev, '内置 dev 角色必须存在')
+  const builtinLine = signatureOf('implementation', '改动最小化')
+  const prompt = buildMemberPrompt({ plan, task: makeTask('t1'), role: dev, name: 'dev-t1' }, noMemory)
+  assert.ok(prompt.includes(builtinLine), '缺省装配不得改变既有提示词内容')
+})

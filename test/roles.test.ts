@@ -4,7 +4,7 @@
  * 重点不是「函数能跑」，而是三条会静默失效的语义：
  *   1. 内置角色的 `prompt` 是**恢复默认的唯一逐字来源**（改坏 → 恢复 → 必须逐字相等）；
  *   2. `builtin` 必须由 `BUILTIN_ROLES` 推导 —— 磁盘上写 `builtin: true` 不许换来删除豁免；
- *   3. `restoreDefaults` 只动内置 6 个，自建角色一个字节都不许变（sha256 断言）。
+ *   3. `restoreDefaults` 只动内置 11 个，自建角色一个字节都不许变（sha256 断言）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ROLE_PROMPT_MAX } from '../src/host/config.ts'
-import { BUILTIN_ROLES } from '../src/host/roles/builtin.ts'
+import { BUILTIN_ROLES, BUILTIN_SKILLS } from '../src/host/roles/builtin.ts'
 import { createRoleRepo, validatePrompt } from '../src/host/roles/repo.ts'
 import type { Role } from '../src/shared/types.ts'
 
@@ -43,8 +43,8 @@ function roleOf(overrides: Partial<Role> & { id: string }): Role {
 
 /* ───────────────────────────── 内置角色的提示词 ───────────────────────────── */
 
-test('内置 6 个角色都带非空中文 prompt，两两互异，且不超过上限', () => {
-  assert.equal(BUILTIN_ROLES.length, 6, '内置角色数量是契约（设置页「恢复默认」按它逐字重写）')
+test('内置 11 个角色都带非空中文 prompt，两两互异，且不超过上限', () => {
+  assert.equal(BUILTIN_ROLES.length, 11, '内置角色数量是契约（r10 AC-17：6 → 11，设置页「恢复默认」按它逐字重写）')
   const seen = new Map<string, string>()
   for (const role of BUILTIN_ROLES) {
     const prompt = role.prompt ?? ''
@@ -54,6 +54,31 @@ test('内置 6 个角色都带非空中文 prompt，两两互异，且不超过�
     const clash = seen.get(prompt)
     assert.equal(clash, undefined, `${role.id} 的 prompt 与 ${clash} 逐字相同：那就是没有各自职责`)
     seen.set(prompt, role.id)
+  }
+})
+
+test('内置角色：name/duty 两两互异、skillIds 1–2 且全部命中出厂技能（AC-17/AC-19）', () => {
+  const ids = new Set<string>()
+  const names = new Map<string, string>()
+  const duties = new Map<string, string>()
+  const skillIds = new Set(BUILTIN_SKILLS.map((skill) => skill.id))
+  for (const role of BUILTIN_ROLES) {
+    assert.equal(ids.has(role.id), false, `内置角色 id 重复：${role.id}`)
+    ids.add(role.id)
+    const nameClash = names.get(role.name)
+    assert.equal(nameClash, undefined, `${role.id} 与 ${nameClash} 的 name 重复：界面上分不清谁是谁`)
+    names.set(role.name, role.id)
+    const dutyClash = duties.get(role.duty)
+    assert.equal(dutyClash, undefined, `${role.id} 与 ${dutyClash} 的 duty 逐字相同`)
+    duties.set(role.duty, role.id)
+    assert.ok(role.skillIds.length >= 1 && role.skillIds.length <= 2, `${role.id} 的 skillIds 必须是 1–2 个`)
+    for (const skillId of role.skillIds) {
+      assert.equal(skillIds.has(skillId), true, `${role.id} 引用了不存在的技能：${skillId}（角色卡会显示悬空技能）`)
+    }
+  }
+  // r10 新增的 5 个角色 id 是 PRD 里定死的（面板角色卡按 id 排序展示）。
+  for (const id of ['frontend', 'backend', 'designer', 'devops', 'security']) {
+    assert.equal(ids.has(id), true, `缺少 r10 新增内置角色：${id}`)
   }
 })
 
@@ -77,7 +102,7 @@ test('validatePrompt：缺席/空白合法，超长与类型错报错（不截�
 
 /* ───────────────────────────── seed 与读盘 ───────────────────────────── */
 
-test('seed()：6 个内置角色的 prompt 逐字落盘，且 get() 读回来一致', () => {
+test('seed()：11 个内置角色的 prompt 逐字落盘，且 get() 读回来一致', () => {
   withRepo((repo, dir) => {
     repo.seed()
     const files = readdirSync(dir).filter((name) => name.endsWith('.json')).sort()
@@ -172,6 +197,33 @@ test('seed() 升级路径：文件损坏时不落补齐标记，修好后下一�
   })
 })
 
+test('seed() 升级路径：r7 安装（标记 schema=2、只有 6 个内置角色）升级后补齐 5 个新内置角色（r10 AC-17）', () => {
+  withRepo((repo, dir) => {
+    const legacyIds = ['pm', 'architect', 'dev', 'qa', 'docs', 'reviewer']
+    for (const role of BUILTIN_ROLES.filter((item) => legacyIds.includes(item.id))) {
+      const legacy = {
+        id: role.id,
+        name: role.name,
+        duty: role.id === 'pm' ? '用户改过的职责' : role.duty,
+        skillIds: [...role.skillIds],
+        builtin: true,
+        updatedAt: 1_600_000_000_000,
+      }
+      writeFileSync(join(dir, `${role.id}.json`), `${JSON.stringify(legacy, null, 2)}\n`, 'utf8')
+    }
+    writeFileSync(join(dir, '.seeded'), `${JSON.stringify({ schema: 2, at: 1_600_000_000_000 })}\n`, 'utf8')
+
+    repo.seed()
+
+    for (const id of ['frontend', 'backend', 'designer', 'devops', 'security']) {
+      assert.equal(existsSync(join(dir, `${id}.json`)), true, `升级必须把新内置角色落到盘上：${id}`)
+      assert.equal(repo.get(id)?.prompt, BUILTIN_ROLES.find((role) => role.id === id)?.prompt, `${id} 的 prompt 必须是内置原样`)
+    }
+    assert.equal(repo.get('pm')?.duty, '用户改过的职责', '既有文件只补缺键：用户改过的 duty 不许被覆盖')
+    assert.equal(JSON.parse(readFileSync(join(dir, '.seeded'), 'utf8')).schema, 3, '补齐完成后标记必须升到 3，否则每次启动都重补')
+  })
+})
+
 test('save()：prompt 去空白后落盘；空提示词不写这个键（盘上不该出现 "prompt": ""）', () => {
   withRepo((repo, dir) => {
     const withPrompt = repo.save(roleOf({ id: 'dev', prompt: '  按方案实现并自测  ' }))
@@ -263,7 +315,7 @@ test('list()/get()：内置角色即便文件被删也仍在列表里，且仍�
     repo.seed()
     rmSync(join(dir, 'qa.json'))
     const listed = repo.list()
-    assert.equal(listed.length, 6)
+    assert.equal(listed.length, BUILTIN_ROLES.length)
     const qa = listed.find((role) => role.id === 'qa')
     assert.ok(qa)
     assert.equal(qa.prompt, BUILTIN_ROLES.find((role) => role.id === 'qa')?.prompt)
@@ -305,7 +357,7 @@ test('restoreDefaults()：改坏的 pm 恢复成与内置逐字相等，自建�
   })
 })
 
-test('restoreDefaults()：六个内置角色全部逐字复原（不只 pm），kept 列出全部自建 id', () => {
+test('restoreDefaults()：十一个内置角色全部逐字复原（不只 pm），kept 列出全部自建 id', () => {
   withRepo((repo, dir) => {
     repo.seed()
     for (const role of BUILTIN_ROLES) {
@@ -323,21 +375,12 @@ test('restoreDefaults()：六个内置角色全部逐字复原（不只 pm），
       assert.equal(onDisk.name, role.name, `${role.id} name 未复原`)
       assert.deepEqual(onDisk.skillIds, role.skillIds, `${role.id} skillIds 未复原`)
     }
-    // 角色文件集合必须恰为「内置 6 + 自建 2」；`.seeded` 是升级补齐标记，不是角色文件。
+    // 角色文件集合必须恰为「内置 11 + 自建 2」；`.seeded` 是升级补齐标记，不是角色文件。
     assert.deepEqual(
       readdirSync(dir)
         .filter((name) => name.endsWith('.json'))
         .sort(),
-      [
-      'a-custom.json',
-      'architect.json',
-      'b-custom.json',
-      'dev.json',
-      'docs.json',
-      'pm.json',
-      'qa.json',
-        'reviewer.json',
-      ],
+      [...BUILTIN_ROLES.map((role) => `${role.id}.json`), 'a-custom.json', 'b-custom.json'].sort(),
     )
   })
 })
@@ -350,7 +393,7 @@ test('restoreDefaults()：把被删掉的内置角色文件补回盘上（不新
     assert.equal(existsSync(join(dir, 'dev.json')), false)
 
     const result = repo.restoreDefaults()
-    assert.equal(result.restored.length, 6)
+    assert.equal(result.restored.length, BUILTIN_ROLES.length)
     assert.deepEqual(result.kept, [])
     for (const role of BUILTIN_ROLES) {
       assert.equal(existsSync(join(dir, `${role.id}.json`)), true, `${role.id} 文件必须被重建`)

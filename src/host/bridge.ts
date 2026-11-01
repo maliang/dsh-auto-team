@@ -39,12 +39,15 @@ import type {
   MemberView,
   MemoryTrack,
   MessageRecord,
+  ModelCatalogView,
   PanelAction,
   PanelSnapshot,
   RejectionCode,
   Result,
   Role,
+  SkillDraft,
   SkillInfo,
+  SkillMutation,
   TaskStatus,
 } from '../shared/types.ts'
 import {
@@ -59,6 +62,8 @@ import { blockedTasks, readyTasks } from './plan/graph.ts'
 import { progressOf } from './plan/plan.ts'
 import { BUILTIN_SKILLS } from './roles/builtin.ts'
 import type { RoleRepo } from './roles/repo.ts'
+import type { SkillRecord, SkillRepo } from './roles/skills-repo.ts'
+import type { SystemSkillSource } from './roles/system-skills.ts'
 import { defaultSettings, type SettingsRepo } from './settings.ts'
 import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
 import { secondsText, stallOf } from './team/stall.ts'
@@ -181,6 +186,31 @@ export interface BridgeDeps {
    * **同步调用**：调用方负责自己吞错 —— 保存已经落盘成功，回调失败不能让面板显示保存失败。
    */
   onSettingsSaved?: (settings: AutoTeamSettings) => void
+  /**
+   * 技能 md 仓储（r10 AC-17/AC-20）：四来源技能的唯一写点 + 快照的技能投影来源。
+   *
+   * 可选装配，理由与 `settingsRepo` 同族：`BridgeDeps` 在多处测试夹具里被直接构造，
+   * 那些用例关心的是派发/Trigger/暂停语义，不该被迫造一个技能目录。缺省时：
+   *   - `skillsOf()` 回退内置技能的只读投影（与 r7 逐字一致，面板不会空列表）；
+   *   - `saveRole` 里带 `skills` 变更 → 明确拒绝「技能仓储未装配」，而不是假装保存成功；
+   *   - `readSkillBody` 明确报「无法读取技能正文」。
+   */
+  skills?: SkillRepo
+  /**
+   * 宿主系统技能库（只读扫描 `~/.agents/skills`，r10 AC-19）。
+   *
+   * 缺省 = 没有系统技能可选（面板的多选弹层显示空 + 原因）。装配层一定会传，
+   * 因为「宿主系统技能库在哪」是**宿主事实**，不能由 bridge 自己拼路径（AGENTS §4）。
+   */
+  systemSkills?: SystemSkillSource
+  /**
+   * 模型清单的同步投影（r10 AC-16）。实现是 `host/model-catalog.ts` 的 TTL 缓存：
+   * 快照是同步 API，宿主清单是异步的，两者只能在这里握手。
+   *
+   * 缺省 = `{ status: 'empty', options: [], reason: '宿主未提供模型清单' }`：
+   * 面板据此显示原因，而不是给一个看起来「没有模型」的空下拉（假阴性）。
+   */
+  modelCatalog?: () => ModelCatalogView
 }
 
 export interface Bridge {
@@ -190,6 +220,13 @@ export interface Bridge {
   act(sessionId: string, action: PanelAction): Promise<ActResult>
   /** 面板记忆页：先读正文再编辑（否则保存会把已有记忆清空，缺陷 D7）。 */
   readMemoryFile(track: MemoryTrack, name: string): Promise<Result<{ track: MemoryTrack; name: string; body: string; chars: number }>>
+  /**
+   * 面板技能编辑弹层：按需读技能正文（r10 AC-17）。
+   *
+   * 复用 `GET /memory?track=skill` 这条**同一条**正文通道（不新开路由），因此返回形状
+   * 与 `readMemoryFile` 同族；`title` 一并带出，弹层标题不必再从 `snapshot.skills` 里反查。
+   */
+  readSkillBody(id: string): Promise<Result<{ id: string; title: string; body: string; chars: number }>>
   /** 队长侧（工具/提示词）用的记忆注入文本。 */
   memoryFor(goal: string): { text: string; truncated: boolean; chars: number }
   /** 队长侧：写入一条记忆（可带 track），按 MEMORY_LINES_PER_TASK 裁剪。 */
@@ -244,13 +281,38 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return deps.stallMs ?? (settings ?? settingsOf()).stallMs
   }
 
-  /** 技能只读投影（AC-16 设置页要能勾选，但正文不进快照）。 */
+  /**
+   * 技能投影（r10 AC-18：四来源 + 「已修改」标记）。
+   *
+   * 有技能仓储时**只认仓储投影**（磁盘是唯一真相：seed 铺底 + 用户覆盖层）；
+   * 没装配仓储时回退内置只读投影，`source:'builtin' / modified:false` —— 与 r7 逐字一致，
+   * 保证「装配层漏接线」不会让面板的技能列表凭空消失。
+   */
   function skillsOf(): SkillInfo[] {
+    const repo = deps.skills
+    if (repo !== undefined) return repo.projection()
     return BUILTIN_SKILLS.map((skill) => ({
       id: skill.id,
       title: skill.title,
       description: firstLine(skill.body.replace(/^#+\s*/, '')),
+      source: 'builtin' as const,
+      modified: false,
     }))
+  }
+
+  /** 系统技能投影（r10 AC-19）：只下发 name/description，正文在保存时由宿主按 systemName 现读。 */
+  function systemSkillsOf(): { name: string; description: string }[] {
+    const source = deps.systemSkills
+    if (source === undefined) return []
+    try {
+      return source
+        .scan()
+        .skills.map((skill: { name: string; description: string }) => ({ name: skill.name, description: skill.description }))
+    } catch {
+      // 扫描器自身已按「坏文件跳过 + reason」降级（roles/system-skills.ts）；这里只兜最后一道，
+      // 绝不让一条坏 SKILL.md 把整个快照打成异常（面板会连角色一起读不出来）。
+      return []
+    }
   }
   const flags = loadFlags()
   let messageSeq = 0
@@ -570,6 +632,85 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return { limit, running, source: host.source, requested, clamped: limit < requested }
   }
 
+  /**
+   * 应用一批技能变更（r10 AC-17/AC-20），逐条执行、遇错即停并返回可读原因。
+   *
+   * 语义要点：
+   *  - `save` 的 `source:'system'` 且正文为空 → 现场按 `systemName` 去系统技能库读正文：
+   *    系统技能正文不进快照（可能上千字 × N 条），只在用户真的选中并保存时读一次。
+   *  - `delete` 成功必须**同时摘除所有角色的引用**，并把「从 N 个角色摘除」报出来 ——
+   *    否则用户只看到技能没了，却不知道角色卡上还挂着已删除的 id（成员提示词会出现「缺失技能」）。
+   */
+  function applySkillMutations(
+    mutations: readonly SkillMutation[],
+  ): { ok: true; notices: string[] } | { ok: false; error: string } {
+    const repo = deps.skills
+    if (repo === undefined) return { ok: false, error: '技能仓储未装配：本次运行无法修改技能' }
+    const notices: string[] = []
+    for (const mutation of mutations) {
+      if (mutation.op === 'save') {
+        const resolved = withSystemBody(mutation.skill)
+        if (!resolved.ok) return { ok: false, error: resolved.error }
+        const saved = repo.save(resolved.draft)
+        if (saved.error !== undefined) return { ok: false, error: saved.error }
+        notices.push(`已保存技能『${saved.data.title}』（${saved.data.id}）`)
+        continue
+      }
+      if (mutation.op === 'delete') {
+        const removed = repo.remove(mutation.id)
+        if (removed.error !== undefined) return { ok: false, error: removed.error }
+        const detached = detachSkill(mutation.id)
+        notices.push(
+          detached === 0
+            ? `已删除『${removed.data.title}』，它未被任何角色引用`
+            : `已删除『${removed.data.title}』，并从 ${detached} 个角色摘除引用`,
+        )
+        continue
+      }
+      const restored = repo.restoreBuiltin(mutation.id)
+      if (restored.error !== undefined) return { ok: false, error: restored.error }
+      notices.push(`已把『${restored.data.title}』恢复为出厂正文`)
+    }
+    return { ok: true, notices }
+  }
+
+  /** 系统技能：正文为空时按 `systemName` 现场读盘（找不到即整条变更失败，不写半截技能）。 */
+  function withSystemBody(draft: SkillDraft): { ok: true; draft: SkillDraft } | { ok: false; error: string } {
+    if (draft.source !== 'system') return { ok: true, draft }
+    if (typeof draft.body === 'string' && draft.body.trim() !== '') return { ok: true, draft }
+    const source = deps.systemSkills
+    const name = typeof draft.systemName === 'string' ? draft.systemName.trim() : ''
+    if (source === undefined) return { ok: false, error: '系统技能库未装配：无法导入系统技能' }
+    if (name === '') return { ok: false, error: '系统技能缺少名称：无法定位正文' }
+    let entry: { name: string; description: string; body: string } | undefined
+    try {
+      entry = source.scan().skills.find((skill: { name: string; description: string; body: string }) => skill.name === name)
+    } catch (error) {
+      return { ok: false, error: `系统技能库扫描失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+    if (entry === undefined) return { ok: false, error: `系统技能已不存在：「${name}」` }
+    return {
+      ok: true,
+      draft: {
+        ...draft,
+        title: draft.title.trim() === '' ? entry.name : draft.title,
+        description: draft.description.trim() === '' ? entry.description : draft.description,
+        body: entry.body,
+      },
+    }
+  }
+
+  /** 把某个技能 id 从所有角色的 `skillIds` 里摘掉，返回被改动的角色数（删除技能后的引用清理）。 */
+  function detachSkill(skillId: string): number {
+    let detached = 0
+    for (const role of deps.roles.list()) {
+      if (!Array.isArray(role.skillIds) || !role.skillIds.includes(skillId)) continue
+      const saved = deps.roles.save({ ...role, skillIds: role.skillIds.filter((item) => item !== skillId) })
+      if (saved.ok) detached += 1
+    }
+    return detached
+  }
+
   function snapshot(sessionId: string): PanelSnapshot {
     const state = loadState(sessionId)
     const roles = deps.roles.list()
@@ -617,6 +758,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ...(paused && pausedAt !== undefined ? { pausedAt } : {}),
       settings,
       skills: skillsOf(),
+      // r10 AC-16/AC-19：模型清单与系统技能库。两者都是「宿主能力」，缺省时必须把
+      // 「为什么是空」一路带到面板（reason），不能只给一个空数组冒充「本来就没有」。
+      modelCatalog: deps.modelCatalog?.() ?? { status: 'empty', options: [], reason: '宿主未提供模型清单' },
+      systemSkills: systemSkillsOf(),
       ...(captain === undefined ? {} : { captainModel: captain }),
       degraded: health?.degraded === true,
       ...(health?.degraded === true
@@ -1014,13 +1159,32 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         case 'saveRole': {
+          // r10：一次 saveRole 可以同时提交「技能变更 + 角色」（形状零扩张：不新增动作）。
+          // 角色形状先做**纯校验**（不落盘），避免「技能写成功、角色因 id 为空被拒」的半截写入。
           const role = action.role
-          if (!role || typeof role.id !== 'string' || role.id.trim() === '' || typeof role.name !== 'string' || role.name.trim() === '') {
-            return reject('BAD_REQUEST', '角色必须有非空的 id 与 name', sessionId)
+          if (role !== undefined) {
+            if (
+              typeof role.id !== 'string' ||
+              role.id.trim() === '' ||
+              typeof role.name !== 'string' ||
+              role.name.trim() === ''
+            ) {
+              return reject('BAD_REQUEST', '角色必须有非空的 id 与 name', sessionId)
+            }
           }
-          const saved = deps.roles.save(role)
-          if (!saved.ok) return reject('BAD_REQUEST', saved.error, sessionId)
-          return accept(sessionId, [`已保存角色 ${saved.role.name}（${saved.role.id}）`])
+          const notices: string[] = []
+          if (action.skills !== undefined && action.skills.length > 0) {
+            const applied = applySkillMutations(action.skills)
+            if (!applied.ok) return reject('BAD_REQUEST', applied.error, sessionId)
+            notices.push(...applied.notices)
+          }
+          if (role !== undefined) {
+            const saved = deps.roles.save(role)
+            if (!saved.ok) return reject('BAD_REQUEST', saved.error, sessionId)
+            notices.push(`已保存角色 ${saved.role.name}（${saved.role.id}）`)
+          }
+          if (notices.length === 0) return reject('BAD_REQUEST', 'saveRole 需要角色或技能变更', sessionId)
+          return accept(sessionId, notices)
         }
 
         case 'deleteRole': {
@@ -1033,7 +1197,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         case 'restoreDefaultRoles': {
-          // AC-8：只重写 6 个内置角色（逐字取 BUILTIN_ROLES，含 prompt），自建角色一字不动。
+          // AC-8：只重写内置角色（逐字取 BUILTIN_ROLES，含 prompt），自建角色一字不动。
           // `builtin` 标志由 repo 从 BUILTIN_ROLES 推导，不信任磁盘上的 `builtin:true`。
           let outcome: { restored: string[]; kept: string[] }
           try {
@@ -1045,11 +1209,31 @@ export function createBridge(deps: BridgeDeps): Bridge {
               sessionId,
             )
           }
-          const keptCustom = outcome.kept.length === 0 ? '没有自建角色' : `自建角色保持不动（${outcome.kept.join('、')}）`
-          return accept(sessionId, [
+          // r10 AC-20：一个按钮连带把内置技能恢复出厂（用户改过的内置技能也要回出厂正文），
+          // 但**绝不删**用户自建/导入/系统技能，也不动自建角色。
+          let restoredSkills: string[] = []
+          let skillsNote = ''
+          if (deps.skills === undefined) {
+            skillsNote = '技能仓储未装配：本次只恢复了角色，内置技能未处理'
+          } else {
+            try {
+              restoredSkills = deps.skills.restoreBuiltins().restored
+            } catch (error) {
+              skillsNote = `内置技能恢复失败：${error instanceof Error ? error.message : String(error)}`
+            }
+          }
+          const userSkills = (deps.skills?.list() ?? []).filter((skill: { source: string }) => skill.source !== 'builtin').length
+          const customRoles = outcome.kept.length
+          const userSkillsText = userSkills === 0 ? '没有自建/导入/系统技能' : `你的 ${userSkills} 条自建/导入/系统技能`
+          const customRolesText = customRoles === 0 ? '没有自建角色' : `${customRoles} 个自建角色`
+          const notices = [
             `已恢复 ${outcome.restored.length} 个内置角色（名称/描述/提示词/技能/模型全部回到内置值）`,
-            keptCustom,
-          ])
+            skillsNote !== ''
+              ? skillsNote
+              : `已把 ${restoredSkills.length} 条内置技能恢复为出厂正文（已修改标记清除）`,
+            `${userSkillsText}与${customRolesText}未受影响`,
+          ]
+          return accept(sessionId, notices)
         }
 
         case 'saveSettings': {
@@ -1112,6 +1296,23 @@ export function createBridge(deps: BridgeDeps): Bridge {
       if (!exists) return { error: `记忆文件不存在：${track}/${safe}` }
       const body = readMemory(track, safe, deps.memoryRoots)
       return { data: { track, name: safe, body, chars: body.length } }
+    },
+
+    /**
+     * r10 AC-17：技能正文（`GET /memory?track=skill&name=<id>` 的唯一实现）。
+     *
+     * 正文**按需读**：快照里只放 id/标题/描述，弹层打开时才读一次正文 ——
+     * 12 条内置技能正文若全进快照，每次 2s 轮询都会多传几十 KB。
+     */
+    async readSkillBody(id: string) {
+      const repo = deps.skills
+      if (repo === undefined) return { error: '技能仓储未装配：无法读取技能正文' }
+      const key = typeof id === 'string' ? id.trim() : ''
+      if (key === '') return { error: '技能 id 不能为空' }
+      const read = repo.readBody(key)
+      if (read.error !== undefined) return { error: read.error }
+      const record = repo.get(key)
+      return { data: { id: key, title: record?.title ?? key, body: read.data, chars: read.data.length } }
     },
 
     memoryFor(goal: string) {

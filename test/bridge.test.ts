@@ -461,7 +461,7 @@ test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
   assert.equal(badName.error, '非法文件名')
 
   const badTrack = (await routes[1].handle(get('/api/auto-team/memory?track=nope&name=a'))) as { error?: string }
-  assert.equal(badTrack.error, 'track 必须是 public 或 project')
+  assert.equal(badTrack.error, 'track 必须是 public、project 或 skill')
 
   const acted = (await routes[2].handle({
     method: 'POST',
@@ -799,8 +799,261 @@ test('restoreDefaultRoles：只重写 6 个内置角色，自建角色一字不�
   assert.deepEqual(builtinDev?.skillIds, pristine.skillIds, '技能必须恢复')
   assert.equal(builtinDev?.builtin, true, '恢复后的内置角色必须重新带 builtin 标志')
   assert.ok(
-    result.notices?.some((notice) => notice.includes('自建角色保持不动')),
+    result.notices?.some((notice) => notice.includes('未受影响')),
     'notice 必须说清自建角色没被动',
   )
   assert.equal(readFileSync(join(rolesDir, 'custom.json'), 'utf8'), customBefore, '自建角色文件字节不变')
+})
+
+/* ───────────────── r10：技能四来源 / 模型清单 / 系统技能（T2 装配层的新能力） ───────────────── */
+
+interface FakeSkillRecord {
+  id: string
+  title: string
+  description: string
+  body: string
+  source: 'builtin' | 'imported' | 'system' | 'manual'
+  modified: boolean
+  updatedAt: number
+}
+
+interface FakeSkills {
+  repo: NonNullable<BridgeDeps['skills']>
+  records: Map<string, FakeSkillRecord>
+  calls: { saved: string[]; removed: string[]; restored: string[]; restoreAll: number }
+}
+
+/**
+ * 内存版技能仓储：只实现 bridge 真正用到的 9 个成员。
+ * 落盘语义（frontmatter / seed 不覆盖 / modified 现算）由 `test/skills-repo.test.ts` 全量覆盖，
+ * 这里测的是「桥有没有正确调用它、失败时有没有如实拒绝」。
+ */
+function fakeSkills(initial: FakeSkillRecord[] = []): FakeSkills {
+  const records = new Map(initial.map((record) => [record.id, { ...record }]))
+  const calls: FakeSkills['calls'] = { saved: [], removed: [], restored: [], restoreAll: 0 }
+  const repo = {
+    list: () => [...records.values()].map((record) => ({ ...record })),
+    projection: () =>
+      [...records.values()].map(({ id, title, description, source, modified }) => ({
+        id,
+        title,
+        description,
+        source,
+        modified,
+      })),
+    get: (id: string) => records.get(id),
+    readBody: (id: string) => {
+      const record = records.get(id)
+      return record === undefined ? { error: `找不到技能 ${id}` } : { data: record.body }
+    },
+    save: (draft: { id?: string; title: string; description: string; body: string; source: FakeSkillRecord['source'] }) => {
+      const id = draft.id !== undefined && draft.id !== '' ? draft.id : 'generated'
+      const record: FakeSkillRecord = {
+        id,
+        title: draft.title,
+        description: draft.description,
+        body: draft.body,
+        source: draft.source,
+        modified: draft.source === 'builtin',
+        updatedAt: NOW,
+      }
+      records.set(id, record)
+      calls.saved.push(id)
+      return { data: record }
+    },
+    remove: (id: string) => {
+      const record = records.get(id)
+      if (record === undefined) return { error: `找不到技能 ${id}` }
+      if (record.source === 'builtin') return { error: `内置技能不可删除：${id}` }
+      records.delete(id)
+      calls.removed.push(id)
+      return { data: { id, title: record.title } }
+    },
+    restoreBuiltin: (id: string) => {
+      const record = records.get(id)
+      if (record === undefined) return { error: `找不到技能 ${id}` }
+      calls.restored.push(id)
+      const restored: FakeSkillRecord = { ...record, body: `出厂正文 ${id}`, modified: false }
+      records.set(id, restored)
+      return { data: restored }
+    },
+    restoreBuiltins: () => {
+      calls.restoreAll += 1
+      const restored = [...records.values()].filter((record) => record.source === 'builtin').map((record) => record.id)
+      return { restored }
+    },
+    seed: () => undefined,
+  }
+  return { repo: repo as unknown as NonNullable<BridgeDeps['skills']>, records, calls }
+}
+
+function skillRecordOf(over: Partial<FakeSkillRecord> = {}): FakeSkillRecord {
+  return { id: 'custom-x', title: '自定义技能', description: '一句话', body: '正文', source: 'manual', modified: false, updatedAt: NOW, ...over }
+}
+
+const fakeSystemSkills = {
+  scan: () => ({
+    skills: [{ name: 'pdf', description: 'PDF 处理', body: '系统技能库里的 PDF 正文', dir: '/tmp/skills/pdf' }],
+  }),
+} as unknown as NonNullable<BridgeDeps['systemSkills']>
+
+test('r10：saveRole 可只提交技能变更（role 缺省），技能写入与 notice 成对', async () => {
+  const skills = fakeSkills()
+  const { bridge, roles } = setup({ skills: skills.repo })
+  await enable(bridge)
+  const before = roles.list().length
+
+  const result = await bridge.act(SESSION, {
+    type: 'saveRole',
+    skills: [{ op: 'save', skill: { id: 'review', title: '代码审查', description: '审查要点', body: '# 审查', source: 'manual' } }],
+  })
+  assert.equal(result.rejected, undefined, `只提交技能变更必须被接受：${result.rejected?.message ?? ''}`)
+  assert.deepEqual(skills.calls.saved, ['review'])
+  assert.ok(result.notices?.some((notice) => notice.includes('已保存技能')), '必须回报技能已保存')
+  assert.equal(roles.list().length, before, '只提交技能时不该动角色')
+})
+
+test('r10：删除技能同步摘除角色引用，并在 notice 里报出 N 个角色', async () => {
+  const skills = fakeSkills([skillRecordOf()])
+  const { bridge, roles } = setup({ skills: skills.repo })
+  roles.save({ ...roleOf('qa2', '测试二号'), skillIds: ['custom-x', 'implementation'] })
+  roles.save({ ...roleOf('qa3', '测试三号'), skillIds: ['custom-x'] })
+  await enable(bridge)
+
+  const result = await bridge.act(SESSION, { type: 'saveRole', skills: [{ op: 'delete', id: 'custom-x' }] })
+  assert.equal(result.rejected, undefined)
+  assert.deepEqual(skills.calls.removed, ['custom-x'])
+  assert.ok(
+    result.notices?.some((notice) => notice.includes('从 2 个角色摘除引用')),
+    `notice 必须报出被摘除引用的角色数，实际 ${JSON.stringify(result.notices)}`,
+  )
+  assert.deepEqual(roles.get('qa2')?.skillIds, ['implementation'], '只摘掉被删的那个 id')
+  assert.deepEqual(roles.get('qa3')?.skillIds, [])
+})
+
+test('r10：restoreBuiltin 只把正文恢复出厂并给 notice；角色引用不受影响', async () => {
+  const skills = fakeSkills([skillRecordOf({ id: 'implementation', title: '实现', source: 'builtin', modified: true })])
+  const { bridge, roles } = setup({ skills: skills.repo })
+  roles.save({ ...roleOf('dev2', '开发二号'), skillIds: ['implementation'] })
+  await enable(bridge)
+
+  const result = await bridge.act(SESSION, { type: 'saveRole', skills: [{ op: 'restoreBuiltin', id: 'implementation' }] })
+  assert.equal(result.rejected, undefined)
+  assert.deepEqual(skills.calls.restored, ['implementation'])
+  assert.ok(result.notices?.some((notice) => notice.includes('恢复为出厂正文')))
+  assert.deepEqual(roles.get('dev2')?.skillIds, ['implementation'], '恢复出厂不是删除，引用必须保留')
+})
+
+test('r10：saveRole 既无角色也无技能 → BAD_REQUEST（不许静默 no-op）', async () => {
+  const { bridge } = setup()
+  await enable(bridge)
+  const result = await bridge.act(SESSION, { type: 'saveRole' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /角色或技能/)
+})
+
+test('r10：restoreDefaultRoles 连带把内置技能恢复出厂，三条 notice 顺序固定', async () => {
+  const skills = fakeSkills([
+    skillRecordOf({ id: 'implementation', title: '实现', source: 'builtin', modified: true }),
+    skillRecordOf({ id: 'my-own', title: '自建技能', source: 'manual' }),
+  ])
+  const { bridge, roles } = setup({ skills: skills.repo })
+  roles.save(roleOf('custom', '自建角色'))
+  await enable(bridge)
+
+  const result = await bridge.act(SESSION, { type: 'restoreDefaultRoles' })
+  assert.equal(result.rejected, undefined)
+  assert.equal(skills.calls.restoreAll, 1, '必须真的调用 restoreBuiltins（连带恢复）')
+  const notices = result.notices ?? []
+  assert.equal(notices.length, 3, `恢复默认必须恰好 3 条 notice，实际 ${JSON.stringify(notices)}`)
+  assert.match(notices[0] ?? '', /已恢复 \d+ 个内置角色/)
+  assert.match(notices[1] ?? '', /已把 1 条内置技能恢复为出厂正文/)
+  assert.match(notices[2] ?? '', /你的 1 条自建\/导入\/系统技能/)
+  assert.match(notices[2] ?? '', /1 个自建角色未受影响/)
+})
+
+test('r10：GET /memory?track=skill 读技能正文（复用同一条正文通道，路由仍是 3 条）', async () => {
+  const skills = fakeSkills([skillRecordOf({ id: 'review', title: '代码审查', body: '# 审查\n- 看边界' })])
+  const { bridge } = setup({ skills: skills.repo })
+  await enable(bridge)
+  const routes = buildHttpRoutes({ bridge, defaultSessionId: () => SESSION })
+  assert.equal(routes.length, 3, '技能正文不许新开路由')
+
+  const get = (url: string): { method: string; pathname: string; url: string; json: () => Promise<unknown> } => ({
+    method: 'GET',
+    pathname: url.split('?')[0],
+    url,
+    json: async () => ({}),
+  })
+
+  const body = (await routes[1].handle(get('/api/auto-team/memory?track=skill&name=review'))) as {
+    data?: { id?: string; title?: string; body?: string; chars?: number }
+    error?: string
+  }
+  assert.equal(body.error, undefined)
+  assert.equal(body.data?.title, '代码审查')
+  assert.equal(body.data?.body, '# 审查\n- 看边界')
+  assert.equal(body.data?.chars, '# 审查\n- 看边界'.length)
+
+  const missing = (await routes[1].handle(get('/api/auto-team/memory?track=skill&name=ghost'))) as { error?: string }
+  assert.match(missing.error ?? '', /找不到技能/)
+})
+
+test('r10：系统技能只下发 name/description，正文在保存时按 systemName 现读', async () => {
+  const skills = fakeSkills()
+  const { bridge } = setup({ skills: skills.repo, systemSkills: fakeSystemSkills })
+  await enable(bridge)
+
+  assert.deepEqual(bridge.snapshot(SESSION).systemSkills, [{ name: 'pdf', description: 'PDF 处理' }])
+
+  const result = await bridge.act(SESSION, {
+    type: 'saveRole',
+    skills: [{ op: 'save', skill: { title: 'PDF 处理', description: '', body: '', source: 'system', systemName: 'pdf' } }],
+  })
+  assert.equal(result.rejected, undefined, result.rejected?.message)
+  assert.equal(skills.records.get('generated')?.body, '系统技能库里的 PDF 正文', '正文必须由宿主现场读盘补上')
+  assert.equal(skills.records.get('generated')?.description, 'PDF 处理', 'description 为空时取系统技能描述')
+
+  const ghost = await bridge.act(SESSION, {
+    type: 'saveRole',
+    skills: [{ op: 'save', skill: { title: '幽灵', description: '', body: '', source: 'system', systemName: 'ghost' } }],
+  })
+  assert.equal(ghost.rejected?.code, 'BAD_REQUEST')
+  assert.match(ghost.rejected?.message ?? '', /系统技能已不存在/)
+})
+
+test('r10：未装配技能仓储时明确拒绝（不假装保存成功），模型清单降级带原因', async () => {
+  const { bridge } = setup()
+  await enable(bridge)
+
+  const read = await bridge.readSkillBody('implementation')
+  assert.match(read.error ?? '', /技能仓储未装配/)
+
+  const save = await bridge.act(SESSION, {
+    type: 'saveRole',
+    skills: [{ op: 'save', skill: { title: 'x', description: '', body: 'y', source: 'manual' } }],
+  })
+  assert.equal(save.rejected?.code, 'BAD_REQUEST')
+  assert.match(save.rejected?.message ?? '', /技能仓储未装配/)
+
+  const snapshot = bridge.snapshot(SESSION)
+  assert.equal(snapshot.modelCatalog?.status, 'empty')
+  assert.ok((snapshot.modelCatalog?.reason ?? '').length > 0, '没有模型清单必须给原因')
+  assert.deepEqual(snapshot.systemSkills, [])
+  assert.ok((snapshot.skills ?? []).length > 0, '没装配仓储时回退内置技能投影，列表不能凭空空掉')
+  assert.ok((snapshot.skills ?? []).every((skill) => skill.source === 'builtin' && skill.modified === false))
+})
+
+test('r10：装配后快照的技能投影与模型清单来自注入的仓储/缓存（不自行编造）', async () => {
+  const skills = fakeSkills([skillRecordOf({ id: 'review', title: '代码审查', source: 'imported', modified: false })])
+  const catalog: NonNullable<BridgeDeps['modelCatalog']> = () => ({
+    status: 'ready',
+    options: [{ provider: 'deepseek', providerName: 'DeepSeek', model: 'v4', modelName: 'v4' }],
+  })
+  const { bridge } = setup({ skills: skills.repo, modelCatalog: catalog })
+
+  const snapshot = bridge.snapshot(SESSION)
+  assert.deepEqual(snapshot.skills, [{ id: 'review', title: '代码审查', description: '一句话', source: 'imported', modified: false }])
+  assert.equal(snapshot.modelCatalog?.status, 'ready')
+  assert.equal(snapshot.modelCatalog?.options[0]?.model, 'v4')
 })

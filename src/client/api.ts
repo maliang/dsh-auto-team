@@ -30,6 +30,20 @@ export interface MemoryBodyPayload {
   chars: number
 }
 
+/**
+ * 技能正文载荷（r10 AC-17）：**复用同一条 `GET /memory` 路由**（`track=skill&name=<id>`）。
+ *
+ * 为什么不新开 `/skill` 路由：AC-25 把「路由仍 3 条」冻结成判据；更重要的是正文读取
+ * 已经有一条通了的 `{data,error}` 通道，再开第二条就多一处解包、多一种失败文案，
+ * 这正是本项目历史 bug 族（「两条链路给出不同结论」）的成因。
+ */
+export interface SkillBodyPayload {
+  id: string
+  title: string
+  body: string
+  chars: number
+}
+
 export interface PanelApi {
   snapshot(sessionId: string): Promise<Result<PanelSnapshot>>
   /**
@@ -41,6 +55,11 @@ export interface PanelApi {
   act(sessionId: string, action: PanelAction): Promise<Result<ActResult>>
   /** 读记忆正文：编辑已有文件前必须先读，否则保存会把已有内容清空（D7）。 */
   readMemory(sessionId: string, track: MemoryTrack, name: string): Promise<Result<MemoryBodyPayload>>
+  /**
+   * 读技能正文（r10 AC-17）：编辑弹层打开时才读，读完才把 textarea 从骨架换成正文。
+   * 走的是 memory 路由的 `track=skill` 分支（auth 与错误处理完全复用）。
+   */
+  readSkill(sessionId: string, id: string): Promise<Result<SkillBodyPayload>>
 }
 
 export interface ApiOptions {
@@ -95,6 +114,11 @@ export function createPanelApi(options: ApiOptions = {}): PanelApi {
     readMemory(sessionId: string, track: MemoryTrack, name: string) {
       const query = `track=${encodeURIComponent(track)}&name=${encodeURIComponent(name)}&sessionId=${encodeURIComponent(sessionId)}`
       return request<MemoryBodyPayload>(`${BRIDGE_ROUTE}/memory?${query}`)
+    },
+    readSkill(sessionId: string, id: string) {
+      // track=skill 是 host/http.ts 里同一个自述式 body 读取口的分支（路由条数不变）
+      const query = `track=skill&name=${encodeURIComponent(id)}&sessionId=${encodeURIComponent(sessionId)}`
+      return request<SkillBodyPayload>(`${BRIDGE_ROUTE}/memory?${query}`)
     },
   }
 }

@@ -113,12 +113,76 @@ export interface Role {
 }
 
 /**
- * 内置技能的只读投影（r7 设置页的角色编辑区要能给技能打勾，但不能编辑正文）。
- * 正文不投影：面板只显示 id/标题/描述，避免把上千字的技能正文塞进面板快照。
+ * 技能来源（r10 AC-19）。**谁写的**决定界面上给哪个动作：
+ * - `builtin`：出厂内置（可改、可恢复出厂，**不可删**）；
+ * - `imported`：用户从本地 md 导入；
+ * - `system`：从宿主系统技能库（`~/.agents/skills`）选入的副本；
+ * - `manual`：在面板/设置页手写新建。
+ */
+export type SkillSource = 'builtin' | 'imported' | 'system' | 'manual'
+
+/**
+ * 技能的只读投影（r7 设置页的角色编辑区要给技能打勾；r10 起还要显示来源与「已修改」）。
+ * 正文**不投影**：面板只显示 id/标题/说明，避免把上千字的技能正文塞进每 2s 一帧的快照。
  */
 export interface SkillInfo {
   id: string
   title: string
+  description: string
+  /** r10：四个来源之一（决定内置不可删、以及是否给「恢复出厂」）。 */
+  source: SkillSource
+  /** r10：内置技能正文被用户改过（正文 sha256 与出厂不同，宿主现算，不落盘）。 */
+  modified: boolean
+}
+
+/**
+ * 技能写入载荷（r10 AC-19）：`saveRole` 动作里随角色一起上送，**不新开动作**。
+ *
+ * 三个来源的差异都在宿主侧（`roles/skills-repo.ts`）收敛：
+ * - 内置技能：`id` 必须是出厂 id，正文写进用户覆盖层；
+ * - 系统技能：客户端不知道正文（清单只下发 name/description），带 `systemName` 由宿主现读盘；
+ * - 导入/手写：正文随载荷上来。
+ */
+export interface SkillDraft {
+  /** 缺省 = 新建（宿主按标题派生 id）；给值 = 更新该 id。 */
+  id?: string
+  title: string
+  description: string
+  body: string
+  source: SkillSource
+  /** 仅 `source === 'system'` 有意义：宿主系统技能库里的目录名（正文由宿主读盘）。 */
+  systemName?: string
+}
+
+/** 技能变更指令（r10）：一次 `saveRole` 可携带多条，宿主按顺序执行并汇总 notice。 */
+export type SkillMutation =
+  | { op: 'save'; skill: SkillDraft }
+  | { op: 'delete'; id: string }
+  | { op: 'restoreBuiltin'; id: string }
+
+/** 模型清单里的一项（r10 AC-16 弹层选择器的一行）。 */
+export interface ModelOption {
+  provider: string
+  providerName: string
+  model: string
+  modelName: string
+}
+
+/**
+ * 宿主模型清单的投影（r10 AC-16）。
+ *
+ * `status` 三态是刻意的：`empty` 必须是**可读的降级**（带 `reason`），
+ * 不能让「宿主没这个服务」与「还没取到」在界面上长得一样。
+ */
+export interface ModelCatalogView {
+  status: 'loading' | 'ready' | 'empty'
+  options: ModelOption[]
+  reason?: string
+}
+
+/** 系统技能库的一条投影（r10 AC-19）：正文不上送，选入时宿主按 name 现读盘。 */
+export interface SystemSkillInfo {
+  name: string
   description: string
 }
 
@@ -342,8 +406,12 @@ export interface PanelSnapshot {
   pausedAt?: number
   /** r7 AC-13：当前生效的可配参数（缺省值已合并，面板设置页直接显示）。 */
   settings?: AutoTeamSettings
-  /** r7 AC-7：内置技能清单（角色编辑区给 skillIds 打勾用）。 */
+  /** r7 AC-7：技能清单（角色编辑区给 skillIds 打勾用；r10 起带来源与「已修改」）。 */
   skills?: SkillInfo[]
+  /** r10 AC-16：宿主模型清单投影（缺省 = 宿主没提供，按 empty+reason 显示）。 */
+  modelCatalog?: ModelCatalogView
+  /** r10 AC-19：本机系统技能库投影（缺省 = 没扫描或本机没有该库，界面给可读说明）。 */
+  systemSkills?: SystemSkillInfo[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -503,7 +571,11 @@ export type PanelAction =
   | { type: 'receipt'; taskId: string; note?: string }
   | { type: 'saveMemory'; track: MemoryTrack; name: string; body: string }
   | { type: 'deleteMemory'; track: MemoryTrack; name: string }
-  | { type: 'saveRole'; role: Role }
+  /**
+   * r10 AC-19：`role` 与 `skills` 至少给一个 —— 技能变更随角色保存一起上送，
+   * 所以动作数仍是 15 条（不新开 `saveSkills`），客户端只有一条写路径。
+   */
+  | { type: 'saveRole'; role?: Role; skills?: SkillMutation[] }
   | { type: 'deleteRole'; roleId: string }
   /** r7 AC-9：暂停推进（只掐派发/回执/停滞判定，不打断在跑成员、不清门禁证据）。 */
   | { type: 'pause' }

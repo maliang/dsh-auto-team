@@ -18,20 +18,27 @@ import { useEffect } from 'react'
 const STYLE_ID = 'dsh-auto-team-style'
 
 export const AUTO_TEAM_CSS = `
-/* ───────────────── 输入框内胶囊（conversation.input.dock，DESIGN §0.2 / §2.1） ─────────────────
- * r7 起 composer.dock 的 32px 开关行**整段撤除**（AC-12）：入口改为输入框内的 28px 胶囊。
- * 命中区用 ::after 外扩到 44×40（视觉高度仍是 28 —— 不改布局高度，只改可点面积）。 */
+/* ───────────────── 输入框左侧选项（conversation.input.left，DESIGN §0.2 / §2.1） ─────────────────
+ * r7 起输入框下方的 32px 开关行**整段撤除**（AC-12）；r10 再把它压成输入框左侧的 24px 紧凑胶囊。
+ * 命中区用 ::after 外扩到 40×40（视觉高度仍是 24 —— 不改布局高度，只改可点面积）。 */
 [data-auto-team-option] {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   box-sizing: border-box;
+  /* AC-3 的六条属性：可变长文本只许省略，不许把工具条撑破 */
   width: fit-content;
-  max-width: min(100%, 260px);
-  height: 28px;
-  padding: 3px 10px;
-  border-radius: 999px;
+  min-width: 0;
+  max-width: min(100%, 160px);
+  flex: 0 1 auto;
+  align-self: center;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  margin-inline-end: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: var(--dsw-radius-sm, 8px);
   border: 1px solid var(--dsw-alias-border-l2, currentColor);
   background: transparent;
   color: var(--dsw-alias-label-secondary, inherit);
@@ -100,12 +107,26 @@ export const AUTO_TEAM_CSS = `
   border-top-color: currentColor;
   animation: dsh-auto-team-spin 800ms linear infinite;
 }
-[data-auto-team-option] [data-option-error] {
-  color: var(--dsw-alias-state-error-primary, #d33);
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+[data-auto-team-option][data-enabled="true"] [data-option-label] {
+  font-weight: 600;
+}
+/* 失败态（AC-6）：只改点与描边，**底不加色、可见文本逐字不变、零红字**。
+ * 原因只进 title / aria-label 与面板的 [data-error]，工具条里不出现任何错误文本节点。 */
+[data-auto-team-option][data-error-state="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 45%, transparent);
+  background: transparent;
+}
+[data-auto-team-option][data-error-state="true"] [data-option-dot] {
+  border-color: var(--dsw-alias-state-warn-primary, #b58900);
+  background: var(--dsw-alias-state-warn-primary, #b58900);
+}
+[data-auto-team-option] [data-option-dot][data-tone="warn"] {
+  border-color: var(--dsw-alias-state-warn-primary, #b58900);
+  background: var(--dsw-alias-state-warn-primary, #b58900);
+}
+[data-auto-team-option] [data-option-dot][data-tone="run"] {
+  border-color: var(--dsw-alias-state-business-primary, #2f6feb);
+  background: var(--dsw-alias-state-business-primary, #2f6feb);
 }
 @keyframes dsh-auto-team-spin {
   to { transform: rotate(360deg); }
@@ -178,8 +199,50 @@ export const AUTO_TEAM_CSS = `
   display: flex;
   align-items: center;
   gap: 8px;
+  box-sizing: border-box;
   min-height: 28px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l2, currentColor);
+  /* AC-9：直系子节点恰好 3 个（标题 / 状态胶囊 / 刷新），所以这里**不许折行**——
+   * 折行会让「3 个子节点」在视觉上变成两行，与人眼看到的「三段」不符。 */
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+[data-auto-team-panel] [data-panel-title] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-sm-14, 14px/20px sans-serif);
+}
+/* 头部状态信息（r10 起从 [data-panel-head] 里搬出来单独成段，AC-9/AC-10）：
+ * 三组各自独立、组间一条 1px 分隔符；窄宽（320）允许折两行，但三组都在 ——
+ * 禁止用 display:none 冒充分区（那是变异测试里必红的作弊）。 */
+[data-auto-team-panel] [data-panel-meta] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   flex-wrap: wrap;
+  min-width: 0;
+  padding: 0 0 4px;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-auto-team-panel] [data-panel-meta] > [data-meta] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-auto-team-panel] [data-panel-meta] [data-meta-sep] {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 10px;
+  background: var(--dsw-alias-border-l1, currentColor);
+}
+[data-auto-team-panel] [data-panel-meta] [data-auto-team-degraded] {
+  color: var(--dsw-alias-state-warn-primary, #b58900);
 }
 [data-auto-team-panel] [data-head-capsule] {
   display: inline-flex;
@@ -1168,6 +1231,600 @@ export const AUTO_TEAM_CSS = `
 [data-auto-team-role-editor][data-density="page"] button { height: 28px; padding: 0 10px; }
 [data-auto-team-role-editor][data-density="panel"] [data-role-card] { padding: 12px; }
 [data-auto-team-role-editor][data-density="panel"] [data-role-field] { grid-template-columns: 56px minmax(0, 1fr); }
+
+/* ───────────────── r10 技能库（四来源 / 已修改 / 三入口，DESIGN §2.4 M4） ─────────────────
+ * 行高 56、列表 max-height:200 内滚 —— **绝不 auto-grow**：12 条内置技能若按内容撑开，
+ * 单张角色卡会长到上千像素，用户要滚三屏才能看到「保存」。 */
+[data-auto-team-role-editor] [data-skill-library] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  padding: 8px 8px 6px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-md, 12px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  min-width: 0;
+}
+[data-auto-team-role-editor] [data-skills-head] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+[data-auto-team-role-editor] [data-skills-count] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, inherit);
+}
+[data-auto-team-role-editor] [data-skill-add-menu] {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+[data-auto-team-role-editor] [data-skill-add-menu] button { height: 24px; }
+[data-auto-team-role-editor] [data-skill-list] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  min-width: 0;
+}
+[data-auto-team-role-editor] [data-skill-row] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-sizing: border-box;
+  min-height: 56px;
+  padding: 5px 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  min-width: 0;
+  transition: border-color 120ms var(--ds-ease-in-out, ease), background-color 120ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-role-editor] [data-skill-row]:hover {
+  border-color: var(--dsw-alias-border-l3, currentColor);
+}
+[data-auto-team-role-editor] [data-skill-row-main] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+[data-auto-team-role-editor] [data-skill-title] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary, inherit);
+}
+[data-auto-team-role-editor] [data-skill-badge] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  white-space: nowrap;
+}
+[data-auto-team-role-editor] [data-skill-badge][data-source="imported"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 45%, transparent);
+  color: var(--dsw-alias-state-business-primary, #2f6feb);
+}
+[data-auto-team-role-editor] [data-skill-badge][data-source="system"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #2f9e44) 45%, transparent);
+  color: var(--dsw-alias-state-success-primary, #2f9e44);
+}
+[data-auto-team-role-editor] [data-skill-badge][data-source="manual"] {
+  border-style: dashed;
+  color: var(--dsw-alias-label-secondary, inherit);
+}
+/* 「已修改」徽标：描边与底用琥珀 45%/16%，**文字不用琥珀**（11px 琥珀在浅底上不可读） */
+[data-auto-team-role-editor] [data-skill-modified] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 16%, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  white-space: nowrap;
+}
+[data-auto-team-role-editor] [data-skill-row-sub] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+[data-auto-team-role-editor] [data-skill-description] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-auto-team-role-editor] [data-skill-row] button { height: 20px; padding: 0 6px; font: var(--dsw-font-xxs-12, 12px/18px sans-serif); }
+[data-auto-team-role-editor] [data-skill-delete-confirm],
+[data-auto-team-role-editor] [data-skill-restore-confirm] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  padding: 4px 6px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  color: var(--dsw-alias-label-secondary, inherit);
+}
+[data-auto-team-role-editor] [data-skill-delete-ok],
+[data-auto-team-role-editor] [data-skill-restore-ok] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 55%, transparent);
+}
+[data-auto-team-role-editor] [data-skill-notice] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-auto-team-role-editor] [data-skill-import-error] {
+  color: var(--dsw-alias-state-warn-primary, #b58900);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  margin: 0;
+}
+/* 勾选中的技能条目（角色卡里的技能选择） */
+[data-auto-team-role-editor] [data-role-field-skills] [data-role-skill-list] { max-height: 160px; overflow-y: auto; scrollbar-gutter: stable; }
+
+/* ───────────────── r10 三个弹层（模型气泡 / 技能编辑 / 系统技能，DESIGN §2.5） ─────────────────
+ * 全部 createPortal 到 body：宿主自绘标题栏的 -webkit-app-region: drag 会让落在里面的
+ * 点击在真机上失效（Playwright 合成点击绕过该判定，所以 e2e 永远绿）——portal 移出该子树，
+ * 顺带避免被角色卡的 overflow:hidden 裁掉。 */
+[data-role-model-popover],
+[data-skill-dialog-backdrop],
+[data-dialog-backdrop] {
+  position: fixed;
+  z-index: 1000;
+}
+[data-skill-dialog-backdrop] {
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 32%, transparent);
+}
+[data-skill-dialog] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+  padding: 12px;
+  border-radius: var(--dsw-radius-md, 12px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.24));
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+}
+[data-skill-dialog][data-dialog-size="wide"] { width: 480px; }
+[data-skill-dialog] [data-dialog-head] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+[data-skill-dialog] [data-dialog-title] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-sm-14, 14px/20px sans-serif);
+}
+[data-skill-dialog] [data-dialog-badge],
+[data-skill-dialog] [data-skill-picker-count] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] [data-dialog-field] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+[data-skill-dialog] [data-dialog-label] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] input,
+[data-skill-dialog] textarea,
+[data-role-model-popover] input {
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  color: inherit;
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  height: 28px;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  min-width: 0;
+}
+[data-skill-dialog] textarea,
+[data-skill-dialog] [data-skill-body-input] {
+  /* 正文固定 200px 内滚（DESIGN §0.2）：20k 字符下 auto-grow 会把弹层顶出屏幕 */
+  height: 200px;
+  padding: 6px 8px;
+  resize: vertical;
+  font-family: var(--ds-font-family-code, monospace);
+  line-height: 18px;
+}
+[data-skill-dialog] button {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  height: 24px;
+  padding: 0 8px;
+  cursor: pointer;
+  transition: background-color 120ms var(--ds-ease-in-out, ease), border-color 120ms var(--ds-ease-in-out, ease);
+}
+[data-skill-dialog] button:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+  border-color: var(--dsw-alias-border-l3, currentColor);
+}
+[data-skill-dialog] button:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #2f6feb);
+  outline-offset: 1px;
+}
+[data-skill-dialog] button:disabled { cursor: not-allowed; opacity: 0.55; }
+[data-skill-dialog] [data-dialog-actions] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+[data-skill-dialog] [data-dialog-actions-spacer] { flex: 1 1 auto; }
+[data-skill-dialog] [data-dialog-save][data-primary="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 12%, transparent);
+}
+[data-skill-dialog] [data-skill-builtin-hint] {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] [data-skill-body-count] {
+  align-self: flex-end;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-skill-dialog] [data-skill-body-count][data-over-limit="true"] {
+  color: var(--dsw-alias-state-error-primary, #d33);
+}
+[data-skill-dialog] [data-dialog-error],
+[data-skill-dialog] [data-skill-body-error] {
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary, #d33);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] [data-skill-body-error] { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 正文骨架：3 条 14px 呼吸条（不用 spinner —— 骨架能表达"要出现的是文字"） */
+[data-skill-dialog] [data-skill-body-skeleton] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 200px;
+  padding: 10px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+[data-skill-dialog] [data-skill-body-skeleton] > span {
+  display: block;
+  height: 14px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, color-mix(in srgb, currentColor 10%, transparent));
+  animation: dsh-auto-team-breathe 1200ms var(--ds-ease-in-out, ease) infinite alternate;
+}
+[data-skill-dialog] [data-skill-body-skeleton] > span:nth-child(2) { width: 82%; }
+[data-skill-dialog] [data-skill-body-skeleton] > span:nth-child(3) { width: 64%; }
+@keyframes dsh-auto-team-breathe {
+  from { opacity: 0.4; }
+  to { opacity: 0.9; }
+}
+/* 系统技能列表：40px 行 + 名称/说明两列 */
+[data-skill-dialog] [data-skill-picker-list] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  min-width: 0;
+}
+[data-skill-dialog] [data-skill-picker-row] {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 8px;
+  box-sizing: border-box;
+  min-height: 40px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--dsw-radius-sm, 8px);
+  cursor: pointer;
+  min-width: 0;
+}
+[data-skill-dialog] [data-skill-picker-row]:hover { background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent)); }
+[data-skill-dialog] [data-skill-picker-row][data-checked="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 8%, transparent);
+}
+[data-skill-dialog] [data-skill-picker-row] input { grid-row: 1 / span 2; align-self: center; height: auto; margin: 0; }
+[data-skill-dialog] [data-skill-picker-name] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary, inherit);
+}
+[data-skill-dialog] [data-skill-picker-desc] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] [data-skill-picker-empty] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  border: 1px dashed var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-skill-dialog] [data-skill-picker-empty] p { margin: 0; }
+
+/* 模型弹层（角色卡上的 button + 气泡） */
+[data-role-model-picker] {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  position: relative;
+}
+[data-role-model-picker-button] {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  height: 24px;
+  max-width: 100%;
+  padding: 0 8px;
+  border-radius: var(--dsw-radius-sm, 8px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  cursor: pointer;
+  transition: background-color 120ms var(--ds-ease-in-out, ease), border-color 120ms var(--ds-ease-in-out, ease);
+}
+[data-role-model-picker-button]:hover {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+  border-color: var(--dsw-alias-border-l3, currentColor);
+}
+[data-role-model-picker-button]:focus-visible,
+[data-role-model-popover] [data-model-option]:focus-visible,
+[data-role-model-popover] [data-model-manual-toggle]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #2f6feb);
+  outline-offset: 1px;
+}
+[data-role-model-picker] [data-model-value] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ds-font-family-code, monospace);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-role-model-picker] [data-model-caret] { flex: 0 0 auto; opacity: 0.7; }
+[data-role-model-popover] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-sizing: border-box;
+  width: 296px;
+  max-width: calc(100vw - 32px);
+  max-height: 320px;
+  padding: 8px;
+  border-radius: var(--dsw-radius-md, 12px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.24));
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+}
+[data-role-model-popover] [data-model-search-row] { display: flex; min-width: 0; }
+[data-role-model-popover] [data-model-search] { flex: 1 1 auto; height: 28px; }
+[data-role-model-popover] [data-model-list] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+[data-role-model-popover] [data-model-option] {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  box-sizing: border-box;
+  min-height: 36px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+[data-role-model-popover] [data-model-option]:hover {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+}
+[data-role-model-popover] [data-model-option][aria-selected="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 8%, transparent);
+}
+[data-role-model-popover] [data-model-option-name] {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ds-font-family-code, monospace);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-role-model-popover] [data-model-option-provider] {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-role-model-popover] [data-model-empty],
+[data-role-model-popover] [data-model-loading] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border: 1px dashed var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-role-model-popover] [data-role-model-manual] { display: flex; flex-direction: column; gap: 4px; }
+[data-role-model-popover] [data-model-manual-toggle] {
+  align-self: flex-start;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: var(--dsw-radius-sm, 8px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  cursor: pointer;
+}
+[data-role-model-popover] [data-model-manual-fields] { display: flex; gap: 4px; }
+[data-role-model-popover] [data-model-manual-field] { flex: 1 1 0; min-width: 0; }
+[data-role-model-popover] [data-model-popover-foot] {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+[data-role-model-popover] [data-model-popover-foot] button {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--dsw-radius-sm, 8px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: transparent;
+  color: inherit;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  cursor: pointer;
+}
+
+/* 恢复默认对话框（替换 r7 的行内确认）：确认键用**琥珀**不用红 —— 红只留给不可恢复的失败 */
+[data-roles-restore-backdrop] {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 32%, transparent);
+}
+[data-roles-restore-confirm] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  width: 400px;
+  max-width: calc(100vw - 32px);
+  padding: 14px;
+  border-radius: var(--dsw-radius-md, 12px);
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.24));
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+}
+[data-roles-restore-confirm] [data-restore-title] { font: var(--dsw-font-sm-14, 14px/20px sans-serif); }
+[data-roles-restore-confirm] [data-restore-line] {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-roles-restore-confirm] [data-restore-actions] {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+[data-roles-restore-confirm] button {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  height: 24px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+[data-roles-restore-confirm] button:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+}
+[data-roles-restore-confirm] button:disabled { cursor: not-allowed; opacity: 0.55; }
+[data-roles-restore-confirm] [data-roles-restore-ok][data-confirm-tone="warn"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 55%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 14%, transparent);
+}
+/* 无障碍：系统要求减少动效时，骨架/呼吸/旋转全部停下（尺寸与文案不变） */
+@media (prefers-reduced-motion: reduce) {
+  [data-skill-dialog] [data-skill-body-skeleton] > span,
+  [data-auto-team-option] [data-option-spinner] {
+    animation: none;
+  }
+}
 
 /* 右栏页签标题（keyed pane.tab.title）：宿主画 hover/active，这里只保证不换行不撑高 */
 [data-auto-team-panel-tab] { white-space: nowrap; }

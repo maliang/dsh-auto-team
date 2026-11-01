@@ -361,7 +361,7 @@ function withTempRoleRepo(fn: (repo: ReturnType<typeof createRoleRepo>, dir: str
   }
 }
 
-test('seed 落盘内置角色与技能，重启（新实例）后仍读得到', () => {
+test('seed 落盘内置角色，重启（新实例）后仍读得到（技能 md 归 skills-repo，角色库不再写）', () => {
   const root = mkdtempSync(join(tmpdir(), 'auto-team-roles-'))
   try {
     const dir = join(root, 'roles')
@@ -371,7 +371,8 @@ test('seed 落盘内置角色与技能，重启（新实例）后仍读得到', 
     first.seed()
     assert.equal(existsSync(join(dir, 'pm.json')), true)
     assert.ok(listRoleIds(first).includes('pm'))
-    assert.equal(existsSync(join(skillsDir, `${BUILTIN_ROLES[0].skillIds[0]}.md`)), true)
+    // r10：角色库只写角色 JSON，技能 md 的 seed 已迁到 roles/skills-repo.ts（覆盖层 + frontmatter）。
+    assert.equal(existsSync(join(skillsDir, `${BUILTIN_ROLES[0].skillIds[0]}.md`)), false)
 
     // 修改内置角色并指定模型 → 新实例（模拟重启）必须读回同一模型
     const pm = first.get('pm')

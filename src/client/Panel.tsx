@@ -19,7 +19,7 @@ import { panelApi } from './api.ts'
 import { capsuleOf, captainModelLabelOf, planStatusView } from './viewmodel.ts'
 import type { ClientAction } from './viewmodel.ts'
 import { pauseButtonView } from './ui.ts'
-import { OPEN_PANEL_EVENT } from './HeaderButton.tsx'
+import { OPEN_PANEL_EVENT, PANEL_CLOSE_EVENT } from './HeaderButton.tsx'
 import { PlanTab } from './tabs/PlanTab.tsx'
 import { MembersTab } from './tabs/MembersTab.tsx'
 import { MemoryTab } from './tabs/MemoryTab.tsx'
@@ -109,6 +109,15 @@ export function Panel(props: PanelProps): React.ReactElement {
     return () => window.removeEventListener(OPEN_PANEL_EVENT, onOpen)
   }, [])
 
+  // 头部按钮三级回退都关不掉时派发 PANEL_CLOSE_EVENT：这里给一句人能看懂的原因，
+  // 而不是让按钮静默什么都不做（AC-11 的「非乐观」配套：状态没变就必须说明为什么）。
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    const onCloseRefused = (): void => setCloseFailure('收起面板失败：宿主未提供关闭入口，请从页签上的 × 关闭')
+    window.addEventListener(PANEL_CLOSE_EVENT, onCloseRefused)
+    return () => window.removeEventListener(PANEL_CLOSE_EVENT, onCloseRefused)
+  }, [])
+
   const capsule = capsuleOf(snapshot?.enabled === true, snapshot)
   const captain = captainModelLabelOf(snapshot?.captainModel)
   const degraded = snapshot?.degraded === true
@@ -117,8 +126,15 @@ export function Panel(props: PanelProps): React.ReactElement {
   const tasks = snapshot?.tasks ?? []
   const total = tasks.length
   const done = tasks.filter((task) => task.status === 'done').length
+  const memberCount = snapshot?.members.length ?? 0
+  const running = snapshot?.concurrency?.running ?? 0
+  const limit = snapshot?.concurrency?.limit ?? 0
   const paused = snapshot?.paused === true
   const pauseView = pauseButtonView({ paused, busy: pauseBusy })
+  // 头部按钮「关不掉」时经由窗口事件把原因送到这里 —— 这是它唯一能说话的地方
+  // （工具栏上不许出现红字，AC-5；面板的 `[data-error]` 是全插件错误文案的归口）。
+  const [closeFailure, setCloseFailure] = React.useState<string | undefined>(undefined)
+  const shownError = typeof error === 'string' && error !== '' ? error : closeFailure
   // 计划状态一律走 viewmodel 的 5 态表（暂停时按 `paused` 归一，不在这里写第二套中文）
   const effectivePlanStatus: PlanStatus | undefined = paused ? 'paused' : snapshot?.planStatus
   const planStatus = effectivePlanStatus === undefined ? undefined : planStatusView(effectivePlanStatus)
@@ -136,28 +152,39 @@ export function Panel(props: PanelProps): React.ReactElement {
 
   return (
     <div data-auto-team-panel data-enabled={snapshot?.enabled === true ? 'true' : 'false'} data-paused={paused ? 'true' : 'false'}>
+      {/* AC-9：`[data-panel-head]` 的直系子节点**恰好 3 个**（标题 / 状态胶囊 / 刷新）。
+          挤进来的一切状态信息都下沉到下面的 `[data-panel-meta]` —— 混排会让 320px 宽度下
+          标题被压成省略号、胶囊换行，这是 r7 面板头部被直接吐槽的根因。 */}
       <div data-panel-head>
         <strong data-panel-title>自动团队</strong>
         <span data-head-capsule data-tone={TONE_DATA[capsule.tone] ?? 'neutral'} title={capsule.text}>
           {capsule.text}
         </span>
-        <span data-head-meta>
-          计划 {total} · 成员 {snapshot?.members.length ?? 0} · 并发 {snapshot?.concurrency?.running ?? 0}/
-          {snapshot?.concurrency?.limit ?? 0}
+        <button type="button" onClick={() => void view.refresh()} data-panel-refresh title="重新拉取快照">
+          刷新
+        </button>
+      </div>
+
+      {/* AC-10：三组信息各占独立槽位（`data-meta-plan` / `data-captain-model` /
+          `data-auto-team-degraded`），组间只有装饰性分隔符（aria-hidden）。空计划时**不隐藏**，
+          显示 `计划 0 · 成员 0 · 并发 0/0` —— 空态也是信息。 */}
+      <div data-panel-meta>
+        <span data-meta-plan data-meta="plan" title={`计划 ${total} · 成员 ${memberCount} · 并发 ${running}/${limit}`}>
+          计划 {total} · 成员 {memberCount} · 并发 {running}/{limit}
         </span>
-        <span data-captain-model data-tone={captain.tone} title={captain.label}>
+        <span data-meta-sep aria-hidden="true" />
+        <span data-captain-model data-meta="captain-model" data-tone={captain.tone} title={captain.label}>
           {captain.label}
         </span>
+        <span data-meta-sep aria-hidden="true" />
         <span
           data-auto-team-degraded={degraded ? 'true' : 'false'}
+          data-meta="degraded"
           data-tone={degraded ? 'warn' : 'neutral'}
           title={degraded ? degradeReason : '四个宿主事件源都已订阅，Trigger 由事件即时推进'}
         >
           {degraded ? `事件源降级${degradeReason !== '' ? `：${degradeReason}` : ''}` : '事件源正常'}
         </span>
-        <button type="button" onClick={() => void view.refresh()} data-panel-refresh>
-          刷新
-        </button>
       </div>
 
       <div data-panel-progress-row>
@@ -212,11 +239,11 @@ export function Panel(props: PanelProps): React.ReactElement {
         ))}
       </div>
 
-      {error !== undefined ? (
+      {shownError === undefined ? null : (
         <div data-error role="alert">
-          {error}
+          {shownError}
         </div>
-      ) : null}
+      )}
 
       <div data-panel-body data-active-tab={tab}>
         {tab === 'plan' ? (

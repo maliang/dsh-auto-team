@@ -10,9 +10,13 @@ import assert from 'node:assert/strict'
 
 import {
   headerButtonView,
+  modelPickerLabel,
   optionView,
   pauseButtonView,
+  restoreConfirmView,
   settingsKeysView,
+  skillRowView,
+  skillSourceLabel,
   taskRowView,
 } from '../src/client/ui.ts'
 import { progressOf } from '../src/client/viewmodel.ts'
@@ -21,6 +25,8 @@ import type {
   PlanStatus,
   PlanTask,
   Role,
+  SkillInfo,
+  SkillSource,
   TaskStatus,
 } from '../src/shared/types.ts'
 
@@ -76,34 +82,74 @@ test('hook：五个描述层输出都带 data-auto-team-* 唯一前缀（旧 dat
   }
 })
 
-/* ───────────────────── ② 输入框内胶囊（AC-12） ───────────────────── */
+/** 可供断言的固定状态集（r10 的可见文本恒为「自动团队」，状态语义全在 aria/tone）。 */
+const OPTION_STATES = [
+  { name: '未启用', input: { enabled: false, busy: false, done: 0, total: 0 } },
+  { name: '计划就绪', input: { enabled: true, busy: false, planStatus: 'draft' as const, done: 0, total: 3 } },
+  { name: '完成', input: { enabled: true, busy: false, planStatus: 'dispatching' as const, done: 3, total: 3 } },
+  { name: '已暂停', input: { enabled: true, busy: false, planStatus: 'paused' as const, done: 1, total: 3 } },
+  { name: '写盘在飞', input: { enabled: true, busy: true, planStatus: 'draft' as const, done: 0, total: 3 } },
+] as const
 
-test('胶囊：未启用 / 计划就绪 / 完成 / 已暂停 四种文案，且 aria 名带状态', () => {
+/* ───────────────────── ② 输入框内胶囊（AC-3 / AC-6） ───────────────────── */
+
+test('胶囊：可见文本逐字「自动团队」，状态只进 aria 与 state（AC-3）', () => {
   const off = optionView({ enabled: false, busy: false, done: 0, total: 0 })
-  assert.equal(off.label, '自动团队 · 未启用')
+  assert.equal(off.label, '自动团队', 'r10 起可见文本恒为「自动团队」，不再把状态拼进文案')
   assert.equal(off.state, 'off')
   assert.equal(off.pressed, false)
-  assert.match(off.ariaLabel, /未启用/)
+  assert.match(off.ariaLabel, /未启用/, '状态语义必须仍在无障碍名里，否则读屏用户看不到状态')
 
   const ready = optionView({ enabled: true, busy: false, planStatus: 'draft', done: 0, total: 3 })
-  assert.equal(ready.label, '自动团队 · 计划就绪 · 3 任务')
+  assert.equal(ready.label, '自动团队')
   assert.equal(ready.state, 'on')
   assert.equal(ready.pressed, true)
   assert.equal(ready.ariaLabel, '自动团队，已启用，计划就绪 · 3 任务')
+  assert.equal(ready.dotTone, 'neutral')
+  assert.equal(ready.failure, undefined, '无失败时不许渲染失败说明')
 
   const done = optionView({ enabled: true, busy: false, planStatus: 'dispatching', done: 3, total: 3 })
-  assert.equal(done.label, '自动团队 · 完成 3/3')
+  assert.equal(done.label, '自动团队')
+  assert.match(done.ariaLabel, /完成 3\/3/)
 
   const paused = optionView({ enabled: true, busy: false, planStatus: 'paused', done: 1, total: 3 })
-  assert.equal(paused.label, '自动团队 · 已暂停')
+  assert.equal(paused.label, '自动团队')
   assert.equal(paused.state, 'paused', '暂停态要能被组件单独上色（琥珀），不能与 on 混为一谈')
   assert.equal(paused.pressed, true, '暂停仍然是「已启用」，开关不能被画成关闭')
 
-  // 四态文案互不重复：否则用户看不出到底是关着、在跑还是暂停了
-  assert.equal(new Set([off.label, ready.label, done.label, paused.label]).size, 4)
+  // 五态：可见文本必须**完全一致**（AC-3 的字面要求），差异只允许落在 state/aria 上
+  const views = OPTION_STATES.map((entry) => optionView(entry.input))
+  assert.deepEqual(new Set(views.map((view) => view.label)), new Set(['自动团队']))
+  assert.equal(new Set(views.map((view) => view.state)).size, 4, 'off/on/paused/busy 四态必须可分')
+  assert.equal(new Set(views.map((view) => view.ariaLabel)).size, 4, 'aria 名也要可区分（busy 只换态，不改 aria）')
 })
 
-test('胶囊：busy 期间文案逐字不变，只换 state（禁止乐观改文案）', () => {
+test('胶囊：失败零红字——只有琥珀点 + 失败说明，可见文本一字不变（AC-6）', () => {
+  const ok = optionView({ enabled: true, busy: false, planStatus: 'draft', done: 0, total: 2 })
+  const failed = optionView({
+    enabled: true,
+    busy: false,
+    planStatus: 'draft',
+    done: 0,
+    total: 2,
+    failure: '宿主未装配派发器\n第二行细节不进摘要',
+  })
+  assert.equal(failed.label, ok.label, '失败时可见文本不许变（不许追加「失败」或错误码）')
+  assert.equal(failed.pressed, ok.pressed)
+  assert.equal(failed.dotTone, 'warn', '失败用琥珀（可恢复），不是红')
+  assert.equal(failed.failure, '操作失败：宿主未装配派发器', '失败说明带逐字前缀「操作失败」，且只取首行')
+  assert.match(failed.ariaLabel, /^操作失败：/, '失败时无障碍名整句改成失败说明')
+  assert.equal(ok.dotTone, 'neutral')
+
+  // 空串/空白不算失败：不许制造「操作失败：」这种半截文案
+  for (const raw of ['', '   ', undefined]) {
+    const view = optionView({ enabled: false, busy: false, done: 0, total: 0, failure: raw })
+    assert.equal(view.failure, undefined)
+    assert.equal(view.dotTone, 'neutral')
+  }
+})
+
+test('胶囊：busy 期间可见文本/aria 逐字不变，只换 state（禁止乐观）', () => {
   const idle = optionView({ enabled: true, busy: false, planStatus: 'draft', done: 0, total: 2 })
   const busy = optionView({ enabled: true, busy: true, planStatus: 'draft', done: 0, total: 2 })
   assert.equal(busy.label, idle.label, 'busy 不得改文案（否则「点了没反应」看起来像已生效）')
@@ -113,7 +159,7 @@ test('胶囊：busy 期间文案逐字不变，只换 state（禁止乐观改文
 
   // 关闭态 busy 也一样
   const offBusy = optionView({ enabled: false, busy: true, done: 0, total: 0 })
-  assert.equal(offBusy.label, '自动团队 · 未启用')
+  assert.equal(offBusy.label, '自动团队')
   assert.equal(offBusy.state, 'busy')
 })
 
@@ -124,25 +170,46 @@ test('胶囊：缺字段/负数/NaN 一律兜底，不出现 NaN 或 undefined �
     done: Number.NaN,
     total: -1,
   })
-  assert.doesNotMatch(broken.label, /NaN|undefined|null/)
-  assert.equal(broken.label, '自动团队 · 待开工')
+  assert.doesNotMatch(broken.label + broken.ariaLabel, /NaN|undefined|null/)
+  assert.equal(broken.label, '自动团队')
+  assert.match(broken.ariaLabel, /待开工/)
 
   const zero = optionView({ enabled: true, busy: false, planStatus: 'dispatching', done: 0, total: 0 })
-  assert.equal(zero.label, '自动团队 · 派发中')
+  assert.equal(zero.label, '自动团队')
+  assert.match(zero.ariaLabel, /派发中/)
 })
 
-/* ───────────────────── ③ 会话头按钮（AC-13） ───────────────────── */
+/* ───────────────────── ③ 会话头按钮（AC-11） ───────────────────── */
 
-test('头按钮：文案含「自动团队」，角标是 完成数/总数，无计划时角标为空', () => {
-  const view = headerButtonView({ enabled: true, planStatus: 'dispatching', done: 2, total: 5 })
-  assert.equal(view.label, '自动团队')
-  assert.match(view.label, /自动团队/, 'AC-13 判据：文案必须含「自动团队」')
-  assert.equal(view.badge, '2/5')
-  assert.match(view.ariaLabel, /^自动团队，已启用，/, '窄视口只留图标时仍要能读出完整名字')
+test('头按钮：三分支 aria-label，opened 由真实页签态驱动（AC-11）', () => {
+  // 未打开 → 动作是 open
+  const closed = headerButtonView({ enabled: true, planStatus: 'dispatching', done: 2, total: 5, opened: false })
+  assert.equal(closed.label, '自动团队')
+  assert.equal(closed.badge, '2/5')
+  assert.equal(closed.action, 'open')
+  assert.equal(closed.opened, false)
+  assert.match(closed.ariaLabel, /^打开自动团队面板/, '未打开时的无障碍名必须是「打开…」')
+
+  // 已打开且宿主给了关闭入口 → close
+  const open = headerButtonView({ enabled: true, opened: true, canClose: true, done: 0, total: 0 })
+  assert.equal(open.action, 'close')
+  assert.equal(open.opened, true)
+  assert.match(open.ariaLabel, /^收起自动团队面板/)
+
+  // 已打开但宿主没有关闭入口 → 说真话，且**不翻转** aria-pressed
+  const stuck = headerButtonView({ enabled: true, opened: true, canClose: false, done: 0, total: 0 })
+  assert.match(stuck.ariaLabel, /^收起失败：宿主未提供关闭入口/)
+  assert.equal(stuck.opened, true, '关不掉时 aria-pressed 不许自己翻成 false（非乐观）')
+
+  // 宿主没有页签服务 → 回退到窗口事件，opened 一律 false
+  const fallback = headerButtonView({ enabled: false, opened: true, available: false, done: 0, total: 0 })
+  assert.equal(fallback.fallback, true)
+  assert.equal(fallback.action, 'open')
+  assert.equal(fallback.opened, false)
+  assert.match(fallback.ariaLabel, /已回退为窗口事件/)
 
   const empty = headerButtonView({ enabled: false, done: 0, total: 0 })
   assert.equal(empty.badge, '', '无计划时不渲染角标（空串，而不是 0/0）')
-  assert.equal(empty.label, '自动团队')
 })
 
 /* ───────────────────── ④ 暂停 / 继续按钮（AC-15） ───────────────────── */
@@ -326,29 +393,108 @@ test('设置页：设置对象整体缺失也不崩（防御式默认值）', ()
   assert.ok(rows.every((row) => row.label !== '' && row.hint !== ''))
 })
 
-/* ───────────────────── ⑦ 计划状态与胶囊的联动（AC-14 页头） ───────────────────── */
+/* ───────────────────── ⑨ 技能四来源（AC-20 / AC-23） ───────────────────── */
 
-test('胶囊：计划 5 态文案各不相同（页头 chip 与 pill 同源）', () => {
-  const statuses: PlanStatus[] = ['draft', 'dispatching', 'paused', 'terminated', 'cancelled']
-  const labels = statuses.map(
-    (planStatus) => optionView({ enabled: true, busy: false, planStatus, done: 0, total: 2 }).label,
+function skillOf(over: Partial<SkillInfo> & { source: SkillSource }): SkillInfo {
+  return { id: 'sk-1', title: '技能甲', description: '一句说明', modified: false, ...over }
+}
+
+test('技能来源：四来源各有人话标签，未知来源不输出 undefined', () => {
+  assert.equal(skillSourceLabel('builtin'), '内置')
+  assert.equal(skillSourceLabel('imported'), '导入')
+  assert.equal(skillSourceLabel('system'), '系统')
+  assert.equal(skillSourceLabel('manual'), '手动')
+  assert.equal(skillSourceLabel('whatever' as SkillSource), '未知')
+})
+
+test('技能行：内置只「恢复出厂」、用户三源只「删除」（AC-23 机械判据）', () => {
+  const builtin = skillRowView(skillOf({ source: 'builtin', modified: true }), false)
+  assert.equal(builtin.actions.restore, '恢复出厂')
+  assert.equal(builtin.actions.delete, null, '内置技能不可删（删了下次 seed 又回来，用户会以为删除失效）')
+  assert.equal(builtin.actions.edit, '编辑')
+  assert.equal(builtin.modifiedLabel, '已修改', '内置技能被改过必须有可见徽标')
+  assert.equal(builtin.sourceTone, 'neutral')
+  assert.equal(builtin.checkboxLabel, '选择技能：技能甲（内置）')
+
+  for (const source of ['imported', 'system', 'manual'] as const) {
+    const row = skillRowView(skillOf({ source }), true)
+    assert.equal(row.actions.delete, '删除', `${source} 必须可删`)
+    assert.equal(row.actions.restore, null, `${source} 没有出厂版本可恢复`)
+    assert.equal(row.checked, true)
+    assert.equal(row.modifiedLabel, null, '用户自建技能的「已修改」没有意义（它本来就是用户的）')
+  }
+
+  // 三种用户来源的色调互不相同（内置 vs 导入 vs 系统 vs 手动，靠色调 + 文字双重区分）
+  const tones = new Set(
+    (['builtin', 'imported', 'system', 'manual'] as const).map(
+      (source) => skillRowView(skillOf({ source }), false).sourceTone,
+    ),
   )
-  assert.equal(new Set(labels).size, 5, '5 种计划状态必须给出 5 种不同文案')
-  for (const label of labels) assert.doesNotMatch(label, /undefined|NaN/)
+  assert.equal(tones.size, 4)
+
+  // 缺字段不许产出 undefined 文案
+  const broken = skillRowView({} as SkillInfo, false)
+  assert.equal(broken.title, '')
+  assert.doesNotMatch(JSON.stringify(broken), /undefined/)
+})
+
+/* ───────────────────── ⑩ 模型选择器文案（AC-16） ───────────────────── */
+
+test('模型选择器：空值写「跟随会话默认」，有值走 provider/model（带 #effort）', () => {
+  assert.equal(modelPickerLabel(undefined), '跟随会话默认')
+  assert.equal(modelPickerLabel({ provider: '', model: '' }), '跟随会话默认', '空串等价于没配，不许渲染空按钮')
+  assert.equal(modelPickerLabel({ provider: 'dsh-primary', model: 'deepseek-v4' }), 'dsh-primary/deepseek-v4')
+  assert.equal(
+    modelPickerLabel({ provider: 'dsh-primary', model: 'deepseek-v4', reasoningEffort: 'high' }),
+    'dsh-primary/deepseek-v4 #high',
+  )
+})
+
+/* ───────────────────── ⑪ 恢复默认对话框（AC-22） ───────────────────── */
+
+test('恢复默认：三个数字全部来自入参，不许写死', () => {
+  const one = restoreConfirmView({ builtinRoles: 11, customRoles: 0, userSkills: 0, builtinSkills: 12 })
+  assert.equal(one.confirmLabel, '恢复默认')
+  assert.equal(one.title, '恢复默认角色与内置技能')
+  assert.equal(one.lines.length, 4, '一句范围说明 + 角色/技能各一行 + 一句「你不受影响」')
+  assert.match(one.lines[0]!, /11 个内置角色与 12 条内置技能/)
+  assert.match(one.lines[3]!, /不会删除任何用户数据/)
+
+  // 换成另一组数字：文案必须跟着变（可分辨性自检：写死就过不了这条）
+  const two = restoreConfirmView({ builtinRoles: 3, customRoles: 2, userSkills: 5, builtinSkills: 4 })
+  assert.match(two.lines[0]!, /3 个内置角色与 4 条内置技能/)
+  assert.match(two.lines[3]!, /2 个自建角色、5 条/)
+  assert.notDeepEqual(one.lines, two.lines)
+
+  // 非法/缺失数字兜底成 0，不产生 NaN
+  const broken = restoreConfirmView({} as never)
+  assert.doesNotMatch(broken.lines.join(' '), /NaN|undefined/)
+  assert.match(broken.lines[0]!, /0 个内置角色与 0 条内置技能/)
+})
+
+
+test('胶囊：计划 5 态在 aria 名与 state 上各不相同（可见文本恒为「自动团队」）', () => {
+  const statuses: PlanStatus[] = ['draft', 'dispatching', 'paused', 'terminated', 'cancelled']
+  const views = statuses.map((planStatus) => optionView({ enabled: true, busy: false, planStatus, done: 0, total: 2 }))
+  assert.deepEqual(new Set(views.map((view) => view.label)), new Set(['自动团队']), 'AC-3：可见文本逐字一致')
+  assert.equal(new Set(views.map((view) => view.ariaLabel)).size, 5, '5 种计划状态必须给出 5 种不同的无障碍名')
+  for (const view of views) assert.doesNotMatch(view.ariaLabel, /undefined|NaN/)
 })
 
 /* ───────────── ⑧ 端到端：把真实主路径走到底（启用→派发→暂停→继续→完成） ───────────── */
 
 /**
  * 描述层的主路径走查（7c）：单点断言只能证明「每个函数各算对」，证明不了「状态推进时
- * 界面跟着对」。这里用一串真实推进的输入把界面文案从「未启用」走到「完成 2/2」这个终态，
- * 并检查中途的暂停/继续往返 —— 尤其是「已完成的不要重跑」在文案上必须可见。
+ * 界面跟着对」。这里用一串真实推进的输入把界面从「未启用」走到「完成 2/2」这个终态，
+ * 并检查中途的暂停/继续往返 —— 尤其是「已完成的不要重跑」在进度上必须可见。
  */
 test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → 暂停 → 继续 → 完成 2/2', () => {
   type Step = {
     name: string
     input: { enabled: boolean; busy: boolean; planStatus?: PlanStatus; done: number; total: number }
-    pill: string
+    /** aria 名里必须出现的片段（可见文本恒为「自动团队」，状态语义全在这里）。 */
+    aria: RegExp
+    state: 'off' | 'on' | 'paused' | 'busy'
     pause: '暂停任务' | '继续任务'
   }
 
@@ -356,57 +502,67 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
     {
       name: '未启用',
       input: { enabled: false, busy: false, done: 0, total: 0 },
-      pill: '自动团队 · 未启用',
+      aria: /^自动团队，未启用$/,
+      state: 'off',
       pause: '暂停任务',
     },
     {
       name: '启用后计划就绪',
       input: { enabled: true, busy: false, planStatus: 'draft', done: 0, total: 2 },
-      pill: '自动团队 · 计划就绪 · 2 任务',
+      aria: /已启用，计划就绪 · 2 任务/,
+      state: 'on',
       pause: '暂停任务',
     },
     {
       name: '派发中（1/2 完成）',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 1, total: 2 },
-      pill: '自动团队 · 派发中 · 1/2',
+      aria: /派发中 · 1\/2/,
+      state: 'on',
       pause: '暂停任务',
     },
     {
       name: '暂停',
       input: { enabled: true, busy: false, planStatus: 'paused', done: 1, total: 2 },
-      pill: '自动团队 · 已暂停',
+      aria: /已暂停/,
+      state: 'paused',
       pause: '继续任务',
     },
     {
       name: '继续（进度不丢，仍是 1/2）',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 1, total: 2 },
-      pill: '自动团队 · 派发中 · 1/2',
+      aria: /派发中 · 1\/2/,
+      state: 'on',
       pause: '暂停任务',
     },
     {
       name: '终态：全部完成',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 2, total: 2 },
-      pill: '自动团队 · 完成 2/2',
+      aria: /完成 2\/2/,
+      state: 'on',
       pause: '暂停任务',
     },
   ]
 
   for (const step of steps) {
-    const pill = optionView(step.input)
+    const option = optionView(step.input)
     const pause = pauseButtonView({ paused: step.input.planStatus === 'paused', busy: step.input.busy })
-    assert.equal(pill.label, step.pill, `步骤「${step.name}」胶囊文案`)
+    assert.equal(option.label, '自动团队', `步骤「${step.name}」可见文本恒为「自动团队」`)
+    assert.match(option.ariaLabel, step.aria, `步骤「${step.name}」无障碍名要能读出状态`)
+    assert.equal(option.state, step.state, `步骤「${step.name}」视觉态`)
     assert.equal(pause.label, step.pause, `步骤「${step.name}」暂停按钮文案`)
     // 终态必须真的「完成」，不能被任何后续状态盖回去
     if (step.name === '终态：全部完成') {
-      assert.match(pill.label, /完成 2\/2/)
+      assert.match(option.ariaLabel, /完成 2\/2/)
       assert.equal(headerButtonView(step.input).badge, '2/2')
+      assert.equal(headerButtonView(step.input).ariaLabel.includes('完成 2/2'), true)
     }
   }
 
-  // 暂停往返的可分辨性：暂停那一步与「继续后」那一步的文案必须不同，否则用户看不出状态
+  // 暂停往返的可分辨性：暂停那一步与「继续后」那一步必须在 state/aria 上不同
   const paused = steps.find((step) => step.name === '暂停')!
   const resumed = steps.find((step) => step.name === '继续（进度不丢，仍是 1/2）')!
-  assert.notEqual(optionView(paused.input).label, optionView(resumed.input).label)
+  assert.notEqual(optionView(paused.input).state, optionView(resumed.input).state)
+  assert.notEqual(optionView(paused.input).ariaLabel, optionView(resumed.input).ariaLabel)
   assert.equal(optionView(resumed.input).state, 'on')
   assert.equal(optionView(paused.input).state, 'paused')
   // 暂停前后完成数一致 —— 「已完成的不要重跑」在描述层可见

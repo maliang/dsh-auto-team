@@ -27,3 +27,24 @@ export const PANEL_ACTIVE_MS = 2_000
 
 /** 面板轮询的「空闲」间隔（毫秒）：没有运行中任务时降频，避免空转打宿主。 */
 export const PANEL_IDLE_MS = 5_000
+
+/**
+ * 技能正文长度上限（字符，r10 AC-19）。
+ *
+ * 放在 shared 而不是 host/config.ts：**客户端编辑弹层要先拦**（否则用户敲到一半才被宿主拒绝），
+ * 宿主 `roles/skills-repo.ts` 还要再校验一次（不信任客户端）。两处必须是同一个数，
+ * 否则会出现「界面放行、宿主拒绝」的错位——这正是本文件存在的理由（单一定义、两处可见）。
+ */
+export const SKILL_BODY_MAX = 20_000
+
+/** 技能标题长度上限（字符）：同样是「弹层先拦 + 宿主再校验」的两处共用一个数。 */
+export const SKILL_TITLE_MAX = 80
+
+/** 技能说明长度上限（字符）：前端单行展示（line-clamp: 1），写长了也读不出来。 */
+export const SKILL_DESCRIPTION_MAX = 200
+
+/**
+ * 技能清单下发上限（条）：投影要进快照、快照每 2s 轮询一次，
+ * 不能因为用户塞了几千条 md 就把整帧撑爆（宿主按内置序 + 标题序截断）。
+ */
+export const SKILL_LIST_LIMIT = 200

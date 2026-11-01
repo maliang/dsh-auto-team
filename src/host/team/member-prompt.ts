@@ -20,12 +20,20 @@ import type { PromptInput } from './dispatch.ts'
 /** 本模块唯一的外部能力：按目标取相关团队记忆（已按预算裁剪好）。 */
 export interface MemberPromptDeps {
   memoryFor(goal: string): { text: string; truncated: boolean }
+  /**
+   * r10 AC-29：技能正文的**真实来源**（读盘上正文，而不是出厂常量）。
+   *
+   * 缺省时 `composeSkillPrompt` 回退 `builtinSkillBody`（出厂正文）—— 装配层一定会传这个
+   * 函数；不传的只有「纯内置技能」的历史单测。用户改过的内置技能若走回退，界面上是新的、
+   * 成员提示词里还是旧的，AC-29 的「重启后读回」就变成了假象。
+   */
+  skillBodyOf?: (skillId: string) => string
 }
 
 /** 把角色 / 任务 / 团队记忆 / 技能正文拼成成员 spawn prompt。 */
 export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): string {
   const role: Role | undefined = input.role
-  const skills = role ? composeSkillPrompt(role) : { text: '', missing: [] }
+  const skills = role ? composeSkillPrompt(role, deps.skillBodyOf) : { text: '', missing: [] }
   const memory = deps.memoryFor(input.task.title)
   // AC-4(b)：上游直投内容原样进首条提示词。段落位置是刻意的 —— 在「本次任务」之后
   // （成员已经知道自己要干什么）、「验收判定」之前（读验收命令前先拿到上游证据与产物路径）。

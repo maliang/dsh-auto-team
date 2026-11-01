@@ -6,16 +6,20 @@
  * 那正是「面板改得动、设置里改不动」的来源，本轮把它收成一条链。
  *
  * 保存动作仍走 `act({type:'saveRole'})`：本文件不 import api、不发请求。
+ * r10 起 `saveRole` 的载荷可以**只带技能**（`role` 省略 + `skills`），技能的新增/编辑/删除/
+ * 恢复出厂都从这里上送 —— 这样 `PanelAction` 仍是 15 种（AC-25 形状冻结）。
  */
 import * as React from 'react'
-import type { Role, SkillInfo } from '../../shared/types.ts'
+import type { Result, Role, SkillInfo, SkillMutation } from '../../shared/types.ts'
 import type { TabProps } from '../Panel.tsx'
 import { actFeedback, hintOf } from '../viewmodel.ts'
 import type { ClientAction } from '../viewmodel.ts'
 import { RoleEditorList } from '../RoleEditor.tsx'
+import { panelApi } from '../api.ts'
+import type { SkillBodyPayload } from '../api.ts'
 
 export function RolesTab(props: TabProps): React.ReactElement {
-  const { snapshot, act } = props
+  const { snapshot, act, sessionId } = props
   const roles: Role[] = snapshot?.roles ?? []
   const skills: SkillInfo[] = snapshot?.skills ?? []
   const [busy, setBusy] = React.useState(false)
@@ -31,6 +35,8 @@ export function RolesTab(props: TabProps): React.ReactElement {
     }
   }
 
+  const readSkill = (id: string): Promise<Result<SkillBodyPayload>> => panelApi.readSkill(sessionId, id)
+
   return (
     <section data-auto-team-roles data-density="panel">
       {hint === undefined ? null : (
@@ -43,9 +49,17 @@ export function RolesTab(props: TabProps): React.ReactElement {
         skills={skills}
         density="panel"
         busy={busy}
-        onSave={(role) => void run({ type: 'saveRole', role }, `已保存角色「${role.name}」`)}
+        modelCatalog={snapshot?.modelCatalog}
+        systemSkills={snapshot?.systemSkills}
+        readSkill={readSkill}
+        onSave={(role?: Role, mutations?: SkillMutation[]) =>
+          void run(
+            mutations === undefined ? { type: 'saveRole', role } : { type: 'saveRole', role, skills: mutations },
+            role === undefined ? '已保存技能变更' : `已保存角色「${role.name}」`,
+          )
+        }
         onDelete={(id) => void run({ type: 'deleteRole', roleId: id }, `已删除角色 ${id}`)}
-        onRestoreDefaults={() => void run({ type: 'restoreDefaultRoles' }, '已把内置角色恢复为出厂定义')}
+        onRestoreDefaults={() => void run({ type: 'restoreDefaultRoles' }, '已把内置角色与内置技能恢复为出厂定义')}
       />
     </section>
   )

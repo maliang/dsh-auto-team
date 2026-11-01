@@ -1,53 +1,55 @@
 /**
- * 挂载点注册契约（r7 四个 slot 的 name/id/key/order/inject + 页签类型的**唯一取值处**）。
+ * 挂载点注册契约（四个可见面的 name/id/key/order/inject + 页签类型的**唯一取值处**）。
  *
  * 页签要出现是**三步**（QA-02 实测，宿主 asar 官方文档 + `ui-schedule`/`dsh-plugin-teamflow` 样本）：
  *   ① `registerPanelTab` 把页签类型（`id === PANEL_KEY`）注册进 `sidebarRightTabs`；
  *   ② `registerSlots` 把 body/title 两个 keyed 座位按同一个 key 注册；
- *   ③ `createOpenPanel` 用 `sidebarRight.openTab(kind)` 打开（页面型页签不会自己出现）。
+ *   ③ `createPanelCommands(ctx).open(sessionId)` 用 `sidebarRight.openTab(kind)` 打开
+ *      （页面型页签不会自己出现）。
  * 只做 ② 的症状：构建全绿、控制台零报错、页签永不出现。
  *
- * 为什么单独成模块（TECHNICAL §4.2）：`node --test` 只能 strip 类型、**不能转 JSX**，
+ * 为什么单独成模块（TECHNICAL §5.1）：`node --test` 只能 strip 类型、**不能转 JSX**，
  * 所以任何 import `index.ts`（它 import 各 `.tsx`）的测试都不可能跑起来。
  * 把注册逻辑放进这里（**零 React / 零 JSX / 只 import `../shared/const.ts`**），
  * `test/client-contract.test.ts` 才能用 fake slots 驱动**真实注册代码**并断言
- * name/key/inject 的逐字关系 —— 这是 AC-6/AC-7/AC-19 唯一的运行期证据。
+ * name/key/inject 的逐字关系 —— 这是 AC-1/AC-2/AC-11 唯一的运行期证据。
  *
- * r7 的四个可见面（DESIGN §1.1，槽名逐字取自 `docs/teamflow/architecture/UI-SLOTS.md`）：
- *   E1 `conversation.input.dock`           输入框内胶囊选项（**非 keyed**，`{ name, id, order, inject }`）
- *   E2 `conversation.session.header.actions` 会话头按钮（**非 keyed**，同上）
- *   E3 `sidebar.right.pane.tab` / `.title`  右栏面板（**keyed**，`{ name, key, inject }`，两处同 key）
- *   E4 `settings.section`                  设置页「自动团队」（**非 keyed**，`{ name, id, order, label, inject }`）
+ * r10 的四个可见面（槽名逐字取自 `docs/teamflow/architecture/UI-SLOTS.md`）：
+ *   E1 `conversation.input.left`              输入框左侧胶囊选项（**非 keyed**，`{ name, id, order, inject }`）
+ *   E2 `conversation.session.header.actions`   会话头按钮（**非 keyed**，同上）
+ *   E3 `sidebar.right.pane.tab` / `.title`    右栏面板（**keyed**，`{ name, key, inject }`，两处同 key）
+ *   E4 `settings.section`                     设置页「自动团队」（**非 keyed**，`{ name, id, order, label, inject }`）
  *
- * 已撤除：r1~r6 的整宽开关行槽位（composer dock）。它的 `replaceRisk` 为 none，
- * 但 r7 把入口搬进输入框后必须整段删掉 —— 留着会让同一个开关出现两份状态与两条点击链。
+ * 已撤除：r1~r6 的整宽开关行槽位，以及 r7~r9 用的输入框**下方**那一位（r10 迁到上面的 E1）。
+ * r10 把胶囊挪进输入框左侧的操作区 —— 留旧槽位会让同一个开关出现两份状态与两条点击链（AC-1）。
+ * **旧槽位名在本文件里一个字都不留**，重复出现就是两处漂移的温床。
  *
  * 禁用槽位（`replaceRisk: shadows-shipped-ui`，占住会遮住宿主自带 UI）：
  * `conversation.composer.bar`、`conversation.input.activity`、
  * `conversation.session.header.corner`、`shell.leading`、`settings.header`。
  *
- * 硬约束（AC-6/AC-7）：
+ * 硬约束（AC-1 / AC-2 / AC-11）：
  *   1. `slots.inject(A, cb)` 的 `A` 与 `cb` 内 `register({ name })` 的 `name` 逐字相同；
  *   2. keyed 两处必须有 `key`；非 keyed 必须没有 `key`（缺 key 的真机症状：
  *      `Uncaught Error: keyed slot "..." requires options.key`，构建全绿、页签永不出现）；
  *   3. `PLUGIN_ID` 只许出现在 `id`/`key` 里，**不许**进 `name`（写成插件名 = 静默不挂载）；
- *   4. 五个座位都传 `inject`，把宿主的 `sessionId` 交给组件（原实现没有它，组件永远拿到兜底值 `'current'`）。
+ *   4. 五个座位都传 `inject`，把宿主的 `sessionId` 交给组件（否则组件永远拿到兜底值 `'current'`）。
  */
 import { PLUGIN_ID } from '../shared/const.ts'
 
-/** E1 输入框内胶囊选项（非 keyed，AC-12）。 */
-export const INPUT_DOCK_SLOT = 'conversation.input.dock'
+/** E1 输入框左侧胶囊选项（非 keyed，AC-1）。 */
+export const INPUT_LEFT_SLOT = 'conversation.input.left'
 
-/** E2 会话头按钮（非 keyed，AC-13）。 */
+/** E2 会话头按钮（非 keyed，AC-11）。 */
 export const HEADER_ACTIONS_SLOT = 'conversation.session.header.actions'
 
 /** E3 右栏「自动团队」面板页签（**keyed**）。 */
 export const PANEL_SLOT = 'sidebar.right.pane.tab'
 
-/** E3 上面那个页签的标题位（**keyed**，与 body 同 key，见文件头第 5 行）。 */
+/** E3 上面那个页签的标题位（**keyed**，与 body 同 key）。 */
 export const PANEL_TITLE_SLOT = 'sidebar.right.pane.tab.title'
 
-/** E4 设置页的「自动团队」分区（非 keyed，root 作用域，AC-16）。 */
+/** E4 设置页的「自动团队」分区（非 keyed，root 作用域）。 */
 export const SETTINGS_SECTION_SLOT = 'settings.section'
 
 /** E1 座位 id。 */
@@ -62,7 +64,7 @@ export const SECTION_ID = PLUGIN_ID
 /** E4 分区标题（宿主设置页左侧导航显示它）。 */
 export const SECTION_LABEL = '自动团队'
 
-/** 页签文案（AC-8 按文案判定，改字必须同步 PRD）。`TabTitle.tsx` 也取它，防两处漂移。 */
+/** 页签文案（AC-11 按文案判定，改字必须同步 PRD）。`TabTitle.tsx` 也取它，防两处漂移。 */
 export const PANEL_TAB_LABEL = '自动团队'
 
 /**
@@ -110,9 +112,34 @@ export interface TabsFace {
   register(definition: PanelTabDefinition): unknown
 }
 
-/** 宿主 `sidebarRight` 服务面：`openTab(kind)` 是**页面型页签唯一的打开方式**。 */
+/** 页签句柄（只声明本插件用来识别「是不是我这一页」的字段）。 */
+export interface SidebarTabLike {
+  id?: unknown
+  kind?: unknown
+  tabId?: unknown
+}
+
+/** 单个页签的动作面：`close()` 是宿主给的官方收起入口（第一级回退）。 */
+export interface TabActionsFace {
+  close?: () => unknown
+}
+
+/** `tabDomain` 把「某个页签」映射到它的动作面。 */
+export interface TabDomainFace {
+  occurrence?(sessionId: string, tab: unknown): { tabActions?: TabActionsFace } | undefined
+}
+
+/**
+ * 宿主 `sidebarRight` 服务面：
+ *  - `openTab(kind)` 是**页面型页签唯一的打开方式**；
+ *  - `tabsIn(sessionId)` / `closeIn(sessionId, tabId)` / `tabDomain` 都是可选成员 ——
+ *    宿主版本不同，只在真的存在时使用（三级回退见 `createPanelCommands`）。
+ */
 export interface SidebarRightFace {
   openTab(kind: string, options?: Record<string, unknown>): unknown
+  tabsIn?(sessionId: string): readonly unknown[]
+  closeIn?(sessionId: string, tabId: string): unknown
+  tabDomain?: TabDomainFace
 }
 
 /** 可选服务作用域（cordis `ctx.inject(deps, cb)` 的回调入参）。 */
@@ -135,9 +162,139 @@ export interface SlotsContext {
   inject?(deps: readonly string[], fn: (scope: ServiceScope) => void): unknown
 }
 
+/* ─────────────────────── 面板开 / 收 / 状态查询（AC-11） ─────────────────────── */
+
+/**
+ * 「右栏面板」的三条命令：开、收、查。
+ *
+ * 为什么要单独成对象（TECHNICAL §5.2）：插槽组件**拿不到 `hookContext`**
+ * （宿主实测 `renderEntry` 只在 `slotHookFactories` 存在时才注入），所以
+ * `tabActions.close` 只能在**持有 ctx 的这一层**取到，组件只能收到一个 `() => boolean`。
+ * 同时保证会话头按钮的 open 与 close 走**同一处**实现 —— 两条链各自摸 window/服务，
+ * 必然出现「能开不能收」或「收了还显示已打开」。
+ */
+export interface PanelCommands {
+  /** 打开本插件页签；`false` = 宿主没提供 `sidebarRight`。 */
+  open(sessionId: string): boolean
+  /**
+   * 收起本插件页签。三级回退（每级都有单测）：
+   *   ① `tabsIn(sessionId)` 找到本插件页签 → `tabDomain.occurrence(...).tabActions.close()`；
+   *   ② `closeIn(sessionId, tabId)`；
+   *   ③ `false` —— 组件据此**不翻转** `aria-pressed`（避免「显示已收起、其实还开着」的假象）。
+   */
+  close(sessionId: string): boolean
+  /** 本插件页签当前是否存在；`undefined` = 宿主没提供 `tabsIn`（组件退回本地态）。 */
+  isOpen(sessionId: string): boolean | undefined
+}
+
+/** 页签句柄里「是不是本插件」的判据：kind / id / tabId 任一等于页签类型。 */
+function isMine(tab: unknown): boolean {
+  if (tab === null || typeof tab !== 'object') return false
+  const handle = tab as SidebarTabLike
+  return handle.kind === PANEL_TAB_KIND || handle.id === PANEL_TAB_KIND || handle.tabId === PANEL_TAB_KIND
+}
+
+/** 从页签句柄里取 closeIn 需要的 id（三种字段名都试，取不到返回空串）。 */
+function tabIdOf(tab: unknown): string {
+  if (tab === null || typeof tab !== 'object') return ''
+  const handle = tab as SidebarTabLike
+  const candidates = [handle.tabId, handle.id, handle.kind]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate !== '') return candidate
+  }
+  return ''
+}
+
+/**
+ * 生成面板的三条命令（唯一实现点）。
+ *
+ * 服务用 `ctx.inject(['sidebarRight'], cb)` 捕获：`ctx.get` 在 client 半是禁用的
+ * （`test/client-contract.test.ts` 有计数断言），且服务稍后就绪时 `inject` 回调仍会被调用。
+ */
+export function createPanelCommands(ctx: SlotsContext): PanelCommands {
+  let right: SidebarRightFace | undefined
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['sidebarRight'], (scope) => {
+      const found = scope.sidebarRight
+      if (found === undefined) return
+      right = found
+    })
+  }
+
+  function mineOf(sessionId: string): { tab: unknown; id: string } | undefined {
+    if (right === undefined || typeof right.tabsIn !== 'function') return undefined
+    let tabs: readonly unknown[]
+    try {
+      tabs = right.tabsIn(sessionId) ?? []
+    } catch {
+      return undefined
+    }
+    for (const tab of tabs) {
+      if (isMine(tab)) return { tab, id: tabIdOf(tab) }
+    }
+    return undefined
+  }
+
+  return {
+    open(_sessionId: string): boolean {
+      const service = right
+      if (service === undefined || typeof service.openTab !== 'function') return false
+      try {
+        // register/openTab 读的是服务对象自身的状态：必须 `service.openTab(...)`，解构裸调会丢 receiver。
+        service.openTab(PANEL_TAB_KIND)
+        return true
+      } catch {
+        return false
+      }
+    },
+
+    close(sessionId: string): boolean {
+      const service = right
+      if (service === undefined) return false
+      const mine = mineOf(sessionId)
+
+      // ① 官方页签动作：tabDomain.occurrence(sessionId, tab).tabActions.close()
+      if (mine !== undefined) {
+        const domain = service.tabDomain
+        if (domain !== undefined && typeof domain.occurrence === 'function') {
+          try {
+            const occurrence = domain.occurrence(sessionId, mine.tab)
+            const closeAction = occurrence?.tabActions?.close
+            if (typeof closeAction === 'function') {
+              closeAction()
+              return true
+            }
+          } catch {
+            // 降级到下一级：宿主版本的 occurrence 形状不一致时不许把异常抛给按钮
+          }
+        }
+      }
+
+      // ② 位置式收起：closeIn(sessionId, tabId)
+      if (mine !== undefined && typeof service.closeIn === 'function' && mine.id !== '') {
+        try {
+          service.closeIn(sessionId, mine.id)
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      // ③ 没有任何官方入口：明确返回 false，由组件保留原状态（不乐观翻转）
+      return false
+    },
+
+    isOpen(sessionId: string): boolean | undefined {
+      const service = right
+      if (service === undefined || typeof service.tabsIn !== 'function') return undefined
+      return mineOf(sessionId) !== undefined
+    },
+  }
+}
+
 /** 五个挂载点的组件。`unknown` 是有意的：本模块不 import React，测试可传字符串桩。 */
 export interface SlotComponents {
-  /** E1 输入框内胶囊选项（`Option.tsx`）。 */
+  /** E1 输入框左侧胶囊选项（`Option.tsx`）。 */
   Option: unknown
   /** E2 会话头按钮（`HeaderButton.tsx`）。 */
   HeaderButton: unknown
@@ -148,23 +305,30 @@ export interface SlotComponents {
   /** E4 设置页分区（`SettingsPage.tsx`）。 */
   SettingsSection: unknown
   /**
-   * 「打开本插件页签」的宿主原生动作（`ctx.sidebarRight.openTab`，由 `createOpenPanel` 生成）。
-   * 拿不到宿主服务时**不传**，组件回退到窗口事件（`OPEN_PANEL_EVENT`）。
-   * 只下发给 E2（唯一需要它的可见面），**不再给 E1** —— 胶囊选项的点击语义只有「开关」。
+   * 「打开本插件页签」的宿主原生动作。
+   * **三种都没传时** `registerSlots` 会自己用 `createPanelCommands(ctx)` 兜底 ——
+   * 这样 `index.ts` 忘记接线也只会降级，不会让头部按钮变成哑键。
    */
   openPanel?: () => boolean
+  /** 「收起本插件页签」（`createPanelCommands(ctx).close`）。 */
+  closePanel?: (sessionId: string) => boolean
+  /** 本插件页签是否开着；`undefined` = 宿主没这个能力（组件退回本地态）。 */
+  isPanelOpen?: (sessionId: string) => boolean | undefined
 }
+
+/** 蓝图里的别名（`SlotDeps` 与本文件的 `SlotComponents` 是同一个形状）。 */
+export type SlotDeps = SlotComponents
 
 /**
  * `slots.register` 的 `inject`：宿主把当次 sessionId 传进来，原样交给组件
- * （组件侧 `state.ts:319 sessionIdOf` 读 `props.sessionId`）。
+ * （组件侧 `state.ts` 的 `sessionIdOf` 读 `props.sessionId`）。
  * 只此一份实现 —— 四个可见面必须拿到同一个 sessionId（同一个 store、同一份快照）。
  */
 export function sessionIdBag(
   sessionId: string,
-  openPanel?: () => boolean,
+  extras: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return openPanel === undefined ? { sessionId } : { sessionId, openPanel }
+  return { sessionId, ...extras }
 }
 
 /**
@@ -172,21 +336,34 @@ export function sessionIdBag(
  * 挂载点不存在时 `slots.inject` 是 inert 的（回调不会被调），因此注册它零副作用。
  */
 export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
+  // 头部按钮需要的三条命令：优先用 `index.ts` 接进来的，缺省时自己从 ctx 生成
+  // （插槽组件拿不到 ctx，所以这一层是唯一的兜底点）。
+  const commands = createPanelCommands(ctx)
+  const openPanel = deps.openPanel ?? (() => commands.open('current'))
+  const closePanel = deps.closePanel ?? ((sessionId: string) => commands.close(sessionId))
+  const isPanelOpen = deps.isPanelOpen ?? ((sessionId: string) => commands.isOpen(sessionId))
+
   const injectOf = (sessionId: string): Record<string, unknown> => sessionIdBag(sessionId)
 
-  // E1 输入框内胶囊选项：非 keyed → name/id/order/inject，**不带 key**。
-  ctx.slots.inject(INPUT_DOCK_SLOT, () => {
-    ctx.slots.register({ name: INPUT_DOCK_SLOT, id: OPTION_ID, order: 5, inject: injectOf }, deps.Option)
+  // E1 输入框左侧胶囊选项：非 keyed → name/id/order/inject，**不带 key**。
+  // 点击语义只有「开关」，所以不把面板命令下发给它。
+  ctx.slots.inject(INPUT_LEFT_SLOT, () => {
+    ctx.slots.register({ name: INPUT_LEFT_SLOT, id: OPTION_ID, order: 5, inject: injectOf }, deps.Option)
   })
 
-  // E2 会话头按钮：非 keyed；`openPanel` 只下发给它（点一下开右栏）。
+  // E2 会话头按钮：非 keyed；三条面板命令只下发给它（点开 / 收回右栏）。
   ctx.slots.inject(HEADER_ACTIONS_SLOT, () => {
     ctx.slots.register(
       {
         name: HEADER_ACTIONS_SLOT,
         id: HEADER_ID,
         order: 0,
-        inject: (sessionId: string) => sessionIdBag(sessionId, deps.openPanel),
+        inject: (sessionId: string) =>
+          sessionIdBag(sessionId, {
+            openPanel,
+            closePanel: () => closePanel(sessionId),
+            isPanelOpen: () => isPanelOpen(sessionId),
+          }),
       },
       deps.HeaderButton,
     )
@@ -200,10 +377,7 @@ export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
 
   // E3 页签标题位：与 body 同 key，宿主据此把标题挂到同一个页签上。
   ctx.slots.inject(PANEL_TITLE_SLOT, () => {
-    ctx.slots.register(
-      { name: PANEL_TITLE_SLOT, key: PANEL_KEY, inject: injectOf },
-      deps.PanelTitle,
-    )
+    ctx.slots.register({ name: PANEL_TITLE_SLOT, key: PANEL_KEY, inject: injectOf }, deps.PanelTitle)
   })
 
   // E4 设置页分区：非 keyed，带 `label`（宿主渲染分区标题）。
@@ -223,7 +397,7 @@ export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
  * 宿主契约（asar 里的官方文档 + 同机样本 `ui-schedule`／`dsh-plugin-teamflow`）：
  *   ① `sidebarRightTabs.register({ id, kind, priority, title })`，返回 disposer，**必须包在 `ctx.effect` 里**；
  *   ② keyed 座位 `sidebar.right.pane.tab`（及 `.title`）的 `key` 必须等于该定义的 `id`；
- *   ③ 页面型页签**只注册不会自己出现**，还要 `ctx.sidebarRight.openTab(kind)` 打开（见 `createOpenPanel`）。
+ *   ③ 页面型页签**只注册不会自己出现**，还要 `sidebarRight.openTab(kind)` 打开（见 `createPanelCommands`）。
  *
  * 用 `ctx.inject(['sidebarRightTabs'], cb)` 而不是 `ctx.get`：服务缺失时回调不执行，
  * 插件照常激活（client 半 `inject` 列表仍是 `['slots']`，不因可选服务拖死整条 entry）。
@@ -243,26 +417,13 @@ export function registerPanelTab(ctx: SlotsContext): boolean {
 }
 
 /**
- * 生成「打开面板」动作：宿主 `sidebarRight.openTab(PANEL_TAB_KIND)`。
+ * 生成「打开面板」动作（r7 兼容入口）：`createPanelCommands(ctx).open` 的薄封装。
  *
  * 历史缺陷形态：`Toggle.tsx` 原先断言「宿主未提供激活某页签的对外动作」，只 `window.dispatchEvent`
  * 一个自己定义的事件 —— 页签尚未打开时没有任何监听者，等于按钮无效。返回 `false` 表示宿主服务不可用，
  * 组件据此回退旧行为。
  */
 export function createOpenPanel(ctx: SlotsContext): () => boolean {
-  let open: (() => void) | undefined
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['sidebarRight'], (scope) => {
-      const right = scope.sidebarRight
-      if (right === undefined || typeof right.openTab !== 'function') return
-      open = () => {
-        right.openTab(PANEL_TAB_KIND)
-      }
-    })
-  }
-  return () => {
-    if (open === undefined) return false
-    open()
-    return true
-  }
+  const commands = createPanelCommands(ctx)
+  return () => commands.open('current')
 }
