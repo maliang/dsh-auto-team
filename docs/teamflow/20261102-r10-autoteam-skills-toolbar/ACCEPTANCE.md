@@ -158,3 +158,37 @@ $ node logs/…/r10-qa-e2e.mjs                         # SUMMARY pass=40 fail=0
 - R3（命名对齐 `AutoTeamSettingsSection` / 登记 r7 checker 冻结快照待办）：**未做**，仅记录。
 - R5 收口提交：本记录随之入仓（`git log` 见 r10 收口提交）。
 - R4 真机七项：按 §4.4 执行，结果另见 §7。
+
+## 7. 真机实录（2026-11-02，第二宿主克隆 profile `rt7`，端口 51897）
+
+环境：`cp -a ~/.dsh/profiles/desktop ~/.dsh/profiles/rt7` 后把仓库新构建覆盖进
+`rt7/node_modules/dsh-auto-team/lib/`（`ls -li` 确认独立 inode），
+`--profile rt7 --no-open --port 51897` 起第二宿主；CDP 脚本 `/tmp/cdp-r10.mjs`、`/tmp/cdp-r10b.mjs`
+（`chrome-headless-shell` + `--remote-debugging-port` + `Runtime.enable`）。
+
+| AC | 判据 | 实测 | 结论 |
+|---|---|---|---|
+| 前置 | 插件激活 | boot 日志 `grep -cE "did not activate\|cannot get property"` = **0** | PASS |
+| 前置 | 面板接口 | `GET /api/auto-team/snapshot?sessionId=x` = **200**，`concurrency` = `{limit:3,running:0,source:"default",requested:6,clamped:true}`（r7 R2 的夹取字段在真机快照里也有值） | PASS |
+| AC-12 | tool-bar 里 option 恰 1 个 | `[data-auto-team-option]` = **1**，且 `closest('[data-slot]')` = **`conversation.input.left`** | PASS |
+| AC-12 | 旧槽位 0 处 | 我们的条目**不在** dock 里（祖先链 `conversation.input.left → conversation.composer.bar → conversation.composer → main.conversation`，前两段是宿主自带容器，非我们注册）；`grep conversation.input.dock src` = 0 | PASS |
+| AC-12 | 与同排按钮同行、`top` 差 ≤4px | option `top` 与同排「添加文件 / 访问模式 / 团队」三钮 `top` 差 = **2px** | PASS |
+| AC-5 | 零红字 | `[data-option-error]` = **0**、`[role=alert]` = **0**、`[data-option-dot]` = **1**（`data-tone="neutral"`） | PASS |
+| AC-3 | 短标签 | 文本 `自动团队`，`height` = **24px**（≤28） | PASS |
+| AC-14 | 两视口无水平溢出 | 800px（默认 headless 宽）与 900px 两档 `overflowX` 均 `false`，option 仍 1、红字仍 0 | PASS（窄档只测到 900，1280 未单测） |
+| — | 控制台异常 | `Runtime.exceptionThrown` 捕获 **0 条** | PASS |
+| AC-13 | 头部按钮连点三次三分支 | `[data-auto-team-header-button]` = **0** → 无法执行 | **未验证** |
+| AC-16 | 模型弹层真机段 | 需活会话内的角色编辑区 | **未验证** |
+| AC-29 | 技能四入口 + 重启读回 | 同上 | **未验证**（数据面已由 E2E E-9*/E-11* 覆盖） |
+
+**未验证的原因（环境限制，不是缺陷）**：克隆 profile 里**进不去活会话**——同样的
+`Input.insertText` + Enter 与四种会话 URL 形态都停在 `/`（与 r7 的 rt6 结论一致，第三方插件
+同座位也不出现）。`data-auto-team-header-button` 注册在 `conversation.session.header.actions`
+（scope=session），面板页签又只能由它 `openTab` 打开，因此在无活会话的克隆宿主里这两个
+元素必然为 0。AC-13/16/29 只能在**真实桌面宿主（有活会话）**上验。
+
+**已同步到真实桌面宿主**：`~/.dsh/profiles/desktop/node_modules/dsh-auto-team/lib/{client,index}.js`
+已换成 r10 构建（`client.js` 与仓库同 inode 11341006、`index.js` 为新 inode 12715545 / 303487 B），
+**重启桌面宿主后 r10 生效**（重启会打断当前会话，需用户点头）。
+
+结论：真机可证部分 **8 项全 PASS**；AC-13/16/29 记「未验证（需活会话）」，与 §2 的原始判定一致。
