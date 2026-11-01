@@ -61,6 +61,10 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 **探针脚本的可重跑前提**
 - `logs/teamflow/<runId>/scripts/*.mjs` 里的探针一律用 `new URL('../../../../', import.meta.url)` 锚定**仓库根**。run 结束后 host 会把 `logs/` 归档到 `$DSH_HOME/teamflow/<workspace>/logs/<runId>/`；从归档位置直接 `node` 跑这些脚本，相对根会解析成 `~/.dsh/teamflow/` → 报 `依赖模块未落盘 / ERR_MODULE_NOT_FOUND`，**看起来像交付坏了，其实只是位置变了**（r4 验收复核时实测：归档位置 9 个探针 6 个红）。要复跑必须先 `cp -r` 回 `<repo>/logs/teamflow/<runId>/scripts/`，跑完删掉（`logs/teamflow/` 已在 `.gitignore`）。报告任何「探针红」之前，先确认脚本是不是从归档位置跑的。
 
+**探针/单测里的宿主桩要跟着契约走**
+- `ctx.get` 现在是可选服务的唯一读取口（`optionalService` 与 r6 新增的 `readServiceQuietly` 都走它）。**手工写的 fake ctx 必须提供 `get`**，否则 `registerHttpRoutes` 拿不到 `webServer`、一条路由都不注册，探针会红在「`routes[0]` undefined」这种与实现无关的地方（r6 复核时 `qa-reverify-probe.mjs` 就是这么假红的，补 `get` 后 9/9）。
+- 同理，断言「`ctx.get` 只出现 1 处」这类**计数式**断言会随受控读取口增加而过期；应断言「只出现在 adapters.ts 且总数 ≤ N」，把不变量说清楚，而不是锁死数字。
+
 **与宿主联调的常识**
 
 - **加服务进 `inject` 之前先看 `ctx.<service>` 的访问面**：cordis 的 `inject` 是「服务名 → 配置」的普通 map，数组形式等于全 required；对象形式 `{required, optional}` 不被支持（宿主会把这两个单词当服务名，报 `pending (waiting for services: required, optional)`）。可选服务**只能**用 `ctx.get("<name>")` 读。真实宿主里漏声明的后果不是功能降级，而是整条 entry 不激活：`dsh: warning: 1 entry did not activate` + `cannot get property "<service>" without inject`（r6 前实测，插件在真机上从未激活过）。
