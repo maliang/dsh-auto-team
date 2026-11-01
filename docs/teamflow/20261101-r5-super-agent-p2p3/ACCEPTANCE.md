@@ -95,3 +95,29 @@
 - **不值得返工的地方**：单测 311 例（超下限 216 达 95 例）覆盖了守卫/展开/Trigger/队长四块主路径与负样本；三块子系统的变异自检红段都是断言红，可直接作为回归哨兵长期保留。
 
 验收结论：⚠️ 有条件通过
+
+## 7. R1 收口记录（2026-11-01，主 agent 执行，用户拍板「我直接回填 §10.2」）
+
+> 本节只追加记录，**不修改** §5 的原始判决与文末「⚠️ 有条件通过」——历史裁定保持可追溯；本节回答「R1 现在是否已关闭」。
+
+**做了什么**：重写 `TECHNICAL.md` §10.2，把九行占位表换成「本轮结论 + 命令 + 返回值原文」三列表，并按 AC-12 补「四事件字段路径与宿主返回值原文」表。证据来源两类：
+
+1. **探针实跑**（主 agent 亲自跑，非转抄）：`captain-guard-probe.mjs` → `ALL PASS (24 asserts)`、`trigger-event-probe.mjs` → `ALL PASS (16 asserts)`、`captain-model-probe.mjs` → `ALL PASS (23 asserts)`、`trigger-probe.mjs` → `ALL PASS (33 asserts)`。执行位置前提：脚本用 `new URL('../../../../', import.meta.url)` 锚定仓库根，必须先在仓库内 `logs/teamflow/tf-mvwzckx8-xugsg1/scripts/` 下运行（host 归档目录里跑会假红，见 `AGENTS.md` §4）。
+2. **真宿主类型取证**：`cordis_inspect_query(platform="host", provider="Event", method="listEvents", input={"event":"agent/status"|"tools/result"|"agent/error"|"subagent/end"})` 四次调用，取回 `mode` / `signature` / 类型 `declaration` 原文，逐条写进 §10.2 的第二张表（含定位成员所用字段路径：`payload.agent.id`、`exec.agent?.id`、`payload.agent.id`、`info.id`）。
+
+**三档结论的判定依据**：U1/U5 判「部分验证」（包装层与账本侧有据、真宿主与面板侧无据）；U2 判「已验证（类型定义层面）」（宿主官方类型保证 agent 归属与作用域过滤，运行时送达仍待装插件）；U3/U4 判「环境不可用·未验证」（`grep -c 'dsh-auto-team' ~/.dsh/profiles/desktop/package.json` = `0`，插件未装进 profile，真宿主行为取不到）。
+
+**复验命令与返回值（实跑）**：
+
+```
+$ grep -c "dev 阶段必须先跑" docs/teamflow/20261101-r5-super-agent-p2p3/TECHNICAL.md
+0
+$ grep -cE "^\| U[1-5] " docs/teamflow/20261101-r5-super-agent-p2p3/TECHNICAL.md
+5
+$ grep -cE '^\| `(agent/status|tools/result|agent/error|subagent/end)` ' docs/teamflow/20261101-r5-super-agent-p2p3/TECHNICAL.md
+4
+$ grep -c 'dsh-auto-team' ~/.dsh/profiles/desktop/package.json
+0
+```
+
+**结论**：R1 的验证判据全部满足（占位表述 0 命中、U1~U5 每行都有命令与返回值、「环境不可用」的两行都写明了原因与依据命令），**R1 关闭**。R2（`TRIGGER_KINDS` 双份字面量）本次未做，仍待整改；三条 P3 与真机补测清单同样未做。

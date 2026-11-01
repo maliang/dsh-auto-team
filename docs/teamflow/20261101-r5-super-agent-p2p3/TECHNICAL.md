@@ -464,15 +464,31 @@ export function captainModelLabelOf(view: CaptainModelView | null | undefined): 
 - `grep -rn "\.activity" src/client` → 0 命中 ⇒ AC-17 必须新增渲染位（§8 表第 2 行）。
 - `grep -n "export function safeMemoryName" src/host/memory/repo.ts` → `35:` ⇒ 展开路径守门复用既有函数，不新写一套。
 
-### 10.2 未验证（dev 阶段必须先跑探针，结论回填本表）
+### 10.2 未验证项的本轮结论（命令 + 返回值原文）
 
-| 编号 | 待测 | 探针 | 不可行时的降级 |
-|---|---|---|---|
-| U1 | `tools/execute` waterfall 短路后，命令是否真的不执行、拒绝形状是否可读 | `captain-guard-probe.mjs` | L2 抛错 → L3 仅提示词（QA 记未验证） |
-| U2 | `agent/status` / `subagent/end` / `agent/error` / `tools/result` 的 payload 能否定位成员/任务 | `trigger-event-probe.mjs` | 该类 Trigger 降级为 poll 通路（AC-18 已覆盖） |
-| U3 | 主 session（队长）能否被指定模型 | `captain-model-probe.mjs` | 快照 `unsupported` + 面板/提示词说明（AC-2/AC-3） |
-| U4 | `tools/execute` 里主 session 的 `exec.agent` 是否为 `undefined` | `captain-guard-probe.mjs` | 改按 sessionId 判定，仍 fail-open |
-| U5 | 事件 → 面板可见的实际毫秒数 | `trigger-probe.mjs` | ≤5000 才通过；超出则记录并回退为纯 poll |
+> 本节由主 agent 于 2026-11-01 回填（验收条件 R1）：每一行给出**本轮结论**、**实跑命令**、**返回值原文**。
+> 结论分三档：`已验证`（有命令与返回值）／`环境不可用·未验证`（需装进 profile 才能测，当前做不到）／`部分验证`（本机可测的一侧有据、真宿主一侧无据）。
+> 探针执行位置有前提：脚本用 `new URL('../../../../', import.meta.url)` 锚定仓库根，必须在**仓库内** `logs/teamflow/<runId>/scripts/` 下跑；在 `~/.dsh/teamflow/` 归档目录里跑会因根解析错误全红（假红，见 `AGENTS.md` §4）。
+
+| 编号 | 待测 | 本轮结论 | 命令 | 返回值原文 |
+|---|---|---|---|---|
+| U1 | `tools/execute` waterfall 短路后，命令是否真的不执行、拒绝形状是否可读 | **部分验证**：包装层行为已实测（放行必 `next()`、拒绝不调 `next()`、拒绝形状 `{ok:false,code,message}`）；**真宿主内「命令确实没被执行」未验证**（需装插件） | `node logs/teamflow/tf-mvwzckx8-xugsg1/scripts/captain-guard-probe.mjs` | `ALL PASS (24 asserts, captain-guard-probe.mjs)`；其中 `PASS [G5] 放行分支必调 next() 且返回其值（next 1 次, 返回 "downstream"）`、`PASS [G5] 拒绝分支不调 next() 且返回 {ok:false,code,message}（next 0 次, code NOWAIT_FOREGROUND_WAIT）`、`PASS [G5] ctx.on 缺失 → 不装守卫、warn 一次、stop 可安全调用（L3 降级，实测 warn 1 条）` |
+| U2 | `agent/status` / `subagent/end` / `agent/error` / `tools/result` 的 payload 能否定位成员 | **已验证（类型定义层面）**：四条事件均由宿主官方类型保证「带 agent 归属 + 按 agent 作用域过滤」，字段路径见下表；**运行时是否真送达成员作用域监听器**未验证（需装插件） | `cordis_inspect_query(platform="host", provider="Event", method="listEvents", input={"event":"<四者之一>"})` ×4；另有 `node …/trigger-event-probe.mjs` | `ALL PASS (16 asserts, trigger-event-probe.mjs)`；宿主原文见下表 |
+| U3 | 主 session（队长）能否被指定模型 | **环境不可用·未验证**：`dsh-auto-team` 未装进 profile（`grep -c 'dsh-auto-team' ~/.dsh/profiles/desktop/package.json` = `0`），真宿主行为取不到；代码侧已 fail-closed 到 `unsupported` 且面板有可读说明 | `node logs/teamflow/tf-mvwzckx8-xugsg1/scripts/captain-model-probe.mjs` | `ALL PASS (23 asserts, captain-model-probe.mjs)`；其中 `PASS [C5] 四种组合 → 三种状态：route=null × ok→host-default / route=null × unsupported→host-default / route=p/m × ok→configured / route=p/m × unsupported→unsupported`、`PASS [C5] 三态都有一句中文说明（面板直接显示，不用客户端再拼文案）` |
+| U4 | `tools/execute` 里主 session 的 `exec.agent` 是否为 `undefined` | **环境不可用·未验证**：主 session 的 `exec.agent` 取值只能由真宿主给出；探针只覆盖「有 agent（成员）→ 放行」与「payload 形状不认识 → fail-open」两条分支 | 同 U1（`captain-guard-probe.mjs`） | `PASS [G5] exec.agent 存在（成员）→ 放行，不误杀成员的长等待`、`PASS [G4] args 形状不认识（缺 command）→ fail-open 放行，不误杀` |
+| U5 | 事件 → 面板可见的实际毫秒数 | **部分验证**：事件入队 → 账本落盘实测最差 `0.45ms`（远低于 5000ms 阈值）；**面板真实渲染可见性本机不可测**（无宿主 GUI） | `node logs/teamflow/tf-mvwzckx8-xugsg1/scripts/trigger-probe.mjs` | `ALL PASS (33 asserts, trigger-probe.mjs)`；其中 `PASS [T7] 事件入队→账本落盘 最差 0.45ms（5 次样本，均值 0.39ms；阈值 5000ms，账本 5 条）`、`PASS [T6] 事件源不可用 → degraded=true「事件源不可用：推进退回 watcher 轮询兜底（最多慢一个 tick）」` |
+
+**四事件字段路径与宿主返回值原文**（AC-12 要求的「字段路径 + 实测返回值」；以下 `signature` 与 `declaration` 均为宿主 inspect 原样返回，未做改写）：
+
+| 事件 | mode | 签名原文 | 定位成员用的字段路径 | 相关类型原文 |
+|---|---|---|---|---|
+| `agent/status` | `emit` | `'agent/status'(this: Scoped<Agent>, payload: { agent: Agent; status: AgentStatus }): void` | `payload.agent.id` | `export interface Agent { readonly id: SessionId; }`；`export type AgentStatus = 'idle' \| 'running';`；参数说明原文：`Scope-filtered dispatch (@deepseek-ai/dsh-scope): agent-scoped listeners receive only that agent.` |
+| `tools/result` | `emit` | `'tools/result'(this: Scoped<ToolRuntime>, exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): undefined` | `exec.agent?.id` | `export interface ToolExecutionInput { readonly callId: ToolCallId; readonly rootCallId?: ToolCallId; readonly name: string; readonly schema?: ToolSchema; readonly arguments: unknown; readonly agent?: Agent; readonly parent?: ToolExecutionToken; readonly signal: AbortSignal; }`；描述原文：`Scope-filtered dispatch (@deepseek-ai/dsh-scope): keyed by exec.agent.` |
+| `agent/error` | `emit` | `'agent/error'(this: Scoped<Agent>, payload: { agent: Agent; turn: number; step: number; error: unknown }): void` | `payload.agent.id` | `payload.error` 为原文透传（描述原文：`the failure, verbatim`），字段路径与 `agent/status` 同源 |
+| `subagent/end` | `emit` | `'subagent/end'(this: Scoped<SubagentRuntime>, info: SubagentRunEndInfo): void` | `info.id`（子 session id，非父） | `export interface SubagentRunEndInfo { readonly runId: SubagentRunId; readonly provider: string; readonly id: SessionId; readonly local: boolean; readonly stopReason: SubagentResult['stopReason']; readonly lastAssistantMessage?: readonly ContentBlock[]; }`；描述原文：`Scope-filtered dispatch uses the same delegating parent carrier as subagent/start, so the lifecycle pair reaches the same scoped audience.` |
+
+**回填时新发现的一条可选改进（本期未做，记此备查）**：宿主 `ToolRuntime` 自带原生守卫接口——`guard(guard: ToolGuard): () => void`，`export type ToolGuard = (execution: Readonly<ToolExecution>) => string | undefined;`。它比「在 `tools/execute` waterfall 上订阅再手工调 `next()`」的接口面更小（不必自己保证放行调 `next()`、拒绝不调），后续可评估把 noWait 守卫改挂 `tools.guard`；本期未改，因为验收口径与 AC-4/AC-5 探针都是按 waterfall 短路口径写的，换实现要连带改探针。
+
 
 ## 11. 测试与门禁策略
 
