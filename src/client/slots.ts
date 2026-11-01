@@ -1,41 +1,66 @@
 /**
- * 挂载点注册契约（三个 slot 的 name/key/id/order/inject + 页签类型的**唯一取值处**）。
+ * 挂载点注册契约（r7 四个 slot 的 name/id/key/order/inject + 页签类型的**唯一取值处**）。
  *
- * 页签要出现是**两步**（QA-02 实测，宿主 asar 官方文档 + `ui-schedule`/`dsh-plugin-teamflow` 样本）：
+ * 页签要出现是**三步**（QA-02 实测，宿主 asar 官方文档 + `ui-schedule`/`dsh-plugin-teamflow` 样本）：
  *   ① `registerPanelTab` 把页签类型（`id === PANEL_KEY`）注册进 `sidebarRightTabs`；
  *   ② `registerSlots` 把 body/title 两个 keyed 座位按同一个 key 注册；
  *   ③ `createOpenPanel` 用 `sidebarRight.openTab(kind)` 打开（页面型页签不会自己出现）。
  * 只做 ② 的症状：构建全绿、控制台零报错、页签永不出现。
  *
  * 为什么单独成模块（TECHNICAL §4.2）：`node --test` 只能 strip 类型、**不能转 JSX**，
- * 所以任何 import `index.ts`（它 import `Toggle.tsx`/`Panel.tsx`）的测试都不可能跑起来。
+ * 所以任何 import `index.ts`（它 import 各 `.tsx`）的测试都不可能跑起来。
  * 把注册逻辑放进这里（**零 React / 零 JSX / 只 import `../shared/const.ts`**），
  * `test/client-contract.test.ts` 才能用 fake slots 驱动**真实注册代码**并断言
- * name/key/inject 的逐字关系 —— 这是 AC-6/AC-7 唯一的运行期证据。
+ * name/key/inject 的逐字关系 —— 这是 AC-6/AC-7/AC-19 唯一的运行期证据。
  *
- * 字段集合照本机两个真实样本（`dsh-better-sidebar/src/client/native/index.ts:318-345`、
- * `dsh-plugin-teamflow/lib/client.js`）：
- *   - keyed slot（`sidebar.right.pane.tab` 与它的 `.title`）：`{ name, key, inject }`，
- *     **不带 `id`/`order`**，且 body 与 title 用**同一个 key**（样本 `key: id` 两处一致）；
- *   - 非 keyed slot（`conversation.composer.dock`）：`{ name, id, order, inject }`，**没有 `key`**。
+ * r7 的四个可见面（DESIGN §1.1，槽名逐字取自 `docs/teamflow/architecture/UI-SLOTS.md`）：
+ *   E1 `conversation.input.dock`           输入框内胶囊选项（**非 keyed**，`{ name, id, order, inject }`）
+ *   E2 `conversation.session.header.actions` 会话头按钮（**非 keyed**，同上）
+ *   E3 `sidebar.right.pane.tab` / `.title`  右栏面板（**keyed**，`{ name, key, inject }`，两处同 key）
+ *   E4 `settings.section`                  设置页「自动团队」（**非 keyed**，`{ name, id, order, label, inject }`）
+ *
+ * 已撤除：r1~r6 的整宽开关行槽位（composer dock）。它的 `replaceRisk` 为 none，
+ * 但 r7 把入口搬进输入框后必须整段删掉 —— 留着会让同一个开关出现两份状态与两条点击链。
+ *
+ * 禁用槽位（`replaceRisk: shadows-shipped-ui`，占住会遮住宿主自带 UI）：
+ * `conversation.composer.bar`、`conversation.input.activity`、
+ * `conversation.session.header.corner`、`shell.leading`、`settings.header`。
  *
  * 硬约束（AC-6/AC-7）：
  *   1. `slots.inject(A, cb)` 的 `A` 与 `cb` 内 `register({ name })` 的 `name` 逐字相同；
- *   2. keyed 两处必须有 `key`；dock 必须没有 `key`（缺 key 的真机症状：
+ *   2. keyed 两处必须有 `key`；非 keyed 必须没有 `key`（缺 key 的真机症状：
  *      `Uncaught Error: keyed slot "..." requires options.key`，构建全绿、页签永不出现）；
  *   3. `PLUGIN_ID` 只许出现在 `id`/`key` 里，**不许**进 `name`（写成插件名 = 静默不挂载）；
- *   4. 三处都传 `inject`，把宿主的 `sessionId` 交给组件（原实现没有它，组件永远拿到兜底值 `'current'`）。
+ *   4. 五个座位都传 `inject`，把宿主的 `sessionId` 交给组件（原实现没有它，组件永远拿到兜底值 `'current'`）。
  */
 import { PLUGIN_ID } from '../shared/const.ts'
 
-/** 输入框下方的开关行（非 keyed，AC-1 的可见入口）。 */
-export const DOCK_SLOT = 'conversation.composer.dock'
+/** E1 输入框内胶囊选项（非 keyed，AC-12）。 */
+export const INPUT_DOCK_SLOT = 'conversation.input.dock'
 
-/** 右栏「自动团队」面板页签（**keyed**）。 */
+/** E2 会话头按钮（非 keyed，AC-13）。 */
+export const HEADER_ACTIONS_SLOT = 'conversation.session.header.actions'
+
+/** E3 右栏「自动团队」面板页签（**keyed**）。 */
 export const PANEL_SLOT = 'sidebar.right.pane.tab'
 
-/** 上面那个页签的标题位（**keyed**，与 body 同 key，见文件头第 4 行）。 */
+/** E3 上面那个页签的标题位（**keyed**，与 body 同 key，见文件头第 5 行）。 */
 export const PANEL_TITLE_SLOT = 'sidebar.right.pane.tab.title'
+
+/** E4 设置页的「自动团队」分区（非 keyed，root 作用域，AC-16）。 */
+export const SETTINGS_SECTION_SLOT = 'settings.section'
+
+/** E1 座位 id。 */
+export const OPTION_ID = `${PLUGIN_ID}-option`
+
+/** E2 座位 id。 */
+export const HEADER_ID = `${PLUGIN_ID}-header-button`
+
+/** E4 座位 id（宿主按它去重，同一个 id 注册两次会覆盖）。 */
+export const SECTION_ID = PLUGIN_ID
+
+/** E4 分区标题（宿主设置页左侧导航显示它）。 */
+export const SECTION_LABEL = '自动团队'
 
 /** 页签文案（AC-8 按文案判定，改字必须同步 PRD）。`TabTitle.tsx` 也取它，防两处漂移。 */
 export const PANEL_TAB_LABEL = '自动团队'
@@ -59,18 +84,16 @@ export function panelTabDefinition(): PanelTabDefinition {
   }
 }
 
-/** 页签标识：body/title 两处 keyed 座位共用，必须与页签类型的 `id` 逐字相同。 */
 export const PANEL_KEY = panelTabDefinition().id
 
-/** `openTab` 用的 kind（宿主按 kind 找已注册的类型）。 */
 export const PANEL_TAB_KIND = panelTabDefinition().kind
 
-/** 注册对象的形状（keyed / 非 keyed 的字段集合靠可选字段区分，不是两套类型）。 */
 export interface SlotMeta {
   name: string
   id?: string
   key?: string
   order?: number
+  label?: string
   inject?: (sessionId: string) => Record<string, unknown>
 }
 
@@ -112,14 +135,22 @@ export interface SlotsContext {
   inject?(deps: readonly string[], fn: (scope: ServiceScope) => void): unknown
 }
 
-/** 三个挂载点的组件。`unknown` 是有意的：本模块不 import React，测试可传字符串桩。 */
+/** 五个挂载点的组件。`unknown` 是有意的：本模块不 import React，测试可传字符串桩。 */
 export interface SlotComponents {
-  Toggle: unknown
+  /** E1 输入框内胶囊选项（`Option.tsx`）。 */
+  Option: unknown
+  /** E2 会话头按钮（`HeaderButton.tsx`）。 */
+  HeaderButton: unknown
+  /** E3 面板体（`Panel.tsx`）。 */
   Panel: unknown
+  /** E3 页签标题（`TabTitle.tsx`）。 */
   PanelTitle: unknown
+  /** E4 设置页分区（`SettingsPage.tsx`）。 */
+  SettingsSection: unknown
   /**
    * 「打开本插件页签」的宿主原生动作（`ctx.sidebarRight.openTab`，由 `createOpenPanel` 生成）。
-   * 拿不到宿主服务时**不传**，组件回退到窗口事件（旧行为）。
+   * 拿不到宿主服务时**不传**，组件回退到窗口事件（`OPEN_PANEL_EVENT`）。
+   * 只下发给 E2（唯一需要它的可见面），**不再给 E1** —— 胶囊选项的点击语义只有「开关」。
    */
   openPanel?: () => boolean
 }
@@ -127,8 +158,7 @@ export interface SlotComponents {
 /**
  * `slots.register` 的 `inject`：宿主把当次 sessionId 传进来，原样交给组件
  * （组件侧 `state.ts:319 sessionIdOf` 读 `props.sessionId`）。
- * 只此一份实现 —— 开关行与面板/页签标题必须拿到同一个 sessionId。
- * 有 `openPanel` 时一并下发（Toggle 的「面板」按钮走宿主原生 `openTab`，不再靠窗口事件撞运气）。
+ * 只此一份实现 —— 四个可见面必须拿到同一个 sessionId（同一个 store、同一份快照）。
  */
 export function sessionIdBag(
   sessionId: string,
@@ -142,28 +172,47 @@ export function sessionIdBag(
  * 挂载点不存在时 `slots.inject` 是 inert 的（回调不会被调），因此注册它零副作用。
  */
 export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
-  const injectOf = (sessionId: string): Record<string, unknown> =>
-    sessionIdBag(sessionId, deps.openPanel)
+  const injectOf = (sessionId: string): Record<string, unknown> => sessionIdBag(sessionId)
 
-  // 输入框下方开关行：非 keyed → name/id/order/inject，**不带 key**。
-  ctx.slots.inject(DOCK_SLOT, () => {
+  // E1 输入框内胶囊选项：非 keyed → name/id/order/inject，**不带 key**。
+  ctx.slots.inject(INPUT_DOCK_SLOT, () => {
+    ctx.slots.register({ name: INPUT_DOCK_SLOT, id: OPTION_ID, order: 5, inject: injectOf }, deps.Option)
+  })
+
+  // E2 会话头按钮：非 keyed；`openPanel` 只下发给它（点一下开右栏）。
+  ctx.slots.inject(HEADER_ACTIONS_SLOT, () => {
     ctx.slots.register(
-      { name: DOCK_SLOT, id: `${PLUGIN_ID}-toggle`, order: 10, inject: injectOf },
-      deps.Toggle,
+      {
+        name: HEADER_ACTIONS_SLOT,
+        id: HEADER_ID,
+        order: 0,
+        inject: (sessionId: string) => sessionIdBag(sessionId, deps.openPanel),
+      },
+      deps.HeaderButton,
     )
   })
 
-  // 右栏面板 body：keyed → name/key/inject，**不带 id/order**
+  // E3 右栏面板 body：keyed → name/key/inject，**不带 id/order**
   // （PRD 待澄清 a2「keyed 是否容忍额外字段」未验证，沿用真实样本的字段集合）。
   ctx.slots.inject(PANEL_SLOT, () => {
     ctx.slots.register({ name: PANEL_SLOT, key: PANEL_KEY, inject: injectOf }, deps.Panel)
   })
 
-  // 页签标题位：与 body 同 key，宿主据此把标题挂到同一个页签上。
+  // E3 页签标题位：与 body 同 key，宿主据此把标题挂到同一个页签上。
   ctx.slots.inject(PANEL_TITLE_SLOT, () => {
     ctx.slots.register(
       { name: PANEL_TITLE_SLOT, key: PANEL_KEY, inject: injectOf },
       deps.PanelTitle,
+    )
+  })
+
+  // E4 设置页分区：非 keyed，带 `label`（宿主渲染分区标题）。
+  // 作用域是 **root**（不是 session）：`inject` 拿不到 sessionId 时组件侧 `sessionIdOf` 兜底
+  // `'current'`，保存设置仍然可用 —— 但绝不能让整个分区因为这个字段缺失而不挂载。
+  ctx.slots.inject(SETTINGS_SECTION_SLOT, () => {
+    ctx.slots.register(
+      { name: SETTINGS_SECTION_SLOT, id: SECTION_ID, order: 40, label: SECTION_LABEL, inject: injectOf },
+      deps.SettingsSection,
     )
   })
 }

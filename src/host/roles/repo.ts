@@ -8,9 +8,23 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import type { Role, RoleModelRoute } from '../../shared/types.ts'
+import { ROLE_PROMPT_MAX } from '../config.ts'
 import { BUILTIN_ROLES, BUILTIN_SKILLS } from './builtin.ts'
 
 const ROLE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/
+
+/**
+ * 角色落盘模式版本（只服务于 seed() 的**一次性补齐**）：
+ *  - 1 = r6 及以前：角色文件没有 `prompt` 字段；
+ *  - 2 = r7：内置角色带 `prompt`。
+ *
+ * r7 之前 seed 出的文件里没有 prompt，`seed()` 又是「已存在的不写」，于是升级后
+ * 六个内置角色的提示词全是空的，直到用户手动点一次「一键恢复默认」（QA-R7-01）。
+ */
+const ROLES_SCHEMA_VERSION = 2
+
+/** 补齐标记文件名：**不带 .json**，避免被 list()/restoreDefaults() 的 `*.json` 扫描当成角色。 */
+const SEED_MARKER = '.seeded'
 
 export interface RoleRepoDeps {
   dir: string
@@ -24,6 +38,11 @@ export interface RoleRepo {
   save(role: Role): { ok: true; role: Role } | { ok: false; error: string }
   remove(id: string): { ok: true } | { ok: false; error: string }
   seed(): void
+  /**
+   * 一键恢复默认角色（r7 AC-8）：**只重写内置 6 个**，自建角色一个字节都不动。
+   * 返回 `restored`（被复原的内置 id）与 `kept`（原样保留的自建 id，供界面回执说明）。
+   */
+  restoreDefaults(): { restored: string[]; kept: string[] }
 }
 
 export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
@@ -46,6 +65,8 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
         model: normalizeModel(parsed.model),
         builtin: parsed.builtin === true,
         updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+        // 提示词读盘口径宽松（不截断、不报错）：用户手写的超长内容照样能被读出来再改回去。
+        prompt: typeof parsed.prompt === 'string' ? parsed.prompt.trim() : undefined,
       }
     } catch {
       // 文件损坏不应让整个角色列表消失：跳过该条，由面板显示「该角色文件损坏」入口缺失。
@@ -56,6 +77,51 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
   function write(role: Role): void {
     mkdirSync(dir, { recursive: true })
     writeFileSync(pathOf(role.id), `${JSON.stringify(role, null, 2)}\n`, 'utf8')
+  }
+
+  const markerPath = (): string => `${dir}/${SEED_MARKER}`
+
+  /** 读补齐标记；读不到/损坏一律当 0（= 从未补齐过），宁可多补一次也不漏补。 */
+  function schemaOf(): number {
+    if (!existsSync(markerPath())) return 0
+    try {
+      const parsed = JSON.parse(readFileSync(markerPath(), 'utf8')) as { schema?: unknown }
+      return typeof parsed.schema === 'number' ? parsed.schema : 0
+    } catch {
+      return 0
+    }
+  }
+
+  function markSchema(): void {
+    writeFileSync(markerPath(), `${JSON.stringify({ schema: ROLES_SCHEMA_VERSION, at: now() })}\n`, 'utf8')
+  }
+
+  /**
+   * 给「文件已存在、但缺新字段」的内置角色补字段（r7 升级路径，QA-R7-01）。
+   *
+   * 只补**磁盘上缺席**的键：已有的键（用户改过的 duty、清空后本就不落盘的 prompt、
+   * 单独指定的 model）一个字节都不动 —— 「补齐新字段」与「覆盖用户编辑」是两件事。
+   * 返回 false 表示文件损坏读不出来：保留原文件不动，让下一轮启动继续尝试。
+   */
+  function backfill(path: string, role: Role): boolean {
+    let raw: Record<string, unknown>
+    try {
+      raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+    } catch {
+      return false
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return false
+    const defaults: Role = { ...role, updatedAt: now() }
+    const merged: Record<string, unknown> = { ...raw }
+    let added = false
+    for (const [key, value] of Object.entries(defaults)) {
+      if (value === undefined) continue
+      if (Object.prototype.hasOwnProperty.call(merged, key)) continue
+      merged[key] = value
+      added = true
+    }
+    if (added) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
+    return true
   }
 
   return {
@@ -86,11 +152,19 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
       if (name === '') return { ok: false, error: '角色名称不能为空' }
       if (id === 'captain') return { ok: false, error: 'captain 是队长保留 id，不能作为角色' }
 
-      const existing = read(id)
-      const builtin = existing?.builtin ?? BUILTIN_ROLES.some((item) => item.id === id)
+      /**
+       * `builtin` **永远由 BUILTIN_ROLES 推导**，绝不从磁盘读（r7 AC-8 的关键判据）。
+       *
+       * 旧写法 `existing?.builtin ?? …` 允许用户建一个 id 为 `my-role` 的角色、手填
+       * `"builtin": true`，于是它既进 `list()` 又被 `remove()` 判成「内置不可删」——
+       * 一个自建角色变相获得了删除豁免，而且 `restoreDefaults` 也不会碰它。
+       */
+      const builtin = BUILTIN_ROLES.some((item) => item.id === id)
       // 逐角色模型：只填一半时**报错**而不是静默退回会话默认（用户会以为设定已生效，AC-22）。
       const verdict = validateModel(role.model)
       if (!verdict.ok) return { ok: false, error: verdict.error }
+      const promptVerdict = validatePrompt(role.prompt)
+      if (!promptVerdict.ok) return { ok: false, error: promptVerdict.error }
       const next: Role = {
         id,
         name,
@@ -99,13 +173,17 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
         model: verdict.model,
         builtin,
         updatedAt: now(),
+        // 空提示词不落盘（写成 undefined = 该角色只有技能正文），避免盘上出现 `"prompt": ""`。
+        prompt: promptVerdict.prompt,
       }
+      if (next.prompt === undefined) delete next.prompt
       write(next)
       return { ok: true, role: next }
     },
 
     remove(id: string): { ok: true } | { ok: false; error: string } {
-      if (BUILTIN_ROLES.some((role) => role.id === id) || read(id)?.builtin) {
+      // 只看 BUILTIN_ROLES：`read(id)?.builtin` 是磁盘可伪造的标志，不能作为删除豁免的依据。
+      if (BUILTIN_ROLES.some((role) => role.id === id)) {
         return { ok: false, error: `内置角色不可删除：「${id}」（可以修改或清除模型指定）` }
       }
       const path = pathOf(id)
@@ -114,17 +192,58 @@ export function createRoleRepo(deps: RoleRepoDeps): RoleRepo {
       return { ok: true }
     },
 
-    /** 首次启动把内置角色与技能 md 落盘（已存在的不覆盖，保护用户编辑）。 */
+    /**
+     * 一键恢复默认（r7 AC-8）：逐字取 `BUILTIN_ROLES`，只写这 6 个文件。
+     *
+     * 为什么不「删掉 roles/ 再 seed」：那会把用户自建角色一起清掉。
+     * 为什么 `updatedAt` 用 `now()` 而不是内置的 0：`0` 会让面板显示「1970 年更新」，
+     * 而且与「这次真的写过盘」这件事矛盾（恢复后要能看出动作发生过）。
+     */
+    restoreDefaults(): { restored: string[]; kept: string[] } {
+      const restored: string[] = []
+      for (const role of BUILTIN_ROLES) {
+        write({ ...role, updatedAt: now() })
+        restored.push(role.id)
+      }
+      const builtinIds = new Set(BUILTIN_ROLES.map((role) => role.id))
+      const kept: string[] = []
+      if (existsSync(dir)) {
+        for (const entry of readdirSync(dir)) {
+          if (!entry.endsWith('.json')) continue
+          const id = entry.slice(0, -'.json'.length)
+          if (builtinIds.has(id)) continue
+          kept.push(id)
+        }
+      }
+      return { restored: restored.sort(), kept: kept.sort() }
+    },
+
+    /**
+     * 首次启动把内置角色与技能 md 落盘（已存在的不覆盖，保护用户编辑）。
+     *
+     * 升级路径（QA-R7-01）：老版本落盘的文件虽然存在，但可能缺本轮新增的字段
+     * （r7 的 `prompt`）。这类文件**只补缺席的键**，且补齐只做一次 ——
+     * 标记 `.seeded` 落盘后不再补，否则用户「清空提示词」会被下次启动悄悄复活。
+     */
     seed(): void {
       mkdirSync(dir, { recursive: true })
       mkdirSync(skillsDir, { recursive: true })
+      const migrate = schemaOf() < ROLES_SCHEMA_VERSION
+      let migrated = true
       for (const role of BUILTIN_ROLES) {
-        if (!existsSync(pathOf(role.id))) write({ ...role, updatedAt: now() })
+        const path = pathOf(role.id)
+        if (!existsSync(path)) {
+          write({ ...role, updatedAt: now() })
+          continue
+        }
+        if (migrate && !backfill(path, role)) migrated = false
       }
       for (const skill of BUILTIN_SKILLS) {
         const path = `${skillsDir}/${skill.id}.md`
         if (!existsSync(path)) writeFileSync(path, `${skill.body}\n`, 'utf8')
       }
+      // 有文件损坏时不落标记：下一轮启动重试，别把「没补上」记成「已补齐」。
+      if (migrate && migrated) markSchema()
     },
   }
 }
@@ -196,4 +315,23 @@ export function validateModel(
   const route: RoleModelRoute = { provider, model: name }
   if (effort === 'low' || effort === 'medium' || effort === 'high') route.reasoningEffort = effort
   return { ok: true, model: route }
+}
+
+/**
+ * 角色提示词校验（r7 AC-7，写入用）：
+ *  - 缺席/空白 = 合法（返回 `prompt: undefined`，盘上不写这个键）；
+ *  - 非字符串 = 报错（面板把整个 role 对象回传，类型错必须被拦住而不是静默塞进 JSON）；
+ *  - 超长 = 报错而不是截断（截断会让用户以为保存成功，实际丢了后半段）。
+ */
+export function validatePrompt(
+  raw: unknown,
+): { ok: true; prompt?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true }
+  if (typeof raw !== 'string') return { ok: false, error: '角色提示词必须是文本' }
+  const prompt = raw.trim()
+  if (prompt === '') return { ok: true }
+  if (prompt.length > ROLE_PROMPT_MAX) {
+    return { ok: false, error: `角色提示词最多 ${ROLE_PROMPT_MAX} 字符（收到 ${prompt.length}）` }
+  }
+  return { ok: true, prompt }
 }

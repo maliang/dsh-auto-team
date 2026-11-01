@@ -30,10 +30,20 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
   // AC-4(b)：上游直投内容原样进首条提示词。段落位置是刻意的 —— 在「本次任务」之后
   // （成员已经知道自己要干什么）、「验收判定」之前（读验收命令前先拿到上游证据与产物路径）。
   const handoffs = input.handoffs ?? []
+  // r7 AC-7：角色提示词（`Role.prompt`，设置页/面板可改）必须真的进成员提示词。
+  // 顺序按 TECHNICAL §6.3 固定：角色名 → duty → prompt → 技能正文 → 任务与验收 → 记忆；
+  // 位置刻意放在技能之前 —— 技能是「怎么做的方法」，prompt 是「这个角色额外要遵守什么」，
+  // 先给身份与纪律、再给方法、最后给本次任务，成员读到的优先级与队长的意图一致。
+  const rolePrompt = role?.prompt?.trim() ?? ''
   const lines = [
     `# 角色：${role?.name ?? input.task.roleId}`,
     role?.duty ? `职责：${role.duty}` : '',
     `模型路由：${describeRoute(role)}`,
+    '',
+    ...(rolePrompt === '' ? [] : ['## 角色要求', rolePrompt, '']),
+    '## 技能',
+    skills.text === '' ? '（无）' : skills.text,
+    skills.missing.length > 0 ? `\n（缺失技能定义：${skills.missing.join('、')}）` : '',
     '',
     `## 本次任务（${input.task.id}）`,
     input.task.title,
@@ -48,10 +58,6 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
     '## 团队记忆（截断策略：总预算固定，超出部分不进上下文）',
     memory.text === '' ? '（暂无相关记忆）' : memory.text,
     memory.truncated ? '\n（注意：记忆已截断，完整内容请用 auto_team_memory 读取）' : '',
-    '',
-    '## 技能',
-    skills.text === '' ? '（无）' : skills.text,
-    skills.missing.length > 0 ? `\n（缺失技能定义：${skills.missing.join('、')}）` : '',
   ]
   return lines.filter((line) => line !== '').join('\n')
 }

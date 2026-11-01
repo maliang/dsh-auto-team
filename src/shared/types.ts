@@ -14,6 +14,12 @@ export type TaskStatus =
   | 'blocked'
   | 'ready'
   | 'running'
+  /**
+   * 用户暂停（r7 AC-9）：原本 `ready`/`running` 的任务被冻结在此态。
+   * 原状态不写进 `PlanTask`（AC-10 冻结字段集），统一记账在 `RunState.pause.tasks`（host/store.ts）；
+   * 暂停期间不得派发、不得回执、不得因停滞被推进，恢复时按原状态还原。
+   */
+  | 'paused'
   | 'gate'
   | 'done'
   | 'rework'
@@ -99,6 +105,41 @@ export interface Role {
   /** 内置角色（可改可删前需用户确认；seed 幂等依赖它）。 */
   builtin: boolean
   updatedAt: number
+  /**
+   * 角色提示词（r7 AC-7）：用户可编辑的一段中文职责补充，会整段进成员提示词。
+   * 缺省 = 该角色只有技能正文（内置角色都带默认提示词，见 host/roles/builtin.ts）。
+   */
+  prompt?: string
+}
+
+/**
+ * 内置技能的只读投影（r7 设置页的角色编辑区要能给技能打勾，但不能编辑正文）。
+ * 正文不投影：面板只显示 id/标题/描述，避免把上千字的技能正文塞进面板快照。
+ */
+export interface SkillInfo {
+  id: string
+  title: string
+  description: string
+}
+
+/**
+ * 自动团队的可配参数（r7 AC-11/AC-13）：落盘在 `<dataRoot>/settings.json`，
+ * 面板设置页改、宿主 5 个消费点读。**每项都是可选缺席 + 缺省值取 host/config.ts 的常量**，
+ * 所以「没有 settings.json」与「settings.json 少写一项」必须等价。
+ */
+export interface AutoTeamSettings {
+  /** 并发上限（1..8）。 */
+  concurrencyLimit: number
+  /** 记忆注入预算（字符，200..4000）。 */
+  memoryBudget: number
+  /** 成员停滞判定阈值（毫秒，1000..600000）。 */
+  stallMs: number
+  /** 单任务返工上限（1..10）。 */
+  maxAttempts: number
+  /** 门禁命令超时（毫秒，1000..600000）。 */
+  gateTimeoutMs: number
+  /** 队长默认模型（缺省 = 跟随会话默认）；settings.json 是唯一写入点。 */
+  captainModel?: RoleModelRoute
 }
 
 /** 面板上的成员行（由 RunState.bindings × Plan.tasks 组装，见 bridge.membersOf）。 */
@@ -286,6 +327,14 @@ export interface PanelSnapshot {
   degradeReason?: string
   /** 最近 N 条 Trigger 记录（含 dropped），供「为什么推进 / 为什么没推进」排查。 */
   triggers?: TriggerRecord[]
+  /** r7 AC-9：暂停中（面板页头「暂停/继续」的单一真值，不从任务状态反推）。 */
+  paused?: boolean
+  /** r7 AC-9：进入暂停的时刻（毫秒），未暂停时缺省。 */
+  pausedAt?: number
+  /** r7 AC-13：当前生效的可配参数（缺省值已合并，面板设置页直接显示）。 */
+  settings?: AutoTeamSettings
+  /** r7 AC-7：内置技能清单（角色编辑区给 skillIds 打勾用）。 */
+  skills?: SkillInfo[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -420,7 +469,7 @@ export interface ExpandPayload {
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
 
 /**
- * 面板动作全集（11 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 面板动作全集（15 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
  * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
  */
 export type PanelAction =
@@ -447,9 +496,17 @@ export type PanelAction =
   | { type: 'deleteMemory'; track: MemoryTrack; name: string }
   | { type: 'saveRole'; role: Role }
   | { type: 'deleteRole'; roleId: string }
+  /** r7 AC-9：暂停推进（只掐派发/回执/停滞判定，不打断在跑成员、不清门禁证据）。 */
+  | { type: 'pause' }
+  /** r7 AC-9：恢复推进，按 `RunState.pause` 记录的原状态还原任务。 */
+  | { type: 'resumeTeam' }
+  /** r7 AC-8：一键恢复默认角色（只重写内置 6 个，自建角色不动）。 */
+  | { type: 'restoreDefaultRoles' }
+  /** r7 AC-13：保存可配参数（`unknown`：校验在 host/settings.ts 单点做，非法即整份拒绝）。 */
+  | { type: 'saveSettings'; settings: unknown }
 
 /**
- * 拒绝码（11 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
+ * 拒绝码（12 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
  * 新增码要同时补文案与面板展示，否则界面会出现「点了没反应」。
  */
 export type RejectionCode =
@@ -472,6 +529,11 @@ export type RejectionCode =
    * 不要在 bridge 里为它加分支，那等于维护第二份码表。
    */
   | 'MEMBER_NAME_COLLISION'
+  /**
+   * r7 AC-10：当前处于暂停态，该动作被闸门拦截（`dispatch`/`resume`/`receipt` 一律拒绝）。
+   * 语义是「先继续再做事」，所以面板必须把这条码翻成一句带「继续」的动作指引。
+   */
+  | 'PAUSED'
 
 /** 一次动作的结果：无论成功失败都带可读快照（界面不会因为没有数据而白屏）。 */
 export interface ActResult {

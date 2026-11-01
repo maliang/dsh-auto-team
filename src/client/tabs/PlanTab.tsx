@@ -1,19 +1,30 @@
 /**
- * 计划页：任务 / 依赖 / 角色（可替换）/ 判定口径 / 预计并发；「开始派发」是唯一的成员创建入口（AC-30）。
+ * 计划页签（DESIGN §2.3 / TECHNICAL §4.7）。
  *
- * 三个可核验点都在这里：
- *  - **计划时间戳**：派发前就在，给 AC-30「计划条目早于首个成员创建」留证据；
- *  - **并发三元组**：运行中 / 上限 / 来源（host 或默认），让用户知道并发是宿主给的还是兜底值；
- *  - **角色下拉**：派发前逐任务替换角色（AC-14），一旦任务开跑就禁用（改也改不动）。
+ * 任务行是本页的全部内容，三条硬规矩：
+ *  1. **10 态文案与色调只来自 `progressOf(task)`**（经 `ui.taskRowView` 打包），
+ *     组件里不许再写一个「进行中/已完成」的 switch —— 这是本项目文案漂移的高发点。
+ *  2. **暂停不清证据**：`退出码 N` 由 `taskRowView.evidence` 给，暂停时照常渲染；
+ *     没有证据时整块不渲染（不写「—」占位，DESIGN §2.3）。
+ *  3. **列表顺序即计划顺序**：暂停后不重排，用户才能看出「谁被打断」。
  */
 import * as React from 'react'
+import type { PlanTask, Role } from '../../shared/types.ts'
 import type { TabProps } from '../Panel.tsx'
-import type { PlanTask } from '../../shared/types.ts'
-import { actFeedback, formatStamp, hintOf, recentTriggersOf, statusBadge, viewExtras } from '../viewmodel.ts'
+import { progressOf, formatStamp, recentTriggersOf, actFeedback, hintOf } from '../viewmodel.ts'
+import type { ClientAction } from '../viewmodel.ts'
+import { taskRowView } from '../ui.ts'
 
-/** 任务未开跑时才允许换角色（AC-14 的窗口期）。 */
-function roleEditable(task: PlanTask): boolean {
+/** 哪些状态允许改角色：已开始/已结束的任务换角色没有意义（会误导「改了会重跑」）。 */
+export function roleEditable(task: PlanTask): boolean {
   return task.status === 'pending' || task.status === 'blocked' || task.status === 'ready'
+}
+
+const TASK_TONE_DATA: Record<string, string> = {
+  ok: 'success',
+  warn: 'warn',
+  bad: 'danger',
+  muted: 'neutral',
 }
 
 export function PlanTab(props: TabProps): React.ReactElement {
@@ -21,187 +32,197 @@ export function PlanTab(props: TabProps): React.ReactElement {
   const [busy, setBusy] = React.useState(false)
   const [hint, setHint] = React.useState<string | undefined>(undefined)
 
+  const tasks: PlanTask[] = snapshot?.tasks ?? []
+  const roles: Role[] = snapshot?.roles ?? []
   const runId = snapshot?.runId
-  const tasks = snapshot?.tasks ?? []
-  const roles = snapshot?.roles ?? []
-  const extras = viewExtras(snapshot)
+  const paused = snapshot?.paused === true
+  const dispatching = snapshot?.planStatus === 'dispatching'
+  const triggers = recentTriggersOf(snapshot)
 
-  async function dispatch(): Promise<void> {
+  async function send(action: ClientAction, done: string): Promise<void> {
     setBusy(true)
-    setHint(undefined)
-    // runId 带上：host 据此拒绝「没有计划就派发」以及重复派发（AC-30）
-    const feedback = await actFeedback(act, { type: 'dispatch', runId })
-    setBusy(false)
-    setHint(hintOf(feedback))
+    try {
+      const feedback = await actFeedback(act, action)
+      setHint(hintOf(feedback) ?? (feedback.ok ? done : '动作未生效'))
+    } finally {
+      setBusy(false)
+    }
   }
 
-  async function cancel(): Promise<void> {
-    setBusy(true)
-    setHint(undefined)
-    const feedback = await actFeedback(act, { type: 'cancel' })
-    setBusy(false)
-    setHint(hintOf(feedback))
-  }
-
-  async function changeRole(taskId: string, roleId: string): Promise<void> {
-    const feedback = await actFeedback(act, { type: 'setTaskRole', taskId, roleId })
-    setHint(hintOf(feedback))
-  }
-
-  if (runId === undefined || runId === '') {
+  if (runId === undefined) {
     return (
-      <div data-auto-team-plan data-empty>
-        <p>还没有执行计划。</p>
-        <p data-empty-next>
-          下一步：让队长在当前会话里说清目标，它会用 <code>auto_team_plan</code> 拆出任务图 ——
-          计划会先出现在这里，**此时不会创建任何成员**，确认无误后再点「开始派发」。
-        </p>
-      </div>
+      <section data-auto-team-plan data-empty>
+        <p>还没有计划。</p>
+        <p data-empty-next>把目标发进会话并启用自动团队，队长会先产出计划，再任务行出现在这里。</p>
+        {triggers.length === 0 ? null : (
+          <ul data-plan-triggers>
+            {triggers.map((item) => (
+              <li key={`${item.at}-${item.sourceLabel}`} data-auto-team-trigger data-source={item.sourceLabel}>
+                <span data-trigger-badge>{item.sourceLabel}</span>
+                <span data-trigger-clock>{item.clock}</span>
+                <span data-trigger-text>{item.text}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     )
   }
 
-  const dispatching = snapshot?.planStatus === 'dispatching'
   const done = tasks.filter((task) => task.status === 'done').length
-  // AC-17：最后 3 条带来源的活动事件（最新在前）。无数据时整块不渲染，不留空标题。
-  const triggers = recentTriggersOf(snapshot)
 
   return (
-    <div data-auto-team-plan data-run-id={runId} data-plan-status={snapshot?.planStatus}>
-      {triggers.length > 0 ? (
-        <section data-plan-triggers data-trigger-count={triggers.length}>
-          <div data-plan-meta-row>
-            <span data-plan-triggers-label>最近推进</span>
-            <span data-plan-triggers-hint>自动 = 系统按事件推进，用户 = 你的动作</span>
-          </div>
-          {triggers.map((row, index) => (
-            <div
-              // 同一毫秒内可能有两件事（dep_ready 连着两次派发），index 参与 key 保证不撞
-              key={`${row.at}-${index}-${row.kind}`}
-              data-plan-meta-row
-              data-auto-team-trigger={row.kind}
-              data-trigger-source={row.sourceLabel === '自动' ? 'trigger' : 'user'}
-            >
-              <span
-                data-trigger-badge
-                data-tone={row.sourceLabel === '自动' ? 'business' : 'neutral'}
-              >
-                {row.sourceLabel}
-              </span>
-              <span data-trigger-clock>{row.clock}</span>
-              <span data-trigger-text>{row.text}</span>
-            </div>
-          ))}
-        </section>
-      ) : null}
-
+    <section data-auto-team-plan data-paused={paused ? 'true' : 'false'}>
       <div data-plan-meta-row>
-        <span data-plan-planned-at title={formatStamp(extras.plannedAt)}>
-          计划时间 {formatStamp(extras.plannedAt)}
+        <span data-plan-run-id title={runId}>
+          运行 {runId}
         </span>
-        <span data-plan-run-id>run {runId}</span>
-        <span data-plan-status-label>状态 {snapshot?.planStatus ?? '—'}</span>
+        {typeof snapshot?.plannedAt === 'number' ? (
+          <span data-plan-planned-at>{formatStamp(snapshot.plannedAt)}</span>
+        ) : null}
+        <span data-plan-concurrency data-concurrency-source={snapshot?.concurrency?.source ?? 'default'}>
+          并发 {snapshot?.concurrency?.running ?? 0}/{snapshot?.concurrency?.limit ?? 0} · 完成 {done}/{tasks.length}
+        </span>
       </div>
 
-      <div data-plan-concurrency data-concurrency-source={extras.concurrency.source}>
-        <span data-concurrency-running>运行中 {extras.concurrency.running}</span>
-        <span data-concurrency-sep>/</span>
-        <span data-concurrency-limit>上限 {extras.concurrency.limit}</span>
-        <span data-concurrency-source-label>
-          来源 {extras.concurrency.source === 'host' ? '宿主' : '默认值'}
-        </span>
-        <span data-concurrency-done>
-          进度 {done}/{tasks.length}
-        </span>
-      </div>
+      {triggers.length === 0 ? null : (
+        <ul data-plan-triggers>
+          {triggers.map((item) => (
+            <li key={`${item.at}-${item.sourceLabel}`} data-auto-team-trigger data-source={item.sourceLabel}>
+              <span data-trigger-badge>{item.sourceLabel}</span>
+              <span data-trigger-clock>{item.clock}</span>
+              <span data-trigger-text>{item.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       <div data-plan-actions>
         <button
           type="button"
-          onClick={() => void dispatch()}
-          disabled={busy || dispatching}
           data-plan-dispatch
-          title={dispatching ? '已派发，等待成员创建完成' : '按任务图创建成员并并行执行'}
+          disabled={busy || paused || dispatching}
+          title={paused ? '已暂停：先点页头的「继续任务」' : '把就绪任务派发给成员'}
+          onClick={() => void send({ type: 'dispatch' }, '已请求派发')}
         >
           {dispatching ? '派发中…' : '开始派发'}
         </button>
-        <button type="button" onClick={() => void cancel()} disabled={busy} data-plan-cancel>
-          取消运行
+        <button
+          type="button"
+          data-plan-cancel
+          disabled={busy}
+          onClick={() => void send({ type: 'cancel' }, '已请求取消计划')}
+        >
+          取消计划
         </button>
-        <span data-plan-members>成员 {snapshot?.members.length ?? 0}</span>
       </div>
 
-      {hint !== undefined ? (
+      {hint === undefined ? null : (
         <div data-hint role="status">
           {hint}
         </div>
-      ) : null}
+      )}
 
-      {tasks.length === 0 ? (
-        <div data-empty data-empty-next>
-          计划里还没有任务，让队长补充拆解后再派发。
-        </div>
-      ) : (
-        <div data-plan-table>
-          {tasks.map((task) => {
-            const badge = statusBadge(task.status)
-            const editable = roleEditable(task)
+      <div data-plan-table>
+        {tasks.length === 0 ? (
+          <div data-empty>计划里还没有任务。</div>
+        ) : (
+          tasks.map((task) => {
+            const row = taskRowView(task, roles)
+            const progress = progressOf(task)
             return (
-              <div
+              <article
                 key={task.id}
                 data-plan-row
                 data-task-id={task.id}
-                data-status={task.status}
+                data-status={progress.status}
+                data-tone={TASK_TONE_DATA[row.statusTone] ?? 'neutral'}
+                data-paused={progress.status === 'paused' ? 'true' : 'false'}
               >
-                <span data-task-id-label>{task.id}</span>
-                <span data-task-title title={task.title}>
-                  {task.title}
-                </span>
-
-                <select
-                  data-task-role
-                  data-role-value={task.roleId}
-                  value={task.roleId}
-                  disabled={!editable}
-                  title={editable ? '派发前可替换执行角色' : '任务已开跑，不能再换角色'}
-                  onChange={(event) => void changeRole(task.id, event.target.value)}
-                >
-                  {roles.every((role) => role.id !== task.roleId) ? (
-                    <option value={task.roleId}>{task.roleId}（已不在角色库）</option>
-                  ) : null}
-                  {roles.map((role) => (
-                    <option key={role.id} value={role.id}>
-                      {role.name}
-                    </option>
-                  ))}
-                </select>
-
-                <span data-task-status-badge data-tone={badge.tone} data-status={task.status}>
-                  <span data-badge-icon aria-hidden="true">
-                    {badge.icon}
+                <header data-task-head>
+                  <span data-task-id-label>{task.id}</span>
+                  <span data-task-title title={row.title}>
+                    {row.title}
                   </span>
-                  {badge.text}
-                </span>
+                  <span
+                    data-task-status-badge
+                    data-tone={TASK_TONE_DATA[row.statusTone] ?? 'neutral'}
+                    data-status={progress.status}
+                  >
+                    {row.statusLabel}
+                  </span>
+                </header>
 
-                {task.dependsOn.length > 0 ? (
-                  <span data-task-deps>依赖 {task.dependsOn.join('、')}</span>
-                ) : null}
-                {task.acceptance !== '' ? (
-                  <span data-task-acceptance title={task.acceptance}>
-                    判定 {task.acceptance}
-                  </span>
-                ) : null}
-                {task.evidence !== undefined ? (
-                  <span data-task-has-evidence data-exit-code={task.evidence.exitCode}>
-                    证据已就位（退出码 {task.evidence.exitCode}）
-                  </span>
-                ) : null}
-              </div>
+                {row.content === '' ? null : (
+                  <p data-task-acceptance title={row.content}>
+                    {row.content}
+                  </p>
+                )}
+
+                <footer data-task-foot>
+                  {roleEditable(task) ? (
+                    <select
+                      data-task-role
+                      value={task.roleId}
+                      disabled={busy}
+                      onChange={(event) =>
+                        void send(
+                          { type: 'setTaskRole', taskId: task.id, roleId: event.target.value },
+                          `已把 ${task.id} 指派给 ${event.target.value}`,
+                        )
+                      }
+                    >
+                      <option value="">未分配</option>
+                      {roles.map((role) => (
+                        <option key={role.id} value={role.id}>
+                          {role.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span data-task-role-readonly>{roleLabelOf(task, roles)}</span>
+                  )}
+
+                  {row.evidence === '' ? null : (
+                    <span data-task-has-evidence data-evidence={row.evidence}>
+                      {row.evidence}
+                    </span>
+                  )}
+
+                  <button
+                    type="button"
+                    data-task-receipt
+                    disabled={busy}
+                    title="人工放行门禁（宿主会记一笔证据）"
+                    onClick={() => void send({ type: 'receipt', taskId: task.id, note: '面板手动放行' }, `已放行 ${task.id}`)}
+                  >
+                    放行
+                  </button>
+
+                  <button
+                    type="button"
+                    data-task-resume
+                    disabled={busy}
+                    onClick={() => void send({ type: 'resume', taskId: task.id }, `已请求续聊 ${task.id}`)}
+                  >
+                    续聊
+                  </button>
+                </footer>
+              </article>
             )
-          })}
-        </div>
-      )}
-    </div>
+          })
+        )}
+      </div>
+    </section>
   )
+}
+
+/** 只读角色名（不可编辑时显示；文案与 `ui.taskRowView().roleLabel` 同口径）。 */
+function roleLabelOf(task: PlanTask, roles: Role[]): string {
+  const id = task.roleId ?? ''
+  if (id === '') return '未分配'
+  const found = roles.find((role) => role.id === id)
+  return found === undefined ? id : found.name
 }
 
 export default PlanTab

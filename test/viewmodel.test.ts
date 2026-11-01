@@ -23,6 +23,8 @@ import {
   memberRouteText,
   parseRouteText,
   peerLabelOf,
+  planStatusView,
+  progressOf,
   recentTriggersOf,
   routeAuditFor,
   routeTextOf,
@@ -34,7 +36,14 @@ import {
   STALL_SUFFIX,
   STALL_TAIL,
 } from '../src/client/viewmodel.ts'
-import type { MemberView, PanelSnapshot, PlanTask, RoleModelRoute, TaskStatus } from '../src/shared/types.ts'
+import type {
+  MemberView,
+  PanelSnapshot,
+  PlanStatus,
+  PlanTask,
+  RoleModelRoute,
+  TaskStatus,
+} from '../src/shared/types.ts'
 
 /* ────────────────────────── 夹具 ────────────────────────── */
 
@@ -607,6 +616,117 @@ test('队长模型三态：configured 才显路由，host-default 是 muted，un
   // 未投影（旧宿主）→ muted，且不能假装成 configured
   assert.deepEqual(captainModelLabelOf(null), { label: '队长模型 · 未投影', tone: 'muted' })
   assert.deepEqual(captainModelLabelOf(undefined), { label: '队长模型 · 未投影', tone: 'muted' })
+})
+
+/* ──────────────────── 任务 10 态进度（AC-14 判据落点） ──────────────────── */
+
+const ALL_TASK_STATUSES: TaskStatus[] = [
+  'pending',
+  'ready',
+  'blocked',
+  'rework',
+  'running',
+  'paused',
+  'gate',
+  'done',
+  'failed',
+  'interrupted',
+]
+
+test('进度：TaskStatus 10 态逐一有中文标签、颜色与百分比（AC-14）', () => {
+  const rows = ALL_TASK_STATUSES.map((status) => progressOf(taskOf(`t-${status}`, status)))
+  assert.equal(rows.length, 10)
+
+  for (const [index, status] of ALL_TASK_STATUSES.entries()) {
+    const row = rows[index]!
+    assert.equal(row.status, status)
+    // 标签必须与徽标表逐字一致 —— 单一文案源，防「同一状态两处文案」漂移
+    assert.equal(row.label, statusBadge(status).text, `${status} 的标签必须来自 statusBadge`)
+    // 回显英文原文 = 根本没映射（本轮最容易漏的正是 paused 那一态）
+    assert.notEqual(row.label, status, `${status} 不得把英文原文当标签`)
+    assert.ok(row.label.trim() !== '', `${status} 标签不能为空`)
+  }
+
+  assert.equal(new Set(rows.map((row) => row.label)).size, 10, '10 态中文标签必须互不重复')
+  assert.deepEqual(
+    new Set(rows.map((row) => row.tone)),
+    new Set(['ok', 'warn', 'bad', 'muted']),
+    '四种 tone 都要用上（色弱/暗色主题下靠颜色 + 文案双重区分）',
+  )
+})
+
+test('进度：百分比边界与单调性（done 满、失败归零、暂停冻结在中途）', () => {
+  const percentOf = (status: TaskStatus) => progressOf(taskOf('t', status)).percent
+  assert.equal(percentOf('done'), 100)
+  assert.equal(percentOf('pending'), 0)
+  assert.equal(percentOf('failed'), 0)
+  assert.equal(percentOf('interrupted'), 0)
+  assert.equal(percentOf('ready'), 10)
+  assert.equal(percentOf('blocked'), 20)
+  assert.equal(percentOf('rework'), 40)
+  assert.equal(percentOf('running'), 50)
+  assert.equal(percentOf('paused'), 50, '暂停冻结在中途：既不能假装完成也不能假装没开始')
+  assert.equal(percentOf('gate'), 80)
+
+  for (const status of ALL_TASK_STATUSES) {
+    const percent = percentOf(status)
+    assert.ok(Number.isFinite(percent), `${status} 百分比不能是 NaN`)
+    assert.ok(percent >= 0 && percent <= 100, `${status} 百分比越界`)
+    assert.equal(Number.isInteger(percent), true, `${status} 百分比必须是整数（进度条不画半像素）`)
+  }
+})
+
+test('进度：暂停是琥珀不是红（DESIGN §0.4「暂停永不用红」）', () => {
+  const paused = progressOf(taskOf('t1', 'paused'))
+  assert.equal(paused.label, '已暂停')
+  assert.equal(paused.tone, 'warn')
+  // 可分辨性：暂停绝不能与「失败 / 已中断」同色，也不能与「运行中」同色
+  assert.notEqual(paused.tone, progressOf(taskOf('t1', 'failed')).tone)
+  assert.notEqual(paused.tone, progressOf(taskOf('t1', 'interrupted')).tone)
+  assert.notEqual(paused.tone, progressOf(taskOf('t1', 'running')).tone)
+
+  const badge = statusBadge('paused')
+  assert.equal(badge.icon, '⏸', '暂停图标必须与失败 ✕ / 中断 ⚡ 区分')
+  assert.equal(badge.text, '已暂停')
+  assert.equal(badge.tone, 'warn')
+})
+
+test('进度：状态缺失或未知一律回落 pending，不出现 NaN/空标签', () => {
+  const unknown = { ...taskOf('t1', 'pending'), status: 'weird_state' } as unknown as PlanTask
+  const row = progressOf(unknown)
+  assert.equal(row.status, 'pending')
+  assert.equal(row.label, '待派发')
+  assert.equal(row.percent, 0)
+
+  const missing = {
+    id: 't2',
+    title: 'x',
+    roleId: 'dev',
+    dependsOn: [],
+    acceptance: '',
+    status: undefined,
+  } as unknown as PlanTask
+  assert.equal(progressOf(missing).label, '待派发')
+  assert.equal(progressOf(missing).percent, 0)
+})
+
+/* ──────────────────── 计划状态中文（AC-14 页头 chip） ──────────────────── */
+
+test('计划状态：5 态全映射为中文，无计划走「未启用」', () => {
+  const cases: [PlanStatus, string, string][] = [
+    ['draft', '计划就绪', 'ok'],
+    ['dispatching', '派发中', 'ok'],
+    ['paused', '已暂停', 'warn'],
+    ['terminated', '已终止', 'muted'],
+    ['cancelled', '已取消', 'muted'],
+  ]
+  for (const [status, label, tone] of cases) {
+    assert.deepEqual(planStatusView(status), { label, tone }, `${status} 的中文与 tone`)
+  }
+  assert.equal(new Set(cases.map((item) => item[1])).size, 5, '5 态中文必须互不重复')
+  assert.deepEqual(planStatusView(undefined), { label: '未启用', tone: 'muted' })
+  // 计划暂停与任务暂停同词（都叫「已暂停」），但语义分层：一个是整条流水线，一个是单条任务
+  assert.equal(planStatusView('paused').label, progressOf(taskOf('t', 'paused')).label)
 })
 
 

@@ -181,3 +181,38 @@ test('buildMemberPrompt：多个上游按传入顺序排列，且不破坏空行
   // 既有契约：lines.filter(l => l !== '') 之后不许出现连续空行（段落间恰好一个空行）。
   assert.ok(!prompt.includes('\n\n\n'), '不许出现连续空行，否则渲染成松散的空段落')
 })
+
+// ---------- r7 AC-7：role.prompt 必须真的进成员提示词 ----------
+
+test('buildMemberPrompt：role.prompt 进 prompt，且排在「本次任务」之前（存了必须用上）', () => {
+  // 特征串取自内置 pm 的逐字正文：只有真把 `role.prompt` 拼进去才会出现。
+  const pm = BUILTIN_ROLES.find((role) => role.id === 'pm')
+  assert.ok(pm?.prompt, '内置 pm 必须带 prompt（AC-7 的逐字来源）')
+  const signature = '验收标准必须可判定'
+  assert.ok(pm!.prompt!.includes(signature), '特征串必须在内置 prompt 里（否则本断言不承载信息）')
+
+  const prompt = buildMemberPrompt(
+    { plan, task: makeTask('t1', { roleId: 'pm' }), role: pm, name: 'pm-t1' },
+    noMemory,
+  )
+  assert.ok(prompt.includes('## 角色要求'), 'prompt 必须有独立段标题（成员才知道这是「额外要求」）')
+  assert.ok(prompt.includes(signature), '内置角色的 prompt 正文必须逐字进成员提示词')
+  assert.ok(
+    prompt.indexOf('## 角色要求') < prompt.indexOf('## 本次任务'),
+    '角色要求必须排在本次任务之前：先给身份纪律、再给方法、最后给任务',
+  )
+})
+
+test('buildMemberPrompt：role.prompt 缺失或空白时不出现「角色要求」段（不许留空壳标题）', () => {
+  for (const role of [makeRole([]), { ...makeRole([]), prompt: '   ' }]) {
+    const prompt = buildMemberPrompt({ plan, task: makeTask('t1'), role, name: 'dev-t1' }, noMemory)
+    assert.ok(!prompt.includes('## 角色要求'), '没有 prompt 时不许留一个空标题（成员会以为要求丢了）')
+    assert.ok(prompt.includes('## 本次任务'), '其他段照常')
+  }
+})
+
+test('buildMemberPrompt：自建角色改过的 prompt 立刻生效（面板/设置页改完不用重启）', () => {
+  const role = { ...makeRole([]), prompt: '本团队约定：提交前必须跑 pnpm build，并在结论里贴退出码。' }
+  const prompt = buildMemberPrompt({ plan, task: makeTask('t1'), role, name: 'dev-t1' }, noMemory)
+  assert.ok(prompt.includes('提交前必须跑 pnpm build'), '自建/改写的 prompt 必须原样进提示词')
+})

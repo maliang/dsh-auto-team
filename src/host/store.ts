@@ -34,8 +34,8 @@ import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_KINDS, TRIGGER_LO
  */
 export { TRIGGER_LOG_LIMIT }
 
-/** 落盘结构版本：2 是 RunState（1 = 历史的裸 Plan）。 */
-export const RUN_STATE_VERSION = 2
+/** 落盘结构版本：3 是 RunState + 暂停记账（2 = RunState，1 = 历史的裸 Plan）。 */
+export const RUN_STATE_VERSION = 3
 
 /** 消息账本上限（AC-16）：超出丢最旧，保证落盘文件不会无限增长。 */
 export const MESSAGES_LIMIT = 200
@@ -49,7 +49,26 @@ export const MESSAGES_LIMIT = 200
 export const STALL_ALERTS_LIMIT = 50
 
 /**
- * 一次运行的完整落盘状态（v2）。
+ * 暂停记账（r7 AC-9）：暂停不是「把状态改掉」，而是一次可逆事务。
+ *
+ * 为什么原状态记在这里而不写在 `PlanTask` 上：AC-10 冻结了 `PlanTask` 的字段集，
+ * 而且暂停/继续必须**原子**落盘「计划状态 + 每条任务原状态」——拆成两处就是两套真值与
+ * 两条回滚路径（本项目历史 bug 族：同一份数据两条链路给不同结论）。
+ *
+ * `tasks` 只记被冻结任务的**原状态**；恢复时按它还原，缺失的按 `ready` 兜底，
+ * 已经 `done` 的任务**永不回退**（AC-9：暂停不能把已完成的工作变回未完成）。
+ */
+export interface PauseRecord {
+  /** 进入暂停的时刻（毫秒）。 */
+  at: number
+  /** 暂停前的计划状态（`dispatching` 或 `draft`），恢复时原样还原。 */
+  planStatus: PlanStatus
+  /** 任务 id → 暂停前的状态。 */
+  tasks: Record<string, TaskStatus>
+}
+
+/**
+ * 一次运行的完整落盘状态（v3）。
  *
  * 注意 `plannedAt` 必须早于首个 `bindings[].spawnedAt` —— 这是 AC-30「先计划、后派发」
  * 的机械证据，不能在派发时补写。
@@ -78,6 +97,11 @@ export interface RunState {
    * （「为什么没推进」）都要**跨重启**成立；只在内存里存的话重启后同一个事件会被再推一次。
    */
   triggers?: TriggerRecord[]
+  /**
+   * 暂停记账（r7 AC-9）：存在即「当前处于暂停态」。
+   * 与 `plan.status === 'paused'` 的区别：这里是**可还原的原状态**，`plan.status` 只是对外的当前态。
+   */
+  pause?: PauseRecord
 }
 
 /** 运行列表的一行（面板/恢复入口用，不含消息账本等大字段）。 */
@@ -125,6 +149,8 @@ export class RunsStore {
       progress: capProgress(state.progress, bindings),
       stallAlerts: capStallAlerts(state.stallAlerts ?? []),
       triggers: capTriggers(state.triggers ?? []),
+      // 暂停记账也走归一化：桥里手搓的 PauseRecord 合法与否不应该决定盘上是什么形状。
+      pause: normalizePause(state.pause),
     }
     const tmp = `${path}.tmp`
     writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
@@ -195,6 +221,8 @@ export function wrapLegacy(raw: unknown): RunState | null {
     progress: normalizeProgress(raw.progress),
     stallAlerts: normalizeStallAlerts(raw.stallAlerts),
     triggers: normalizeTriggers(raw.triggers),
+    // v2 老文件没有 pause 字段：归一后是 undefined = 未暂停（向后兼容，不需要迁移脚本）。
+    pause: normalizePause(raw.pause),
   }
 }
 
@@ -242,12 +270,16 @@ const PLAN_STATUSES: readonly PlanStatus[] = ['draft', 'dispatching', 'paused', 
  * `interrupted` 必须在这里：watcher 把「成员进程已死、上下文仍在」写成 interrupted（AC-18），
  * 如果读盘时被当成脏值归回 pending，面板会显示「待办」而不是「已中断」，
  * 而 resume 只挑 running|gate|interrupted —— 恢复就会静默跳过这些任务（AC-17 失效）。
+ *
+ * `paused` 同理（r7 AC-9）：暂停期间任务被冻结成 paused，读盘若归回 pending，
+ * 恢复时会把它当「待办」重派一次 —— 已完成的工作被重跑，是暂停功能最坏的事故形态。
  */
 const TASK_STATUSES: readonly TaskStatus[] = [
   'pending',
   'blocked',
   'ready',
   'running',
+  'paused',
   'gate',
   'done',
   'rework',
@@ -350,6 +382,27 @@ function normalizeTriggers(raw: unknown): TriggerRecord[] {
     kept.push(value as unknown as TriggerRecord)
   }
   return capTriggers(kept)
+}
+
+/**
+ * 暂停记账归一化（r7 AC-9）：白名单校验，任何一项不合格就整体视为「未暂停」。
+ *
+ * 为什么整体丢弃而不是局部修补：`pause` 是恢复时的**唯一依据**，半份记录会导致
+ * 「有的任务还原成 running、有的回落 ready」——那比当成未暂停更危险（会派发一个其实在跑的任务）。
+ * 整体丢弃的后果只有一个：用户需要重新点一次继续（可见、可恢复）。
+ */
+function normalizePause(raw: unknown): PauseRecord | undefined {
+  if (!isRecord(raw)) return undefined
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return undefined
+  if (!PLAN_STATUSES.includes(raw.planStatus as PlanStatus)) return undefined
+  if (!isRecord(raw.tasks)) return undefined
+  const tasks: Record<string, TaskStatus> = {}
+  for (const [taskId, status] of Object.entries(raw.tasks)) {
+    if (taskId === '') return undefined
+    if (!TASK_STATUSES.includes(status as TaskStatus)) return undefined
+    tasks[taskId] = status as TaskStatus
+  }
+  return { at: raw.at, planStatus: raw.planStatus as PlanStatus, tasks }
 }
 
 function normalizePlan(raw: Record<string, unknown>): Plan | null {

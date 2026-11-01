@@ -17,7 +17,9 @@ import { join } from 'node:path'
 import type { MemberBinding, MessageRecord, PanelAction, Plan, PlanTask, Role } from '../src/shared/types.ts'
 import { createBridge, type Bridge, type BridgeDeps, type ReceiptInput } from '../src/host/bridge.ts'
 import { buildHttpRoutes } from '../src/host/http.ts'
+import { BUILTIN_ROLES } from '../src/host/roles/builtin.ts'
 import { createRoleRepo } from '../src/host/roles/repo.ts'
+import { createSettingsRepo } from '../src/host/settings.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { NOT_ENABLED_MESSAGE, buildToolSpecs, sessionOf } from '../src/host/tools.ts'
 
@@ -712,4 +714,92 @@ test('receipt：peer 实发失败只给 notice，不补 captain、不重复落�
   assert.equal(replayResult.rejected, undefined)
   assert.equal(replay.calls.sent.length, 0, '同一 (A,B) 不重复实发')
   assert.equal(replayResult.snapshot.messages.filter((m) => m.from === 'peer').length, 1)
+})
+
+// ---------- r7：设置生效与恢复默认角色（T2 新增动作） ----------
+
+test('saveSettings：合法提交落盘并立刻反映在快照（含队长模型），回调被调用一次', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'auto-team-settings-')), 'settings.json')
+  const seen: number[] = []
+  const { bridge } = setup({
+    settingsRepo: createSettingsRepo({ file, now: () => NOW }),
+    onSettingsSaved: (settings) => {
+      seen.push(settings.concurrencyLimit)
+    },
+  })
+  await enable(bridge)
+
+  const before = bridge.snapshot(SESSION)
+  assert.equal(before.settings?.concurrencyLimit, 3, '未保存前快照回落的必须是 config 缺省值（AC-11 冻结）')
+  assert.ok((before.skills?.length ?? 0) >= 1, '快照必须带技能只读投影')
+  assert.equal(before.skills?.[0]?.id !== undefined, true, '技能项必须有 id（设置页勾选要用）')
+
+  const result = await bridge.act(SESSION, {
+    type: 'saveSettings',
+    settings: { concurrencyLimit: 2, memoryBudget: 1200, stallMs: 30_000, maxAttempts: 2, gateTimeoutMs: 60_000 },
+  })
+  assert.equal(result.rejected, undefined, '合法设置必须保存成功')
+  assert.equal(result.snapshot.settings?.memoryBudget, 1200, '快照必须立刻用新设置（不需重启）')
+  assert.equal(result.snapshot.memory.budget, 1200, '记忆预算的投影与设置同源（不能一处新一处旧）')
+  assert.deepEqual(seen, [2], '保存后必须回调一次重生效（队长路由 + watcher 重建）')
+  assert.ok(existsSync(file), '设置必须真的落盘')
+  assert.ok(
+    result.notices?.some((notice) => notice.includes('队长模型')),
+    'notice 要说清队长模型当前取自哪里（设置页/迁移回落/跟随默认）',
+  )
+})
+
+test('saveSettings：非法提交 → BAD_REQUEST，磁盘一字不改，回调不触发', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-settings-bad-'))
+  const file = join(dir, 'settings.json')
+  let calls = 0
+  const { bridge } = setup({
+    settingsRepo: createSettingsRepo({ file, now: () => NOW }),
+    onSettingsSaved: () => {
+      calls += 1
+    },
+  })
+  await enable(bridge)
+
+  // 先存一份合法的，再提交非法的：判据是「文件字节完全相同」（不是「文件还在」）。
+  const ok = await bridge.act(SESSION, { type: 'saveSettings', settings: { concurrencyLimit: 4 } })
+  assert.equal(ok.rejected, undefined)
+  calls = 0
+  const bytes = readFileSync(file, 'utf8')
+
+  const bad = await bridge.act(SESSION, { type: 'saveSettings', settings: { concurrencyLimit: 99 } })
+  assert.equal(bad.rejected?.code, 'BAD_REQUEST', '越界设置必须被拒（不是夹到边界值）')
+  assert.match(bad.rejected!.message, /并发上限/, '拒绝文案要点名是哪一项')
+  assert.equal(readFileSync(file, 'utf8'), bytes, '非法提交时磁盘必须一字不改（AC-17）')
+  assert.equal(calls, 0, '没保存成功就不许触发重生效回调')
+
+  assert.equal(bridge.snapshot(SESSION).settings?.concurrencyLimit, 4, '快照仍显示上一次生效的值')
+})
+
+test('restoreDefaultRoles：只重写 6 个内置角色，自建角色一字不动（AC-8）', async () => {
+  const harness = setup()
+  const { bridge, roles } = harness
+  // setup 把角色库建在 `<tmp>/roles`（与 test 里 createRoleRepo 的参数一致）。
+  const rolesDir = join(harness.dir, 'roles')
+  await enable(bridge)
+
+  // 把内置 dev 改坏（duty/prompt/技能全变），再建一个自建角色。
+  roles.save({ id: 'dev', name: '被改坏的开发', duty: '随便写写', skillIds: [], builtin: false, updatedAt: NOW, prompt: '坏了' })
+  roles.save(roleOf('custom', '自建角色'))
+  const customBefore = readFileSync(join(rolesDir, 'custom.json'), 'utf8')
+
+  const result = await bridge.act(SESSION, { type: 'restoreDefaultRoles' })
+  assert.equal(result.rejected, undefined, '恢复默认必须成功')
+  const builtinDev = result.snapshot.roles.find((role) => role.id === 'dev')
+  const pristine = BUILTIN_ROLES.find((role) => role.id === 'dev')!
+  assert.equal(builtinDev?.name, pristine.name, '内置角色必须逐字回到内置值')
+  assert.equal(builtinDev?.duty, pristine.duty)
+  assert.equal(builtinDev?.prompt, pristine.prompt, '提示词也要恢复（AC-7 的字段之一）')
+  assert.deepEqual(builtinDev?.skillIds, pristine.skillIds, '技能必须恢复')
+  assert.equal(builtinDev?.builtin, true, '恢复后的内置角色必须重新带 builtin 标志')
+  assert.ok(
+    result.notices?.some((notice) => notice.includes('自建角色保持不动')),
+    'notice 必须说清自建角色没被动',
+  )
+  assert.equal(readFileSync(join(rolesDir, 'custom.json'), 'utf8'), customBefore, '自建角色文件字节不变')
 })

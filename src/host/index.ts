@@ -11,10 +11,11 @@
  * `bridge.act`，所以「工具能用、面板不能」这类历史缺陷不会从装配层长出来。
  */
 import { homedir } from 'node:os'
-import { GATE_TIMEOUT_MS, NOWAIT_THRESHOLD_MS, STALL_MS } from './config.ts'
-import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, skillsDir } from './paths.ts'
+import { NOWAIT_THRESHOLD_MS } from './config.ts'
+import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, settingsPath, skillsDir } from './paths.ts'
 import { RunsStore, type RunState } from './store.ts'
 import { createRoleRepo } from './roles/repo.ts'
+import { createSettingsRepo } from './settings.ts'
 import {
   createBridge,
   type ApplyReceiptPort,
@@ -87,6 +88,15 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   const store = new RunsStore(runsDir(home))
   const roles = createRoleRepo({ dir: rolesDir(home), skillsDir: skillsDir(home), now })
 
+  /**
+   * 设置仓储（r7 AC-13）：`settings.json` 是**唯一**可配参数写入点，路径由
+   * `paths.settingsPath(home)` 单点推导（真机 = `~/.dsh/auto-team/settings.json`）。
+   *
+   * 文件缺失时 `read()` 返回缺省值且**不建文件**（首启不落盘，避免把缺省值冻成用户的设置）；
+   * 内容损坏/非法时回落缺省并 warn —— 设置坏了不能拖垮整条 entry。
+   */
+  const settingsRepo = createSettingsRepo({ file: settingsPath(home), now, warn: (text) => warn(ctx, text) })
+
   // seed 失败不阻断装配（例如只读 home）：面板会显示「无角色」而工具仍可报错说明原因。
   try {
     roles.seed()
@@ -118,7 +128,11 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   }
 
   function hostConcurrency(): { limit: number; source: 'host' | 'default' } {
-    return resolveConcurrencyLimit(ctx)
+    const host = resolveConcurrencyLimit(ctx)
+    // AC-13 生效点①：设置是**天花板**，不替代宿主约束 —— 宿主给的更小就以宿主为准，
+    // 否则「设置 8」会让面板宣称能跑 8 个而宿主只肯给 3 个（并发越权 + 面板说谎）。
+    const cap = settingsRepo.read().concurrencyLimit
+    return host.limit <= cap ? host : { limit: cap, source: host.source }
   }
 
   /**
@@ -170,7 +184,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   }
 
   /** 回执端口：`done` 的唯一写点（AC-19），门禁证据由 bridge 传入。 */
-  const applyReceiptPort: ApplyReceiptPort = (state, taskId, receipt, at) => applyReceipt(state, taskId, receipt, at)
+  const applyReceiptPort: ApplyReceiptPort = (state, taskId, receipt, at, maxAttempts) =>
+    applyReceipt(state, taskId, receipt, at, maxAttempts)
 
   const sendMessage: SendPort = (memberId, text) => spawnPorts.sendMessage(memberId, text)
 
@@ -182,26 +197,55 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    *   返回 null，就落 `unsupported`。绝不因为「配置存在」就宣称生效（anti-goal 5）。
    */
   let captainView: CaptainModelView = captainModelView(null, 'unsupported')
-  try {
-    const route = readCaptainModel(dataRoot)
-    let capability: 'ok' | 'unsupported' = captainAgentScopeOf(ctx) === null ? 'unsupported' : 'ok'
-    if (route !== null && capability === 'ok') {
-      const undo = installCaptainRoute(ctx, route)
-      if (undo === null) {
-        capability = 'unsupported'
-        warn(ctx, `队长模型 ${route.provider}/${route.model} 未生效：宿主未提供可安装的主 session 作用域`)
-      } else {
-        registerEffect(ctx, undo)
+  /** 当前装上的队长路由撤销函数（重装时先撤销，避免改两次设置叠两个路由）。 */
+  let captainUndo: (() => void) | null = null
+  /** 卸载清理钩子只注册一次（`registerEffect` 每多注册一个都会让装配面多一条清理）。 */
+  let captainCleanupRegistered = false
+
+  /**
+   * 队长模型装配（r7 改造）：**`settings.json` 是唯一写入点**，既有 `<dataRoot>/captain.json`
+   * 降级为迁移期只读回落 —— 否则「设置页改了不生效」或「两边各说一套」必犯其一。
+   *
+   * - 配置位与能力位仍然分开：配置永远回显，能力位只认实测（`captainAgentScopeOf` /
+   *   `installCaptainRoute` 任一拿不到就 `unsupported`），绝不因「配置存在」宣称生效。
+   * - 可重入：保存设置后由 `onSettingsSaved` 再调一次，旧路由先撤销。
+   */
+  function syncCaptainRoute(): void {
+    try {
+      const fromSettings = settingsRepo.read().captainModel ?? null
+      const route = fromSettings ?? readCaptainModel(dataRoot)
+      captainUndo?.()
+      captainUndo = null
+      let capability: 'ok' | 'unsupported' = captainAgentScopeOf(ctx) === null ? 'unsupported' : 'ok'
+      if (route !== null && capability === 'ok') {
+        const undo = installCaptainRoute(ctx, route)
+        if (undo === null) {
+          capability = 'unsupported'
+          warn(ctx, `队长模型 ${route.provider}/${route.model} 未生效：宿主未提供可安装的主 session 作用域`)
+        } else {
+          captainUndo = undo
+          // 清理钩子**只在真有路由装上时**注册一次：没装路由的宿主不该多一条空清理
+          // （`test/wire.test.ts` 断言装配面 effect 条数，也顺带把「无配置不多挂」钉住）。
+          if (!captainCleanupRegistered) {
+            captainCleanupRegistered = true
+            registerEffect(ctx, () => {
+              captainUndo?.()
+              captainUndo = null
+            })
+          }
+        }
       }
+      captainView = captainModelView(route, capability)
+      if (route !== null && capability === 'ok') {
+        ctx.logger?.info?.(`[auto-team] 队长模型已生效：${route.provider}/${route.model}`)
+      }
+    } catch (error) {
+      warn(ctx, `队长模型装配失败（面板显示未生效）：${messageOf(error)}`)
+      captainView = captainModelView(null, 'unsupported')
     }
-    captainView = captainModelView(route, capability)
-    if (route !== null && capability === 'ok') {
-      ctx.logger?.info?.(`[auto-team] 队长模型已生效：${route.provider}/${route.model}`)
-    }
-  } catch (error) {
-    warn(ctx, `队长模型装配失败（面板显示未生效）：${messageOf(error)}`)
-    captainView = captainModelView(null, 'unsupported')
   }
+
+  syncCaptainRoute()
 
   /**
    * Trigger 总线（AC-13~AC-18）：判定与记账在这里，推进仍然只有 `bridge.act` 一个出口。
@@ -209,6 +253,33 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    * 先声明后赋值是为了打破环：快照要读总线健康度（`triggerHealth`），总线又需要 bridge。
    */
   let bus: TriggerBus | null = null
+
+  /**
+   * 成员对账 watcher 句柄（r7 起可重建）：停滞阈值与返工上限来自 settings，
+   * 用户保存设置后必须按新阈值重建，否则「改了不生效」只能靠重启治。
+   * 重建只碰 watcher 自己的表（先 stop 再 start），全仓定时器仍然只有一处。
+   */
+  let watcherRef: ReturnType<typeof createMemberWatcher> | null = null
+
+  function startWatcher(): void {
+    watcherRef?.stop()
+    const settings = settingsRepo.read()
+    watcherRef = createMemberWatcher({
+      store,
+      listMembers,
+      now,
+      // AC-13 生效点④：停滞阈值从设置读（缺省 = config.STALL_MS，值不变）。
+      stallMs: settings.stallMs,
+      // AC-13 生效点⑤：返工上限同样可配（缺省 = config.MAX_ATTEMPTS）。
+      maxAttempts: settings.maxAttempts,
+      // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
+      onPoll: async (state) => {
+        if (bus === null) return
+        await bus.poll(state)
+      },
+    })
+    watcherRef.start()
+  }
 
   const bridge = createBridge({
     store,
@@ -219,12 +290,20 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     resume,
     applyReceipt: applyReceiptPort,
     sendMessage,
-    gate: { cwd: workspace, artifactsDir, timeoutMs: GATE_TIMEOUT_MS },
+    // 门禁超时（AC-13 生效点②）**不在这里传**：缺省时 bridge 取 `settings.gateTimeoutMs`
+    // （其缺省正是 GATE_TIMEOUT_MS），设置才能立刻生效；这里硬塞常量会把可配点做废。
+    gate: { cwd: workspace, artifactsDir },
     hostConcurrency,
-    // 停滞阈值唯一来源是 config.STALL_MS；bridge 只 receive（快照三字段即由此推导）。
-    stallMs: STALL_MS,
+    // 停滞阈值同理**不传**：bridge 每次快照按 settings 现算，面板与 watcher 同源同值。
     now,
     captainModel: () => captainView,
+    settingsRepo,
+    // 保存设置后的两个重生效动作：队长路由重装 + watcher 按新阈值重建。
+    // 回调在 bridge 里被 try/catch 包住 —— 保存已落盘，这里出错只降级成 notice。
+    onSettingsSaved: () => {
+      syncCaptainRoute()
+      startWatcher()
+    },
     // 未装配总线 = 没有任何事件源可用：如实报降级，面板可见（AC-18）。
     triggerHealth: () =>
       bus === null ? { degraded: true, reason: 'Trigger 总线未装配，推进只剩轮询兜底' } : bus.health(),
@@ -345,21 +424,13 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
 
   // ⑦ 运行时对账：成员存活轮询（AC-18 的反面目标只能由 host 侧发现）+ 实际路由回填（AC-22）
   try {
-    // stallMs 只在这里传入（AC-13：阈值常量只在 config.ts 定义，watcher 不自读常量）。
-    const watcher = createMemberWatcher({
-      store,
-      listMembers,
-      now,
-      stallMs: STALL_MS,
-      // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
-      onPoll: async (state) => {
-        if (bus === null) return
-        await bus.poll(state)
-      },
-    })
-    watcher.start()
+    startWatcher()
     // 插件卸载/宿主关闭时必须停表，否则定时器会在 ctx 已经失效后继续摸 store。
-    registerEffect(ctx, () => watcher.stop())
+    // 经过 watcherRef 间接停：保存设置会重建 watcher，这里必须停「当前那个」而不是装配时那个。
+    registerEffect(ctx, () => {
+      watcherRef?.stop()
+      watcherRef = null
+    })
 
     registerAgentCreated(ctx, (payload) => {
       // 实际路由的来源有两档：

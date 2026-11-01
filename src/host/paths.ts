@@ -24,6 +24,16 @@ export function skillsDir(home: string): string {
   return `${globalDataRoot(home)}/skills`
 }
 
+/**
+ * 可配参数落点：`<home>/.dsh/auto-team/settings.json`（r7 AC-13）。
+ *
+ * 真机目标是 `~/.dsh/auto-team/settings.json` —— `globalDataRoot` 里**已经含 `.dsh`**，
+ * 这里绝不能再拼一层（拼了会落到 `~/.dsh/.dsh/...`，表现为「设置保存成功、重启全部丢失」）。
+ */
+export function settingsPath(home: string): string {
+  return `${globalDataRoot(home)}/settings.json`
+}
+
 /** 公共记忆目录（跨项目）。 */
 export function publicMemoryDir(home: string): string {
   return `${globalDataRoot(home)}/memory/public`

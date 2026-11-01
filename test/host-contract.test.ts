@@ -19,8 +19,9 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
-import { extname, join } from 'node:path'
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { extname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // typescript 是 `export =` 的 CJS 包：namespace import 在 verbatimModuleSyntax 下也能过 tsc，
 // 且 node 的 cjs-module-lexer 能取到 createSourceFile（已实测两种写法都可用，选不依赖 esModuleInterop 的）。
@@ -49,9 +50,20 @@ const LOCAL_CTX_MODULES: Readonly<Record<string, string>> = {
   'src/host/team/trigger.ts': 'FastContext',
 }
 
+/**
+ * 把「相对仓库根的路径」归一成绝对路径；绝对路径原样返回。
+ *
+ * 支持绝对路径是为了**可分辨性自检**：下列守卫（唯一 setInterval / 3 条路由 / 数据根单点）
+ * 必须能在「合成的违规样本」上真的判红，否则它们只是恒绿的装饰
+ * （本项目历史教训：判据恒绿与恒红一样不承载信息）。
+ */
+function absolute(relOrAbs: string): string {
+  return isAbsolute(relOrAbs) ? relOrAbs : join(ROOT, relOrAbs)
+}
+
 /** 递归列出目录下的源文件（跳过 node_modules / lib）。 */
 function sourceFiles(dir: string, exts: readonly string[], out: string[] = []): string[] {
-  for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+  for (const entry of readdirSync(absolute(dir), { withFileTypes: true })) {
     if (entry.name === 'node_modules' || entry.name === 'lib' || entry.name.startsWith('.')) continue
     const relPath = `${dir}/${entry.name}`
     if (entry.isDirectory()) sourceFiles(relPath, exts, out)
@@ -60,10 +72,10 @@ function sourceFiles(dir: string, exts: readonly string[], out: string[] = []): 
   return out
 }
 
-function parse(relPath: string): { source: string; file: ts.SourceFile } {
-  const source = readFileSync(join(ROOT, relPath), 'utf8')
-  const kind = relPath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
-  return { source, file: ts.createSourceFile(relPath, source, ts.ScriptTarget.Latest, true, kind) }
+function parse(filePath: string): { source: string; file: ts.SourceFile } {
+  const source = readFileSync(absolute(filePath), 'utf8')
+  const kind = filePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  return { source, file: ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, kind) }
 }
 
 interface CtxHit {
@@ -218,4 +230,219 @@ test('client 侧 ctx.<x> ⊆ inject(=[slots]) ∪ 非服务白名单', () => {
     violations.push(`ctx.${name} 未在 client inject 中登记（${places.join(', ')}）`)
   }
   assert.deepEqual(violations, [], violations.join('\n'))
+})
+
+/* ============================================================================
+ * r7 新增：形态冻结的三条不变式（AC-11）
+ *
+ * PRD 把「3 条 HTTP 路由 / 4 项 inject / 唯一 setInterval」列为**冻结形状**：
+ * r7 只许新增面板动作（pause / resumeTeam / restoreDefaultRoles / saveSettings），
+ * 不许新增路由、不许另起心跳、不许把数据根拼到第二层 `.dsh`。
+ *
+ * 三条判据都必须落在 AST 上，因为这三样东西的失效形态全是「注释里说单点、运行时多了一处」：
+ *   1. 多一条路由：宿主路由表与 `src/client/api.ts` 各自多一个入口，面板与工具读到两份真值；
+ *   2. 多一个 setInterval：暂停后仍有心跳（假暂停），且卸载/退出时进程不干净；
+ *   3. 数据根拼错：`~/.dsh/.dsh/auto-team/settings.json` 写得到处都是，面板永远读不到用户设置
+ *      （PRD 澄清阶段实测过的真机落点是 `/Users/maliang/.dsh/auto-team/settings.json`）。
+ * ========================================================================== */
+
+/** 遍历单个文件的整棵 AST（含所有子节点）。 */
+function walkAst(relPath: string, visit: (node: ts.Node, file: ts.SourceFile) => void): void {
+  const { file } = parse(relPath)
+  const visitNode = (node: ts.Node): void => {
+    visit(node, file)
+    ts.forEachChild(node, visitNode)
+  }
+  visitNode(file)
+}
+
+/** 收集某几个目录树里所有「callee 名字等于 name 的调用」位置（`f()` 与 `x.f()` 都算）。 */
+function callSites(name: string, dirs: readonly string[], exts: readonly string[]): string[] {
+  const sites: string[] = []
+  for (const dir of dirs) {
+    for (const relPath of sourceFiles(dir, exts)) {
+      walkAst(relPath, (node, file) => {
+        if (!ts.isCallExpression(node)) return
+        const callee = node.expression
+        const label = ts.isIdentifier(callee)
+          ? callee.text
+          : ts.isPropertyAccessExpression(callee)
+            ? callee.name.text
+            : ''
+        if (label !== name) return
+        const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))
+        sites.push(`${relPath}:${line + 1}`)
+      })
+    }
+  }
+  return sites
+}
+
+/**
+ * 从 `src/host/http.ts` 的 `buildHttpRoutes` 里取出「METHOD /尾段」表。
+ *
+ * 取的是**函数体里 return 的那个数组字面量**，不是源码正则：路由表一旦被改成
+ * 「按条件 push」「从常量表 map 出来」，这里会直接判红并提示，而不是静默数错。
+ */
+function httpRouteTable(relPath = 'src/host/http.ts'): string[] {
+  let routes: ts.ArrayLiteralExpression | undefined
+  walkAst(relPath, (node) => {
+    if (routes || !ts.isFunctionDeclaration(node) || node.name?.text !== 'buildHttpRoutes') return
+    const visit = (inner: ts.Node): void => {
+      if (routes) return
+      if (ts.isReturnStatement(inner) && inner.expression && ts.isArrayLiteralExpression(inner.expression)) {
+        routes = inner.expression
+        return
+      }
+      ts.forEachChild(inner, visit)
+    }
+    visit(node)
+  })
+  assert.ok(routes, 'src/host/http.ts 必须仍有 buildHttpRoutes(...)，且**返回数组字面量**（动态拼表会让冻结判据失效）')
+  const { file } = parse(relPath)
+  return routes.elements.map((element) => {
+    const text = element.getText(file)
+    const method = /method:\s*'([A-Z]+)'/.exec(text)?.[1] ?? '?'
+    // 路径是模板串 `${BRIDGE_ROUTE}/snapshot` —— 只取静态尾段（前缀由 BRIDGE_ROUTE 单点决定）。
+    const tail = /\/([a-z]+)`/.exec(text)?.[1] ?? '?'
+    return `${method} /${tail}`
+  })
+}
+
+/** 收集所有 `{ kind: 'prefix' }` 宿主路由注册点（宿主 WebRoute 只有这一个 shape）。 */
+function prefixRegistrations(): string[] {
+  const hits: string[] = []
+  for (const relPath of HOST_FILES) {
+    walkAst(relPath, (node, file) => {
+      if (!ts.isObjectLiteralExpression(node)) return
+      for (const property of node.properties) {
+        if (!ts.isPropertyAssignment(property)) continue
+        if (property.name.getText(file) !== 'kind') continue
+        const value = property.initializer
+        if (!ts.isStringLiteral(value) || value.text !== 'prefix') continue
+        const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))
+        hits.push(`${relPath}:${line + 1}`)
+      }
+    })
+  }
+  return hits
+}
+
+test('setInterval 全仓只有 1 处调用，且必须在成员看护器里（AC-11：暂停/继续不得另起心跳）', () => {
+  const sites = callSites('setInterval', ['src/host', 'src/client'], ['.ts', '.tsx'])
+  assert.equal(sites.length, 1, `定时器必须单点（唯一 setInterval），实际 ${sites.length} 处：${sites.join('、')}`)
+  assert.ok(
+    sites[0]?.startsWith('src/host/team/watcher.ts:'),
+    `唯一 setInterval 必须在 src/host/team/watcher.ts（暂停语义也在那里），实际 ${sites[0]}`,
+  )
+})
+
+test('面板 HTTP 桥恰好 3 条路由（r7 只加动作，不加路由），且经 1 条宿主 prefix 路由暴露', () => {
+  assert.deepEqual(
+    httpRouteTable().sort(),
+    ['GET /memory', 'GET /snapshot', 'POST /act'],
+    `面板接口必须仍是这 3 条（新增能力走 act 的 action.type），实际 ${httpRouteTable().join('、')}`,
+  )
+  const prefixes = prefixRegistrations()
+  assert.equal(prefixes.length, 1, `宿主只许注册 1 条 prefix 路由（3 条内部路由合成 1 条），实际 ${prefixes.join('、')}`)
+  assert.ok(
+    prefixes[0]?.startsWith('src/host/adapters.ts:'),
+    `宿主路由的唯一注册处必须是 src/host/adapters.ts（其余模块不许直接碰 ctx.webServer），实际 ${prefixes[0]}`,
+  )
+})
+
+/** 收集「数据根字面量」出现的位置（字符串与模板串静态片段都算，注释里的不算）。 */
+function dataRootLiterals(dirs: readonly string[]): string[] {
+  const LITERALS = ['.dsh/auto-team', '.dsh\\auto-team'] as const
+  const hits: string[] = []
+  for (const dir of dirs) {
+    for (const relPath of sourceFiles(dir, ['.ts', '.tsx'])) {
+      walkAst(relPath, (node, file) => {
+        const isText =
+          ts.isStringLiteral(node) ||
+          ts.isNoSubstitutionTemplateLiteral(node) ||
+          ts.isTemplateHead(node) ||
+          ts.isTemplateMiddle(node) ||
+          ts.isTemplateTail(node)
+        if (!isText) return
+        const text = (node as ts.LiteralLikeNode).text
+        if (!LITERALS.some((literal) => text.includes(literal))) return
+        const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))
+        hits.push(`${relPath}:${line + 1}`)
+      })
+    }
+  }
+  return hits
+}
+
+test('数据根只在 paths.ts 里推导（AC-6：多拼一层 .dsh 会让 settings.json 落到错目录）', () => {
+  const hits = dataRootLiterals(['src/host', 'src/client'])
+  const outside = hits.filter((where) => !where.startsWith('src/host/paths.ts:'))
+  assert.deepEqual(outside, [], `数据根只许在 src/host/paths.ts 里拼（settings/roles/runs 都从 globalDataRoot 派生）：${outside.join('、')}`)
+  assert.ok(
+    hits.some((where) => where.startsWith('src/host/paths.ts:')),
+    'src/host/paths.ts 必须仍是数据根的唯一推导处（globalDataRoot）',
+  )
+})
+
+test('ActivityEvent.kind 仍是 9 态（r7 不加新活动类型：面板改的是渲染，不是事件源）', () => {
+  const { file } = parse('src/shared/types.ts')
+  let kinds: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (kinds.length === 0 && ts.isInterfaceDeclaration(node) && node.name.text === 'ActivityEvent') {
+      for (const member of node.members) {
+        if (!ts.isPropertySignature(member) || member.name.getText(file) !== 'kind' || !member.type) continue
+        if (!ts.isUnionTypeNode(member.type)) continue
+        kinds = member.type.types
+          .filter((item): item is ts.LiteralTypeNode => ts.isLiteralTypeNode(item))
+          .map((item) => (item.literal as ts.StringLiteral).text)
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  assert.equal(kinds.length, 9, `ActivityEvent.kind 必须仍是 9 态，实际 ${kinds.length}：${kinds.join(', ')}`)
+})
+
+/**
+ * 判据可分辨性自检（本项目的头号判据事故是「恒绿」）：
+ * 三条冻结守卫必须能在一个**合成的违规样本**上真的判红。
+ *
+ * 这里不临时改真实源码（并行开发期改 src 会互相覆盖），而是在临时目录造三份小样本，
+ * 直接喂给上面同一批扫描函数：能扫出 2 处 setInterval / 1 处越界数据根 / 少一条路由，
+ * 就说明「=== 1 / 只在 paths.ts / === 3」这些数字不是装饰。
+ */
+test('冻结守卫可分辨：合成违规样本必须被判红（否则守卫只是恒绿）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-guard-'))
+  const timerFile = join(dir, 'two-timers.ts')
+  writeFileSync(
+    timerFile,
+    ['const a = setInterval(() => {}, 1000)', 'const b = globalThis.setInterval(() => {}, 10)', 'export { a, b }', ''].join('\n'),
+    'utf8',
+  )
+  const rootFile = join(dir, 'bad-root.ts')
+  writeFileSync(rootFile, ["import { join } from 'node:path'", "export const p = join('/home/x', '.dsh/auto-team/settings.json')", ''].join('\n'), 'utf8')
+  const httpFile = join(dir, 'http-bad.ts')
+  writeFileSync(
+    httpFile,
+    [
+      'export function buildHttpRoutes(deps) {',
+      '  return [',
+      "    { method: 'GET', path: `${BRIDGE_ROUTE}/snapshot`, handle: () => deps },",
+      '  ]',
+      '}',
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+
+  // ① 计数器必须能数到 2（真仓断言「=== 1」才有信息量）
+  const timers = callSites('setInterval', [dir], ['.ts'])
+  assert.equal(timers.length, 2, `扫描必须能同时数到 a() 与 globalThis.setInterval()，实际 ${timers.join('、')}`)
+  // ② 越界数据根必须被扫到（且能点出行号）
+  const roots = dataRootLiterals([dir])
+  assert.equal(roots.length, 1, `越界数据根必须被抓到，实际 ${roots.join('、') || '0 处'}`)
+  assert.ok(roots[0]?.startsWith(`${dir}/bad-root.ts:`), `必须点出越界位置，实际 ${roots[0]}`)
+  // ③ 路由表读取必须能读出「只有 1 条」，即真仓的「=== 3」是可分辨的
+  assert.deepEqual(httpRouteTable(httpFile), ['GET /snapshot'], '路由表读取必须能在样本上给出真实条目')
 })

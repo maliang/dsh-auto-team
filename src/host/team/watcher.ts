@@ -34,6 +34,11 @@ export interface WatcherDeps {
    * 判定本身不读常量（AC-13：判定实现只有一个，阈值只做参数）。
    */
   stallMs?: number
+  /**
+   * 返工上限（r7 AC-13 的 settings 生效点）。缺省取 `config.MAX_ATTEMPTS`；
+   * 与 `stallMs` 同一条纪律：判定实现只有一个，上限只做参数。
+   */
+  maxAttempts?: number
   /** 对账发生变更时的回调（宿主装配层用它刷新快照/打点，不在这里硬编码）。 */
   onReconciled?(state: RunState): void
   /**
@@ -65,7 +70,14 @@ export interface MemberWatcher {
  *
  * 只处理 running / gate / interrupted 三类任务：done / failed 是终态，rework 由回执链路负责。
  */
-export function reconcileMembers(state: RunState, members: HostMember[], now?: number): ReconcileResult {
+export function reconcileMembers(
+  state: RunState,
+  members: HostMember[],
+  now?: number,
+  /** 返工上限（r7 AC-13 的 settings 生效点）：缺省 `config.MAX_ATTEMPTS`，常量值不变。 */
+  maxAttempts?: number,
+): ReconcileResult {
+  const limit = maxAttempts ?? MAX_ATTEMPTS
   const at = now ?? Date.now()
   let next = state
   let changed = 0
@@ -80,7 +92,7 @@ export function reconcileMembers(state: RunState, members: HostMember[], now?: n
 
     if (!member) {
       if (task.status === 'interrupted') continue
-      const exhausted = (task.attempts ?? 0) >= MAX_ATTEMPTS
+      const exhausted = (task.attempts ?? 0) >= limit
       next = patch(next, task.id, { status: exhausted ? 'failed' : 'interrupted' })
       next = appendMessage(
         next,
@@ -90,7 +102,7 @@ export function reconcileMembers(state: RunState, members: HostMember[], now?: n
           taskId: task.id,
           at,
           body: exhausted
-            ? `成员「${binding?.name ?? task.roleId}」已失联且重试次数用尽（${task.attempts ?? 0}/${MAX_ATTEMPTS}）：任务「${task.title}」转人工。`
+            ? `成员「${binding?.name ?? task.roleId}」已失联且重试次数用尽（${task.attempts ?? 0}/${limit}）：任务「${task.title}」转人工。`
             : `成员「${binding?.name ?? task.roleId}」已失联：任务「${task.title}」标记为中断，可在面板点「恢复」重试。`,
         }),
       )
@@ -102,7 +114,7 @@ export function reconcileMembers(state: RunState, members: HostMember[], now?: n
 
     if (status === 'dead') {
       if (task.status === 'interrupted') continue
-      const exhausted = (task.attempts ?? 0) >= MAX_ATTEMPTS
+      const exhausted = (task.attempts ?? 0) >= limit
       next = patch(next, task.id, { status: exhausted ? 'failed' : 'interrupted' })
       next = appendMessage(
         next,
@@ -203,6 +215,7 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
   const now = deps.now ?? Date.now
   const intervalMs = deps.intervalMs ?? WATCHER_INTERVAL_MS
   const stallMs = deps.stallMs ?? STALL_MS
+  const maxAttempts = deps.maxAttempts ?? MAX_ATTEMPTS
   let timer: ReturnType<typeof setInterval> | null = null
   let busy = false
 
@@ -217,8 +230,16 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
       for (const summary of runs) {
         const state = deps.store.load(summary.runId)
         if (!state) continue
+        // r7 AC-9：暂停只掐「推进」，不掐「看清事实」——本 tick 仍做存活对账（成员死了要看得见），
+        // 只跳过停滞判定与 Trigger 轮询兜底。反过来（暂停连对账也停）会让面板在暂停期间
+        // 一直显示「运行中」，恢复后才发现成员早就没了。
+        const paused = state.plan.status === 'paused'
         const active = state.plan.tasks.some(
-          (task) => task.status === 'running' || task.status === 'gate' || task.status === 'interrupted',
+          (task) =>
+            task.status === 'running' ||
+            task.status === 'gate' ||
+            task.status === 'interrupted' ||
+            task.status === 'paused',
         )
         if (!active) continue
 
@@ -233,8 +254,10 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
 
         // 顺序固定：先对账存活，再判停滞（对账把任务判成 interrupted 后就不该再报停滞）。
         const at = now()
-        const reconciled = reconcileMembers(state, members, at)
-        const judged = stallAlertsOf(reconciled.state, at, stallMs)
+        const reconciled = reconcileMembers(state, members, at, maxAttempts)
+        const judged = paused
+          ? { state: reconciled.state, raised: [] as ActivityEvent[] }
+          : stallAlertsOf(reconciled.state, at, stallMs)
         if (reconciled.changed > 0 || judged.state !== reconciled.state) {
           deps.store.save(judged.state)
           deps.onReconciled?.(judged.state)
@@ -243,7 +266,9 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
 
         // Trigger 轮询兜底（AC-18）：紧跟在「对账 → 停滞判定」之后，喂的是同一份已落盘状态，
         // 所以 poll 看到的世界与刚写下去的一致（不会基于旧状态重复推导同一条 Trigger）。
-        if (deps.onPoll !== undefined) {
+        // 暂停时**不 poll**：Trigger 的每个动作都是推进，暂停期间派发会被 PAUSED 闸门拒掉，
+        // 但让它白跑一轮并在账本里留「被拒」记录没有意义。
+        if (!paused && deps.onPoll !== undefined) {
           try {
             await deps.onPoll(judged.state)
           } catch {

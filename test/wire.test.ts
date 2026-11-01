@@ -23,7 +23,7 @@ import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.t
 import { createRoleRepo } from '../src/host/roles/repo.ts'
 import { createBridge, type BridgeDeps } from '../src/host/bridge.ts'
 import { createExpander } from '../src/host/memory/expand.ts'
-import { TOOL_PREFIX } from '../src/host/config.ts'
+import { TOOL_PREFIX, BRIDGE_ROUTE } from '../src/host/config.ts'
 import type { CaptainModelView, Plan, PlanTask, TriggerRecord } from '../src/shared/types.ts'
 
 const NOW = 1_700_000_000_000
@@ -526,4 +526,52 @@ test('r5 缺省装配：没注入三个新端口时快照与今天完全一致�
   // 展开端口缺失必须明确报「不可用」，而不是静默返回空正文（那会让模型以为文件是空的）
   const expanded = h.bridge.expandMemory('mem://project/r5-note.md')
   assert.ok((expanded.error ?? '').includes('记忆展开不可用'))
+})
+
+/**
+ * r7 形态冻结（AC-11）：面板能力只许**加动作**（pause / resumeTeam / restoreDefaultRoles /
+ * saveSettings），不许加路由、不许加工具、不许加服务依赖。
+ *
+ * 为什么 host-contract 扫过源码还要在这里再守一遍：那边守的是「源码里没有第 4 条路由」，
+ * 这里守的是「装配之后宿主**真的**只看到 1 条 prefix 路由、3 条内部路径可用、第 4 条 404」。
+ * 源码看着对但装配顺序/前缀写错时，只有这一层能红。
+ */
+test('形态冻结：apply 后 3 面板接口 / 1 条 prefix 路由 / 4 项 inject / 7 工具（r7 只加 action.type）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'auto-team-freeze-'))
+  const previousHome = process.env.HOME
+  process.env.HOME = home
+  const h = makeHarness()
+  try {
+    apply(h.ctx as never, { workspace: home })
+  } finally {
+    process.env.HOME = previousHome
+  }
+
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'agents', 'agentTeams'], 'inject 冻结为 4 项硬依赖')
+  assert.equal(h.tools.length, 7, `工具面冻结为 7 个（r7 不加工具），实际 ${h.tools.map((tool) => tool.name).join(', ')}`)
+  assert.equal(h.routes.length, 1, '宿主只注册 1 条 prefix 路由（3 条内部路由合成 1 条）')
+  assert.equal(h.routes[0]?.path, BRIDGE_ROUTE, `prefix 必须是 ${BRIDGE_ROUTE}`)
+  assert.equal(h.routes[0]?.kind, 'prefix')
+
+  // 三条内部路径全部可用
+  assert.equal(
+    (await panel(h.routes, 'GET', `${BRIDGE_ROUTE}/snapshot?sessionId=${SESSION}`)).status,
+    200,
+    'GET snapshot 必须可用（设置与角色都经它投影）',
+  )
+  assert.equal(
+    (await panel(h.routes, 'GET', `${BRIDGE_ROUTE}/memory?track=public&name=team`)).status,
+    200,
+    'GET memory 必须可用（修 D7：编辑前先读正文）',
+  )
+  assert.equal(
+    (await panel(h.routes, 'POST', `${BRIDGE_ROUTE}/act`, { sessionId: SESSION, action: { type: 'toggle', enabled: false } })).status,
+    200,
+    'POST act 必须可用（r7 的四个新动作都走它）',
+  )
+  // 第 4 条路径必须不存在：settings / roles / skills 一律走「快照读 + act 写」，不许各开一个端点
+  for (const ghost of ['settings', 'roles', 'skills']) {
+    const reply = await panel(h.routes, 'GET', `${BRIDGE_ROUTE}/${ghost}?sessionId=${SESSION}`)
+    assert.equal(reply.status, 404, `${BRIDGE_ROUTE}/${ghost} 不许存在（设置与角色只在 snapshot + act 里）`)
+  }
 })

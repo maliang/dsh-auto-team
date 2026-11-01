@@ -24,7 +24,7 @@ export interface ToolsDeps {
   now: () => number
 }
 
-const NOT_ENABLED = '自动团队未启用：请在输入框下方的「自动团队」开关处启用后再试。'
+const NOT_ENABLED = '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。'
 
 /** 当前会话 id：由工具调用元信息带入；缺失时退回 'current'（面板按会话隔离，不会串数据）。 */
 export function sessionOf(meta: unknown): string {

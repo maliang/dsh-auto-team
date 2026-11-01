@@ -1,55 +1,38 @@
 /**
- * 右栏「自动团队」面板外壳（sidebar.right.pane.tab）。
+ * 自动团队右栏面板容器（`sidebar.right.pane.tab` + `.title`，DESIGN §1.1 E3）。
  *
- * 四页：计划 / 成员 / 记忆 / 角色（DESIGN §2）。本组件只做三件事：
- *   1. 取数（usePanelState，与开关行共享同一个 store → 单一数据源）；
- *   2. 把动作收窄成 tab 能用的形状（**全项目唯一的 as PanelAction 在 here**）；
- *   3. 切页与空态。
+ * 页头是这轮改造的门面，四条硬规矩：
+ *  1. **`完成 x/N` + 计划状态 chip + 暂停/继续按钮** 一行（高度 40px，DESIGN §0.2）。
+ *     数字全部由快照派生，组件里不存第二份计数。
+ *  2. **暂停按钮非乐观更新**：点击只发 `act({type:'pause'|'resumeTeam'})` + 本地 busy，
+ *     文案切换等宿主快照回来（`pauseButtonView` 的 label 只吃 `snapshot.paused`）。
+ *     乐观改文案会让「点了没生效」看起来像生效，是本项目反复踩的坑。
+ *  3. **暂停时不清门禁证据、不重排列表**（DESIGN §0.4）：任务行只由 PlanTab 按原顺序渲染。
+ *  4. 页头几何在 320px 下限可读：`完成 999/999` 约 79px + badge + 按钮 ≈ 190px < 320px。
  *
- * AC-30 的入口就在这里：计划生成后胶囊变琥珀「计划就绪 · N 任务」，此时成员数必须仍为 0
- * —— 成员只在用户点「开始派发」后才创建。
+ * 本文件只做「容器 + 页头 + 四个页签」，可见文案尽量下沉到 `ui.ts` / `viewmodel.ts`。
  */
 import * as React from 'react'
 import { useAutoTeamStyle } from './styles.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
 import { panelApi } from './api.ts'
-import { capsuleOf, captainModelLabelOf, viewExtras } from './viewmodel.ts'
+import { capsuleOf, captainModelLabelOf, planStatusView } from './viewmodel.ts'
 import type { ClientAction } from './viewmodel.ts'
-import { OPEN_PANEL_EVENT } from './Toggle.tsx'
+import { pauseButtonView } from './ui.ts'
+import { OPEN_PANEL_EVENT } from './HeaderButton.tsx'
 import { PlanTab } from './tabs/PlanTab.tsx'
 import { MembersTab } from './tabs/MembersTab.tsx'
 import { MemoryTab } from './tabs/MemoryTab.tsx'
 import { RolesTab } from './tabs/RolesTab.tsx'
-import type { CaptainModelView, MemoryTrack, PanelAction, PanelSnapshot, Result } from '../shared/types.ts'
-
-/**
- * `CaptainModelLabel.tone`（ok/warn/muted）→ styles.ts 既有的 5 色 `data-tone`。
- *
- * 为什么不直接在 viewmodel 里产出 `data-tone` 的值：那是**宿主 token 的取值域**（组件层知识），
- * 放进纯视图模型会把样式词表耦合进可单测的文案层。而这里只做一次机械改名，不是第二份状态映射。
- */
-const TONE_DATA: Record<'ok' | 'warn' | 'muted', string> = {
-  ok: 'success',
-  warn: 'warn',
-  muted: 'neutral',
-}
+import type { MemoryTrack, PanelAction, PanelSnapshot, PlanStatus, Result } from '../shared/types.ts'
 
 export interface PanelProps {
   sessionId?: string
-  session?: { id?: string }
+  session?: unknown
   [key: string]: unknown
 }
 
-type TabKey = 'plan' | 'members' | 'memory' | 'roles'
-
-const TABS: Array<{ key: TabKey; label: string }> = [
-  { key: 'plan', label: '计划' },
-  { key: 'members', label: '成员' },
-  { key: 'memory', label: '记忆' },
-  { key: 'roles', label: '角色' },
-]
-
-/** 记忆正文（GET /memory 的 data，见 TECHNICAL §4.1）。 */
+/** 记忆正文的一次读取结果（宿主侧已截断，客户端不再二次处理）。 */
 export interface MemoryBody {
   track: MemoryTrack
   name: string
@@ -62,102 +45,157 @@ export type ReadMemoryFn = (track: MemoryTrack, name: string) => Promise<Result<
 export interface TabProps {
   sessionId: string
   snapshot: PanelSnapshot | undefined
-  /** 动作结果原样交给 viewmodel.feedbackOf 解包（组件里不许再解一次）。 */
   act: (action: ClientAction) => Promise<unknown>
-  /** 点记忆条目时先读正文再进编辑器（D7：不读就写会把已有记忆清空）。 */
   readMemory: ReadMemoryFn
+}
+
+type TabKey = 'plan' | 'members' | 'memory' | 'roles'
+
+const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
+  { key: 'plan', label: '计划' },
+  { key: 'members', label: '成员' },
+  { key: 'memory', label: '记忆' },
+  { key: 'roles', label: '角色' },
+]
+
+/** 计划状态 / 语义色 → 宿主 tone 名（只做映射，文案与音调由 viewmodel 单点给）。 */
+const TONE_DATA: Record<string, string> = {
+  ok: 'success',
+  run: 'success',
+  plan: 'success',
+  done: 'success',
+  warn: 'warn',
+  bad: 'danger',
+  fail: 'danger',
+  muted: 'neutral',
+  idle: 'neutral',
+  neutral: 'neutral',
 }
 
 export function Panel(props: PanelProps): React.ReactElement {
   useAutoTeamStyle()
-  const sessionId = sessionIdOf(props as Record<string, unknown>)
+  const sessionId = sessionIdOf(props)
   const view = usePanelState(sessionId)
-  const snapshot = view.snapshot ?? undefined
+  const snapshot: PanelSnapshot | undefined = view.snapshot ?? undefined
   const [tab, setTab] = React.useState<TabKey>('plan')
+  const [pauseBusy, setPauseBusy] = React.useState(false)
 
-  const rawAct = view.act
-  const act = React.useCallback(
-    (action: ClientAction): Promise<unknown> => rawAct(action as PanelAction) as Promise<unknown>,
-    [rawAct],
-  )
+  const act = view.act as (action: ClientAction) => Promise<unknown>
+  const error = view.error
 
-  const readMemory = React.useCallback(
-    async (track: MemoryTrack, name: string): Promise<Result<MemoryBody>> => {
-      const api = panelApi as unknown as {
-        readMemory?: (id: string, track2: MemoryTrack, name2: string) => Promise<Result<MemoryBody>>
-      }
+  const readMemory = React.useCallback<ReadMemoryFn>(
+    async (track, name) => {
+      const api = panelApi
       if (typeof api.readMemory !== 'function') {
-        return { error: '宿主未提供记忆正文读取接口（插件与宿主版本不一致），为免清空已有记忆，已拒绝打开编辑器' }
+        return { error: '宿主未提供记忆读取接口' } as unknown as Result<MemoryBody>
       }
-      return api.readMemory.call(panelApi, sessionId, track, name)
+      const result = (await api.readMemory(sessionId, track, name)) as unknown as Result<MemoryBody>
+      return result
     },
     [sessionId],
   )
 
-  const tasks = snapshot?.tasks ?? []
-  const members = snapshot?.members ?? []
-  const extras = viewExtras(snapshot)
-  const capsule = capsuleOf(snapshot?.enabled === true, snapshot)
+  // 计划一就位就切到「计划」页：用户点开面板最想看的是任务流转，不是空着的上一页。
+  const planReady = snapshot?.planStatus !== undefined
+  React.useEffect(() => {
+    if (planReady) setTab('plan')
+  }, [planReady])
 
-  // r5：队长模型三态 + 事件源降级（AC-2 / AC-18）。两者都是**只读回显**，这里没有任何输入控件
-  // —— 本期不给队长模型写入口（新写入口只能是新 PanelAction 或新路由，两者都违反 AC-16）。
-  const captainView: CaptainModelView | undefined = snapshot?.captainModel
-  const captainLabel = captainModelLabelOf(captainView)
-  // 缺快照字段 = 宿主还没投影能力位 → fail-closed 按 `unsupported` 呈现，绝不假称「已配置」
-  const captainState = captainView?.source ?? 'unsupported'
+  // 会话头按钮点「开面板」但宿主没提供 openTab 时会派发这个事件；收到就切到计划页。
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    const onOpen = (): void => setTab('plan')
+    window.addEventListener(OPEN_PANEL_EVENT, onOpen)
+    return () => window.removeEventListener(OPEN_PANEL_EVENT, onOpen)
+  }, [])
+
+  const capsule = capsuleOf(snapshot?.enabled === true, snapshot)
+  const captain = captainModelLabelOf(snapshot?.captainModel)
   const degraded = snapshot?.degraded === true
   const degradeReason = (snapshot?.degradeReason ?? '').trim()
 
-  // AC-30：计划一出现（还没有任何成员）就停在「计划」页，用户要立刻看见计划与「开始派发」
-  const planReady = tasks.length > 0 && members.length === 0
-  React.useEffect(() => {
-    if (planReady) setTab('plan')
-  }, [planReady, snapshot?.runId])
+  const tasks = snapshot?.tasks ?? []
+  const total = tasks.length
+  const done = tasks.filter((task) => task.status === 'done').length
+  const paused = snapshot?.paused === true
+  const pauseView = pauseButtonView({ paused, busy: pauseBusy })
+  // 计划状态一律走 viewmodel 的 5 态表（暂停时按 `paused` 归一，不在这里写第二套中文）
+  const effectivePlanStatus: PlanStatus | undefined = paused ? 'paused' : snapshot?.planStatus
+  const planStatus = effectivePlanStatus === undefined ? undefined : planStatusView(effectivePlanStatus)
 
-  // 开关行的「面板」按钮：面板已在时可切页（页面没挂载时该事件无人接收，属正常）
-  React.useEffect(() => {
-    if (typeof window === 'undefined') return
-    const handler = (): void => setTab('plan')
-    window.addEventListener(OPEN_PANEL_EVENT, handler)
-    return () => window.removeEventListener(OPEN_PANEL_EVENT, handler)
-  }, [])
-
-  const error = view.error ?? undefined
+  async function togglePause(): Promise<void> {
+    if (pauseBusy) return
+    setPauseBusy(true)
+    try {
+      // 非乐观：不发本地翻转，只发动作；文案/几何等 snapshot.paused 回来再变。
+      await act({ type: pauseView.action } as ClientAction)
+    } finally {
+      setPauseBusy(false)
+    }
+  }
 
   return (
-    <div data-dsh-auto-team-panel data-enabled={snapshot?.enabled === true ? 'true' : 'false'}>
+    <div data-auto-team-panel data-enabled={snapshot?.enabled === true ? 'true' : 'false'} data-paused={paused ? 'true' : 'false'}>
       <div data-panel-head>
-        <strong>自动团队</strong>
-        <span data-head-capsule data-tone={capsule.tone}>
+        <strong data-panel-title>自动团队</strong>
+        <span data-head-capsule data-tone={TONE_DATA[capsule.tone] ?? 'neutral'} title={capsule.text}>
           {capsule.text}
         </span>
         <span data-head-meta>
-          计划 {tasks.length} · 成员 {members.length} · 并发 {extras.concurrency.running}/
-          {extras.concurrency.limit}
+          计划 {total} · 成员 {snapshot?.members.length ?? 0} · 并发 {snapshot?.concurrency?.running ?? 0}/
+          {snapshot?.concurrency?.limit ?? 0}
         </span>
-        <span data-head-meta>
-          <span
-            data-captain-model={captainState}
-            data-tone={TONE_DATA[captainLabel.tone]}
-            title={(captainView?.note ?? '').trim()}
-          >
-            {captainLabel.label}
-          </span>
-          <span data-head-sep> · </span>
-          <span
-            data-auto-team-degraded={degraded ? 'true' : 'false'}
-            data-tone={degraded ? 'warn' : 'neutral'}
-            title={degraded ? degradeReason : '四个宿主事件源都已订阅，Trigger 由事件即时推进'}
-          >
-            {degraded
-              ? `事件源降级${degradeReason !== '' ? `：${degradeReason}` : ''}`
-              : '事件源正常'}
-          </span>
+        <span data-captain-model data-tone={captain.tone} title={captain.label}>
+          {captain.label}
+        </span>
+        <span
+          data-auto-team-degraded={degraded ? 'true' : 'false'}
+          data-tone={degraded ? 'warn' : 'neutral'}
+          title={degraded ? degradeReason : '四个宿主事件源都已订阅，Trigger 由事件即时推进'}
+        >
+          {degraded ? `事件源降级${degradeReason !== '' ? `：${degradeReason}` : ''}` : '事件源正常'}
         </span>
         <button type="button" onClick={() => void view.refresh()} data-panel-refresh>
           刷新
         </button>
       </div>
+
+      <div data-panel-progress-row>
+        <span data-panel-progress data-done={done} data-total={total}>
+          完成 {done}/{total}
+        </span>
+        {planStatus === undefined ? null : (
+          <span data-panel-plan-status data-tone={planStatus.tone}>
+            {planStatus.label}
+          </span>
+        )}
+        <span data-panel-progress-spacer />
+        <button
+          type="button"
+          data-auto-team-pause
+          data-action={pauseView.action}
+          data-tone={pauseView.tone}
+          disabled={pauseView.disabled || snapshot === undefined}
+          aria-busy={pauseBusy ? 'true' : 'false'}
+          title={paused ? '从中断处继续推进（不重跑已完成任务）' : '暂停派发与推进（在跑成员不被打断）'}
+          onClick={() => void togglePause()}
+        >
+          {pauseBusy ? <span data-pause-spinner aria-hidden="true" /> : null}
+          <span data-pause-label>{pauseView.label}</span>
+        </button>
+      </div>
+
+      {paused ? (
+        <div data-panel-paused-banner role="status">
+          <span data-paused-icon aria-hidden="true">
+            ⏸
+          </span>
+          <span data-paused-text>已暂停：派发与推进已停止，在跑成员不被打断</span>
+          {typeof snapshot?.pausedAt === 'number' ? (
+            <span data-paused-at>{formatClock(snapshot.pausedAt)}</span>
+          ) : null}
+        </div>
+      ) : null}
 
       <div data-panel-tabs role="tablist">
         {TABS.map((item) => (
@@ -198,4 +236,14 @@ export function Panel(props: PanelProps): React.ReactElement {
   )
 }
 
+function formatClock(at: number): string {
+  const date = new Date(at)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 export default Panel
+
+/** 计划状态文案的唯一出处仍是 `viewmodel.planStatusView`；此处仅做音调补强。 */
+export type { PanelAction }

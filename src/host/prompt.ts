@@ -41,7 +41,7 @@ export function captainSection(deps: PromptDeps, sessionId: string): string {
     '4. 成员是**可续聊**的独立 Agent：用 `auto_team_message` 直达消息，中断后用同一 memberId 继续（面板「继续」或 `resume`），不要重新创建同名成员。',
     '5. **完成必须过门禁**：任务从 running 到 done 唯一入口是 `auto_team_receipt`（host 会执行该任务的 acceptance 并记录命令、退出码、输出尾部）。成员口头说「做完了」、你读代码觉得「应该没问题」都不算完成；门禁失败的任务转 rework，其下游保持 blocked，你必须把失败证据发回原成员再改。',
     '6. 团队记忆分公共与项目两轨，都是 md：相关约定优先 `auto_team_memory` 读取，沉淀时才写入。',
-    '7. 面板（输入框下方开关 + 右栏「自动团队」）是用户的可视入口与唯一状态来源；你的结论要与面板显示一致。',
+    '7. 面板（输入框内「自动团队」选项 + 右栏面板）是用户的可视入口与唯一状态来源；你的结论要与面板显示一致。',
   ]
   // 两行都「有内容才出现」，避免常驻段随风膨胀（预算 ≤2600 字符，见 test/captain.test.ts）。
   const notes = [captainModelLineOf(snapshot.captainModel), memoryLineOf(snapshot.memory)].filter(

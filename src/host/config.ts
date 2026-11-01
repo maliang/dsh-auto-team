@@ -10,7 +10,7 @@
 export { PLUGIN_ID, BRIDGE_ROUTE, PANEL_ACTIVE_MS, PANEL_IDLE_MS } from '../shared/const.ts'
 
 import { PANEL_ACTIVE_MS } from '../shared/const.ts'
-import type { TriggerKind } from '../shared/types.ts'
+import type { AutoTeamSettings, TriggerKind } from '../shared/types.ts'
 
 /**
  * 面板轮询间隔的**兼容别名**（= 活跃档 2000ms）。
@@ -153,3 +153,41 @@ export const HOST_MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 /** 宿主成员名长度上限（`memberName()` 同款截断；聚合后再截会留下结尾 `-`，须二次归一）。 */
 export const HOST_MEMBER_NAME_MAX = 48
+
+/* ─────────────────────── 可配参数（r7 AC-11：缺省值 = 今天的冻结常量） ─────────────────────── */
+
+/**
+ * 设置页可配参数的**缺省值**（r7 AC-11/AC-13）。
+ *
+ * 铁律：每一项都必须引用上面的冻结常量，不许在这里重新写一遍数字 ——
+ * 否则「默认并发 3」就有两个真值，settings.json 少写一项与不写文件会给出不同结论。
+ * 上面那些常量本身**一个值都不改**（AC-11 的形态冻结判据就是它们各自只出现一次）。
+ */
+export const DEFAULT_SETTINGS: AutoTeamSettings = {
+  concurrencyLimit: DEFAULT_MAX_CONCURRENT,
+  memoryBudget: MEMORY_INJECT_BUDGET,
+  stallMs: STALL_MS,
+  maxAttempts: MAX_ATTEMPTS,
+  gateTimeoutMs: GATE_TIMEOUT_MS,
+}
+
+/**
+ * 可配参数的合法域（闭区间，均为整数）。写在这里的唯一理由是**校验与设置页提示共用同一份**：
+ * 校验函数（host/settings.ts）按它拒绝非法值，设置页按同一个数字显示「1~8」，
+ * 两边各写一份就会出现「页面说 1~8、保存时按 1~6 拒」的错位。
+ */
+export const SETTINGS_LIMITS = {
+  concurrencyLimit: [1, MAX_CONCURRENT_LIMIT],
+  memoryBudget: [200, MEMORY_INJECT_BUDGET],
+  stallMs: [1_000, 600_000],
+  maxAttempts: [1, 10],
+  gateTimeoutMs: [1_000, 600_000],
+} as const
+
+/**
+ * 角色提示词字符上限（r7 AC-7）。
+ *
+ * 8000 字符是「一整段可读的职责说明」的合理上界：再长成员提示词会挤占任务与记忆的预算，
+ * 而且设计稿里提示词框是固定 96px 内滚，超长内容在界面上等于不可编辑。
+ */
+export const ROLE_PROMPT_MAX = 8000

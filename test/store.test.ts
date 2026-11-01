@@ -215,11 +215,11 @@ test('RunsStore.save/load 往返一致，原子写不留 .tmp', () => {
     store.save(state)
 
     assert.deepEqual(readdirSync(dir), ['run-legacy.json'])
-    assert.equal(JSON.parse(readFileSync(join(dir, 'run-legacy.json'), 'utf8')).version, 2)
+    assert.equal(JSON.parse(readFileSync(join(dir, 'run-legacy.json'), 'utf8')).version, RUN_STATE_VERSION)
 
     const loaded = store.load('run-legacy')
     assert.ok(loaded)
-    assert.equal(loaded.version, 2)
+    assert.equal(loaded.version, RUN_STATE_VERSION)
     assert.equal(loaded.plannedAt, now)
     assert.equal(loaded.messages.length, 3)
     assert.equal(loaded.messages[2].body, 'm2')
@@ -259,12 +259,12 @@ test('save 落盘前把消息账本裁到 200 条', () => {
   })
 })
 
-test('load 能读磁盘上的 v1 裸 Plan 文件（自动升 v2）', () => {
+test('load 能读磁盘上的 v1 裸 Plan 文件（自动升到当前版本）', () => {
   withTempDir((dir) => {
     writeFileSync(join(dir, 'legacy.json'), JSON.stringify(legacyPlan({ runId: 'legacy' })), 'utf8')
     const state = new RunsStore(dir).load('legacy')
     assert.ok(state)
-    assert.equal(state.version, 2)
+    assert.equal(state.version, RUN_STATE_VERSION)
     assert.deepEqual(state.messages, [])
     assert.equal(state.plannedAt, now)
   })
@@ -408,4 +408,109 @@ test('旧文件缺字段时给安全默认值，并发上限被夹到硬上限',
   assert.equal(garbageTask.plan.tasks.length, 1)
   assert.equal(garbageTask.plan.tasks[0].status, 'pending')
   assert.deepEqual(garbageTask.plan.tasks[0].dependsOn, [])
+})
+
+/* ───────────────────── r7 T1：暂停记账（RUN_STATE_VERSION = 3） ───────────────────── */
+
+test('r7：RUN_STATE_VERSION 升到 3，暂停记账原子落盘后可原样读回', () => {
+  assert.equal(RUN_STATE_VERSION, 3)
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const state = wrapLegacy(legacyPlan())
+    assert.ok(state)
+    assert.equal(state.pause, undefined, '未暂停的运行不该凭空有 pause')
+    state.plan.tasks[0].status = 'paused'
+    // 暂停/继续是一次事务：计划状态 + 每条任务原状态写在同一个对象里（AC-9）。
+    state.pause = { at: now, planStatus: 'dispatching', tasks: { t1: 'running', t2: 'ready' } }
+    store.save(state)
+
+    const loaded = store.load('run-legacy')
+    assert.ok(loaded)
+    assert.equal(loaded.version, RUN_STATE_VERSION)
+    assert.deepEqual(loaded.pause, { at: now, planStatus: 'dispatching', tasks: { t1: 'running', t2: 'ready' } })
+    assert.equal(loaded.plan.tasks[0].status, 'paused', 'paused 任务状态必须读回 paused，不许归回 pending')
+  })
+})
+
+test('r7：paused 是 TASK_STATUSES 的合法值（读盘不归回 pending，否则恢复会重派已完成任务）', () => {
+  const state = wrapLegacy({
+    runId: 'r1',
+    sessionId: 's1',
+    tasks: [
+      { id: 't1', title: '冻结中', roleId: 'dev', dependsOn: [], acceptance: 'pnpm test', status: 'paused' },
+      { id: 't2', title: '真脏值', roleId: 'dev', dependsOn: [], acceptance: 'pnpm test', status: 'whatever' },
+    ],
+  })
+  assert.ok(state)
+  assert.equal(state.plan.tasks[0].status, 'paused')
+  assert.equal(state.plan.tasks[1].status, 'pending', '白名单外的状态仍归回 pending')
+})
+
+test('r7：normalizePause 白名单 —— 四项任一不合格就整体视为未暂停', () => {
+  const base = { at: now, planStatus: 'dispatching', tasks: { t1: 'running' } }
+  const okCase = wrapLegacy({ ...legacyPlan(), pause: base })
+  assert.ok(okCase)
+  assert.deepEqual(okCase.pause, base)
+
+  const cases: { label: string; pause: unknown }[] = [
+    { label: 'at 非数字', pause: { ...base, at: 'now' } },
+    { label: 'at 非有限', pause: { ...base, at: Number.POSITIVE_INFINITY } },
+    { label: 'planStatus 非法', pause: { ...base, planStatus: 'whatever' } },
+    { label: 'tasks 不是对象', pause: { ...base, tasks: [] } },
+    { label: '任务状态在白名单外', pause: { ...base, tasks: { t1: 'whatever' } } },
+    { label: '任务 id 为空串', pause: { ...base, tasks: { '': 'running' } } },
+    { label: 'pause 不是对象', pause: 'paused' },
+  ]
+  for (const item of cases) {
+    const state = wrapLegacy({ ...legacyPlan(), pause: item.pause })
+    assert.ok(state)
+    assert.equal(state.pause, undefined, `${item.label}：半份暂停记录必须整体丢弃（否则会派发其实在跑的任务）`)
+  }
+
+  const emptyTasks = wrapLegacy({ ...legacyPlan(), pause: { at: now, planStatus: 'draft', tasks: {} } })
+  assert.ok(emptyTasks)
+  assert.deepEqual(emptyTasks.pause, { at: now, planStatus: 'draft', tasks: {} }, '空 tasks 合法（刚计划就暂停）')
+})
+
+test('r7：save() 会把手搓的非法 pause 归一掉，盘上不许出现脏记账', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const state = wrapLegacy(legacyPlan())
+    assert.ok(state)
+    state.pause = { at: now, planStatus: 'bogus', tasks: {} } as unknown as NonNullable<typeof state.pause>
+    store.save(state)
+    const raw = JSON.parse(readFileSync(join(dir, 'run-legacy.json'), 'utf8')) as Record<string, unknown>
+    assert.equal('pause' in raw, false, '非法 pause 不许落盘（JSON.stringify 丢掉 undefined 键）')
+  })
+})
+
+test('r7：v2 老文件（无 pause 字段）升到 v3 后仍是「未暂停」', () => {
+  withTempDir((dir) => {
+    // v2 时代的文件形状：有 version:2、没有 pause。
+    const v2 = { ...legacyPlan(), version: 2, plannedAt: now, messages: [], bindings: [], routeAudits: [] }
+    writeFileSync(join(dir, 'run-legacy.json'), `${JSON.stringify(v2, null, 2)}\n`, 'utf8')
+    const store = new RunsStore(dir)
+    const loaded = store.load('run-legacy')
+    assert.ok(loaded)
+    assert.equal(loaded.version, RUN_STATE_VERSION, '读回即升版，不需要迁移脚本')
+    assert.equal(loaded.pause, undefined)
+    assert.equal(loaded.plan.tasks.length, 2)
+  })
+})
+
+test('r7：暂停记账随运行落盘 —— 另一个 store 实例也能读到（跨重启不丢）', () => {
+  withTempDir((dir) => {
+    const first = new RunsStore(dir)
+    const state = wrapLegacy(legacyPlan())
+    assert.ok(state)
+    state.pause = { at: now, planStatus: 'dispatching', tasks: { t1: 'done', t2: 'ready' } }
+    first.save(state)
+
+    const second = new RunsStore(dir)
+    const loaded = second.load('run-legacy')
+    assert.ok(loaded)
+    assert.equal(loaded.pause?.tasks.t2, 'ready', '恢复时按原状态还原（ready 不该被改成 pending）')
+    assert.equal(loaded.pause?.tasks.t1, 'done', '已完成任务的原状态也记着，恢复时不得回退')
+    assert.equal(second.list()[0].status, loaded.plan.status, '列表口径不受 pause 影响')
+  })
 })

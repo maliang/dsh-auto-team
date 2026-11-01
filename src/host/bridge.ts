@@ -6,7 +6,7 @@
  *   - HTTP：POST /api/auto-team/act  →  bridge.act
  *   - 工具：auto_team_message / auto_team_receipt / auto_team_memory / auto_team_role → 同一个 bridge.act
  *
- * 11 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x）：
+ * 15 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x，r7 新增 4 个动作与 PAUSED 码）：
  *   toggle               → 只改开关并落盘，**绝不派发**（反目标 1）
  *   dispatch             → NOT_ENABLED / NO_PLAN / NOT_FOUND(runId) / PLAN_ALREADY_DISPATCHED /
  *                          ROLE_UNAVAILABLE / MODEL_UNRESOLVABLE / CONCURRENCY_FULL（后三者来自编排层 skipped 分类）
@@ -19,11 +19,19 @@
  *   deleteMemory         → NOT_ENABLED / BAD_REQUEST / NOT_FOUND
  *   saveRole             → NOT_ENABLED / BAD_REQUEST
  *   deleteRole           → NOT_ENABLED / NOT_FOUND / BAD_REQUEST（内置角色不可删）
+ *   pause                → NOT_ENABLED / NO_PLAN / BAD_REQUEST（计划已结束）；重复暂停幂等
+ *   resumeTeam           → NOT_ENABLED / NO_PLAN / BAD_REQUEST（计划已结束）；未暂停幂等 no-op
+ *   restoreDefaultRoles  → NOT_ENABLED / BAD_REQUEST（角色库不可写）
+ *   saveSettings         → NOT_ENABLED / BAD_REQUEST（任一项非法 → 磁盘一字不改）
+ *
+ * **PAUSED 闸门**（r7 AC-16）：计划处于暂停态时，`dispatch` / `resume` / `receipt` 一律被拒
+ * （这三个都会推进状态机），其余动作放行。闸门就在 `act()` 的入口处一处判断，不散落到组件。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import type {
   ActResult,
   ActivityEvent,
+  AutoTeamSettings,
   CaptainModelView,
   ExpandPayload,
   GateEvidence,
@@ -36,11 +44,11 @@ import type {
   RejectionCode,
   Result,
   Role,
+  SkillInfo,
+  TaskStatus,
 } from '../shared/types.ts'
 import {
-  GATE_TIMEOUT_MS,
   MAX_CONCURRENT_LIMIT,
-  MEMORY_INJECT_BUDGET,
   MEMORY_LINES_PER_TASK,
   STALL_MS,
 } from './config.ts'
@@ -49,7 +57,9 @@ import { selectMemory } from './memory/inject.ts'
 import { deleteMemory, listMemory, readMemory, safeMemoryName, writeMemory } from './memory/repo.ts'
 import { blockedTasks, readyTasks } from './plan/graph.ts'
 import { progressOf } from './plan/plan.ts'
+import { BUILTIN_SKILLS } from './roles/builtin.ts'
 import type { RoleRepo } from './roles/repo.ts'
+import { defaultSettings, type SettingsRepo } from './settings.ts'
 import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
 import { secondsText, stallOf } from './team/stall.ts'
 
@@ -99,6 +109,11 @@ export type ApplyReceiptPort = (
   taskId: string,
   receipt: ReceiptInput,
   now: number,
+  /**
+   * 返工上限（r7 AC-13 的 settings 生效点）。**可选**：既有实现在不传时取 `config.MAX_ATTEMPTS`，
+   * 与今天的逐字行为一致；装配层传 `settings.maxAttempts` 才让它可配。
+   */
+  maxAttempts?: number,
 ) => RunState
 
 /** 直达消息端口（adapters 注入 agentTeams.sendMessage；无 caller 时带 code='NO_CALLER'）。 */
@@ -150,6 +165,22 @@ export interface BridgeDeps {
    * 单测可以传一个只返回固定 payload 的桩，不必造临时目录。
    */
   expander?: (id: string, depth?: number) => ExpandPayload
+  /**
+   * settings.json 仓储（r7 AC-13 的**唯一**可配参数来源）。
+   *
+   * 可选而不是必选：`BridgeDeps` 在 `test/trigger-bus.test.ts` 与 `test/wire.test.ts` 里也被直接构造，
+   * 那些用例关心的是 Trigger/HTTP 语义、不该被迫造一个设置文件。缺省时：
+   *   - 快照 `settings` 回落到 `defaultSettings()`（与今天逐字一致，AC-11）；
+   *   - `saveSettings` 明确拒绝「设置仓储未装配」，而不是假装保存成功。
+   */
+  settingsRepo?: SettingsRepo
+  /**
+   * 设置保存成功后的重生效回调（r7）。装配层用它重装队长模型路由（`settings.captainModel`
+   * 是 settings.json 唯一写入点），并让 watcher 的停滞阈值取到新值。
+   *
+   * **同步调用**：调用方负责自己吞错 —— 保存已经落盘成功，回调失败不能让面板显示保存失败。
+   */
+  onSettingsSaved?: (settings: AutoTeamSettings) => void
 }
 
 export interface Bridge {
@@ -181,11 +212,46 @@ interface SessionFlag {
 /** 空验收命令的拒绝码：TECHNICAL §5.3 明确要求 GATE_FAILED，但 §4.2 的码表未收录，故窄化断言。 */
 const GATE_FAILED = 'GATE_FAILED' as unknown as RejectionCode
 
-const NOT_ENABLED_TEXT = '自动团队未启用：请先在输入框下方的「自动团队」开关处启用'
+const NOT_ENABLED_TEXT = '自动团队未启用：请先在输入框内的「自动团队」选项处启用'
+
+/** PAUSED 文案（AC-16）：必须同时说清「为什么被拒」与「下一步点哪儿」。 */
+const PAUSED_TEXT = '任务已暂停：请先在面板顶部点「继续任务」再操作'
+
+/** 暂停期间被闸门拒绝的动作（三个都会推进状态机；其余动作照常放行）。 */
+const PAUSED_BLOCKED: ReadonlySet<PanelAction['type']> = new Set<PanelAction['type']>([
+  'dispatch',
+  'resume',
+  'receipt',
+])
 
 export function createBridge(deps: BridgeDeps): Bridge {
   const now = deps.now ?? (() => Date.now())
-  const stallMs = deps.stallMs ?? STALL_MS
+
+  /**
+   * 生效设置（r7 AC-13）：**每次读盘**而不是装配时读一次 —— 用户在设置页改完立刻生效，
+   * 不需要重启宿主。读失败（文件损坏/无权限）由 `settingsRepo.read()` 自己回落缺省，这里不再兜。
+   */
+  function settingsOf(): AutoTeamSettings {
+    return deps.settingsRepo === undefined ? defaultSettings() : deps.settingsRepo.read()
+  }
+
+  /**
+   * 停滞阈值：装配层显式注入优先（测试/演练要固定阈值），否则取 settings（缺省 = `STALL_MS`）。
+   * 这条优先级刻意与「设置生效点」相反，理由见 AC-11：常量值不变、参数可注入，
+   * 单测才能用 2000ms 打出 stalls 而不必等 90 秒。
+   */
+  function stallMsOf(settings?: AutoTeamSettings): number {
+    return deps.stallMs ?? (settings ?? settingsOf()).stallMs
+  }
+
+  /** 技能只读投影（AC-16 设置页要能勾选，但正文不进快照）。 */
+  function skillsOf(): SkillInfo[] {
+    return BUILTIN_SKILLS.map((skill) => ({
+      id: skill.id,
+      title: skill.title,
+      description: firstLine(skill.body.replace(/^#+\s*/, '')),
+    }))
+  }
   const flags = loadFlags()
   let messageSeq = 0
   let gateQueueDepth = 0
@@ -396,7 +462,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return events.sort((a, b) => b.at - a.at).slice(0, ACTIVITY_LIMIT)
   }
 
-  function membersOf(state: RunState | null, roles: Role[]): MemberView[] {
+  function membersOf(state: RunState | null, roles: Role[], stallMs: number): MemberView[] {
     if (!state) return []
     const roleById = new Map(roles.map((role) => [role.id, role]))
     const taskById = new Map(state.plan.tasks.map((task) => [task.id, task]))
@@ -414,7 +480,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         roleId: binding.roleId,
         taskId: binding.taskId,
         status,
-        ...stallFieldsOf(state, binding.memberId, status, binding.spawnedAt),
+        ...stallFieldsOf(state, binding.memberId, status, binding.spawnedAt, stallMs),
         lastEventAt: lastEventAtOf(state, binding.memberId, binding.spawnedAt),
         modelRoute: describeRoute(roleById.get(binding.roleId)),
         canResume: status !== 'done',
@@ -432,7 +498,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         roleId: task.roleId,
         taskId: task.id,
         status,
-        ...stallFieldsOf(state, task.memberId, status, state.plannedAt),
+        ...stallFieldsOf(state, task.memberId, status, state.plannedAt, stallMs),
         lastEventAt: lastEventAtOf(state, task.memberId, state.plannedAt),
         modelRoute: describeRoute(roleById.get(task.roleId)),
         canResume: status !== 'done',
@@ -453,6 +519,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     memberId: string,
     status: MemberStatus,
     fallbackAt: number,
+    stallMs: number,
   ): { stalled: boolean; stalledForMs: number; stalledSecondsText: string } {
     if (status !== 'running') return { stalled: false, stalledForMs: 0, stalledSecondsText: '' }
     const progressAt = state.progress?.[memberId]?.at
@@ -505,12 +572,21 @@ export function createBridge(deps: BridgeDeps): Bridge {
     const state = loadState(sessionId)
     const roles = deps.roles.list()
     const { files, candidates } = memoryFiles()
+    // 生效设置只取一次：同一份快照里的预算与停滞阈值必须来自同一次读，否则会出现
+    // 「预算 4000 但只注入了 200」这种自相矛盾（一次 snapshot 读两次盘就会发生）。
+    const settings = settingsOf()
+    const stallMs = stallMsOf(settings)
     const goal = state?.plan.tasks.map((task) => task.title).join(' ') ?? ''
-    const selected = selectMemory(goal, candidates, MEMORY_INJECT_BUDGET)
+    const selected = selectMemory(goal, candidates, settings.memoryBudget)
     // 事件源健康度与队长模型都由装配层注入（见 BridgeDeps 注释）：缺失就是「未投影」，
     // 不能在这里编一个默认值假装正常——面板的职责是把「我不知道」显示出来（anti-goal 5）。
     const health = deps.triggerHealth?.()
     const captain = deps.captainModel?.()
+    // 暂停态（AC-15）：`paused` 是布尔，按钮文案与 `data-paused` 都只看它；
+    // `pausedAt` 只在真暂停时给。计划状态是权威判据（重启后 pause 记录可能被
+    // store.normalizePause 丢掉，但 plan.status 一定还在）。
+    const paused = state?.plan.status === 'paused'
+    const pausedAt = state?.pause?.at
 
     return {
       enabled: flags[sessionId]?.enabled === true,
@@ -518,13 +594,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
       planStatus: state?.plan.status,
       plannedAt: state?.plannedAt,
       tasks: state?.plan.tasks ?? [],
-      members: membersOf(state, roles),
+      members: membersOf(state, roles, stallMs),
       messages: state?.messages ?? [],
       routeAudits: state?.routeAudits ?? [],
       concurrency: concurrencyOf(state),
       memory: {
         injectedChars: selected.chars,
-        budget: MEMORY_INJECT_BUDGET,
+        budget: settings.memoryBudget,
         truncated: selected.truncated,
         files,
         // 内联索引明细（AC-7）与未内联条目（AC-8）：面板据此说「哪几条进了上下文 / 哪几条可展开」。
@@ -533,6 +609,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
       },
       roles,
       activity: activityOf(state),
+      // r7 四个新字段：暂停态、生效设置、技能只读投影。全部**必给**（客户端不做缺省推断），
+      // pausedAt 例外：未暂停时「没有暂停时刻」是事实，给 0 会被读成「1970 年暂停的」。
+      paused,
+      ...(paused && pausedAt !== undefined ? { pausedAt } : {}),
+      settings,
+      skills: skillsOf(),
       ...(captain === undefined ? {} : { captainModel: captain }),
       degraded: health?.degraded === true,
       ...(health?.degraded === true
@@ -564,6 +646,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
         return reject('NOT_ENABLED', NOT_ENABLED_TEXT, sessionId)
       }
 
+      // PAUSED 闸门（r7 AC-16）：**只拦推进类动作**，一个判断点，不散落到各个 case 与组件里。
+      // 放行的动作（toggle/cancel/message/saveRole/pause/resumeTeam/...）在暂停时仍然可用：
+      // 用户暂停后还得能停用、能发消息问成员、能改角色、能继续。暂停语义见 TECHNICAL §2.3。
+      if (PAUSED_BLOCKED.has(action.type)) {
+        const paused = loadState(sessionId)
+        if (paused?.plan.status === 'paused') return reject('PAUSED', PAUSED_TEXT, sessionId)
+      }
+
       switch (action.type) {
         case 'toggle': {
           flags[sessionId] = { enabled: action.enabled, updatedAt: now() }
@@ -575,6 +665,89 @@ export function createBridge(deps: BridgeDeps): Bridge {
           ])
         }
 
+        case 'pause': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话没有可暂停的运行', sessionId)
+          const current = state.plan.status
+          if (current === 'terminated' || current === 'cancelled') {
+            return reject('BAD_REQUEST', `计划已结束（${current}），无法暂停`, sessionId)
+          }
+          // 幂等：重复点「暂停」不改 `pause.at`（否则面板会显示「刚暂停」而实际已冻结很久）。
+          if (current === 'paused' && state.pause !== undefined) {
+            return accept(sessionId, ['任务已处于暂停状态'])
+          }
+          // 只冻结「可推进」的两个状态：ready（还没起人）/ running（成员在跑，**不中断成员**，
+          // 只把任务状态改成 paused；成员的下一次回执照常会被闸门拒，恢复后由下一 tick 补推进）。
+          const frozen: Record<string, TaskStatus> = {}
+          const tasks = state.plan.tasks.map((task) => {
+            if (task.status !== 'running' && task.status !== 'ready') return task
+            frozen[task.id] = task.status
+            return { ...task, status: 'paused' as const }
+          })
+          // `planStatus` 记「暂停前是什么」：terminated/cancelled 已在上方拒绝，所以只会是
+          // draft / dispatching；若磁盘上是「status=paused 但没有 pause 记录」的旧账，
+          // 回落 dispatching —— 否则 resumeTeam 会把计划还原成 paused，永远出不来。
+          const preStatus: RunState['plan']['status'] = current === 'paused' ? 'dispatching' : current
+          const at = now()
+          const next = withMessage(
+            {
+              ...state,
+              plan: { ...state.plan, status: 'paused', tasks },
+              pause: { at, planStatus: preStatus, tasks: frozen },
+            },
+            recordOf({
+              from: 'captain',
+              to: 'user',
+              at,
+              body: `已暂停本次运行：冻结 ${Object.keys(frozen).length} 个任务（在跑的成员不会被中断，门禁/恢复/派发暂停受理）`,
+            }),
+          )
+          saveState(next)
+          return accept(sessionId, [
+            `已暂停：${Object.keys(frozen).length} 个任务被冻结，计划状态 ${preStatus} → paused`,
+          ])
+        }
+
+        case 'resumeTeam': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话没有可继续的运行', sessionId)
+          const current = state.plan.status
+          if (current === 'terminated' || current === 'cancelled') {
+            return reject('BAD_REQUEST', `计划已结束（${current}），无法继续`, sessionId)
+          }
+          // 幂等：没暂停就点「继续」不是错误，但也不该写盘（否则 pause 记录会凭空消失/重建）。
+          if (state.pause === undefined && current !== 'paused') {
+            return accept(sessionId, ['当前没有暂停的任务：无需继续'])
+          }
+          const restore = state.pause?.tasks ?? {}
+          let restored = 0
+          const tasks = state.plan.tasks.map((task) => {
+            if (task.status !== 'paused') return task // done/failed/interrupted/gate 一律不动：done 永不回退
+            const target = restore[task.id]
+            // 原状态缺失（旧账/被 normalizePause 丢掉）→ ready：让下一轮 dispatch 自然重新起人，
+            // 而不是猜成 running（猜 running 会让面板永远显示一个不存在的成员在跑）。
+            const status: TaskStatus = target === undefined || target === 'paused' || target === 'done' ? 'ready' : target
+            restored += 1
+            return { ...task, status }
+          })
+          const planStatus = state.pause?.planStatus ?? 'dispatching'
+          const backTo: RunState['plan']['status'] =
+            planStatus === 'draft' || planStatus === 'dispatching' ? planStatus : 'dispatching'
+          const at = now()
+          const { pause: _dropped, ...rest } = state
+          const next = withMessage(
+            { ...rest, plan: { ...state.plan, status: backTo, tasks } },
+            recordOf({
+              from: 'captain',
+              to: 'user',
+              at,
+              body: `已继续：${restored} 个任务按暂停前的原状态还原，计划状态 paused → ${backTo}`,
+            }),
+          )
+          saveState(next)
+          return accept(sessionId, [`已继续：${restored} 个任务已还原`, `计划状态 paused → ${backTo}`])
+        }
+
         case 'dispatch': {
           const state = loadState(sessionId)
           if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：先让队长拆解目标（auto_team_plan）', sessionId)
@@ -582,8 +755,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
             return reject('NOT_FOUND', `找不到运行 ${action.runId}（当前会话最新运行是 ${state.plan.runId}）`, sessionId)
           }
           const status = state.plan.status
-          if (status !== 'draft' && status !== 'dispatching' && status !== 'paused') {
-            return reject('NO_PLAN', `计划状态为 ${status}，不能派发（需要 draft/dispatching/paused）`, sessionId)
+          // r7：`paused` 已由入口的 PAUSED 闸门拦掉，这里只留两个可派发状态 ——
+          // 两处都收窄是刻意的（bridge 一处、dispatchReady 一处）：任何一条推进路径绕开都不会起人。
+          if (status !== 'draft' && status !== 'dispatching') {
+            return reject('NO_PLAN', `计划状态为 ${status}，不能派发（需要 draft/dispatching）`, sessionId)
           }
 
           const boundIds = new Set(
@@ -724,6 +899,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (task.status === 'done') return accept(sessionId, [`任务 ${action.taskId} 已完成，不重复跑门禁`])
 
           const empty = task.acceptance.trim() === ''
+          // settings 一次读：门禁超时与返工上限来自同一次读（否则一次回执会用到两个版本的设置）。
+          const settings = settingsOf()
           const gateState = withTask(state, action.taskId, (item) => ({ ...item, status: 'gate' }))
           saveState(gateState)
 
@@ -736,7 +913,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
                 runGate(task, {
                   cwd: deps.gate.cwd,
                   artifactsDir: deps.gate.artifactsDir,
-                  timeoutMs: deps.gate.timeoutMs ?? GATE_TIMEOUT_MS,
+                  // AC-13 生效点：装配层显式注入优先（测试要定值），否则取 settings.gateTimeoutMs。
+                  timeoutMs: deps.gate.timeoutMs ?? settings.gateTimeoutMs,
                   now,
                 }),
               ),
@@ -766,6 +944,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
             action.taskId,
             { verdict, note: action.note, evidence },
             now(),
+            // AC-13 生效点：返工上限可配（缺省 = config.MAX_ATTEMPTS，值不变）。
+            settings.maxAttempts,
           )
           const notices: string[] = [
             outcome.ok
@@ -850,6 +1030,49 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return accept(sessionId, [`已删除角色 ${roleId}`])
         }
 
+        case 'restoreDefaultRoles': {
+          // AC-8：只重写 6 个内置角色（逐字取 BUILTIN_ROLES，含 prompt），自建角色一字不动。
+          // `builtin` 标志由 repo 从 BUILTIN_ROLES 推导，不信任磁盘上的 `builtin:true`。
+          let outcome: { restored: string[]; kept: string[] }
+          try {
+            outcome = deps.roles.restoreDefaults()
+          } catch (error) {
+            return reject(
+              'BAD_REQUEST',
+              `恢复默认角色失败：${error instanceof Error ? error.message : String(error)}`,
+              sessionId,
+            )
+          }
+          const keptCustom = outcome.kept.length === 0 ? '没有自建角色' : `自建角色保持不动（${outcome.kept.join('、')}）`
+          return accept(sessionId, [
+            `已恢复 ${outcome.restored.length} 个内置角色（名称/描述/提示词/技能/模型全部回到内置值）`,
+            keptCustom,
+          ])
+        }
+
+        case 'saveSettings': {
+          if (deps.settingsRepo === undefined) {
+            return reject('BAD_REQUEST', '设置仓储未装配：本次运行无法保存设置', sessionId)
+          }
+          // 校验与落盘都在 settings.save 一个入口里（先校验后 tmp+rename 原子写）：
+          // 非法提交时磁盘一字不改（AC-17），所以这里绝不做「先写再校验」。
+          const saved = deps.settingsRepo.save(action.settings)
+          if (!saved.ok) return reject('BAD_REQUEST', saved.reason, sessionId)
+          // 保存已落盘：回调失败只降级成 notice，不能让面板显示「保存失败」而磁盘其实已经变了。
+          let callbackError = ''
+          try {
+            deps.onSettingsSaved?.(saved.settings)
+          } catch (error) {
+            callbackError = error instanceof Error ? error.message : String(error)
+          }
+          const notices = [
+            `设置已保存：并发 ${saved.settings.concurrencyLimit}｜记忆预算 ${saved.settings.memoryBudget}｜停滞阈值 ${saved.settings.stallMs}ms｜返工上限 ${saved.settings.maxAttempts}｜门禁超时 ${saved.settings.gateTimeoutMs}ms`,
+            `队长模型：${saved.settings.captainModel === undefined ? '跟随会话默认' : `${saved.settings.captainModel.provider}/${saved.settings.captainModel.model}`}`,
+          ]
+          if (callbackError !== '') notices.push(`设置已落盘，但生效步骤失败：${callbackError}（重启宿主后生效）`)
+          return accept(sessionId, notices)
+        }
+
         default: {
           const unknown = action as { type?: string }
           return reject('BAD_REQUEST', `未知面板动作：${unknown.type ?? 'undefined'}`, sessionId)
@@ -891,7 +1114,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
     memoryFor(goal: string) {
       const { candidates } = memoryFiles()
-      const selected = selectMemory(goal, candidates, MEMORY_INJECT_BUDGET)
+      // AC-13 生效点③：队长侧注入预算与面板 `memory.budget` 必须**同源**（都读 settings），
+      // 否则面板显示 4000 而成员实际只拿到 200 —— 本项目历史高频 bug 族的形态。
+      const selected = selectMemory(goal, candidates, settingsOf().memoryBudget)
       return { text: selected.text, truncated: selected.truncated, chars: selected.chars }
     },
 

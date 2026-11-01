@@ -23,7 +23,7 @@ export const TAB_TITLE_TEXT = PANEL_TAB_LABEL
 export function TabTitle(): React.ReactElement {
   return (
     <span
-      data-auto-team-tab-title
+      data-auto-team-panel-tab
       style={{
         font: 'var(--dsw-font-xs-13, 13px/20px sans-serif)',
         whiteSpace: 'nowrap',

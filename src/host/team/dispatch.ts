@@ -342,8 +342,10 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   let changed = false
 
   const planStatus = next.plan.status
-  if (planStatus !== 'draft' && planStatus !== 'dispatching' && planStatus !== 'paused') {
-    // 已终止/取消的计划不再派发：明确拒绝，而不是静默什么都不做。
+  // r7 AC-9/AC-16：**暂停不是可派发状态**。除了 `bridge.act` 的 PAUSED 闸门，纯函数层也收窄 ——
+  // 否则换一条推进路径（工具/Trigger）绕过 bridge 就能在暂停期间起人，闸门变成一处例外。
+  if (planStatus !== 'draft' && planStatus !== 'dispatching') {
+    // 已终止/取消/暂停的计划不再派发：明确拒绝，而不是静默什么都不做。
     for (const task of next.plan.tasks) {
       if (task.status === 'pending' || task.status === 'ready') skipped.push({ taskId: task.id, reason: 'NO_PLAN' })
     }
@@ -658,7 +660,13 @@ export function applyReceipt(
   taskId: string,
   receipt: { verdict: 'done' | 'rework' | 'failed'; note?: string; evidence?: import('../../shared/types.ts').GateEvidence },
   now?: number,
+  /**
+   * 返工上限（r7 AC-13 的 settings 生效点）。缺省取 `config.MAX_ATTEMPTS` —— 常量的值不变，
+   * 这里只接收参数，所以「没有 settings.json」与今天的逐字行为完全一致（AC-11）。
+   */
+  maxAttempts?: number,
 ): RunState {
+  const limit = maxAttempts ?? MAX_ATTEMPTS
   const at = now ?? Date.now()
   const task = state.plan.tasks.find((item) => item.id === taskId)
   if (!task) return state
@@ -676,15 +684,15 @@ export function applyReceipt(
     body = gateSummary(task, evidence, '已被判定失败')
   } else {
     const nextAttempts = attempts + 1
-    const giveUp = nextAttempts >= MAX_ATTEMPTS
+    const giveUp = nextAttempts >= limit
     next = patchTask(next, taskId, {
       status: giveUp ? 'failed' : 'rework',
       attempts: nextAttempts,
       evidence,
     })
     body = giveUp
-      ? `返工已达上限（${nextAttempts}/${MAX_ATTEMPTS} 次）：任务「${task.title}」已转人工，下游保持阻塞。${receipt.note ?? ''}`.trim()
-      : `返工第 ${nextAttempts}/${MAX_ATTEMPTS} 次：任务「${task.title}」未通过门禁，请按证据修改后再次回报。${receipt.note ?? ''}`.trim()
+      ? `返工已达上限（${nextAttempts}/${limit} 次）：任务「${task.title}」已转人工，下游保持阻塞。${receipt.note ?? ''}`.trim()
+      : `返工第 ${nextAttempts}/${limit} 次：任务「${task.title}」未通过门禁，请按证据修改后再次回报。${receipt.note ?? ''}`.trim()
   }
 
   next = appendMessage(

@@ -17,6 +17,7 @@ import type {
   MemberView,
   PanelAction,
   PanelSnapshot,
+  PlanStatus,
   PlanTask,
   RoleModelRoute,
   TaskStatus,
@@ -53,6 +54,8 @@ const BADGES: Record<string, Badge> = {
   pending: { icon: '·', text: '待派发', tone: 'neutral' },
   ready: { icon: '▸', text: '就绪', tone: 'business' },
   gate: { icon: '⚖', text: '门禁中', tone: 'warn' },
+  // r7 新增：暂停态（AC-9/AC-14）。琥珀 + ⏸ —— 暂停是「用户主动冻结」，不是失败，永不用红（DESIGN §0.4）。
+  paused: { icon: '⏸', text: '已暂停', tone: 'warn' },
 }
 
 const UNKNOWN_BADGE: Badge = { icon: '?', text: '未知', tone: 'neutral' }
@@ -585,4 +588,75 @@ export function captainModelLabelOf(
   }
   // unsupported 之外的未知取值也走这条：宁可显示「未生效」也不要假装生效
   return { label: '队长模型 宿主不支持 · 未生效', tone: 'warn' }
+}
+
+/* ─────────────────────────── 任务行进度（AC-14） ─────────────────────────── */
+
+/** 任务行的语义 tone（styles.ts 的 [data-tone] 据此上色；与 BadgeTone 不同族，故单列）。 */
+export type ProgressTone = 'ok' | 'warn' | 'bad' | 'muted'
+
+export interface TaskProgress {
+  status: TaskStatus
+  label: string
+  tone: ProgressTone
+  percent: number
+}
+
+/**
+ * `TaskStatus` 10 态 → 进度值与颜色（**全项目唯一一份**，AC-14 判据落在 progressOf 上）。
+ *
+ * label 一律从 `statusBadge` 取，这里**不再写第二遍中文** —— 同一状态两处文案必然漂移。
+ * percent 口径：待派发 0 → 就绪 10 → 阻塞 20 → 待返工 40 → 运行中/已暂停 50 →
+ * 门禁中 80 → 已通过 100；失败/已中断归 0（要重跑，进度不保留）。
+ * 已暂停取 50：暂停冻结在「中途」，既不能假装完成（100），也不能假装没开始（0）。
+ */
+const TASK_PROGRESS: Record<TaskStatus, { tone: ProgressTone; percent: number }> = {
+  pending: { tone: 'muted', percent: 0 },
+  ready: { tone: 'muted', percent: 10 },
+  blocked: { tone: 'warn', percent: 20 },
+  rework: { tone: 'warn', percent: 40 },
+  running: { tone: 'ok', percent: 50 },
+  paused: { tone: 'warn', percent: 50 },
+  gate: { tone: 'warn', percent: 80 },
+  done: { tone: 'ok', percent: 100 },
+  failed: { tone: 'bad', percent: 0 },
+  interrupted: { tone: 'bad', percent: 0 },
+}
+
+/** 单条任务的展示态：状态 / 中文标签 / 颜色 / 进度百分比（缺状态一律按 pending 兜底）。 */
+export function progressOf(task: PlanTask): TaskProgress {
+  const raw = (task as { status?: unknown } | null | undefined)?.status
+  const status = typeof raw === 'string' && raw in TASK_PROGRESS ? (raw as TaskStatus) : 'pending'
+  const row = TASK_PROGRESS[status]
+  return { status, label: statusBadge(status).text, tone: row.tone, percent: row.percent }
+}
+
+/* ─────────────────────── 计划状态中文（AC-14 页头 chip） ─────────────────────── */
+
+/** 计划状态的语义 tone。 */
+export type PlanStatusTone = 'ok' | 'warn' | 'bad' | 'muted'
+
+export interface PlanStatusView {
+  label: string
+  tone: PlanStatusTone
+}
+
+/**
+ * `PlanStatus` 5 态 → 中文 + 颜色（AC-14 页头「完成 x/N + 计划状态」）。
+ *
+ * 放在 viewmodel 而不是 ui/组件里的理由：10 态中文标签的守卫判据是「只许出现在
+ * viewmodel.ts」，而「已暂停」既是任务态也是计划态 —— 分两处写必然被守卫判红，也必然漂移。
+ */
+const PLAN_STATUS: Record<PlanStatus, PlanStatusView> = {
+  draft: { label: '计划就绪', tone: 'ok' },
+  dispatching: { label: '派发中', tone: 'ok' },
+  paused: { label: '已暂停', tone: 'warn' },
+  terminated: { label: '已终止', tone: 'muted' },
+  cancelled: { label: '已取消', tone: 'muted' },
+}
+
+/** 计划状态中文：未启用（无计划）走「未启用」，未知取值同样保守回落。 */
+export function planStatusView(planStatus?: PlanStatus): PlanStatusView {
+  if (!planStatus) return { label: '未启用', tone: 'muted' }
+  return PLAN_STATUS[planStatus] ?? { label: '未启用', tone: 'muted' }
 }

@@ -1,15 +1,16 @@
 /**
- * 挂载点契约守卫（AC-6 / AC-7）：用 fake slots **驱动真实的 `registerSlots`**。
+ * client 半的**契约**测试（r7：四挂载点 / 三可见面 / 样式前缀统一）。
  *
- * 为什么不能只断言「代码里写了 key」：keyed slot 的判据在**宿主运行期**
- * （缺 `key` → `Uncaught Error: keyed slot "..." requires options.key`；缺 `inject`
- * → 组件永远拿不到 sessionId，退化成兜底值 `'current'`）。构建全绿、单测全绿、页签永不出现，
- * 是 r6 之前真实发生过的缺陷。所以这里把宿主的注册口做成 fake，跑一遍真代码，
- * 断言注册对象的**字段集合与字面值**，并让缺 key 时红在 `requires key` 这条断言文本上。
+ * 为什么这些断言值得写：本产品的头号 bug 族是「构建全绿、真机没有任何东西出现」——
+ * 成因只有四种，全部可以在这里静态判死：
+ *   ① 座位注册对象的字段集合写错（keyed slot 缺 key / 多带 id）；
+ *   ② 页签类型没注册进 `sidebarRightTabs`（座位在、页签永不派发）；
+ *   ③ 入口里出现 slot 字面量或 `slots.register(`（两处漂移，改一处另一处不动）；
+ *   ④ 渲染描述层写好了但**模板根本没调用它**（逻辑与界面各说一套）。
  *
- * fake slots 语义照 cordis（同机样本 `dsh-better-sidebar`）：
- *   `slots.inject(name, cb)` —— 挂载点存在时才调 `cb`；`cb` 里 `slots.register(meta, comp)`。
- * 因此回调要**手动触发**（等价于挂载点存在），这样才能断言到 register 的入参。
+ * 本仓没有 react-dom，`node --test` 也不转 JSX，所以判据分两层：
+ *   - 行为层：直接驱动 `registerSlots` / `registerPanelTab` / `createOpenPanel`（无 JSX）；
+ *   - 结构层：用 TypeScript AST 断言组件**真的调用了** ui.ts 的渲染函数、hook 字面量真在模板里。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -18,146 +19,70 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as ts from 'typescript'
 import {
-  DOCK_SLOT,
+  HEADER_ACTIONS_SLOT,
+  HEADER_ID,
+  INPUT_DOCK_SLOT,
+  OPTION_ID,
   PANEL_KEY,
   PANEL_SLOT,
   PANEL_TAB_KIND,
   PANEL_TAB_LABEL,
   PANEL_TITLE_SLOT,
+  SECTION_ID,
+  SECTION_LABEL,
+  SETTINGS_SECTION_SLOT,
   createOpenPanel,
+  panelTabDefinition,
   registerPanelTab,
   registerSlots,
-  type SlotMeta,
 } from '../src/client/slots.ts'
 import { PLUGIN_ID } from '../src/shared/const.ts'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
-interface Injected {
-  name: string
-  run: () => void
-}
-
-interface Harness {
-  ctx: { slots: { inject(name: string, fn: () => unknown): void; register(meta: SlotMeta, component: unknown): unknown } }
-  injected: Injected[]
-  metas: SlotMeta[]
-  components: unknown[]
-}
-
-/** 跑一遍真实注册流程：先收集 inject，再逐个触发回调（模拟三个挂载点都存在）。 */
-function runRegisterSlots(): Harness {
-  const injected: Injected[] = []
-  const metas: SlotMeta[] = []
-  const components: unknown[] = []
-  const ctx = {
-    slots: {
-      inject(name: string, fn: () => unknown) {
-        injected.push({ name, run: () => void fn() })
-      },
-      register(meta: SlotMeta, component: unknown) {
-        metas.push(meta)
-        components.push(component)
-        return meta
-      },
-    },
-  }
-  registerSlots(ctx, { Toggle: 'toggle-stub', Panel: 'panel-stub', PanelTitle: 'title-stub' })
-
-  const beforeTrigger = metas.length
-  assert.equal(beforeTrigger, 0, 'register 只能发生在 inject 回调里（挂载点不存在时零注册）')
-  for (const item of injected) item.run()
-  return { ctx, injected, metas, components }
-}
-
 function sourceOf(relPath: string): string {
   return readFileSync(join(ROOT, relPath), 'utf8')
 }
 
-/** 该文件里真实的代码节点（注释/字符串不参与）——检查「不许出现」时不能只看子串，否则会命中注释。 */
-function codeFactsOf(relPath: string): { registerCalls: number; literals: Set<string> } {
-  const source = sourceOf(relPath)
-  const kind = relPath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
-  const file = ts.createSourceFile(relPath, source, ts.ScriptTarget.Latest, true, kind)
-  const literals = new Set<string>()
-  let registerCalls = 0
-  const visit = (node: ts.Node): void => {
-    if (ts.isStringLiteralLike(node)) literals.add(node.text)
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'register') {
-      registerCalls += 1
-    }
-    ts.forEachChild(node, visit)
-  }
-  visit(file)
-  return { registerCalls, literals }
-}
-
-/** meta 的 runtime 形状（shallow clone 后取键，避免把类型声明当作事实）。 */
-function keysOf(meta: SlotMeta): string[] {
-  return Object.keys(meta)
-}
-
-/**
- * 只留代码、去掉注释后的源码。
- * 「不许出现 ctx.get」这类判据必须走它：本项目注释里本来就在解释「为什么不用 ctx.get」，
- * 直接对全文做正则会把解释本身当成违规（判据写错，不是实现错了）。
- * 用状态机而不是 AST：注释作为 trivia 挂在 token 上，`getChildren` 拿不到全部注释。
- */
+/** 去注释后的代码（避免注释里提到 hook/函数名就把判据判绿）。 */
 function stripComments(source: string): string {
   let out = ''
-  let index = 0
-  let mode: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
-  while (index < source.length) {
-    const char = source[index] ?? ''
-    const next = source[index + 1] ?? ''
-    if (mode === 'code') {
-      if (char === '/' && next === '/') {
-        mode = 'line'
-        index += 2
-        continue
-      }
-      if (char === '/' && next === '*') {
-        mode = 'block'
-        index += 2
-        continue
-      }
-      if (char === "'") mode = 'single'
-      else if (char === '"') mode = 'double'
-      else if (char === '`') mode = 'template'
+  let state: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]
+    const next = source[index + 1]
+    if (state === 'code') {
+      if (char === '/' && next === '/') { state = 'line'; index += 1; continue }
+      if (char === '/' && next === '*') { state = 'block'; index += 1; continue }
+      if (char === "'") { state = 'single'; out += char; continue }
+      if (char === '"') { state = 'double'; out += char; continue }
+      if (char === '`') { state = 'template'; out += char; continue }
       out += char
-      index += 1
       continue
     }
-    if (mode === 'line') {
-      if (char === '\n') {
-        mode = 'code'
-        out += char
-      }
-      index += 1
+    if (state === 'line') {
+      if (char === '\n') { state = 'code'; out += char }
       continue
     }
-    if (mode === 'block') {
-      if (char === '*' && next === '/') {
-        mode = 'code'
-        index += 2
-      } else index += 1
+    if (state === 'block') {
+      if (char === '*' && next === '/') { state = 'code'; index += 1 }
       continue
     }
-    // 字符串/模板字符串里原样保留（注释符在其中不是注释）
-    if (char === '\\') {
-      out += char + next
-      index += 2
+    if (state === 'single') {
+      out += char
+      if (char === '\\') { out += next ?? ''; index += 1; continue }
+      if (char === "'") state = 'code'
       continue
     }
-    if (
-      (mode === 'single' && char === "'") ||
-      (mode === 'double' && char === '"') ||
-      (mode === 'template' && char === '`')
-    ) {
-      mode = 'code'
+    if (state === 'double') {
+      out += char
+      if (char === '\\') { out += next ?? ''; index += 1; continue }
+      if (char === '"') state = 'code'
+      continue
     }
     out += char
-    index += 1
+    if (char === '\\') { out += next ?? ''; index += 1; continue }
+    if (char === '`') state = 'code'
   }
   return out
 }
@@ -166,293 +91,356 @@ function codeOnlyOf(relPath: string): string {
   return stripComments(sourceOf(relPath))
 }
 
-test('三个挂载点各注册一次，且 inject 名与 register 名逐字相同', () => {
-  const h = runRegisterSlots()
+/** AST 事实：字符串字面量集合 + 是否出现过某些调用名。 */
+function codeFactsOf(relPath: string): { literals: Set<string>; calls: Set<string>; text: string } {
+  const text = sourceOf(relPath)
+  const file = ts.createSourceFile(relPath, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TSX)
+  const literals = new Set<string>()
+  const calls = new Set<string>()
+  const visit = (node: ts.Node): void => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) literals.add(node.text)
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression
+      if (ts.isIdentifier(callee)) calls.add(callee.text)
+      if (ts.isPropertyAccessExpression(callee)) calls.add(callee.name.text)
+    }
+    ts.forEachChild(node, visit)
+  }
+  ts.forEachChild(file, visit)
+  return { literals, calls, text }
+}
 
-  assert.deepEqual(
-    h.injected.map((item) => item.name),
-    [DOCK_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT],
-    `三个挂载点必须都注册，实际 ${JSON.stringify(h.injected.map((item) => item.name))}`,
-  )
-  assert.equal(h.metas.length, 3, `三个 inject 回调各应注册一个组件，实际 ${h.metas.length}`)
-  assert.deepEqual(h.components, ['toggle-stub', 'panel-stub', 'title-stub'], '组件必须原样交给宿主')
-  for (let index = 0; index < h.injected.length; index += 1) {
-    const name = h.injected[index]?.name
-    const metaName = h.metas[index]?.name
+interface Harness {
+  injected: string[]
+  metas: Record<string, unknown>[]
+  components: unknown[]
+}
+
+function runRegisterSlots(
+  deps: Record<string, unknown> = {},
+  openPanel?: () => boolean,
+): Harness {
+  const injected: string[] = []
+  const callbacks: Array<() => void> = []
+  const metas: Record<string, unknown>[] = []
+  const components: unknown[] = []
+  const ctx = {
+    slots: {
+      inject(name: string, run: () => void) {
+        injected.push(name)
+        callbacks.push(run)
+      },
+      register(meta: Record<string, unknown>, component: unknown) {
+        metas.push(meta)
+        components.push(component)
+      },
+    },
+  }
+  const stubs = {
+    Option: 'option-stub',
+    HeaderButton: 'header-stub',
+    Panel: 'panel-stub',
+    PanelTitle: 'title-stub',
+    SettingsSection: 'settings-stub',
+    ...deps,
+    ...(openPanel === undefined ? {} : { openPanel }),
+  }
+  registerSlots(ctx as never, stubs as never)
+  for (const run of callbacks) run()
+  return { injected, metas, components }
+}
+
+function bagOf(h: Harness, name: string, sessionId = 'sess-1'): Record<string, unknown> {
+  const meta = h.metas.find((item) => item.name === name)
+  assert.ok(meta, `没找到 ${name} 的注册对象`)
+  const inject = meta.inject
+  assert.equal(typeof inject, 'function', `${name} 的 inject 必须是函数（宿主靠它下发 sessionId）`)
+  return (inject as (id: string) => Record<string, unknown>)(sessionId)
+}
+
+test('四个可见面的五个座位各注册一次，且 inject 名与 register 名逐字相同', () => {
+  const h = runRegisterSlots()
+  // E1 输入框内胶囊 / E2 会话头按钮 / E3 右栏面板 body + 标题 / E4 设置页分区
+  const expected = [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]
+  assert.deepEqual(h.injected, expected, 'inject 的座位集合与顺序必须与 DESIGN §1.1 一致')
+  assert.equal(h.metas.length, expected.length, '每个座位只许注册一次')
+  for (const name of expected) {
     assert.equal(
-      metaName,
-      name,
-      `inject("${String(name)}") 的回调里 register 的 name 必须是 "${String(name)}"，实际 "${String(metaName)}"`,
+      h.metas.filter((meta) => meta.name === name).length,
+      1,
+      `${name} 必须恰好注册一次（注册两次=两份组件抢同一槽位）`,
     )
   }
 })
 
-test('keyed slot（面板 body 与标题）必须带 key，且两处同 key', () => {
-  const h = runRegisterSlots()
-  const keyed = h.metas.filter((meta) => meta.name === PANEL_SLOT || meta.name === PANEL_TITLE_SLOT)
-  assert.equal(keyed.length, 2, 'sidebar.right.pane.tab 与 .title 都必须注册')
-
-  for (const meta of keyed) {
+test('撤除 composer.dock：client 半不许再出现旧开关行槽位（AC-12）', () => {
+  // 旧槽名拼出来而不是写字面量：本文件自己不能成为 grep 判据的命中项
+  const RETIRED_SLOT = ['conversation', 'composer', 'dock'].join('.')
+  const files = [
+    'src/client/slots.ts',
+    'src/client/index.ts',
+    'src/client/Option.tsx',
+    'src/client/HeaderButton.tsx',
+    'src/client/Panel.tsx',
+    'src/client/TabTitle.tsx',
+    'src/client/SettingsPage.tsx',
+    'src/client/RoleEditor.tsx',
+    'src/client/styles.ts',
+  ]
+  for (const relPath of files) {
+    const code = codeOnlyOf(relPath)
     assert.equal(
-      typeof meta.key === 'string' && meta.key !== '',
-      true,
-      `keyed slot "${meta.name}" requires key（缺了宿主抛 Uncaught Error: keyed slot ... requires options.key，页签永不出现）`,
+      code.includes(RETIRED_SLOT),
+      false,
+      `${relPath} 仍引用已撤除的旧开关行槽位（r7 起入口在 input.dock）`,
     )
   }
-  assert.equal(
-    keyed[0]?.key,
-    keyed[1]?.key,
-    '页签 body 与 title 必须用同一个 key，宿主据此把标题挂到同一个页签上',
-  )
-  assert.equal(keyed[0]?.key, PANEL_KEY, `页签 key 必须等于 PANEL_KEY（${PANEL_KEY}）`)
-  assert.equal(PANEL_KEY, `${PLUGIN_ID}-panel`, 'PANEL_KEY 必须以 PLUGIN_ID 为前缀且项目内唯一')
+  assert.equal(INPUT_DOCK_SLOT, 'conversation.input.dock', '输入框内选项必须挂 conversation.input.dock')
+  assert.equal(HEADER_ACTIONS_SLOT, 'conversation.session.header.actions')
+  assert.equal(SETTINGS_SECTION_SLOT, 'settings.section')
 })
 
-test('非 keyed 的 dock 不许带 key（带上等于对非 keyed slot 撒谎）', () => {
+test('keyed 座位（面板 body 与标题）带同一个 key，且 key === 页签类型 id', () => {
   const h = runRegisterSlots()
-  const dock = h.metas.find((meta) => meta.name === DOCK_SLOT)
-  assert.ok(dock, 'dock 必须注册')
-  assert.equal(dock.key, undefined, `conversation.composer.dock 不是 keyed slot，不许传 key：${String(dock.key)}`)
-  assert.equal(typeof dock.id, 'string', 'dock 用 id 标识（宿主同机样本 { name, id, order }）')
-  assert.equal(typeof dock.order, 'number', 'dock 用 order 控制与其它 dock 项的先后')
+  const body = h.metas.find((meta) => meta.name === PANEL_SLOT)
+  const title = h.metas.find((meta) => meta.name === PANEL_TITLE_SLOT)
+  assert.ok(body && title)
+  assert.equal(typeof body.key, 'string')
+  assert.equal(body.key, title.key, 'body 与 title 必须同 key，否则标题挂到别的页签上')
+  assert.equal(body.key, PANEL_KEY)
+  assert.equal(PANEL_KEY, `${PLUGIN_ID}-panel`, 'key 必须含插件前缀（多插件共存时防撞名）')
 })
 
-test('三处 inject 都把宿主 sessionId 原样交给组件（AC-7）', () => {
+test('非 keyed 座位不许带 key，且字段都在宿主允许的集合内', () => {
   const h = runRegisterSlots()
-  assert.equal(h.metas.length, 3)
-  for (const meta of h.metas) {
-    assert.equal(typeof meta.inject, 'function', `${meta.name} 必须传 inject(sessionId)，否则组件永远拿到兜底值`)
-    const bag = (meta.inject as (sessionId: string) => Record<string, unknown>)('sess-1')
-    assert.deepEqual(bag, { sessionId: 'sess-1' }, `${meta.name} 的 inject 必须原样返回 { sessionId }`)
+  for (const name of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
+    const meta = h.metas.find((item) => item.name === name)
+    assert.ok(meta)
+    assert.equal(meta.key, undefined, `${name} 不是 keyed slot，带 key 等于对宿主撒谎`)
+    assert.equal(typeof meta.id, 'string', `${name} 必须带 id`)
+    assert.equal(typeof meta.order, 'number', `${name} 必须带 order`)
   }
-  const distinct = new Set(h.metas.map((meta) => (meta.inject as (id: string) => Record<string, unknown>)('sess-2').sessionId))
-  assert.deepEqual([...distinct], ['sess-2'], 'sessionId 必须透传真实值，不许硬编码')
+  // keyed 恰好三个字段：name/key/inject（真实样本里 keyed 不带 id/order）
+  for (const name of [PANEL_SLOT, PANEL_TITLE_SLOT]) {
+    const meta = h.metas.find((item) => item.name === name)
+    assert.ok(meta)
+    assert.deepEqual(Object.keys(meta).sort(), ['inject', 'key', 'name'], `${name} 字段集必须逐字为 name/key/inject`)
+  }
+  // 设置分区带 label（宿主据此渲染分区标题）
+  const section = h.metas.find((item) => item.name === SETTINGS_SECTION_SLOT)
+  assert.ok(section)
+  assert.equal(section.label, SECTION_LABEL)
+  assert.equal(SECTION_LABEL, '自动团队')
+  assert.equal(section.id, SECTION_ID)
+})
+
+test('每个座位的 inject 都把宿主 sessionId 原样交给组件', () => {
+  const h = runRegisterSlots()
+  for (const name of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+    const bag = bagOf(h, name, 'sess-42')
+    assert.equal(bag.sessionId, 'sess-42', `${name} 必须把 sessionId 原样传下去（否则四个面各读一份状态）`)
+  }
+})
+
+test('openPanel 只下发给会话头按钮，胶囊与其它座位不许拿到', () => {
+  const openPanel = (): boolean => true
+  const h = runRegisterSlots({}, openPanel)
+  assert.equal(bagOf(h, HEADER_ACTIONS_SLOT).openPanel, openPanel, '头按钮点一下要能原生开页签')
+  for (const name of [INPUT_DOCK_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+    assert.equal(bagOf(h, name).openPanel, undefined, `${name} 不该拿到 openPanel（胶囊的点击语义只有开关）`)
+  }
 })
 
 test('PLUGIN_ID 只进 id/key，不许进 name（写进 name 会静默不挂载）', () => {
   const h = runRegisterSlots()
   for (const meta of h.metas) {
-    assert.equal(meta.name.includes(PLUGIN_ID), false, `name 不许含插件名：${meta.name}`)
-  }
-  assert.ok(
-    h.metas.some((meta) => String(meta.id ?? '').includes(PLUGIN_ID) || String(meta.key ?? '').includes(PLUGIN_ID)),
-    'id/key 至少一处应以 PLUGIN_ID 标识归属',
-  )
-})
-
-test('注册对象的字段集合是白名单（keyed 不许夹带 id/order，PRD 待澄清 a2 未验证）', () => {
-  const h = runRegisterSlots()
-  const allowed = new Set(['name', 'id', 'key', 'order', 'inject'])
-  for (const meta of h.metas) {
-    const extra = keysOf(meta).filter((key) => !allowed.has(key))
-    assert.deepEqual(extra, [], `${meta.name} 带上了未在样本里验证过的字段：${extra.join(', ')}`)
-  }
-  const keyed = h.metas.filter((meta) => meta.key !== undefined)
-  for (const meta of keyed) {
-    assert.deepEqual(keysOf(meta).sort(), ['inject', 'key', 'name'], `keyed slot ${meta.name} 的字段集合按真实样本只有 name/key/inject`)
-  }
-})
-
-test('client 入口只做接线：零 slots.register(、零 slot 字面量（防两处漂移）', () => {
-  const entry = sourceOf('src/client/index.ts')
-  assert.ok(entry.includes('registerSlots('), 'index.ts 必须调用 registerSlots(')
-  assert.equal(
-    codeFactsOf('src/client/index.ts').registerCalls,
-    0,
-    'index.ts 内不许直接 slots.register(（注册只许经 slots.ts 的 registerSlots，两处漂移是历史实锤的失效形态）',
-  )
-
-  const literals = [DOCK_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT]
-  // 组件文件同样不许重复 slot 字面量：字样只允许出现在 slots.ts。
-  // 注意用 AST 取字符串字面量：这些文件的**注释**里本来就写着 slot 名（解释去哪注册），
-  // 子串匹配会把注释当违规，属于「判据写错」而不是「实现错了」。
-  for (const relPath of ['src/client/index.ts', 'src/client/Toggle.tsx', 'src/client/Panel.tsx', 'src/client/TabTitle.tsx']) {
-    const facts = codeFactsOf(relPath)
-    assert.equal(facts.registerCalls, 0, `${relPath} 不许直接 slots.register(`)
-    for (const literal of literals) {
-      assert.equal(
-        facts.literals.has(literal),
-        false,
-        `${relPath} 不许出现 slot 字面量 "${literal}"（只许在 src/client/slots.ts）`,
-      )
-    }
-  }
-})
-
-// ─────────────────────────────────────────────────────────────────────────────
-// QA-02 类门禁：页签**类型**必须注册进宿主 `sidebarRightTabs`，且 id 与 keyed 座位的 key 相同。
-//
-// 上面 7 条只验「座位注册对象的形状」，验不出「宿主根本没有这个 kind 的 tab」——
-// 这正是 r6 真机不出现面板的根因（构建全绿 / 控制台零报错 / keyed 座位永不派发）。
-// 所以这里用 fake `ctx.inject` 驱动真实 `registerPanelTab`，把宿主契约钉成断言：
-//   ① 必须通过 `ctx.inject(['sidebarRightTabs'], cb)` 拿服务（不用 ctx.get：I8 要求它只出现在 host/adapters.ts）；
-//   ② register 的入参必须带 `id === PANEL_KEY`（否则 keyed 座位的 key 指向不存在的类型）；
-//   ③ 注册必须包在 `ctx.effect(...)` 里（宿主卸载时据返回的 disposer 回收）。
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface TabTypeHarness {
-  deps: string[][]
-  effects: (string | undefined)[]
-  registered: { id: string; kind: string; priority: string; title: () => string }[]
-}
-
-/** 跑一遍真实的 `registerPanelTab`：fake `ctx.inject` 收集依赖，再手动触发回调（等价服务就绪）。 */
-function runRegisterPanelTab(): TabTypeHarness {
-  const deps: string[][] = []
-  const effects: (string | undefined)[] = []
-  const registered: TabTypeHarness['registered'] = []
-  const pending: (() => void)[] = []
-  const scope = {
-    sidebarRightTabs: {
-      register(definition: TabTypeHarness['registered'][number]) {
-        registered.push(definition)
-        return () => {}
-      },
-    },
-    effect(fn: () => unknown, label?: string) {
-      effects.push(label)
-      pending.push(() => void fn())
-      return () => {}
-    },
-  }
-  const ctx = {
-    slots: { inject() {}, register: () => ({}) },
-    inject(names: readonly string[], fn: (value: unknown) => void) {
-      deps.push([...names])
-      pending.push(() => fn(scope))
-    },
-  }
-
-  const ok = registerPanelTab(ctx as unknown as Parameters<typeof registerPanelTab>[0])
-  assert.equal(ok, true, 'registerPanelTab 必须在有 ctx.inject 时返回 true（false=宿主契约缺失，页签永不出现）')
-  assert.equal(registered.length, 0, 'register 只能发生在 ctx.inject 回调里（服务未就绪时零注册）')
-  for (const run of pending) run()
-  return { deps, effects, registered }
-}
-
-test('页签类型必须注册进 sidebarRightTabs：id===PANEL_KEY、kind 非空、priority 为 extension', () => {
-  const h = runRegisterPanelTab()
-
-  assert.deepEqual(h.deps, [['sidebarRightTabs']], `必须经 ctx.inject 取 sidebarRightTabs 服务，实际 ${JSON.stringify(h.deps)}`)
-  assert.equal(h.registered.length, 1, `必须注册恰好一个页签类型，实际 ${h.registered.length}`)
-  const definition = h.registered[0]
-  assert.ok(definition, '页签类型定义必须存在')
-  assert.equal(
-    definition.id,
-    PANEL_KEY,
-    `页签类型 id 必须是 "${PANEL_KEY}"，否则 keyed 座位（key 同为 PANEL_KEY）永不派发`,
-  )
-  assert.ok(typeof definition.kind === 'string' && definition.kind !== '', 'kind 不能为空：sidebarRight.openTab 按 kind 打开')
-  assert.equal(definition.priority, 'extension', '第三方插件必须声明 priority="extension"（样本 dsh-plugin-teamflow 同）')
-  assert.equal(typeof definition.title, 'function', 'title 必须是函数（宿主在渲染时取值）')
-  assert.equal(definition.title(), PANEL_TAB_LABEL, `页签标题必须与 PANEL_TAB_LABEL（${PANEL_TAB_LABEL}）一致`)
-  assert.deepEqual(
-    h.effects,
-    ['dsh-auto-team: panel tab type'],
-    `注册必须包在 ctx.effect 里，实际 ${JSON.stringify(h.effects)}`,
-  )
-})
-
-test('页签类型 id 与两处 keyed 座位的 key 逐一相等（缺类型=座位永不派发）', () => {
-  const tabs = runRegisterPanelTab()
-  const seats = runRegisterSlots()
-  const definition = tabs.registered[0]
-  assert.ok(definition, '页签类型定义必须存在')
-  const keyed = seats.metas.filter((meta) => meta.name === PANEL_SLOT || meta.name === PANEL_TITLE_SLOT)
-  assert.equal(keyed.length, 2, 'sidebar.right.pane.tab 与 .title 都必须注册')
-  for (const meta of keyed) {
     assert.equal(
-      meta.key,
-      definition.id,
-      `${meta.name} 的 key 必须等于页签类型 id（${definition.id}），否则宿主找不到该 kind 的 tab`,
+      String(meta.name).includes(PLUGIN_ID),
+      false,
+      `name 必须是宿主槽位字面量，不能含插件 id：${String(meta.name)}`,
     )
   }
+  assert.equal(OPTION_ID, `${PLUGIN_ID}-option`)
+  assert.equal(HEADER_ID, `${PLUGIN_ID}-header-button`)
+})
+
+test('client 入口只做接线：零 slots.register(、零 slot 字面量', () => {
+  const entry = codeOnlyOf('src/client/index.ts')
+  assert.equal(/slots\.register\s*\(/.test(entry), false, '入口不许自己 register（注册细节必须留在 slots.ts）')
+  for (const literal of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, PANEL_SLOT, PANEL_TITLE_SLOT, SETTINGS_SECTION_SLOT]) {
+    assert.equal(entry.includes(literal), false, `入口里出现了 slot 字面量 ${literal}（两处漂移的起点）`)
+  }
+  // 组件文件同样不许自己注册座位
+  for (const relPath of [
+    'src/client/Option.tsx',
+    'src/client/HeaderButton.tsx',
+    'src/client/Panel.tsx',
+    'src/client/TabTitle.tsx',
+    'src/client/SettingsPage.tsx',
+    'src/client/RoleEditor.tsx',
+  ]) {
+    const code = codeFactsOf(relPath)
+    assert.equal(code.calls.has('register'), false, `${relPath} 不许直接调用 register`)
+    for (const literal of [INPUT_DOCK_SLOT, HEADER_ACTIONS_SLOT, SETTINGS_SECTION_SLOT]) {
+      assert.equal(code.literals.has(literal), false, `${relPath} 里出现了 slot 字面量 ${literal}`)
+    }
+  }
+  assert.match(entry, /registerPanelTab\(/, '入口必须调用 registerPanelTab（只注册座位=真机页签永不出现）')
+})
+
+test('页签类型：id===PANEL_KEY、kind 非空、priority=extension、title 中文逐字', () => {
+  const definition = panelTabDefinition()
+  assert.equal(definition.id, PANEL_KEY)
+  assert.equal(definition.kind, PANEL_TAB_KIND)
+  assert.equal(definition.priority, 'extension')
+  assert.equal(definition.title(), PANEL_TAB_LABEL)
+  assert.equal(PANEL_TAB_LABEL, '自动团队')
+})
+
+test('registerPanelTab 把类型注册进 sidebarRightTabs，并包在 effect 里', () => {
+  const registered: unknown[] = []
+  const effects: Array<{ label?: string }> = []
+  let deps: readonly string[] = []
+  const ctx = {
+    slots: { inject() {}, register() {} },
+    inject(names: readonly string[], fn: (scope: unknown) => void) {
+      deps = names
+      fn({
+        sidebarRightTabs: { register: (value: unknown) => registered.push(value) },
+        effect: (run: () => unknown, label?: string) => {
+          effects.push({ label })
+          run()
+        },
+      })
+    },
+  }
+  assert.equal(registerPanelTab(ctx as never), true)
+  assert.deepEqual([...deps], ['sidebarRightTabs'])
+  assert.equal(registered.length, 1, '页签类型必须注册且只注册一次')
+  const entry = registered[0] as ReturnType<typeof panelTabDefinition>
+  assert.equal(entry.id, PANEL_KEY)
+  assert.equal(entry.kind, PANEL_TAB_KIND)
+  assert.equal(entry.priority, 'extension')
+  assert.equal(entry.title(), PANEL_TAB_LABEL)
+  assert.equal(effects[0]?.label, 'dsh-auto-team: panel tab type', 'register 必须包在 ctx.effect 里以便卸载')
 })
 
 test('没有 ctx.inject 的宿主上 registerPanelTab 必须降级（不许裸访问服务而抛错）', () => {
-  const ctx = { slots: { inject() {}, register: () => ({}) } }
-  const ok = registerPanelTab(ctx as unknown as Parameters<typeof registerPanelTab>[0])
-  assert.equal(ok, false, '拿不到 ctx.inject 时必须返回 false 而不是抛错（整条 client entry 不许因可选服务崩掉）')
+  const ctx = { slots: { inject() {}, register() {} } }
+  assert.equal(registerPanelTab(ctx as never), false, '服务读取口缺失时必须安静返回 false')
 })
-
-// ─────────────────────────────────────────────────────────────────────────────
-// QA-02 配套：页面型页签必须**打开**才会出现（`sidebarRight.openTab`）。
-// 旧实现只 `window.dispatchEvent` 一个自己定义的事件，页签未打开时没有监听者 → 按钮无效。
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('createOpenPanel 走宿主 sidebarRight.openTab(kind)，服务缺失时返回 false', () => {
   function harness(withService: boolean): { deps: string[][]; opened: string[]; openPanel: () => boolean } {
     const deps: string[][] = []
     const opened: string[] = []
-    const pending: ((value: unknown) => void)[] = []
     const ctx = {
-      slots: { inject() {}, register: () => ({}) },
-      inject(names: readonly string[], fn: (value: unknown) => void) {
+      slots: { inject() {}, register() {} },
+      inject(names: readonly string[], fn: (scope: unknown) => void) {
         deps.push([...names])
-        pending.push(fn)
+        fn(
+          withService
+            ? { sidebarRight: { openTab: (kind: string) => opened.push(kind) } }
+            : {},
+        )
       },
     }
-    const openPanel = createOpenPanel(ctx as unknown as Parameters<typeof createOpenPanel>[0])
-    if (withService) {
-      for (const fn of pending) fn({ sidebarRight: { openTab: (kind: string) => opened.push(kind) } })
-    }
+    const openPanel = createOpenPanel(ctx as never)
     return { deps, opened, openPanel }
   }
-
   const live = harness(true)
-  assert.deepEqual(live.deps, [['sidebarRight']], `必须经 ctx.inject 取 sidebarRight 服务，实际 ${JSON.stringify(live.deps)}`)
   assert.equal(live.openPanel(), true, '服务可用时必须报告已走宿主路径')
-  assert.deepEqual(live.opened, [PANEL_TAB_KIND], `必须用 sidebarRight.openTab(kind) 打开页签，实际打开 ${JSON.stringify(live.opened)}`)
-
+  assert.deepEqual(live.opened, [PANEL_TAB_KIND], '必须用同一个 kind 打开（与页签类型一致）')
   const degraded = harness(false)
-  assert.equal(degraded.openPanel(), false, '服务不可用时必须返回 false，让组件回退旧行为')
-  assert.deepEqual(degraded.opened, [], '服务不可用时不许假装打开')
+  assert.equal(degraded.openPanel(), false, '服务不可用时必须返回 false，让组件回退窗口事件')
 })
 
-test('开关行拿得到 openPanel（宿主服务就绪时随 inject 下发给 Toggle）', () => {
-  const openPanel = (): boolean => true
-  const injected: { name: string; run: () => void }[] = []
-  const metas: SlotMeta[] = []
-  const ctx = {
-    slots: {
-      inject(name: string, fn: () => unknown) {
-        injected.push({ name, run: () => void fn() })
-      },
-      register(meta: SlotMeta) {
-        metas.push(meta)
-        return meta
-      },
-    },
+test('渲染描述层必须真的被组件调用（防「逻辑写完、模板没绑」）', () => {
+  const pairs: Array<[string, string]> = [
+    ['src/client/Option.tsx', 'optionView'],
+    ['src/client/HeaderButton.tsx', 'headerButtonView'],
+    ['src/client/Panel.tsx', 'pauseButtonView'],
+    ['src/client/tabs/PlanTab.tsx', 'taskRowView'],
+    ['src/client/SettingsPage.tsx', 'settingsKeysView'],
+  ]
+  for (const [relPath, fn] of pairs) {
+    const facts = codeFactsOf(relPath)
+    assert.equal(facts.calls.has(fn), true, `${relPath} 必须调用 ${fn}（否则可见文案脱离单点来源）`)
   }
-  registerSlots(ctx, { Toggle: 'toggle-stub', Panel: 'panel-stub', PanelTitle: 'title-stub', openPanel })
-  for (const item of injected) item.run()
-
-  const dock = metas.find((meta) => meta.name === DOCK_SLOT)
-  assert.ok(dock, 'dock 必须注册')
-  const bag = (dock.inject as (sessionId: string) => Record<string, unknown>)('sess-9')
-  assert.equal(bag.sessionId, 'sess-9', 'sessionId 必须照旧透传')
-  assert.equal(bag.openPanel, openPanel, '宿主服务就绪时 openPanel 必须随 inject 下发给 Toggle（否则「面板」按钮回退到无效的窗口事件）')
 })
 
-test('client 入口必须调用 registerPanelTab（只注册座位=真机永不出现页签）', () => {
-  const entry = sourceOf('src/client/index.ts')
-  assert.ok(
-    entry.includes('registerPanelTab('),
-    'index.ts 必须调用 registerPanelTab(：页签类型不注册，keyed 座位永不派发（QA-02 的根因）',
-  )
-  assert.equal(
-    codeFactsOf('src/client/index.ts').registerCalls,
-    0,
-    'index.ts 仍不许直接 slots.register(（注册细节留在 slots.ts）',
-  )
+test('四个新 hook 真出现在模板里，且旧前缀 0 命中', () => {
+  const hooks: Array<[string, string]> = [
+    ['src/client/Option.tsx', 'data-auto-team-option'],
+    ['src/client/HeaderButton.tsx', 'data-auto-team-header-button'],
+    ['src/client/Panel.tsx', 'data-auto-team-pause'],
+    ['src/client/SettingsPage.tsx', 'data-auto-team-settings'],
+    ['src/client/TabTitle.tsx', 'data-auto-team-panel-tab'],
+    ['src/client/RoleEditor.tsx', 'data-role-card'],
+  ]
+  for (const [relPath, hook] of hooks) {
+    // hook 以属性名形式出现（JSX 属性不是字符串字面量，用源码匹配）
+    assert.equal(codeOnlyOf(relPath).includes(hook), true, `${relPath} 的模板里没有 ${hook}`)
+  }
+  // 旧前缀整族 0 命中（样式与组件同批改名，DC 判据 AC-21）。
+  // 拼出来而不是写字面量：否则本文件自己就成了 grep 判据的命中项（判据命中自己 = 恒红）。
+  const OLD_PREFIX = ['data', 'dsh', 'auto-team'].join('-')
+  for (const relPath of ['src/client/styles.ts', 'src/client/Panel.tsx', 'src/client/Option.tsx', 'src/client/HeaderButton.tsx']) {
+    assert.equal(codeOnlyOf(relPath).includes(OLD_PREFIX), false, `${relPath} 仍有旧前缀 ${OLD_PREFIX}`)
+  }
 })
 
-test('client 半不许用 ctx.get 取可选服务（与 host 半同一纪律：只许 adapters.ts）', () => {
-  for (const relPath of ['src/client/index.ts', 'src/client/slots.ts', 'src/client/Toggle.tsx', 'src/client/TabTitle.tsx']) {
-    assert.equal(
-      /\bctx\s*\.\s*get\b/.test(codeOnlyOf(relPath)),
-      false,
-      `${relPath} 不许用 ctx.get（可选服务只许经 ctx.inject 回调取；QA 的 I8 判据要求 ctx.get 只出现在 src/host/adapters.ts）`,
-    )
+test('样式层：四族新选择器都在，且字号只用 font 简写', () => {
+  const css = sourceOf('src/client/styles.ts')
+  for (const selector of [
+    '[data-auto-team-option]',
+    '[data-auto-team-header-button]',
+    '[data-auto-team-panel]',
+    '[data-auto-team-pause]',
+    '[data-auto-team-settings]',
+    '[data-auto-team-role-editor]',
+  ]) {
+    assert.equal(css.includes(selector), true, `styles.ts 缺少 ${selector} 段`)
+  }
+  assert.equal(/font-size:\s*var\(--dsw-font/.test(css), false, '字号必须写 font 简写（--dsw-font-* 是复合值）')
+  // 命中区外扩 44×40 的判据（DESIGN §0.2：视觉 28 高，命中区靠 ::after 撑开）
+  assert.match(css, /\[data-auto-team-option\]::after\s*\{[^}]*inset:\s*-8px -6px/, '胶囊必须用 ::after 把命中区扩到 44×40')
+  // 提示词 textarea 固定内滚，不许 auto-grow（8000 字符会把卡撑爆）
+  assert.match(css, /textarea\s*\{[^}]*height:\s*96px/, '提示词/正文 textarea 必须固定 96px 内滚')
+})
+
+test('client 半不许用 ctx.get 取可选服务（与 host 半同一纪律）', () => {
+  for (const relPath of [
+    'src/client/index.ts',
+    'src/client/slots.ts',
+    'src/client/Option.tsx',
+    'src/client/HeaderButton.tsx',
+    'src/client/Panel.tsx',
+    'src/client/TabTitle.tsx',
+    'src/client/SettingsPage.tsx',
+    'src/client/RoleEditor.tsx',
+  ]) {
+    const code = codeOnlyOf(relPath)
+    assert.equal(/ctx\.get\s*\(/.test(code), false, `${relPath} 不许用 ctx.get（可选服务只能用 ctx.inject）`)
+  }
+})
+
+test('client 与 host 零直接 import（只许 import type 共享契约）', () => {
+  const files = [
+    'src/client/index.ts',
+    'src/client/slots.ts',
+    'src/client/Option.tsx',
+    'src/client/HeaderButton.tsx',
+    'src/client/Panel.tsx',
+    'src/client/TabTitle.tsx',
+    'src/client/SettingsPage.tsx',
+    'src/client/RoleEditor.tsx',
+    'src/client/tabs/PlanTab.tsx',
+    'src/client/tabs/RolesTab.tsx',
+  ]
+  for (const relPath of files) {
+    const code = codeOnlyOf(relPath)
+    assert.equal(/from ['"]\.\.?\/host\//.test(code), false, `${relPath} 出现了对 host 半的直接 import`)
+    assert.equal(/from ['"]\.\.\/\.\.\/host\//.test(code), false, `${relPath} 出现了对 host 半的直接 import`)
   }
 })

@@ -80,6 +80,8 @@ function makeRoleRepo(roles: Role[]): RoleRepo {
     save: (role: Role) => ({ ok: true as const, role }),
     remove: () => ({ ok: true as const }),
     seed: () => {},
+    // r7 T1：RoleRepo 新增 restoreDefaults，桩必须跟着契约走（缺了 typecheck 直接红）。
+    restoreDefaults: () => ({ restored: [], kept: [] }),
   }
 }
 
@@ -1062,5 +1064,68 @@ test('dispatchReady：下游创建时把上游交接注入首条提示词（AC-4
   } finally {
     cleanup()
   }
+})
+
+// ---------- r7：暂停不是可派发状态（纯函数层的第二道闸门，TECHNICAL §6.1） ----------
+
+test('dispatch：planStatus=paused 时纯函数层也不派发（不靠 bridge 闸门兜底）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    // 暂停态 + 两个「本来可派发」的任务（ready / pending）。纯函数层若没拦，这两个必然被 spawn，
+    // 所以 `spawned.length === 0` 是能分辨的判据（不是空跑也绿的那种）。
+    const tasks = [makeTask('t1', { status: 'ready' }), makeTask('t2', { status: 'pending' })]
+    const state = makeState(tasks, { plan: makePlan(tasks, { status: 'paused' }) })
+    const { deps, spawned } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, [], '暂停期间不许起人')
+    assert.equal(spawned.length, 0, 'spawn 端口一次都不能被调用')
+    assert.deepEqual(
+      result.skipped.map((item) => [item.taskId, item.reason]),
+      [
+        ['t1', 'NO_PLAN'],
+        ['t2', 'NO_PLAN'],
+      ],
+      '被拦下的任务必须逐条报出来（面板据此解释「为什么点了没动」）',
+    )
+    assert.equal(result.state.plan.tasks[0]?.status, 'ready', '状态不许被改写')
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：同一份状态把 planStatus 换回 dispatching 就会派发（对照实验，证明上面的 0 是「被拦」）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [makeTask('t1', { status: 'ready' })]
+    const state = makeState(tasks, { plan: makePlan(tasks, { status: 'dispatching' }) })
+    const { deps, spawned } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t1'], '未暂停时同一份状态必须真派出（否则上面的断言不承载信息）')
+    assert.equal(spawned.length, 1)
+  } finally {
+    cleanup()
+  }
+})
+
+test('applyReceipt：返工上限可取 settings 值，缺省仍是 config.MAX_ATTEMPTS（AC-13 生效点，值不变）', () => {
+  const evidence = evidenceOf('t1', { exitCode: 1, tail: 'boom' })
+  const base = makeState([makeTask('t1', { status: 'running' })])
+
+  // 上限 1：第 1 次返工就到顶（`nextAttempts >= limit`），必须直接转 failed —— 这正是「可配」与
+  // 「写死 3」的可分判据；上限仍然缺省取常量时，同一输入必须是 rework。
+  const first = applyReceipt(base, 't1', { verdict: 'rework', evidence }, now, 1)
+  assert.equal(first.plan.tasks[0]?.status, 'failed', '上限 1 时第 1 次返工即到顶')
+  assert.equal(first.plan.tasks[0]?.attempts, 1)
+
+  // 不传上限：沿用 config 常量（MAX_ATTEMPTS），第 2 次仍应是 rework —— 「常量值不变」不许被悄悄改。
+  const loose = applyReceipt(base, 't1', { verdict: 'rework', evidence }, now)
+  assert.equal(loose.plan.tasks[0]?.status, 'rework', `缺省上限是 MAX_ATTEMPTS(${MAX_ATTEMPTS})，第 1 次不许转 failed`)
+  assert.equal(loose.plan.tasks[0]?.attempts, 1)
+  const second = applyReceipt(loose, 't1', { verdict: 'rework', evidence }, now)
+  assert.equal(second.plan.tasks[0]?.status, 'rework', '第 2 次仍在上限内')
+  const third = applyReceipt(second, 't1', { verdict: 'rework', evidence }, now)
+  assert.equal(third.plan.tasks[0]?.status, MAX_ATTEMPTS <= 3 ? 'failed' : 'rework', `第 3 次按 MAX_ATTEMPTS(${MAX_ATTEMPTS}) 到顶`)
 })
 
