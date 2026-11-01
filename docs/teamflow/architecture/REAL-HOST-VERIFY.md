@@ -110,3 +110,32 @@ rm -rf ~/.dsh/profiles/dv          # 实验 profile（含本插件安装，硬�
 # desktop 若装了： cd ~/.dsh/profiles/desktop && npx --yes pnpm@11 remove dsh-auto-team
 #                 并确认 dsh.profile.bundles 里已摘除
 ```
+
+## 7. r6 实测结果（2026-11-01，插件首次真机跑通）
+
+三次真机取证各暴露一个阻塞项，前两次修完后第三次才把面板真正点亮：
+
+| # | 症状（真机） | 根因 | 修复 |
+|---|---|---|---|
+| 1 | boot 日志 `dsh: warning: 1 entry did not activate` + `Error: cannot get property "agentTeams" without inject` | entry 的 `inject` 只声明了 `tools`/`systemPrompt`，代码却访问 `ctx.agents`/`ctx.agentTeams`/`ctx.webServer`/`ctx.llm`/`ctx.agentDefaultModel` | `src/host/index.ts` 的 `inject` 补齐硬依赖，可选服务改经 `optionalService` / `ctx.get` |
+| 2 | 控制台 `Uncaught Error: keyed slot "sidebar.right.pane.tab" requires options.key` | keyed slot 的注册少 `key`；且右栏页签还缺「tab 类型注册」这一步 | `src/client/slots.ts` 用 `{ name, key, inject }` 注册挂载点，并向 `sidebarRightTabs` 注册 `{ id, kind, priority, title }` |
+| 3 | 面板永远显示「面板接口失败：HTTP 404」 | `webServer` 在 `apply` 时刻尚未激活，`registerHttpRoutes` 只试一次就 `return false`，路由一条都没注册 | `registerHttpRoutes` 两级：先试一次 → 失败则 `ctx.inject(['webServer'], cb)` 等就绪再注册 |
+
+真机复验（克隆 profile `rt5`，端口 51895，2026-11-01）：
+
+```bash
+# ① 激活：宿主日志无告警
+grep -cE "did not activate|cannot get property" /tmp/rt5-boot3.log   # → 0
+# ② 面板接口
+curl -s -o /dev/null -w '%{http_code}' -b <cookie> \
+  'http://127.0.0.1:51895/api/auto-team/snapshot?sessionId=x'        # → 200（含 roles/concurrency/memory）
+# ③ 界面（无头浏览器 + CDP）
+#   造一个活会话后：[data-slot] 出现 conversation.composer.dock，开关行渲染，控制台零异常
+#   点「面板」→ sidebar.right.pane.tab / .title 各 1 个座位，右栏渲染
+#     「自动团队 / 已关闭 / 计划 0 · 成员 0 · 并发 0/3 / 队长模型 跟随宿主默认 · 事件源正常」
+#   点「启用自动团队」→ 状态变「待派发」（act 路由通）
+```
+
+**三条经验**：① 前两类错误 mock 测不出来，只有真机能抓（`ctx.slots` 的 keyed 判定、cordis 的 inject 判定都在宿主侧）；② 前两类失败的表现都是「构建全绿、控制台/日志安静、功能不存在」，所以**「构建通过」不能作为可用的证据**；③ 启动早期拿不到的服务，别急着降级返回，先问一句「它是不是稍后才 provide」（`ctx.inject(deps, cb)` 就是为这件事存在的）。
+
+第四类同源坑（不属于插件缺陷）：`cordis_inspect_query` 的 `input` 必须是对象，四次误判里有四次都把它当成 env-unavailable 反复重试——见 §4。
