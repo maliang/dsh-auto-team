@@ -18,6 +18,7 @@
 | 架构总览 | docs/teamflow/architecture/ARCHITECTURE.md | 技术栈权衡、模块契约、目录树、构建/测试/CI、**未完成清单** |
 | 架构参考 | docs/teamflow/architecture/SUPER-AGENT-MAPPING.md | Super-agent（DeepSeek 原型仓）→ 本插件的映射：能搬 / 需改造 / 不搬 + 分期 + 证据索引 |
 | 宿主事实 | docs/teamflow/architecture/HOST-EVENTS.md | 宿主事件目录、emit/waterfall 取舍、`ToolExecution` 形状、inspect 的正确调用姿势（**查事件先读它，别自己调 inspect**） |
+| 真机验证 | docs/teamflow/architecture/REAL-HOST-VERIFY.md | 第二宿主（克隆 profile + 端口 51890）启动命令、cookie 取页面、无头浏览器抓控制台、cordis `inject` 语义（**只许主 agent 跑；已开场即读它，别临场猜命令**） |
 | 产品记忆 | docs/teamflow/memory.md | 团队约定/技术栈/已知待办（低频更新） |
 | 运行日志 | logs/teamflow/<runId>/ → $DSH_HOME/teamflow/<workspace>/logs/<runId>/ | 只放**要留存**的东西（一次性检查脚本 scripts/、不可重跑的命令载荷 captures.json、结论笔记 .md）——**不制造命令输出 dump**；run 期间在项目内暂存，run 结束由 host 归档到 $DSH_HOME 并从项目删除 |
 
@@ -61,6 +62,9 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 - `logs/teamflow/<runId>/scripts/*.mjs` 里的探针一律用 `new URL('../../../../', import.meta.url)` 锚定**仓库根**。run 结束后 host 会把 `logs/` 归档到 `$DSH_HOME/teamflow/<workspace>/logs/<runId>/`；从归档位置直接 `node` 跑这些脚本，相对根会解析成 `~/.dsh/teamflow/` → 报 `依赖模块未落盘 / ERR_MODULE_NOT_FOUND`，**看起来像交付坏了，其实只是位置变了**（r4 验收复核时实测：归档位置 9 个探针 6 个红）。要复跑必须先 `cp -r` 回 `<repo>/logs/teamflow/<runId>/scripts/`，跑完删掉（`logs/teamflow/` 已在 `.gitignore`）。报告任何「探针红」之前，先确认脚本是不是从归档位置跑的。
 
 **与宿主联调的常识**
+
+- **加服务进 `inject` 之前先看 `ctx.<service>` 的访问面**：cordis 的 `inject` 是「服务名 → 配置」的普通 map，数组形式等于全 required；对象形式 `{required, optional}` 不被支持（宿主会把这两个单词当服务名，报 `pending (waiting for services: required, optional)`）。可选服务**只能**用 `ctx.get("<name>")` 读。真实宿主里漏声明的后果不是功能降级，而是整条 entry 不激活：`dsh: warning: 1 entry did not activate` + `cannot get property "<service>" without inject`（r6 前实测，插件在真机上从未激活过）。
+- **`sidebar.right.pane.tab` 是 keyed slot，`conversation.composer.dock` 不是**：keyed slot 的注册必须带 `key`（同机样本 `dsh-better-sidebar` 用 `{ name, key, inject }`），缺了会抛 `Uncaught Error: keyed slot "..." requires options.key`，表现是「构建全绿、页签永不出现」。**这类错误只有真机能抓，mock slots 测不出来。**
 - 本机 `dsh` 不在 PATH：安装走 `cd ~/.dsh/profiles/desktop && pnpm add file:<repo>`，并同步 `dsh.profile.bundles`；安装只能由主 agent 执行。
 - 宿主实际 API 形状（工具定义、prompt section、route、`spawnTeammate` 返回值、`resolveCallConfig`）**尚未全部核实**，见 ARCHITECTURE §8.2；任何"已验证"声明必须附命令与返回值，不得凭记忆断言。
 - **`cordis_inspect_query` 的 `input` 必须是对象**（主 agent 2026-11-01 实测）：列全部用 `input: {}`；查单个事件/服务用 `input: {"event": "<name>"}` / `input: {"service": "<name>"}`。传字符串、数组或省略成非对象时会返回 `rejected input: "input" must be an object`——**这是调用姿势错误，不是环境不可用**，不要把阶段判成 env-unavailable 然后反复重试（已有**三轮**因此烧穿阶段 token 预算：r1 scaffold、r4 tech、r5 dev-T5，累计约 700k 新增 token）。

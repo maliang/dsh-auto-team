@@ -18,6 +18,7 @@
 - `tsconfig` 的 `jsx` 必须是 classic `"react"`（client 的 `require` 由宿主提供，不保证解析 `react/jsx-runtime`）。
 - client 产物必须保留 `typeof window !== "undefined" && window.__ModuleLoader__` 守卫，否则 node 侧 `await import('./lib/client.js')` 自检会失败。
 - `cordis.patch.yml` 的 `name` 必须是包根名 `dsh-auto-team`（写子路径会让 clientModules 扫描跳过，症状：工具在、面板不出现）。
+- **宿主服务访问契约（真机实测，r6）**：cordis 的 `inject` 是普通 map，数组 = 全部 required，**对象形式 `{required, optional}` 是错的**（宿主把 required/optional 当服务名，报 `pending (waiting for services: required, optional)`）；未注入的属性一访问就抛 `cannot get property "<name>" without inject`。因此 `inject` 只放硬依赖（`tools`/`systemPrompt`/`agents`/`agentTeams`），可选服务（`webServer`/`llm`/`agentDefaultModel`）一律 `ctx.get("<name>")` 读（缺失返回 undefined 不抛错），读取收敛在 `adapters.ts`。**`sidebar.right.pane.tab` 是 keyed slot，注册必须带 `key`**（缺失即 `Uncaught Error: keyed slot "…" requires options.key`，整插件 UI 不渲染）；两处挂载点都必须传 `inject(sessionId)`，且 `inject('<slot>')` 的参数与 `register({name})` 逐字相同、插件标识只进 `id`/`key`。
 - 前端样式只用宿主 token；字号写 `font: var(--dsw-font-xs-13, …)`，**不许写 `font-size: var(...)`**（该 token 是 font 简写复合值，写 font-size 是无效声明且静默继承父级）。
 - 前端读接口必须解构 `{data,error}` 包装（历史高频 bug 族：整包赋值 → 界面"点了没反应"）。
 - 面板可视约束（r4 DESIGN 实测，后续别再试错）：成员行网格 `76px minmax(96px,1fr) 64px 44px` 的列宽冻结，**不要往状态列塞复合徽标**（「运行中·停滞」实测需 ≥110px，会撑破网格），新增的横向提示走跨全宽插槽 `grid-column: 1/-1`；11px 正文不得用琥珀 `--dsw-alias-state-warn-primary`（在 `bg-layer-1` 上对比度约 3.2:1，不达标），琥珀只用于非文本位置（竖条/图标/描边/微底），文字用 `--dsw-alias-label-secondary`；账本正文折叠用 `max-height`，不要 `-webkit-line-clamp`（`white-space: pre-wrap` 的多行正文会被 `-webkit-box` 算坏换行）。

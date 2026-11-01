@@ -1,0 +1,7 @@
+{
+  "reqId": "req-6",
+  "runId": "tf-mvxcfxze-e9elp3",
+  "title": "修复真机加载缺陷：让 dsh-auto-team 插件在真实宿主里能被激活，并让输入框下方的开关行与右栏「自动团队」页签真正渲染出来",
+  "mode": "lite",
+  "createdAt": 1793508145624
+}
