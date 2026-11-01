@@ -85,6 +85,14 @@ export interface HostContext {
    * 缺 `get`（旧宿主 / 手搓 fake ctx）时一律按服务缺失降级，不回退裸读。
    */
   get?<T = unknown>(name: string): T | undefined
+  /**
+   * [已核] Cordis 的「依赖就绪才回调」口：`ctx.inject(deps, cb)`，cb 收到带该依赖的 ctx。
+   *
+   * 为什么需要它（真机实测 2026-11-01，r6）：`webServer` 在插件 `apply` 时刻**尚未激活**
+   * （实测 `ctx.get('webServer')` = undefined），于是面板路由一次也没注册、前端全部 404
+   * `not found`。硬写进 `inject` 会让非 web 宿主整条 entry 不激活；`ctx.inject` 两者兼顾。
+   */
+  inject?(deps: readonly string[], fn: (scope: HostContext) => void): unknown
   logger?: { warn?: (message: string) => void; info?: (message: string) => void }
   /** Cordis 事件订阅形态（ctx.on(event, listener)）；事件名/payload 尚未实测，仅用于兜底。 */
   on?: (event: string, listener: (...args: unknown[]) => void) => (() => void) | void
@@ -137,6 +145,26 @@ export function optionalService<K extends OptionalServiceName>(
     return service
   } catch (error) {
     ctx.logger?.warn?.(`[auto-team] 读取可选服务 ${name} 失败（${messageOf(error)}），按缺失降级`)
+    return undefined
+  }
+}
+
+/**
+ * 静默读一个服务：与 `optionalService` 同源，但**不 warn**。
+ *
+ * 用在「此刻缺失是正常时序」的地方（启动早期 webServer 尚未激活、随后由 `ctx.inject`
+ * 等它就绪）。用 `optionalService` 会让正常启动刷一条「相关功能降级」的假告警。
+ */
+function readServiceQuietly<K extends OptionalServiceName>(
+  ctx: HostContext,
+  name: K,
+): OptionalServiceMap[K] | undefined {
+  const getter = ctx.get
+  if (typeof getter !== 'function') return undefined
+  try {
+    const service = getter.call(ctx, name) as OptionalServiceMap[K] | undefined | null
+    return service ?? undefined
+  } catch {
     return undefined
   }
 }
@@ -242,51 +270,72 @@ interface NodeLikeResponse {
 /**
  * 把全部内部路由挂到宿主：单条 prefix 路由 + 自己写 res。
  * 任一路由抛错都必须转成 500 JSON，绝不能把异常抛回宿主 HTTP 栈。
+ *
+ * 时序（真机实测 2026-11-01，r6 的 404 根因）：宿主启动早期 `webServer` **尚未激活**，
+ * `ctx.get('webServer')` 返回 undefined —— 早先的实现只试这一次就 `return false`，
+ * 结果是路由一条也没注册，面板「刷新」永远拿到 404 `not found`，而宿主日志里没有告警
+ * （可选服务 warn 走的是 logger，启动早期也可能还没接上）。
+ * 现在的顺序：① 先试一次立即注册（服务已就绪的宿主一次性成功）；
+ * ② 拿不到就 `ctx.inject(['webServer'], cb)` 等它就绪再注册；③ 都没有（非 web 宿主）才 false。
  */
 export function registerHttpRoutes(
   ctx: HostContext,
   routes: HttpRoute[],
   prefix: string = BRIDGE_ROUTE,
 ): boolean {
-  // 可选服务：只经 optionalService 走 ctx.get（缺失时它已 warn，这里只降级不重复告警）。
-  const sink = optionalService(ctx, 'webServer')
-  if (!sink?.register) {
-    return false
+  const install = (sink: OptionalServiceMap['webServer'] | undefined): boolean => {
+    if (!sink?.register) return false
+    try {
+      sink.register({
+        kind: 'prefix',
+        path: prefix,
+        handler: async (req: NodeLikeRequest, res: NodeLikeResponse) => {
+          const url = typeof req.url === 'string' ? req.url : ''
+          const pathname = url.includes('?') ? url.slice(0, url.indexOf('?')) : url
+          const method = (req.method ?? 'GET').toUpperCase()
+          const route = routes.find((item) => item.method === method && item.path === pathname)
+
+          const reply = (status: number, payload: unknown): void => {
+            res.statusCode = status
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.end(JSON.stringify(payload))
+          }
+
+          if (!route) {
+            reply(404, { error: `未知面板接口：${method} ${pathname}` })
+            return
+          }
+          try {
+            const body = await readJson(req)
+            const result = await route.handle({ method, pathname, url, json: async () => body })
+            reply(200, result ?? {})
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            ctx.logger?.warn?.(`[auto-team] 面板接口失败：${method} ${pathname} → ${message}`)
+            reply(500, { error: message })
+          }
+        },
+      })
+      return true
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] 面板路由注册失败（${messageOf(error)}）`)
+      return false
+    }
   }
+
+  if (install(readServiceQuietly(ctx, 'webServer'))) return true
+
+  if (typeof ctx.inject !== 'function') return false
   try {
-    sink.register({
-      kind: 'prefix',
-      path: prefix,
-      handler: async (req: NodeLikeRequest, res: NodeLikeResponse) => {
-        const url = typeof req.url === 'string' ? req.url : ''
-        const pathname = url.includes('?') ? url.slice(0, url.indexOf('?')) : url
-        const method = (req.method ?? 'GET').toUpperCase()
-        const route = routes.find((item) => item.method === method && item.path === pathname)
-
-        const reply = (status: number, payload: unknown): void => {
-          res.statusCode = status
-          res.setHeader('content-type', 'application/json; charset=utf-8')
-          res.end(JSON.stringify(payload))
-        }
-
-        if (!route) {
-          reply(404, { error: `未知面板接口：${method} ${pathname}` })
-          return
-        }
-        try {
-          const body = await readJson(req)
-          const result = await route.handle({ method, pathname, url, json: async () => body })
-          reply(200, result ?? {})
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          ctx.logger?.warn?.(`[auto-team] 面板接口失败：${method} ${pathname} → ${message}`)
-          reply(500, { error: message })
-        }
-      },
+    ctx.inject(['webServer'], (scope) => {
+      const late = scope?.webServer ?? readServiceQuietly(ctx, 'webServer')
+      if (!install(late)) {
+        ctx.logger?.warn?.('[auto-team] webServer 就绪后仍无法注册面板路由，面板将显示接口不可用')
+      }
     })
     return true
   } catch (error) {
-    ctx.logger?.warn?.(`[auto-team] 面板路由注册失败（${messageOf(error)}）`)
+    ctx.logger?.warn?.(`[auto-team] 等待 webServer 就绪失败（${messageOf(error)}）`)
     return false
   }
 }

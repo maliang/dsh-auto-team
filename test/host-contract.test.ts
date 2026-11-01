@@ -30,8 +30,12 @@ import { OPTIONAL_SERVICES } from '../src/host/adapters.ts'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
-/** cordis Context 自身成员，**不是服务**，永远不进 inject（设计 §9 层 1 的白名单）。 */
-const CORE_MEMBERS: ReadonlySet<string> = new Set(['logger', 'effect', 'on', 'get'])
+/**
+ * cordis Context 自身成员，**不是服务**，永远不进 inject（设计 §9 层 1 的白名单）。
+ * `inject` 是 cordis 的「依赖就绪才回调」API（`ctx.inject(['<service>'], cb)`），
+ * client 半用它取可选服务 `sidebarRightTabs`/`sidebarRight`（QA-02 修复），因此它不算裸访问面。
+ */
+const CORE_MEMBERS: ReadonlySet<string> = new Set(['logger', 'effect', 'on', 'get', 'inject'])
 
 /** 可选服务白名单的字符串形态（从实现的唯一登记处派生，测试里不再抄一份字面量）。 */
 const OPTIONAL: readonly string[] = [...OPTIONAL_SERVICES]
@@ -86,12 +90,23 @@ function ctxAccesses(relPath: string): CtxHit[] {
   return hits
 }
 
-/** `optionalService(ctx, '<literal>')` 的第二个实参（必须是字面量，变量透传不算登记）。 */
+/**
+ * `optionalService(ctx, '<literal>')` 与 `readServiceQuietly(ctx, '<literal>')` 的第二个实参
+ * （必须是字面量，变量透传不算登记）。
+ *
+ * 两个读取口都要扫：`readServiceQuietly` 是「此刻缺失属正常时序」时的静默读法
+ * （r6 真机实测的 webServer 早启动场景），不扫它就等于留了一条绕过白名单的路。
+ */
 function optionalServiceLiterals(relPath: string): Array<{ name: string; where: string }> {
   const { file } = parse(relPath)
+  const READERS = new Set(['optionalService', 'readServiceQuietly'])
   const hits: Array<{ name: string; where: string }> = []
   const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'optionalService') {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      READERS.has(node.expression.text)
+    ) {
       const [first, second] = node.arguments
       if (first && ts.isIdentifier(first) && first.text === 'ctx' && second && ts.isStringLiteralLike(second)) {
         const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))

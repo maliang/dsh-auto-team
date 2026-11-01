@@ -11,9 +11,14 @@
  * 且静默继承父级字号（AGENTS §4 铁律）。
  */
 import * as React from 'react'
+import { PANEL_TAB_LABEL } from './slots.ts'
 
-/** 页签文案（AC-8 按文案判定，改字必须同步 PRD）。 */
-export const TAB_TITLE_TEXT = '自动团队'
+/**
+ * 页签文案（AC-8 按文案判定，改字必须同步 PRD）。
+ * 单点在 `slots.ts: PANEL_TAB_LABEL` —— 它同时喂给 `sidebarRightTabs` 类型定义的 `title`，
+ * 两处各写一份就会出现「页签标题」与「类型标题」不一致（组件与类型分属两条渲染路径）。
+ */
+export const TAB_TITLE_TEXT = PANEL_TAB_LABEL
 
 export function TabTitle(): React.ReactElement {
   return (

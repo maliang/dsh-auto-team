@@ -18,7 +18,7 @@
  * 而 client **不允许** import host 半的任何模块 —— 从 host/config.ts 取值会把宿主代码拖进
  * 浏览器产物，是本脚手架真实的断点之一。
  */
-import { registerSlots } from './slots.ts'
+import { createOpenPanel, registerPanelTab, registerSlots } from './slots.ts'
 import type { SlotsContext } from './slots.ts'
 import { Toggle } from './Toggle.tsx'
 import { Panel } from './Panel.tsx'
@@ -33,5 +33,7 @@ export function apply(ctx: ClientContext): void {
   // 宿主没提供 slots 服务时安静退出：整插件不激活比抛错好（与 host 半的降级纪律一致）。
   if (!ctx?.slots?.register) return
 
-  registerSlots(ctx, { Toggle, Panel, PanelTitle: TabTitle })
+  // 页签类型必须先于/独立于座位注册存在，否则 keyed 座位永不派发（QA-02）。
+  registerPanelTab(ctx)
+  registerSlots(ctx, { Toggle, Panel, PanelTitle: TabTitle, openPanel: createOpenPanel(ctx) })
 }

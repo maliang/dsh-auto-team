@@ -32,10 +32,10 @@
 |---|---|---|---|
 | `src/host/index.ts` | 宿主入口：声明插件名/`inject`、装配 adapters | `inject` 从 2 项扩到 4 项硬依赖（字面） | T1 |
 | `src/host/adapters.ts` | 唯一接触宿主 API 的胶水层 | 新增 `OPTIONAL_SERVICES`/`OptionalServiceName`/`optionalService()`；`HostContext` 增 `get?`；3 处可选服务读取改造；文件头写访问纪律 | T1 |
-| `src/client/slots.ts`（新） | 挂载点注册契约：slot 名常量 + `registerSlots()`（**不 import React/JSX**） | 新建 | T2 |
-| `src/client/TabTitle.tsx`（新） | `sidebar.right.pane.tab.title` 的页签文案「自动团队」 | 新建 | T2 |
-| `src/client/index.ts` | client 入口：只做薄接线（把真组件交给 `registerSlots`） | 删掉内联 `register` 调用；`ClientContext.slots.register` 类型加 `key?`/`inject?` | T2 |
-| `src/client/Toggle.tsx` / `Panel.tsx` | 开关行 / 面板本体 | **零改动**（props 已有 `sessionId?`，DOM 锚点已存在） | — |
+| `src/client/slots.ts`（新） | 挂载点注册契约：slot 名常量 + `registerSlots()` + **页签类型注册 `registerPanelTab()`** + 打开动作 `createOpenPanel()`（**不 import React/JSX**） | 新建 | T2 |
+| `src/client/TabTitle.tsx`（新） | `sidebar.right.pane.tab.title` 的页签文案「自动团队」（文案单点取 `slots.ts: PANEL_TAB_LABEL`，与页签类型 `title` 同源） | 新建 | T2 |
+| `src/client/index.ts` | client 入口：只做薄接线（`registerPanelTab(ctx)` → `registerSlots(...)`） | 删掉内联 `register` 调用；`ClientContext.slots.register` 类型加 `key?`/`inject?` | T2 |
+| `src/client/Toggle.tsx` / `Panel.tsx` | 开关行 / 面板本体 | `Toggle` 增 `openPanel?`（走宿主 `sidebarRight.openTab`），拿不到服务回退旧窗口事件；`Panel` 零改动 | T2 |
 | `test/host-contract.test.ts`（新） | 服务访问面守卫（源码扫描 + 集合断言） | 新建 | T3 |
 | `test/client-contract.test.ts`（新） | 挂载点契约守卫（fake slots 驱动真实 `registerSlots`） | 新建 | T3 |
 | `test/wire.test.ts` / `test/adapters.test.ts` | 现有集成/单元测试 | fakeCtx 补 `get(name)`（建模 cordis） | T3 |
@@ -137,6 +137,48 @@ const get = (name: string) => (ctx as Record<string, unknown>)[name]
 - 插件标识（`PLUGIN_ID`）只允许出现在 `id`/`key` 里，**不许**出现在 `name`（写成插件名 = 静默不挂载，历史实锤）；
 - 三个挂载点都传 `inject(sessionId)`：开关行与面板必须拿到同一个 `sessionId`（`state.ts:319 sessionIdOf` 会读 `props.sessionId`，缺失兜底 `'current'`）；
 - keyed 挂载点**不传 `id`/`order`**：PRD 待澄清 a2（keyed 是否容忍额外字段）未验证，方案选择「不触碰未知形状」——沿用两个真实样本的字段集合。
+
+### 4.1b 第 0 步：页签**类型**必须先注册进 `sidebarRightTabs`（QA-02 补，蓝图缺口）
+
+**本节是 r6 第 2 轮 QA 打回的根因，原蓝图缺这一步。** 只注册 `sidebar.right.pane.tab` 两个 keyed 座位**不会**让页签出现：宿主派发 keyed 座位时，用「在册 tab 类型的 `id`」作为 key（宿主契约原文："dispatched with the `id` of the type in force for `tab.kind`"）；本插件从未往 `sidebarRightTabs` 注册类型，宿主因此没有该 kind 的 tab，座位永不派发 —— 症状是**构建全绿、控制台零报错、页签永不出现**（`grep -rn sidebarRightTabs src/` 当时 = 0 命中）。
+
+三步缺一不可：
+
+| # | 动作 | API | 位置 |
+|---|---|---|---|
+| ⓪ | 注册页签类型（`id === PANEL_KEY`，`priority: 'extension'`，`title: () => '自动团队'`） | `ctx.inject(['sidebarRightTabs'], cb)` → `cb.effect(() => tabs.register(definition))` | `slots.ts: registerPanelTab()`，由 `index.ts` 的 `apply()` 调用 |
+| ① | 注册 body/title 两个 keyed 座位，`key` = ⓪ 的 `id` | `ctx.slots.inject(...)` → `register({ name, key, inject })` | `slots.ts: registerSlots()`（§4.1） |
+| ② | **打开**页签（页面型页签不会自己出现） | `ctx.inject(['sidebarRight'], cb)` → `cb.sidebarRight.openTab(kind)` | `slots.ts: createOpenPanel()`，经 `inject` 下发给 `Toggle` 的「面板」按钮 |
+
+```ts
+// src/client/slots.ts（节选）
+export const PANEL_TAB_LABEL = '自动团队'
+export function panelTabDefinition(): PanelTabDefinition {
+  return { id: 'dsh-auto-team-panel', kind: 'dsh-auto-team-panel', priority: 'extension', title: () => PANEL_TAB_LABEL }
+}
+export const PANEL_KEY = panelTabDefinition().id          // 单点：类型 id 与 keyed key 同源
+export const PANEL_TAB_KIND = panelTabDefinition().kind
+
+export function registerPanelTab(ctx: SlotsContext): boolean {
+  if (typeof ctx.inject !== 'function') return false        // 拿不到 cordis inject → 降级，不抛
+  ctx.inject(['sidebarRightTabs'], (scope) => {
+    const tabs = scope.sidebarRightTabs
+    if (tabs === undefined || typeof tabs.register !== 'function') return
+    const definition = panelTabDefinition()
+    const register = () => tabs.register(definition)        // 必须 `tabs.register(...)`：解构丢 receiver 会抛
+    if (typeof scope.effect === 'function') scope.effect(register, 'dsh-auto-team: panel tab type')
+    else register()
+  })
+  return true
+}
+```
+
+四条实现纪律（均来自宿主 asar 官方文档 + 同机样本 `ui-schedule`／`dsh-plugin-teamflow`）：
+
+1. **用 `ctx.inject([...], cb)`，不要 `ctx.get`**：`ctx.get` 全仓只许出现在 `src/host/adapters.ts`（QA 的 I8 判据 + `test/host-contract.test.ts` 的 `ctx.get` 断言）。`ctx.inject` 是 cordis 的「服务就绪才回调」，服务缺失时整插件照常激活，不会拖死 client entry。
+2. 注册必须包在 `ctx.effect(...)` 里，宿主卸载时据返回的 disposer 回收。
+3. `id` 必须与两个 keyed 座位的 `key` **同一个值**（`PANEL_KEY = panelTabDefinition().id` 单点派生，杜绝两处漂移）。
+4. 页面型页签必须 `openTab(kind)` 才会出现；`Toggle` 的「面板」按钮优先走它，拿不到服务才回退旧的 `window.dispatchEvent`（旧实现只有事件、没有监听者时按钮等于无效）。
 
 ### 4.2 为什么把注册抽成 `src/client/slots.ts`
 
@@ -283,13 +325,28 @@ calls.forEach((c) => c.fn())   // 回调触发 → metas 被填满
 
 断言：3 个挂载点各出现一次；`PANEL_SLOT`/`PANEL_TITLE_SLOT` 的 `key` 非空且互不冲突；`DOCK_SLOT` 的 `key === undefined`；`metas` 里 `inject('sess-1').sessionId === 'sess-1'`（三个都断言）；`inject(name)` 名字与 `register({name})` 逐字相同；`PLUGIN_ID` 不出现在任何 `name` 里；`src/client/index.ts` 源码内**零** `slots.register(`（结构断言：注册只许经 `registerSlots`）。
 
+**QA-02 追加的类门禁（原守卫验不出「宿主没有这个 tab 类型」）**，同样用 fake `ctx.inject` 驱动真实 `registerPanelTab`／`createOpenPanel`：
+
+| 断言 | 打回的缺陷 | 红它的方式 |
+|---|---|---|
+| `ctx.inject(['sidebarRightTabs'], cb)` 被调用，`cb` 里 `tabs.register(...)` 恰好一次 | 页签类型从未注册 | 删 `registerPanelTab` 调用 / 删 `ctx.inject` 分支 → 红 |
+| 类型定义 `id === PANEL_KEY`，`kind` 非空，`priority === 'extension'`，`title() === PANEL_TAB_LABEL` | 类型与 keyed key 漂移 | 改 `id` 字面量 → 红 |
+| 两处 keyed 座位的 `key` 逐一等于类型 `id` | 座位指向不存在的 kind | 改任一处 key → 红 |
+| 注册包在 `ctx.effect(...)` 里（label=`dsh-auto-team: panel tab type`） | 卸载不回收 | 去掉 effect → 红 |
+| 无 `ctx.inject` 时 `registerPanelTab` 返回 `false` 且不抛 | 可选服务拖死 entry | 改成裸访问 → 红 |
+| `createOpenPanel()` 走 `sidebarRight.openTab(PANEL_TAB_KIND)`，无服务返回 `false` | 「面板」按钮点了没反应 | 删 openTab 分支 → 红 |
+| `inject` 给 dock 的 bag 含 `openPanel` | 动作没送达组件 | 去掉 deps 透传 → 红 |
+| client 半源码（剥注释）零 `ctx.get` | 与 host 半纪律一致（I8） | 改用 `ctx.get` → 红 |
+| `index.ts` 必须调用 `registerPanelTab(` | 只注册座位 | 删调用 → 红 |
+
 ### 层 3：变异自检（AC-4 的「红得对」判据，脚本形式，不新建 checker 体系）
 
 `logs/teamflow/tf-mvxcfxze-e9elp3/scripts/guard-mutation.sh`：
 
-1. 从 `inject` 删 `'agentTeams'` → `node --test test/host-contract.test.ts` **必须失败**，且 stderr 含 `ctx.agentTeams 未在 inject 中登记`（红的是断言文本，不是语法错/异常）→ `git checkout -- src/host/index.ts`;
-2. 从 `PANEL_SLOT` 注册对象删 `key` → `node --test test/client-contract.test.ts` **必须失败**，且文案含 `requires key` → `git checkout -- src/client/slots.ts`;
-3. 复原后全绿。
+1. 从 `inject` 删 `'agentTeams'` → `node --test test/host-contract.test.ts` **必须失败**，且 stderr 含 `ctx.agentTeams 未在 inject 中登记`（红的是断言文本，不是语法错/异常）→ 按字节还原（sha256 校验）；
+2. 从 `PANEL_SLOT` 注册对象删 `key` → `node --test test/client-contract.test.ts` **必须失败**，且文案含 `requires key` → 按字节还原；
+3. 从 `src/client/index.ts` 删 `registerPanelTab(ctx)` 调用（= QA-02 原缺陷形态）→ 同测试**必须失败**，且文案含 `index.ts 必须调用 registerPanelTab(` → 按字节还原；
+4. 复原后全绿。
 
 判定要求：**分别记录**「变异前绿 / 变异后红 / 复原后绿」三次退出码 + 命中的断言文本。
 

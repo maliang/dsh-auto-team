@@ -73,6 +73,7 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 - **查宿主事件先去读 `docs/teamflow/architecture/HOST-EVENTS.md`**（已核实的 76 条事件目录、emit/waterfall 取舍、`ToolExecution` 形状、作用域规则）。那里没有你需要的，再按上一节的姿势调 `cordis_inspect_query`；**一次调用取不到就换姿势或读源码 `/tmp/dsh-src/`，不要用同一形状重试**。
 - **观测工具调用要订阅 `tools/result`，不要订阅 `tools/execute`**：`tools/result` 是 `emit`（签名 `(exec: Readonly<ToolExecution>, result)`，监听器异常会被隔离），`tools/execute` 是 `waterfall`（必须 `next()`，漏调就吞掉工具执行、改错信号会破坏取消链）。宿主文档原文：`tools/result` 的 scope 过滤 **keyed by `exec.agent`**——在 `agent.ctx` 上注册的监听器**只收到该 agent 的调用**，`src/host/adapters.ts` 的 `agentContextOf(agent)` 可直接复用，不必按 id 过滤、不必装全局监听。
 - `exec` 形状（宿主 `ToolExecutionInput` + `rootCallId` + `token`）：`callId` / `rootCallId?` / `name` / `schema?` / `arguments` / `agent?: Agent { readonly id: SessionId }` / `parent?: ToolExecutionToken` / `signal`。嵌套子调用 `parent` 非空、`agent` 仍指向所属成员。
+- **`webServer` 在插件 `apply` 时刻往往还没激活**（r6 真机实测）：`ctx.get('webServer')` 返回 `undefined`，此时「拿不到就 return」会让面板路由一条都不注册，前端所有请求 `HTTP 404 not found`，而宿主日志里**没有任何告警**（logger 早期也未接上）。正确姿势是两级：先试一次立即注册，拿不到就 `ctx.inject(['webServer'], cb)` 等它就绪再注册（`src/host/adapters.ts` 的 `registerHttpRoutes` 已是此实现，`readServiceQuietly` 是配套的静默读法）。**不要**把 `webServer` 硬写进 entry 的 `inject`——那会让非 web 宿主整条 entry 不激活（`cannot get property … without inject` 的另一面）。自检命令：起一个克隆 profile 的宿主后 `curl -b <cookie> 'http://127.0.0.1:<port>/api/auto-team/snapshot?sessionId=x'`，返回 200 且带 `roles` 才算过。
 
 <!-- teamflow:begin -->
 ## TeamFlow 托管区（本块由 TeamFlow 自动维护，团队请勿手改）

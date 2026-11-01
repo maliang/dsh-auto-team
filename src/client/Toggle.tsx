@@ -16,10 +16,12 @@ import type { PanelAction } from '../shared/types.ts'
 export interface ToggleProps {
   sessionId?: string
   session?: { id?: string }
+  /** 宿主原生「打开本插件页签」动作（`sidebarRight.openTab`，由 slots.ts 的 inject 下发）。 */
+  openPanel?: () => boolean
   [key: string]: unknown
 }
 
-/** 面板入口事件：右栏面板订阅它并切到「计划」页（TECHNICAL §6）。 */
+/** 面板入口事件：宿主无 `sidebarRight` 服务时的**回退**（面板已挂载则切到「计划」页）。 */
 export const OPEN_PANEL_EVENT = 'dsh-auto-team:open-panel'
 
 export function Toggle(props: ToggleProps): React.ReactElement {
@@ -49,7 +51,10 @@ export function Toggle(props: ToggleProps): React.ReactElement {
   }
 
   function openPanel(): void {
-    // 面板在右栏：宿主未提供「激活某页签」的对外动作，先用事件通知已挂载的面板切页。
+    // 优先走宿主原生路径 `sidebarRight.openTab(kind)`（页面型页签的唯一打开方式，QA-02 修复）；
+    // 拿不到服务时才回退到窗口事件（旧行为：没人监听时按钮等于无效）。
+    const viaHost = typeof props.openPanel === 'function' ? props.openPanel : undefined
+    if (viaHost !== undefined && viaHost() === true) return
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent(OPEN_PANEL_EVENT))
     }
