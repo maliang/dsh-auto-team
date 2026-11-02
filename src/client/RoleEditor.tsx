@@ -660,13 +660,14 @@ export function RoleEditorList(props: RoleEditorListProps): React.ReactElement {
 
               <div data-role-field data-role-field-model>
                 <span data-role-field-label>默认模型</span>
+                {/* r11：删掉「留空 = 跟随会话默认」这行小字——r10 已改成弹层选择器，
+                    留空在弹层里就是「跟随会话默认」这一个选项，再说一遍是噪音。 */}
                 <ModelPicker
                   value={role.model}
                   catalog={props.modelCatalog}
                   busy={busy}
                   onChange={(model) => patch(role.id, { model })}
                 />
-                <span data-role-model-hint>留空 = 跟随会话默认</span>
               </div>
 
               {problem !== '' ? (

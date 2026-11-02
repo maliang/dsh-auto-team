@@ -81,6 +81,19 @@ test('AC-1：段落总长 ≤ 2600 字符', () => {
   assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
 })
 
+test('r11：常驻段落不再断言「当前会话已启用/未启用」（改以面板与工具返回为准）', () => {
+  const on = sectionOf(makeSnapshot({ enabled: true }))
+  const off = sectionOf(makeSnapshot({ enabled: false }))
+  // 旧文案用占位会话 id 查开关，真机上恒为「未启用」，于是队长被明确告知「不得创建成员」，
+  // 用户看到的就是「开了自动团队但它从不干活」。段落拿不到会话维度（PromptSection.text
+  // 只收到 AssembleContext），所以**开关状态不许影响这段文本**——两态必须逐字相同。
+  assert.equal(on, off, '开关状态不得影响常驻段落：它拿不到会话维度，任何断言都会与实际不符')
+  assert.equal(on.includes('当前会话的自动团队开关'), false)
+  assert.equal(on.includes('未启用时不得创建成员'), false)
+  assert.match(on, /按会话启用/)
+  assert.match(on, /会直接返回「未启用」/)
+})
+
 test('AC-1：不把计划塞进常驻上下文（acceptance 原文 0 命中）', () => {
   const acceptance = `pnpm typecheck && node --test test/captain.test.ts 并逐条核对产物：${'验收证据'.repeat(1200)}`
   assert.ok(acceptance.length > 4000, '样本必须够长，否则断言不承载信息')

@@ -1174,10 +1174,6 @@ export const AUTO_TEAM_CSS = `
 }
 [data-auto-team-role-editor] [data-role-skill] input { height: auto; margin: 0; }
 [data-auto-team-role-editor] [data-role-skill-empty] { color: var(--dsw-alias-label-tertiary, inherit); }
-[data-auto-team-role-editor] [data-role-model-hint] {
-  color: var(--dsw-alias-label-tertiary, inherit);
-  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
-}
 [data-auto-team-role-editor] [data-role-error] {
   color: var(--dsw-alias-state-error-primary, #d33);
   font: var(--dsw-font-xxs-12, 12px/18px sans-serif);

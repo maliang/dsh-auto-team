@@ -52,7 +52,7 @@
 **验证命令（提交前必须全绿）**
 ```bash
 pnpm typecheck   # tsc --noEmit
-pnpm test        # node --test test/*.test.ts（当前 216 例）
+pnpm test        # node --test test/*.test.ts（当前 484 例）
 pnpm build       # 双产物
 node --input-type=module -e "await import('./lib/index.js')"
 node --input-type=module -e "await import('./lib/client.js')"
@@ -76,6 +76,7 @@ npm pack --dry-run   # 必须含 lib/index.js / lib/client.js / cordis.patch.yml
 - **client 侧 inspect 同理**（`platform: "client"` 的 `Service`/`Event`/`Builtin`/`Slots`/`Theme`）：`input` 同样必须是对象。r6 QA 用 `Slots.listSubTree` 不带对象 `input` 又报同一条错，把整个阶段判成 env-unavailable——**第四次同坑**（第五次是 r7 的 PRD 阶段，同一条报错又烧了 212k）。看到 `rejected input: "input" must be an object` 一律先改姿势；**更好的是根本不要为 UI 槽位去调它**：`docs/teamflow/architecture/UI-SLOTS.md` 已经把 106 个槽位里要用的部分逐字摘录（kind/scope/replaceRisk/注册字段/右栏页签三步注册）。
 - **右栏页签要两步，不是一步**：`sidebar.right.pane.tab`（body）与 `.title` 只是**挂载点**；要让页签真的出现，还必须把 tab 类型注册进 `sidebarRightTabs` 服务（同机样本 `dsh-plugin-teamflow`：先 `ctx.get("sidebarRightTabs")` 再 `tabs.register({ id, ... })`，`id` 与 keyed key 复用同一个值）。只注册挂载点的症状是「构建全绿、控制台不报错、页签永不出现」，r6 QA-02 实测确认（`grep -r sidebarRightTabs src` = 0 命中）。
 - **查宿主事件先去读 `docs/teamflow/architecture/HOST-EVENTS.md`**（已核实的 76 条事件目录、emit/waterfall 取舍、`ToolExecution` 形状、作用域规则）。那里没有你需要的，再按上一节的姿势调 `cordis_inspect_query`；**一次调用取不到就换姿势或读源码 `/tmp/dsh-src/`，不要用同一形状重试**。
+- **自己注册的工具第二参是 `ToolRunContext`，会话 id 只在 `exec.agent.id`**（没有 `sessionId`/`session`）；常驻提示词段落拿到的是 `AssembleContext`（也没有 session id），**因此段落里不许断言「当前会话是否已启用」**。两条都是 r11 的真机事故：工具永远查 `'current'` 而面板记在真实会话上 → 「开关打开了但自动团队从不干活」。详见 HOST-EVENTS §3.1/§3.2。
 - **观测工具调用要订阅 `tools/result`，不要订阅 `tools/execute`**：`tools/result` 是 `emit`（签名 `(exec: Readonly<ToolExecution>, result)`，监听器异常会被隔离），`tools/execute` 是 `waterfall`（必须 `next()`，漏调就吞掉工具执行、改错信号会破坏取消链）。宿主文档原文：`tools/result` 的 scope 过滤 **keyed by `exec.agent`**——在 `agent.ctx` 上注册的监听器**只收到该 agent 的调用**，`src/host/adapters.ts` 的 `agentContextOf(agent)` 可直接复用，不必按 id 过滤、不必装全局监听。
 - `exec` 形状（宿主 `ToolExecutionInput` + `rootCallId` + `token`）：`callId` / `rootCallId?` / `name` / `schema?` / `arguments` / `agent?: Agent { readonly id: SessionId }` / `parent?: ToolExecutionToken` / `signal`。嵌套子调用 `parent` 非空、`agent` 仍指向所属成员。
 - **`webServer` 在插件 `apply` 时刻往往还没激活**（r6 真机实测）：`ctx.get('webServer')` 返回 `undefined`，此时「拿不到就 return」会让面板路由一条都不注册，前端所有请求 `HTTP 404 not found`，而宿主日志里**没有任何告警**（logger 早期也未接上）。正确姿势是两级：先试一次立即注册，拿不到就 `ctx.inject(['webServer'], cb)` 等它就绪再注册（`src/host/adapters.ts` 的 `registerHttpRoutes` 已是此实现，`readServiceQuietly` 是配套的静默读法）。**不要**把 `webServer` 硬写进 entry 的 `inject`——那会让非 web 宿主整条 entry 不激活（`cannot get property … without inject` 的另一面）。自检命令：起一个克隆 profile 的宿主后 `curl -b <cookie> 'http://127.0.0.1:<port>/api/auto-team/snapshot?sessionId=x'`，返回 200 且带 `roles` 才算过。

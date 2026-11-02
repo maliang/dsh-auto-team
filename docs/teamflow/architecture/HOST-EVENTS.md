@@ -89,6 +89,36 @@ ToolExecution = ToolExecutionInput & { rootCallId: string; token: ... }
 **不含** agent 归属。所以「按成员归属工具调用」只有一条正路：在 `agent.ctx` 上注册 `tools/result`，
 或根级注册后读 `exec.agent`。**不要**从持久化事件流里反推归属。
 
+### 3.1 我们自己注册的工具，第二参收到什么（r11 实测教训）
+
+`ctx.tools.register({ ..., execute(args, exec) })` 的第二个参数类型是 `ToolRunContext`：
+
+```ts
+ToolDefinition.execute(args: unknown, exec: ToolRunContext): Promise<unknown>
+ToolRunContext extends ToolExecution   // 即 ToolExecutionInput + rootCallId + token + 两个方法
+interface ToolRunContext extends ToolExecution { deferContext(c): void; concludeTurn(): void }
+```
+
+**`exec` 上没有 `sessionId`，也没有 `session`**——会话 id 只在 `agent.id`（`Agent = { readonly id: SessionId }`）。
+只能拿到 `Agent` 时，`agent.id` 就是它所属的会话/成员 id。
+
+踩过的坑：本插件 `sessionOf(meta)` 原先只认 `meta.sessionId ?? meta.session?.id`，真机上永远落回 `'current'`，
+于是**面板把开关记在真实会话 id 上、工具却去查 `'current'`**，七个 `auto_team_*` 工具一律返回「未启用」，
+用户看到的现象是「开关打开了，但自动团队从不干活」。修法（r11）：`sessionOf` 优先读 `agent.id`。
+
+### 3.2 常驻提示词段落拿不到会话维度
+
+```ts
+PromptSection = { name: string; order: number; text: string | ((context: AssembleContext) => string) }
+AssembleContext = { scope?: ScopeKey; signal?: AbortSignal }   // 没有 session id
+```
+
+`ctx.systemPrompt.section()` 注册在**调用方上下文的 scope** 里；在插件根 ctx 注册就是全局段落，
+它的 `text(context)` 也拿不到会话。所以**常驻段落里不许断言「当前会话已启用/未启用」**——那必须靠猜，
+而猜错的表现是队长被自己的提示词拦住（r11 之前就是这样）。正确做法：段落说清「按会话启用、以面板为准」，
+把判定权交给工具（工具按 `exec.agent.id` 查开关，未开时回可读的「未启用」）。
+
+
 ## 4. 已知作用域事实
 
 - `agent.ctx` 上注册的 `agent/*` 监听器**只收到该 agent 的**事件（宿主 `dsh-scope` 的作用域派发）。

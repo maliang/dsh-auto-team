@@ -26,10 +26,15 @@ export const CAPTAIN_CONSTRAINTS: readonly string[] = [
 
 export function captainSection(deps: PromptDeps, sessionId: string): string {
   const snapshot = deps.bridge.snapshot(sessionId)
-  const enabled = snapshot.enabled ? '已启用' : '未启用'
   const lines = [
     '## 自动团队（队长视角）',
-    `当前会话的自动团队开关：${enabled}${snapshot.enabled ? '' : '——未启用时不得创建成员，先用一句话说明如何启用'}。`,
+    // r11 修复：常驻段落是按插件作用域注册的、拿不到会话维度（`PromptSection.text` 只收到
+    // `AssembleContext = { scope?, signal? }`，没有 session id），所以**不许断言「当前会话已启用/未启用」**
+    // ——旧文案用占位会话 id 去查，真机上恒为「未启用」，于是队长被明确告知「不得创建成员」，
+    // 用户看到的现象就是「开了自动团队但它从不干活」。改成把判定权交给工具：工具按真实
+    // `exec.agent.id` 查开关，未开时回一条可读的「未启用」。
+    '本插件按会话启用：开关是输入框工具条里的「自动团队」选项，状态以它和面板为准（本段不替你断言当前会话是否已开）。',
+    '开关没开时 `auto_team_*` 工具会直接返回「未启用」：那时用一句话告诉用户在哪里打开，不要假设已开启、也不要自行创建成员。',
     '',
     '队长定位（硬约束，任何情况下都不得违反）：',
     ...CAPTAIN_CONSTRAINTS,

@@ -26,10 +26,23 @@ export interface ToolsDeps {
 
 const NOT_ENABLED = '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。'
 
-/** 当前会话 id：由工具调用元信息带入；缺失时退回 'current'（面板按会话隔离，不会串数据）。 */
+/**
+ * 当前会话 id：面板按会话隔离，工具必须**认到同一个会话**——否则就是「面板里开关打开了，
+ * 工具还一律回未启用」，用户看到的是「开了自动团队但它从不干活」。
+ *
+ * 宿主真实形状是 `ToolDefinition.execute(args, exec: ToolRunContext)`：`exec` 上**没有**
+ * `sessionId` / `session` 字段，只有 `agent: Agent { readonly id: SessionId }`
+ * （`cordis_inspect_query` 的 `ToolExecutionInput` 声明可在 HOST-EVENTS.md 查到），
+ * 所以**必须优先读 `agent.id`**。r11 修复前这里只认 `sessionId` / `session.id`，
+ * 真机上一律退回 `'current'`：面板把开关记在真实会话 id 上，工具却查 `'current'`，
+ * 于是七个工具全部返回 NOT_ENABLED。`sessionId` / `session.id` 保留为简化形状
+ * （面板 HTTP 入口、单测桩）的兜底。
+ */
 export function sessionOf(meta: unknown): string {
-  const value = meta as { sessionId?: string; session?: { id?: string } } | undefined
-  return value?.sessionId ?? value?.session?.id ?? 'current'
+  const value = meta as
+    | { sessionId?: string; session?: { id?: string }; agent?: { id?: string } }
+    | undefined
+  return value?.agent?.id ?? value?.sessionId ?? value?.session?.id ?? 'current'
 }
 
 function taskBrief(task: PlanTask): Record<string, unknown> {

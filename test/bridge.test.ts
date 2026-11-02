@@ -505,6 +505,16 @@ test('tools：7 个工具、未启用统一文案、dispatch 强制 runId（AC-3
   assert.equal(sessionOf({ sessionId: SESSION }), SESSION)
   assert.equal(sessionOf(undefined), 'current')
 
+  // r11：宿主真实形状是 exec: ToolRunContext，会话只出现在 `agent.id`（没有 sessionId）。
+  // 少了这条，真机上七个工具会一律退回 'current'，而面板把开关记在真实会话 id 上
+  // → 用户看到「开了自动团队但它从不干活」。这里连形状带行为一起钉住。
+  assert.equal(sessionOf({ agent: { id: SESSION } }), SESSION, '必须认宿主真实的 exec.agent.id')
+  assert.equal(
+    sessionOf({ agent: { id: SESSION }, callId: 'c1', name: 'auto_team_plan' }),
+    SESSION,
+    '必须能从完整 ToolRunContext 里取到会话',
+  )
+
   const meta = { sessionId: SESSION }
   for (const spec of specs) {
     const result = (await spec.handler({}, meta)) as { ok?: boolean; error?: string }
@@ -514,6 +524,16 @@ test('tools：7 个工具、未启用统一文案、dispatch 强制 runId（AC-3
 
   await enable(bridge)
   const tool = (name: string) => specs.find((spec) => spec.name === name)!
+
+  // r11 行为闭环：面板在会话 S 上打开开关，队长侧工具按宿主真实入参
+  // `exec = { agent: { id: S } }` 调用，必须认到同一个会话并放行（此前会回未启用）。
+  const hostShaped = (await tool('auto_team_status').handler({}, { agent: { id: SESSION }, callId: 'c9' })) as {
+    ok?: boolean
+    enabled?: boolean
+    error?: string
+  }
+  assert.equal(hostShaped.ok, true, `工具必须认 exec.agent.id：${hostShaped.error ?? ''}`)
+  assert.equal(hostShaped.enabled, true, '面板打开的开关必须对工具可见')
 
   const noRunId = (await tool('auto_team_dispatch').handler({}, meta)) as { ok?: boolean; error?: string }
   assert.equal(noRunId.ok, false)
