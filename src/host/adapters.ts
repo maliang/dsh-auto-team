@@ -289,10 +289,45 @@ export interface ToolSpec {
 }
 
 /**
+ * 把工具返回值整理成「lossless JSON」：宿主会拒收含 `undefined` 值的返回
+ * （实测原文 `tool "auto_team_status" returned invalid output: value is not lossless JSON`，
+ * 因为 `JSON.stringify` 会把 undefined 键丢掉，宿主据此判定有信息损失）。
+ *
+ * r12 真机事故：`auto_team_status` 在「还没计划」时返回 `runId/planStatus/plannedAt = undefined`，
+ * 任务未派发时 `memberId`、无门禁证据时 `evidence` 也是 undefined —— 于是**只要还没有计划，
+ * 队长就查不了状态**；单测全绿是因为没人按宿主口径校验「返回值可无损序列化」。
+ *
+ * 收口放在 `execute` 这一处（8 个工具共用），比逐个工具手改更难漏。语义：
+ * 对象里值为 undefined/函数/Symbol 的键**丢掉**；数组里这类元素换 null（保住位置）；
+ * NaN/Infinity 换 null；bigint 转字符串；循环引用换 null。
+ */
+export function losslessJson(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return undefined
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'bigint') return value.toString()
+  if (value === null || typeof value !== 'object') return value
+  if (seen.has(value as object)) return null
+  seen.add(value as object)
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const next = losslessJson(item, seen)
+      return next === undefined ? null : next
+    })
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const next = losslessJson(item, seen)
+    if (next !== undefined) out[key] = next
+  }
+  return out
+}
+
+/**
  * [已核] ToolDefinition = ToolSchema & { output: ToolOutputDefinition, execute(args, exec) }
  *   ToolSchema        = { name, description, parameters }
  *   ToolOutputDefinition = { schema: JsonSchemaNode, render(args, value): ContentBlock[] }
  * 缺 `output` 会让宿主在 register 或首次调用时报错，因此这里必须补齐。
+ * `execute` 统一过 `losslessJson`（见上，r12 真机事故）。
  */
 export function toHostToolDefinition(spec: ToolSpec): unknown {
   return {
@@ -305,7 +340,8 @@ export function toHostToolDefinition(spec: ToolSpec): unknown {
         { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? null) },
       ],
     },
-    execute: spec.handler,
+    execute: async (args: Record<string, unknown>, meta?: unknown): Promise<unknown> =>
+      losslessJson(await spec.handler(args, meta)),
   }
 }
 

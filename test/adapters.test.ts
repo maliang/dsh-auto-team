@@ -12,6 +12,7 @@ import {
   createSpawnPorts,
   installCaptainRoute,
   listHostMembers,
+  losslessJson,
   onHostTriggerEvents,
   onMemberProgress,
   optionalService,
@@ -852,4 +853,58 @@ test('createSpawnPorts：缺 agentDefaultModel 时不带模型覆盖，并给出
   const ok = await createSpawnPorts(withDefault).spawn({ prompt: '去做 t2', name: 'dev-t2', sessionId: 's1', taskId: 't2' })
   assert.equal(ok.ok, true)
   assert.equal(requests[0]?.provider, 'host-default', '有宿主默认模型时 provider 落成它')
+})
+
+test('losslessJson：undefined 键必须被丢掉（宿主拒收 lossy 返回，r12 真机事故）', () => {
+  const stripped = losslessJson({
+    ok: true,
+    runId: undefined,
+    planStatus: undefined,
+    tasks: [{ id: 't1', memberId: undefined, evidence: undefined, status: 'pending' }],
+    members: [],
+  })
+  assert.deepEqual(stripped, { ok: true, tasks: [{ id: 't1', status: 'pending' }], members: [] })
+  assert.equal(JSON.stringify(stripped).includes('undefined'), false, '序列化后不得残留 undefined')
+  // 「有键但值是 undefined」与「没有键」在宿主眼里都必须是后者，否则 auto_team_status 在无计划时必挂。
+  assert.equal(Object.hasOwn(stripped as object, 'runId'), false)
+})
+
+test('losslessJson：数组内 undefined 换 null（保位置）、NaN 换 null、bigint 转字符串、循环引用不炸', () => {
+  const circular: Record<string, unknown> = { name: 'loop' }
+  circular.self = circular
+  const out = losslessJson({
+    list: [undefined, 1, null],
+    nan: Number.NaN,
+    inf: Number.POSITIVE_INFINITY,
+    big: 10n,
+    fn: () => 1,
+    circular,
+  }) as Record<string, unknown>
+  assert.deepEqual(out.list, [null, 1, null])
+  assert.equal(out.nan, null)
+  assert.equal(out.inf, null)
+  assert.equal(out.big, '10')
+  assert.equal(Object.hasOwn(out, 'fn'), false, '函数值也要丢键')
+  assert.deepEqual((out.circular as Record<string, unknown>).self, null, '循环引用收敛成 null')
+})
+
+test('工具 execute 收口过 losslessJson：含 undefined 的 handler 返回值不再被判 lossy', async () => {
+  const def = toHostToolDefinition({
+    name: 'auto_team_status',
+    description: '读取状态',
+    parameters: { type: 'object' },
+    // 复刻 r12 事故形状：无计划时 runId/planStatus/plannedAt 全 undefined，任务未派发时 memberId/evidence 也是 undefined。
+    handler: async () => ({
+      ok: true,
+      enabled: true,
+      runId: undefined,
+      planStatus: undefined,
+      plannedAt: undefined,
+      tasks: [{ id: 't1', memberId: undefined, evidence: undefined }],
+    }),
+  }) as { execute: (args: Record<string, unknown>, meta?: unknown) => Promise<unknown> }
+
+  const value = await def.execute({}, { agent: { id: 's1' } })
+  assert.deepEqual(value, { ok: true, enabled: true, tasks: [{ id: 't1' }] })
+  assert.equal(JSON.stringify(value).includes('undefined'), false)
 })
