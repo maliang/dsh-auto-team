@@ -6,7 +6,8 @@
  *   - HTTP：POST /api/auto-team/act  →  bridge.act
  *   - 工具：auto_team_message / auto_team_receipt / auto_team_memory / auto_team_role → 同一个 bridge.act
  *
- * 15 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x，r7 新增 4 个动作与 PAUSED 码）：
+ * 18 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x；r7 新增 4 个动作与 PAUSED 码，
+ * r11 新增 cancelTask / skipTask / updateAcceptance 三个单任务动作）：
  *   toggle               → 只改开关并落盘，**绝不派发**（反目标 1）
  *   dispatch             → NOT_ENABLED / NO_PLAN / NOT_FOUND(runId) / PLAN_ALREADY_DISPATCHED /
  *                          ROLE_UNAVAILABLE / MODEL_UNRESOLVABLE / CONCURRENCY_FULL（后三者来自编排层 skipped 分类）
@@ -23,6 +24,9 @@
  *   resumeTeam           → NOT_ENABLED / NO_PLAN / BAD_REQUEST（计划已结束）；未暂停幂等 no-op
  *   restoreDefaultRoles  → NOT_ENABLED / BAD_REQUEST（角色库不可写）
  *   saveSettings         → NOT_ENABLED / BAD_REQUEST（任一项非法 → 磁盘一字不改）
+ *   cancelTask           → NO_PLAN / NOT_FOUND / BAD_REQUEST（允许集只从 shared/task-actions.ts 派生）
+ *   skipTask             → NO_PLAN / NOT_FOUND / BAD_REQUEST（下游 blocked → pending）
+ *   updateAcceptance     → NO_PLAN / NOT_FOUND / BAD_REQUEST（空串 → 三条模板全文）
  *
  * **PAUSED 闸门**（r7 AC-16）：计划处于暂停态时，`dispatch` / `resume` / `receipt` 一律被拒
  * （这三个都会推进状态机），其余动作放行。闸门就在 `act()` 的入口处一处判断，不散落到组件。
@@ -51,6 +55,13 @@ import type {
   TaskStatus,
 } from '../shared/types.ts'
 import {
+  TASK_STATUS_LABELS,
+  taskActionAllowed,
+  taskActionDisabledReason,
+  type TaskActionName,
+} from '../shared/task-actions.ts'
+import {
+  DEVIATION_SNAPSHOT_LIMIT,
   MAX_CONCURRENT_LIMIT,
   MEMORY_LINES_PER_TASK,
   STALL_MS,
@@ -58,15 +69,21 @@ import {
 import { runGate } from './gate/gate.ts'
 import { selectMemory } from './memory/inject.ts'
 import { deleteMemory, listMemory, readMemory, safeMemoryName, writeMemory } from './memory/repo.ts'
-import { blockedTasks, readyTasks } from './plan/graph.ts'
+import { emptyAcceptanceError } from './plan/acceptance.ts'
+import { blockedTasks, depSatisfied, readyTasks } from './plan/graph.ts'
 import { progressOf } from './plan/plan.ts'
+import { deriveScopeLocks } from './plan/scope.ts'
 import { BUILTIN_SKILLS } from './roles/builtin.ts'
 import type { RoleRepo } from './roles/repo.ts'
 import type { SkillRecord, SkillRepo } from './roles/skills-repo.ts'
 import type { SystemSkillSource } from './roles/system-skills.ts'
 import { defaultSettings, type SettingsRepo } from './settings.ts'
 import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
+import type { DeviationRecorder } from './team/deviation.ts'
+import { isTerminalTaskStatus } from './team/dispatch.ts'
+import { releaseScopes } from './team/scope-locks.ts'
 import { secondsText, stallOf } from './team/stall.ts'
+
 
 /** 门禁串行队列上限（TECHNICAL §5.3：避免一次 receipt 风暴炸出多个 shell）。 */
 const GATE_QUEUE_LIMIT = 8
@@ -211,6 +228,19 @@ export interface BridgeDeps {
    * 面板据此显示原因，而不是给一个看起来「没有模型」的空下拉（假阴性）。
    */
   modelCatalog?: () => ModelCatalogView
+  /**
+   * 中断成员端口（r11 AC-26）：`cancelTask` 取消一个 `running` 任务时**尽力**中断它的成员。
+   *
+   * 缺省 = 只改任务状态：`cancelled` 是权威，成员由 watcher 对账；中断失败只进 notice，
+   * 绝不让「取消」这个动作失败（否则用户点一次取消得到红字，状态却没变）。
+   */
+  interruptMember?: (name: string) => Promise<{ ok: boolean; error?: string }>
+  /**
+   * 队长亲手写文件的留痕（r11 AC-22/AC-24）：快照 `deviations` 的**唯一**来源。
+   *
+   * 缺省 = 空数组：`BridgeDeps` 在多处测试夹具里被直接构造，那些用例不该被迫造一个可写目录。
+   */
+  deviations?: DeviationRecorder
 }
 
 export interface Bridge {
@@ -785,6 +815,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
         ? { degradeReason: health.reason ?? '事件源不可用，推进退回轮询兜底' }
         : {}),
       triggers: state?.triggers ?? [],
+      // r11 AC-16/AC-19：写域占用**不落盘**，每次快照按 `status + writeScopes` 现算 ——
+      // 重启/换 store/读回旧 run 之后等待关系自动重建，不存在「锁表与任务状态不一致」。
+      scopeLocks: deriveScopeLocks(state?.plan.tasks ?? [], state?.bindings ?? []),
+      // r11 AC-22：执行痕迹只读最近 N 条（DEVIATION_SNAPSHOT_LIMIT）；未装配 = 空数组，
+      // 面板据此渲染 0 节点（AC-24 的「0 条不渲染」），而不是显示一块空白标题。
+      deviations: deps.deviations?.recent(DEVIATION_SNAPSHOT_LIMIT) ?? [],
     }
   }
 
@@ -801,6 +837,28 @@ export function createBridge(deps: BridgeDeps): Bridge {
   function bindingFor(state: RunState, taskId: string | undefined): RunState['bindings'][number] | undefined {
     if (taskId === undefined) return undefined
     return state.bindings.find((binding) => binding.taskId === taskId && binding.retired !== true)
+  }
+
+  /**
+   * 单任务动作的拒绝文案（r11 AC-26）：**必须**含任务 id 与当前状态中文。
+   *
+   * 原因句取 `shared/task-actions.ts` 的同一张表（`taskActionDisabledReason`）：面板 disabled
+   * 按钮的 `title` 与这里的拒绝是同一句，用户先看到「为什么不能点」，再收到拒绝时说法一致。
+   */
+  function taskActionDeniedText(
+    task: RunState['plan']['tasks'][number],
+    action: TaskActionName,
+  ): string {
+    const label = TASK_STATUS_LABELS[task.status] ?? task.status
+    const reason = taskActionDisabledReason(action, task.status)
+    return `任务 ${task.id} 当前状态为「${label}」，${reason === '' ? '不允许该动作' : reason}`
+  }
+
+  /** 依赖本任务、且尚未终态的下游（AC-26 的「下游未完成者」）。 */
+  function downstreamOf(state: RunState, taskId: string): RunState['plan']['tasks'] {
+    return state.plan.tasks.filter(
+      (item) => item.dependsOn.includes(taskId) && !isTerminalTaskStatus(item.status),
+    )
   }
 
   async function act(sessionId: string, action: PanelAction): Promise<ActResult> {
@@ -998,6 +1056,131 @@ export function createBridge(deps: BridgeDeps): Bridge {
           }
           saveState(withTask(state, action.taskId, (item) => ({ ...item, roleId: role.id })))
           return accept(sessionId, [`任务 ${action.taskId} 的角色已改为 ${role.name}（${role.id}）`])
+        }
+
+        /**
+         * 单任务取消（r11 AC-26）。
+         *
+         * 允许集只从 `shared/task-actions.ts` 派生（桥里不写第二份 13×3 表）：面板的 disabled
+         * 矩阵与这里的拒绝必须是同一份来源，否则第一次改允许集就会分叉。
+         *
+         * 副作用顺序是刻意的：**先落状态**（cancelled 是权威），再尽力中断成员，最后
+         * `releaseScopes` 唤醒等它写域的成员 —— 中断失败不能让「取消」这个动作失败。
+         */
+        case 'cancelTask': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可取消的任务', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          if (!taskActionAllowed('cancel', task.status)) {
+            return reject('BAD_REQUEST', taskActionDeniedText(task, 'cancel'), sessionId)
+          }
+
+          const at = now()
+          // `reason` 是面板可选的补充说明（AC-25）：折进第一条 notice，账本里就能查到「为什么取消」。
+          const reason = typeof action.reason === 'string' ? action.reason.trim() : ''
+          const notices: string[] = [
+            `任务 ${task.id} 已取消（${TASK_STATUS_LABELS[task.status]} → ${TASK_STATUS_LABELS.cancelled}）${reason === '' ? '' : `：${reason}`}`,
+          ]
+          if (task.status === 'running') {
+            const binding = bindingFor(state, task.id)
+            const memberName = binding?.name ?? binding?.memberId
+            const interrupt = deps.interruptMember
+            if (typeof interrupt === 'function' && memberName !== undefined) {
+              const stopped = await interrupt(memberName)
+              notices.push(
+                stopped.ok
+                  ? `已中断成员 ${memberName}`
+                  : `成员 ${memberName} 中断失败：${stopped.error ?? '未知原因'}（任务状态已取消，成员由 watcher 对账）`,
+              )
+            }
+          }
+
+          const downstream = downstreamOf(state, task.id)
+          let next = withTask(state, task.id, (item) => {
+            const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+            return { ...rest, status: 'cancelled' as const }
+          })
+          for (const child of downstream) {
+            next = withTask(next, child.id, (item) => ({
+              ...item,
+              status: 'blocked' as const,
+              waitingOn: [task.id],
+              waitReason: `上游 ${task.id} 已取消`,
+            }))
+          }
+          if (downstream.length > 0) {
+            notices.push(`下游 ${downstream.map((child) => child.id).join('、')} 转为阻塞（上游 ${task.id} 已取消）`)
+          }
+
+          next = releaseScopes(next, task.id, at)
+          saveState(withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })))
+          return accept(sessionId, notices)
+        }
+
+        /**
+         * 单任务跳过（r11 AC-26）：`skipped` 在依赖语义里**视为满足**（`graph.depSatisfied` 单点），
+         * 所以这里只需要把「本任务解锁后全部依赖都满足」的下游 blocked 放回 pending。
+         *
+         * 仍被别的依赖挡住的子任务**原样不动**：它的 waitingOn/waitReason 由下一次回执的解锁
+         * 分支重算，桥里再算一遍就会写出第二份依赖文案。
+         */
+        case 'skipTask': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可跳过的任务', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          if (!taskActionAllowed('skip', task.status)) {
+            return reject('BAD_REQUEST', taskActionDeniedText(task, 'skip'), sessionId)
+          }
+
+          const at = now()
+          let next = withTask(state, task.id, (item) => {
+            const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+            return { ...rest, status: 'skipped' as const }
+          })
+          const released: string[] = []
+          for (const child of next.plan.tasks) {
+            if (child.status !== 'blocked' || !child.dependsOn.includes(task.id)) continue
+            const statusById = new Map(next.plan.tasks.map((item) => [item.id, item.status]))
+            const unsatisfied = child.dependsOn.filter((dep) => !depSatisfied(statusById.get(dep) ?? 'pending'))
+            if (unsatisfied.length > 0) continue
+            released.push(child.id)
+            next = withTask(next, child.id, (item) => {
+              const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+              return { ...rest, status: 'pending' as const }
+            })
+          }
+
+          next = releaseScopes(next, task.id, at)
+          const notices = [`任务 ${task.id} 已跳过（${TASK_STATUS_LABELS[task.status]} → ${TASK_STATUS_LABELS.skipped}）`]
+          if (released.length > 0) notices.push(`下游 ${released.join('、')} 解除阻塞（依赖视为满足）`)
+          saveState(withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })))
+          return accept(sessionId, notices)
+        }
+
+        /**
+         * 改验收命令（r11 AC-26）：空串拒绝并返回三条模板全文（`emptyAcceptanceError` 单点生成，
+         * 与工具入口 `tools.ts` 的整批拒绝是同一份文案）。
+         *
+         * 只改 `acceptance`：已落盘的 `evidence` 一字不动 —— 那是「上次门禁跑的是什么」的历史事实。
+         */
+        case 'updateAcceptance': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可改验收的任务', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          if (!taskActionAllowed('edit-acceptance', task.status)) {
+            return reject('BAD_REQUEST', taskActionDeniedText(task, 'edit-acceptance'), sessionId)
+          }
+          const acceptance = action.acceptance.trim()
+          if (acceptance === '') {
+            return reject('BAD_REQUEST', emptyAcceptanceError([{ id: task.id, title: task.title }]), sessionId)
+          }
+          saveState(withTask(state, task.id, (item) => ({ ...item, acceptance })))
+          return accept(sessionId, [
+            `任务 ${task.id} 的验收命令已更新（当前状态：${TASK_STATUS_LABELS[task.status]}）`,
+          ])
         }
 
         case 'message': {

@@ -578,6 +578,330 @@ export const AUTO_TEAM_CSS = `
   flex: 0 0 auto;
 }
 
+/* ═════════ r11：写域占用 / 等待条 / 三动作 / 改验收浮层 / 执行痕迹 ═════════
+ * 三条纪律（DESIGN §0）：
+ *  1. 字号一律 font 简写（--dsw-font-* 是复合值，写 font-size 是无效声明）；
+ *  2. 颜色只用语义 token；等待/取消/跳过是琥珀或中性，**不用红**；
+ *  3. 等待原因、占用原因、留痕原因不 clamp 关键信息（留痕原因按设计单行省略 120 字）。 */
+
+/* 任务卡是浮层的定位上下文（改验收浮层绝对定位在卡内）。 */
+[data-auto-team-plan] [data-plan-row] { position: relative; }
+/* 等待写域：左 3px 琥珀竖条，阴影保留（它不是异常，只是被挡住了）。 */
+[data-auto-team-plan] [data-plan-row][data-status="waiting"] {
+  border-left: 3px solid var(--dsw-alias-state-warn-primary, #b58900);
+  padding-left: 10px;
+}
+[data-auto-team-plan] [data-task-status-badge][data-status="waiting"] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #b58900) 45%, transparent);
+}
+/* 动作成功后的 300ms 闪烁：只改描边，尺寸不动（否则整页会跳）。 */
+[data-auto-team-plan] [data-plan-row][data-flash="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 60%, transparent);
+  transition: border-color 120ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-plan] [data-plan-row][data-editing="true"] {
+  z-index: 2;
+  box-shadow: var(--dsw-shadow-lv3, 0 8px 24px color-mix(in srgb, currentColor 18%, transparent));
+}
+
+/* 等待条（acceptance 与 foot 之间）：快照原文，不截断。 */
+[data-auto-team-plan] [data-wait-reason] {
+  margin: 0;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-2, color-mix(in srgb, currentColor 6%, transparent));
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  overflow-wrap: anywhere;
+}
+
+/* 写域占用区块（动作行与任务表之间；空数组时组件根本不渲染）。 */
+[data-auto-team-plan] [data-scope-locks] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-md, 12px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+[data-auto-team-plan] [data-locks-head] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  letter-spacing: 0.02em;
+}
+[data-auto-team-plan] [data-lock-list] {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+[data-auto-team-plan] [data-lock-row] {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  min-width: 0;
+}
+[data-auto-team-plan] [data-lock-path] {
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  overflow-wrap: anywhere;
+}
+[data-auto-team-plan] [data-lock-holder] {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  white-space: nowrap;
+}
+[data-auto-team-plan] [data-lock-waiters] {
+  flex: 1 1 100%;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 1px dashed var(--dsw-alias-border-l2, currentColor);
+}
+[data-auto-team-plan] [data-lock-waiter] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  overflow-wrap: anywhere;
+}
+
+/* 三动作（foot 末尾整组）：取消 → 跳过 → 验收。 */
+[data-auto-team-plan] [data-task-actions] {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+[data-auto-team-plan] [data-task-action] {
+  box-sizing: border-box;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/20px sans-serif);
+  cursor: pointer;
+  transition: background-color 120ms var(--ds-ease-in-out, ease), border-color 120ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-plan] [data-task-action]:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+  border-color: var(--dsw-alias-border-l3, currentColor);
+}
+[data-auto-team-plan] [data-task-action]:active:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-active, color-mix(in srgb, currentColor 14%, transparent));
+}
+[data-auto-team-plan] [data-task-action]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #2f6feb);
+  outline-offset: 1px;
+}
+[data-auto-team-plan] [data-task-action="cancel"]:hover:not(:disabled) {
+  color: var(--dsw-alias-state-error-primary, #d33);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d33) 45%, transparent);
+}
+[data-auto-team-plan] [data-task-action="edit-acceptance"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 40%, transparent);
+  color: var(--dsw-alias-state-business-primary, #2f6feb);
+}
+[data-auto-team-plan] [data-task-action]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+[data-auto-team-plan] [data-task-action-spinner] {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 4px;
+  vertical-align: -2px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  animation: dsh-auto-team-spin 800ms linear infinite;
+}
+
+/* 改验收浮层（卡内绝对浮层，不是模态）：宽 272 / 最小高 196。 */
+[data-auto-team-plan] [data-acceptance-editor] {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 6;
+  width: 272px;
+  max-width: calc(100% - 16px);
+  min-height: 196px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l3, currentColor);
+  border-radius: var(--dsw-radius-md, 12px);
+  background: var(--dsw-alias-bg-layer-2, #fff);
+  box-shadow: var(--dsw-shadow-lv3, 0 8px 24px color-mix(in srgb, currentColor 18%, transparent));
+}
+[data-auto-team-plan] [data-acceptance-editor-head] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+[data-auto-team-plan] [data-acceptance-editor-title] {
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  font-weight: 600;
+}
+[data-auto-team-plan] [data-acceptance-input] {
+  width: 100%;
+  height: 96px;
+  box-sizing: border-box;
+  resize: none;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+}
+[data-auto-team-plan] [data-acceptance-input]:focus {
+  outline: 2px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 40%, transparent);
+  outline-offset: 1px;
+  border-color: var(--dsw-alias-state-business-primary, #2f6feb);
+}
+[data-auto-team-plan] [data-acceptance-hint] {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-auto-team-plan] [data-acceptance-actions] {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: auto;
+}
+[data-auto-team-plan] [data-acceptance-actions] button {
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xs-13, 13px/22px sans-serif);
+  cursor: pointer;
+}
+[data-auto-team-plan] [data-acceptance-actions] button:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+  border-color: var(--dsw-alias-border-l3, currentColor);
+}
+[data-auto-team-plan] [data-acceptance-actions] button:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, #2f6feb);
+  outline-offset: 1px;
+}
+[data-auto-team-plan] [data-acceptance-save] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 55%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2f6feb) 14%, transparent);
+  color: var(--dsw-alias-state-business-primary, #2f6feb);
+  font-weight: 600;
+}
+[data-auto-team-plan] [data-acceptance-actions] button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* 执行痕迹（页面最末；审计不是告警，不用红/琥珀、不加 badge）。 */
+[data-auto-team-plan] [data-deviation] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1, currentColor);
+}
+[data-auto-team-plan] [data-deviation-head] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-auto-team-plan] [data-deviation-list] {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+[data-auto-team-plan] [data-deviation-row] {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  padding: 1px 2px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  transition: background-color 100ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-plan] [data-deviation-row]:hover {
+  background: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));
+}
+[data-auto-team-plan] [data-deviation-at] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-variant-numeric: tabular-nums;
+}
+[data-auto-team-plan] [data-deviation-tool] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+}
+[data-auto-team-plan] [data-deviation-paths] {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  overflow-wrap: anywhere;
+}
+[data-auto-team-plan] [data-deviation-count] {
+  color: var(--dsw-alias-state-warn-primary, #b58900);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-variant-numeric: tabular-nums;
+}
+[data-auto-team-plan] [data-deviation-reason] {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 360px) {
+  [data-auto-team-plan] [data-acceptance-editor] {
+    left: 4px;
+    right: 4px;
+    width: auto;
+    max-width: none;
+  }
+}
+
+
 /* ───────────────── 成员页 ───────────────── */
 [data-auto-team-members] { display: flex; flex-direction: column; gap: 8px; }
 [data-auto-team-member] {
@@ -1817,9 +2141,11 @@ export const AUTO_TEAM_CSS = `
 /* 无障碍：系统要求减少动效时，骨架/呼吸/旋转全部停下（尺寸与文案不变） */
 @media (prefers-reduced-motion: reduce) {
   [data-skill-dialog] [data-skill-body-skeleton] > span,
-  [data-auto-team-option] [data-option-spinner] {
+  [data-auto-team-option] [data-option-spinner],
+  [data-auto-team-plan] [data-task-action-spinner] {
     animation: none;
   }
+  [data-auto-team-plan] [data-plan-row][data-flash="true"] { transition: none; }
 }
 
 /* 右栏页签标题（keyed pane.tab.title）：宿主画 hover/active，这里只保证不换行不撑高 */

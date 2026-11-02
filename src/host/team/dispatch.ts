@@ -24,10 +24,12 @@ import {
   MAX_CONCURRENT_LIMIT,
   RESUME_DEBOUNCE_MS,
 } from '../config.ts'
-import { readyTasks } from '../plan/graph.ts'
+import { depSatisfied, readyTasks } from '../plan/graph.ts'
+import { waitReasonOf } from '../plan/scope.ts'
 import { handoffBodiesFor, handoffMessages } from './handoff.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { auditRoute, preflightRoutes, type RoutePort } from './route.ts'
+import { applyScopeWaits, releaseScopes, waitFor } from './scope-locks.ts'
 
 /** 创建成员的入参：名字是确定性的，路由是角色声明的（宿主可能不支持 model，见 L1）。 */
 export interface SpawnInput {
@@ -352,6 +354,15 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     return { state: next, started, skipped, errors, renamed }
   }
 
+  // r11 F4：先把等待关系按当前持锁情况重算一遍（幂等）。
+  // 放在派发闸门**之后**：暂停/终止的计划不允许被改状态（恢复时按原状态还原，AC-10）。
+  // 放在成员名单**之前**：等待判定只看 plan.tasks 的 status + writeScopes，与成员死活无关。
+  const settledWaits = applyScopeWaits(next, now())
+  if (settledWaits !== next) {
+    next = settledWaits
+    changed = true
+  }
+
   // 成员名单：拿不到就**保守当作成员都还活着**，宁可少派一个，也不重复建人。
   let members: HostMember[] | null = null
   try {
@@ -371,7 +382,10 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   // 宿主重启/成员被杀之后，interrupted 任务只有靠一次显式 dispatch 才能用同一个确定性名字重建成员。
   // 少了这一段，任务会永远停在 interrupted —— 既派不出去，也不会自己变回 running。
   const depsDone = (task: (typeof next.plan.tasks)[number]): boolean =>
-    task.dependsOn.every((dep) => next.plan.tasks.find((item) => item.id === dep)?.status === 'done')
+    task.dependsOn.every((dep) => {
+      const upstream = next.plan.tasks.find((item) => item.id === dep)
+      return upstream !== undefined && depSatisfied(upstream.status)
+    })
   const recoverable = next.plan.tasks
     .filter((task) => task.status === 'interrupted' && depsDone(task))
     .map((task) => task.id)
@@ -383,6 +397,8 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
 
   if (slots <= 0) {
     for (const taskId of ready) skipped.push({ taskId, reason: 'CONCURRENCY_FULL' })
+    // 等待关系可能刚被重算过（waiting → pending），必须落盘，否则下一轮又要算一遍。
+    if (changed) deps.store.save(next)
     return { state: next, started, skipped, errors, renamed }
   }
 
@@ -406,12 +422,28 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     if (!task) continue
 
     // 依赖未过门禁（防御性二次校验）：置 blocked，且**不算一次派发尝试**。
+    // skipped 视为依赖满足的口径只在 graph.depSatisfied 里判（AC-26），这里复用同一函数。
     const unfinished = task.dependsOn.filter((dep) => {
       const upstream = next.plan.tasks.find((item) => item.id === dep)
-      return !upstream || upstream.status !== 'done'
+      return !upstream || !depSatisfied(upstream.status)
     })
     if (unfinished.length > 0) {
       next = patchTask(next, taskId, { status: 'blocked' })
+      changed = true
+      continue
+    }
+
+    // r11 AC-14：写域正被别人占着 → 先排队：不 spawn、**不扣并发位**、不计入 running。
+    // 位置刻意在「依赖校验」之后、「并发位判定」之前：
+    //  - 依赖没满足的任务该显示 blocked，不是 waiting（waiting 的语义是「轮到我了但文件被占」）；
+    //  - 等待不是「并发满了」，面板要能回答「在等谁、等哪条路径」，所以必须先于 slots 判定。
+    const conflict = waitFor(next, task, started)
+    if (conflict) {
+      next = patchTask(next, taskId, {
+        status: 'waiting',
+        waitingOn: [conflict.holderTaskId],
+        waitReason: waitReasonOf(conflict.holderTaskId, conflict.path),
+      })
       changed = true
       continue
     }
@@ -601,6 +633,8 @@ export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<Resu
       // 没有 binding 的「运行中」只可能是脏数据：标中断，等人工/重新派发。
       if (task.status !== 'interrupted') {
         next = patchTask(next, task.id, { status: 'interrupted' })
+        // r11 AC-15：转 interrupted 是终态转换 → 立刻释放写域（否则等待者永远等不到）。
+        next = releaseScopes(next, task.id, now())
         changedCount += 1
       } else {
         skipped += 1
@@ -619,6 +653,8 @@ export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<Resu
             item.taskId === task.id && !item.retired ? { ...item, retired: true } : item,
           ),
         }
+        // r11 AC-15：同上，终态转换即释放写域。
+        next = releaseScopes(next, task.id, now())
         changedCount += 1
       } else {
         skipped += 1
@@ -670,6 +706,10 @@ export function applyReceipt(
   const at = now ?? Date.now()
   const task = state.plan.tasks.find((item) => item.id === taskId)
   if (!task) return state
+  // r11 AC-15/AC-18：只有**真的从非终态转成终态**才释放写域并通知等待者。
+  // 判据取「进入本函数时的状态」：重放一条 done 回执（QA 的幂等探针会连发两次）时
+  // wasTerminal 已经为 true，不会写出第二条释放通知。
+  const wasTerminal = isTerminalTaskStatus(task.status)
 
   const attempts = task.attempts ?? 0
   const evidence = receipt.evidence ?? task.evidence
@@ -707,7 +747,15 @@ export function applyReceipt(
     }),
   )
 
+  // r11 AC-15：进入终态立即释放写域（done/failed/cancelled/skipped/interrupted 五态同待遇）。
+  // 只在该任务**原本不是终态**时做：重放回执不能二次唤醒等待者。
+  const settledTask = next.plan.tasks.find((item) => item.id === taskId)
+  if (!wasTerminal && settledTask && isTerminalTaskStatus(settledTask.status)) {
+    next = releaseScopes(next, taskId, at)
+  }
+
   // done 后解锁下游：blocked → pending，让下一轮 dispatch 自然取到。
+  // skipped 也算满足（AC-26）：用户显式跳过一条任务，下游必须能继续，否则整条计划被卡死。
   if (receipt.verdict === 'done') {
     next = {
       ...next,
@@ -715,9 +763,10 @@ export function applyReceipt(
         ...next.plan,
         tasks: next.plan.tasks.map((item) => {
           if (item.status !== 'blocked') return item
-          const allDone = item.dependsOn.every(
-            (dep) => next.plan.tasks.find((candidate) => candidate.id === dep)?.status === 'done',
-          )
+          const allDone = item.dependsOn.every((dep) => {
+            const upstream = next.plan.tasks.find((candidate) => candidate.id === dep)
+            return upstream !== undefined && depSatisfied(upstream.status)
+          })
           return allDone ? { ...item, status: 'pending' as const } : item
         }),
       },
@@ -754,7 +803,9 @@ export function applyReceipt(
   }
 
   // 全部终态 → 计划终止（面板胶囊才会从「运行中」翻到「已完成/有失败」）。
-  const allSettled = next.plan.tasks.every((item) => item.status === 'done' || item.status === 'failed')
+  // 口径：done/failed/cancelled/skipped 都算「这条不会再跑了」；
+  // interrupted **不算**——它的出路是续聊或改验收后重派，把计划终止掉会让恢复失去入口。
+  const allSettled = next.plan.tasks.every((item) => SETTLED_PLAN_STATUSES.has(item.status))
   if (allSettled && next.plan.tasks.length > 0) {
     next = { ...next, plan: { ...next.plan, status: 'terminated' } }
   }
@@ -774,6 +825,33 @@ function gateSummary(task: PlanTask, evidence: PlanTask['evidence'], prefix: str
 
 function liveBinding(state: RunState, taskId: string) {
   return state.bindings.find((item) => item.taskId === taskId && !item.retired)
+}
+
+/**
+ * 终态集合（r11 AC-15）：进入即释放写域。
+ *
+ * `interrupted` 也在里面：成员进程已死，它不会再改文件，占着写域只会让等待者永远等下去。
+ * 但它**不**让计划收口（见 SETTLED_PLAN_STATUSES）——中断的任务还能被续聊救回来。
+ */
+const TERMINAL_TASK_STATUSES: ReadonlySet<PlanTask['status']> = new Set<PlanTask['status']>([
+  'done',
+  'failed',
+  'cancelled',
+  'skipped',
+  'interrupted',
+])
+
+/** 计划可以收口的任务状态（done/failed/cancelled/skipped）：interrupted 不算。 */
+const SETTLED_PLAN_STATUSES: ReadonlySet<PlanTask['status']> = new Set<PlanTask['status']>([
+  'done',
+  'failed',
+  'cancelled',
+  'skipped',
+])
+
+/** 任务是否已进入终态（写域该释放了）。 */
+export function isTerminalTaskStatus(status: PlanTask['status']): boolean {
+  return TERMINAL_TASK_STATUSES.has(status)
 }
 
 function patchTask(state: RunState, taskId: string, patch: Partial<PlanTask>): RunState {

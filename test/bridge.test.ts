@@ -22,6 +22,7 @@ import { createRoleRepo } from '../src/host/roles/repo.ts'
 import { createSettingsRepo } from '../src/host/settings.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { NOT_ENABLED_MESSAGE, buildToolSpecs, sessionOf } from '../src/host/tools.ts'
+import { createDeviationRecorder } from '../src/host/team/deviation.ts'
 
 const NOW = 1_700_000_000_000
 const SESSION = 'sess-t4'
@@ -485,11 +486,11 @@ test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
   store.save(stateOf())
 })
 
-test('tools：7 个工具、未启用统一文案、dispatch 强制 runId（AC-30）', async () => {
+test('tools：8 个工具、未启用统一文案、dispatch 强制 runId（AC-30）', async () => {
   const { bridge, store, roles } = setup()
   const specs = buildToolSpecs({ store, roles, bridge, now: () => NOW })
 
-  assert.equal(specs.length, 7)
+  assert.equal(specs.length, 8)
   assert.deepEqual(
     specs.map((spec) => spec.name),
     [
@@ -500,6 +501,7 @@ test('tools：7 个工具、未启用统一文案、dispatch 强制 runId（AC-3
       'auto_team_receipt',
       'auto_team_memory',
       'auto_team_role',
+      'auto_team_add_tasks',
     ],
   )
   assert.equal(sessionOf({ sessionId: SESSION }), SESSION)
@@ -1092,4 +1094,270 @@ test('r10：装配后快照的技能投影与模型清单来自注入的仓储/�
   assert.deepEqual(snapshot.skills, [{ id: 'review', title: '代码审查', description: '一句话', source: 'imported', modified: false }])
   assert.equal(snapshot.modelCatalog?.status, 'ready')
   assert.equal(snapshot.modelCatalog?.options[0]?.model, 'v4')
+})
+
+// ---------------------------------------------------------------------------
+// r11 F8：单任务三动作（AC-25 / AC-26）+ 快照两字段（AC-19 / AC-24）
+// ---------------------------------------------------------------------------
+
+/** 两个任务：t1 是上游，t2 依赖 t1（用于验「下游转 blocked / 解除阻塞」）。 */
+function pairState(t1: Partial<PlanTask> = {}, t2: Partial<PlanTask> = {}): RunState {
+  return stateOf({
+    plan: planOf({
+      status: 'dispatching',
+      tasks: [taskOf('t1', t1), taskOf('t2', { dependsOn: ['t1'], ...t2 })],
+    }),
+    bindings: [bindingOf(), bindingOf({ taskId: 't2', memberId: 'member-2', name: '开发-2' })],
+  })
+}
+
+test('r11：快照必给 scopeLocks 与 deviations（缺省空数组，有内容时原样投影）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-dev-'))
+  const recorder = createDeviationRecorder({
+    file: join(dir, 'deviations.jsonl'),
+    sessionId: SESSION,
+    now: () => NOW,
+  })
+  const { bridge, store } = setup({ deviations: recorder })
+  await enable(bridge)
+
+  const bare = bridge.snapshot(SESSION)
+  assert.deepEqual(bare.scopeLocks, [], '没有运行中的写域时必须是空数组而不是 undefined')
+  assert.deepEqual(bare.deviations, [], '没有留痕时必须是空数组')
+
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [
+          taskOf('t1', { status: 'running', writeScopes: ['src/host'] }),
+          taskOf('t2', {
+            status: 'waiting',
+            writeScopes: ['src/host/bridge.ts'],
+            waitingOn: ['t1'],
+            waitReason: '等待 t1 释放 src/host',
+          }),
+        ],
+      }),
+      bindings: [bindingOf(), bindingOf({ taskId: 't2', memberId: 'member-2', name: '开发-2' })],
+    }),
+  )
+  recorder.record({ toolName: 'write', args: { path: 'src/host/bridge.ts', content: 'x'.repeat(200) } })
+
+  const snapshot = bridge.snapshot(SESSION)
+  const locks = snapshot.scopeLocks ?? []
+  const deviations = snapshot.deviations ?? []
+  assert.equal(locks.length, 1)
+  assert.equal(locks[0]?.path, 'src/host')
+  assert.equal(locks[0]?.holderTaskId, 't1')
+  assert.equal(locks[0]?.holderMember, '开发-1')
+  assert.equal(locks[0]?.waiters[0]?.taskId, 't2')
+  assert.equal(locks[0]?.waiters[0]?.reason, '等待 t1 释放 src/host', '等待原因原样透传')
+  assert.equal(deviations.length, 1)
+  assert.equal(deviations[0]?.toolName, 'write')
+  assert.deepEqual(deviations[0]?.paths, ['src/host/bridge.ts'])
+  const reason = deviations[0]?.reason ?? ''
+  assert.ok(reason.length > 0 && reason.length <= 120, '留痕理由必须存在且不超过 120 字')
+  assert.ok(!reason.includes('xxxx'), '留痕只记路径，绝不带文件正文')
+})
+
+test('r11 cancelTask 允许：pending → cancelled，下游转 blocked 且带等待原因', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(pairState({ status: 'pending' }, { status: 'blocked' }))
+
+  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1', reason: '需求方撤回' })
+  assert.equal(result.rejected, undefined)
+  assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'cancelled')
+  const downstream = result.snapshot.tasks.find((task) => task.id === 't2')
+  assert.equal(downstream?.status, 'blocked', '下游必须转为阻塞')
+  assert.equal(downstream?.waitReason, '上游 t1 已取消', '等待原因逐字由宿主生成')
+  assert.deepEqual(downstream?.waitingOn, ['t1'])
+  assert.ok((result.notices ?? []).some((text) => text.includes('t1') && text.includes('已取消')))
+  assert.ok(
+    (result.notices ?? []).some((text) => text.includes('需求方撤回')),
+    '取消理由必须落进 notice（否则账本里查不到为什么取消）',
+  )
+})
+
+test('r11 cancelTask 允许：running → cancelled 并按成员名尽力中断', async () => {
+  const interrupted: string[] = []
+  const { bridge, store } = setup({
+    interruptMember: async (name) => {
+      interrupted.push(name)
+      return { ok: true }
+    },
+  })
+  await enable(bridge)
+  store.save(pairState({ status: 'running' }, { status: 'blocked' }))
+
+  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  assert.equal(result.rejected, undefined)
+  assert.deepEqual(interrupted, ['开发-1'], 'running 任务取消必须中断对应成员')
+  assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'cancelled')
+  assert.ok((result.notices ?? []).some((text) => text.includes('已中断成员')))
+})
+
+test('r11 cancelTask 释放写域：等待者收到一条释放消息并回到 pending', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  // 等待者**不依赖** t1（纯写域冲突）：依赖 t1 的任务会按 AC-26 转 blocked，那与释放无关。
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [
+          taskOf('t1', { status: 'running', writeScopes: ['src/host/bridge.ts'] }),
+          taskOf('t2', {
+            status: 'waiting',
+            writeScopes: ['src/host/bridge.ts'],
+            waitingOn: ['t1'],
+            waitReason: '等待 t1 释放 src/host/bridge.ts',
+          }),
+        ],
+      }),
+      bindings: [bindingOf(), bindingOf({ taskId: 't2', memberId: 'member-2', name: '开发-2' })],
+    }),
+  )
+
+  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  const waiter = result.snapshot.tasks.find((task) => task.id === 't2')
+  assert.equal(waiter?.status, 'pending', '持有者取消后等待者必须被放回 pending')
+  assert.equal(waiter?.waitReason, undefined)
+  const released = result.snapshot.messages.filter((message) => (message.messageId ?? '').startsWith('rel-t1-t2-'))
+  assert.equal(released.length, 1, '释放通知必须落账且恰好一条')
+})
+
+test('r11 cancelTask 拒绝：done 不可取消，文案含任务 id 与状态中文', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'done' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /t1/)
+  assert.match(result.rejected?.message ?? '', /已通过/)
+  assert.equal(result.snapshot.tasks[0]?.status, 'done', '被拒时状态不变')
+})
+
+test('r11 cancelTask 拒绝：gate 正在跑门禁不可取消（出路是改验收）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'gate' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /t1/)
+  assert.match(result.rejected?.message ?? '', /门禁中/)
+})
+
+test('r11 skipTask 允许：pending → skipped，依赖它的下游解除阻塞', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(pairState({ status: 'pending' }, { status: 'blocked' }))
+
+  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  assert.equal(result.rejected, undefined)
+  assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'skipped')
+  assert.equal(result.snapshot.tasks.find((task) => task.id === 't2')?.status, 'pending', '依赖视为满足')
+})
+
+test('r11 skipTask 允许：waiting → skipped（等待中可直接跳过）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(pairState({ status: 'waiting', waitingOn: ['t2'], waitReason: '等待 t2 释放 a.ts' }, { status: 'running' }))
+
+  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  assert.equal(result.rejected, undefined)
+  const skipped = result.snapshot.tasks.find((task) => task.id === 't1')
+  assert.equal(skipped?.status, 'skipped')
+  assert.equal(skipped?.waitReason, undefined, '跳过必须清掉等待原因')
+})
+
+test('r11 skipTask 拒绝：running 请先取消', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'running' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /t1/)
+  assert.match(result.rejected?.message ?? '', /运行中/)
+})
+
+test('r11 skipTask 拒绝：failed 不可跳过（请重跑或取消）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'failed' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /t1/)
+  assert.match(result.rejected?.message ?? '', /失败/)
+})
+
+test('r11 updateAcceptance 允许：pending 改写验收命令并 trim', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'pending' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: '  pnpm typecheck  ' })
+  assert.equal(result.rejected, undefined)
+  assert.equal(result.snapshot.tasks[0]?.acceptance, 'pnpm typecheck')
+})
+
+test('r11 updateAcceptance 允许：interrupted 可改验收后重派', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'interrupted' })] }) }))
+
+  const result = await bridge.act(SESSION, {
+    type: 'updateAcceptance',
+    taskId: 't1',
+    acceptance: "grep -RIn --fixed-strings 'deriveScopeLocks' src/host >/dev/null",
+  })
+  assert.equal(result.rejected, undefined)
+  assert.match(result.snapshot.tasks[0]?.acceptance ?? '', /deriveScopeLocks/)
+})
+
+test('r11 updateAcceptance 拒绝：done 不可改（不改已完成证据）', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'done' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /t1/)
+  assert.match(result.rejected?.message ?? '', /已通过/)
+})
+
+test('r11 updateAcceptance 拒绝：cancelled 不可改', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'cancelled' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  assert.match(result.rejected?.message ?? '', /已取消/)
+})
+
+test('r11 updateAcceptance 拒绝：空白验收返回三条模板且不落盘', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'pending' })] }) }))
+
+  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: '   ' })
+  assert.equal(result.rejected?.code, 'BAD_REQUEST')
+  const message = result.rejected?.message ?? ''
+  assert.match(message, /t1/)
+  assert.match(message, /pnpm typecheck/)
+  assert.match(message, /grep -RIn --fixed-strings/)
+  assert.equal(result.snapshot.tasks[0]?.acceptance, 'exit 0', '被拒时原验收命令不变')
+})
+
+test('r11 三动作都走既有 POST /act 路由（不新增路由）', () => {
+  const routes = buildHttpRoutes({ bridge: createBridge(setup().deps), defaultSessionId: () => SESSION })
+  assert.equal(routes.length, 3, '路由数必须仍是 3')
+  const paths = routes.map((route) => route.path)
+  assert.deepEqual(paths.filter((path) => path.includes('/act')).length, 1)
 })

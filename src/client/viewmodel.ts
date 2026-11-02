@@ -11,8 +11,11 @@
  *  2. 数据只读不造 —— 缺字段一律给保守默认值（见 viewExtras），绝不用 `!` 强断。
  *  3. 纯函数 —— 同样的输入永远同样的输出，时间由调用方传入（便于单测固定）。
  */
+import { TASK_STATUS_LABELS, taskActionAllowed, taskActionDisabledReason } from '../shared/task-actions.ts'
+import type { TaskActionName } from '../shared/task-actions.ts'
 import type {
   CaptainModelView,
+  DeviationView,
   MemberStatus,
   MemberView,
   PanelAction,
@@ -20,6 +23,7 @@ import type {
   PlanStatus,
   PlanTask,
   RoleModelRoute,
+  ScopeLockView,
   TaskStatus,
 } from '../shared/types.ts'
 
@@ -41,21 +45,33 @@ export interface Badge {
   tone: BadgeTone
 }
 
-/** 成员状态（7 态）+ 任务专属态（3 个）的完整映射表 —— **全项目唯一一份**。 */
+/**
+ * 任务状态（13 态）→ 徽标三元组：**文案一律读 `TASK_STATUS_LABELS`**（AC-27）。
+ *
+ * 宿主拒绝文案与面板徽标从同一张表派生；这里只补「图标 + 色调」两个视觉维度，
+ * 不再写第二份中文。r11 新增 waiting / cancelled / skipped：等待是琥珀（被挡住，不是失败），
+ * 取消与跳过是中性 —— 用户主动行为不该标红。
+ */
+const TASK_BADGES: Record<string, Badge> = {
+  running: { icon: '●', text: TASK_STATUS_LABELS.running, tone: 'business' },
+  blocked: { icon: '⛓', text: TASK_STATUS_LABELS.blocked, tone: 'warn' },
+  rework: { icon: '↺', text: TASK_STATUS_LABELS.rework, tone: 'warn' },
+  done: { icon: '✓', text: TASK_STATUS_LABELS.done, tone: 'success' },
+  failed: { icon: '✕', text: TASK_STATUS_LABELS.failed, tone: 'danger' },
+  interrupted: { icon: '⚡', text: TASK_STATUS_LABELS.interrupted, tone: 'danger' },
+  pending: { icon: '·', text: TASK_STATUS_LABELS.pending, tone: 'neutral' },
+  ready: { icon: '▸', text: TASK_STATUS_LABELS.ready, tone: 'business' },
+  gate: { icon: '⚖', text: TASK_STATUS_LABELS.gate, tone: 'warn' },
+  paused: { icon: '⏸', text: TASK_STATUS_LABELS.paused, tone: 'warn' },
+  waiting: { icon: '⏳', text: TASK_STATUS_LABELS.waiting, tone: 'warn' },
+  cancelled: { icon: '⊘', text: TASK_STATUS_LABELS.cancelled, tone: 'neutral' },
+  skipped: { icon: '↷', text: TASK_STATUS_LABELS.skipped, tone: 'neutral' },
+}
+
+/** 成员状态（7 态）∪ 任务状态（13 态）的完整映射表 —— **全项目唯一一份**。 */
 const BADGES: Record<string, Badge> = {
-  running: { icon: '●', text: '运行中', tone: 'business' },
+  ...TASK_BADGES,
   idle: { icon: '○', text: '空闲', tone: 'neutral' },
-  blocked: { icon: '⛓', text: '阻塞', tone: 'warn' },
-  rework: { icon: '↺', text: '待返工', tone: 'warn' },
-  done: { icon: '✓', text: '已通过', tone: 'success' },
-  failed: { icon: '✕', text: '失败', tone: 'danger' },
-  interrupted: { icon: '⚡', text: '已中断', tone: 'danger' },
-  // 任务侧独有（MemberStatus 里没有，但 PlanTab 的任务行要显示）
-  pending: { icon: '·', text: '待派发', tone: 'neutral' },
-  ready: { icon: '▸', text: '就绪', tone: 'business' },
-  gate: { icon: '⚖', text: '门禁中', tone: 'warn' },
-  // r7 新增：暂停态（AC-9/AC-14）。琥珀 + ⏸ —— 暂停是「用户主动冻结」，不是失败，永不用红（DESIGN §0.4）。
-  paused: { icon: '⏸', text: '已暂停', tone: 'warn' },
 }
 
 const UNKNOWN_BADGE: Badge = { icon: '?', text: '未知', tone: 'neutral' }
@@ -611,22 +627,26 @@ export interface TaskProgress {
 }
 
 /**
- * `TaskStatus` 10 态 → 进度值与颜色（**全项目唯一一份**，AC-14 判据落在 progressOf 上）。
+ * `TaskStatus` 13 态 → 进度值与颜色（**全项目唯一一份**，AC-14 判据落在 progressOf 上）。
  *
  * label 一律从 `statusBadge` 取，这里**不再写第二遍中文** —— 同一状态两处文案必然漂移。
- * percent 口径：待派发 0 → 就绪 10 → 阻塞 20 → 待返工 40 → 运行中/已暂停 50 →
- * 门禁中 80 → 已通过 100；失败/已中断归 0（要重跑，进度不保留）。
+ * percent 口径：待派发 0 → 就绪 10 → 阻塞/等待 20 → 待返工 40 → 运行中/已暂停 50 →
+ * 门禁中 80 → 已通过 100；失败/已中断/已取消/已跳过归 0（要重跑，进度不保留）。
  * 已暂停取 50：暂停冻结在「中途」，既不能假装完成（100），也不能假装没开始（0）。
  */
 const TASK_PROGRESS: Record<TaskStatus, { tone: ProgressTone; percent: number }> = {
   pending: { tone: 'muted', percent: 0 },
   ready: { tone: 'muted', percent: 10 },
   blocked: { tone: 'warn', percent: 20 },
+  // r11：等待写域 = 被挡住但没失败，进度与阻塞同档；取消/跳过是用户主动行为，退回 0 且不标红。
+  waiting: { tone: 'warn', percent: 20 },
   rework: { tone: 'warn', percent: 40 },
   running: { tone: 'ok', percent: 50 },
   paused: { tone: 'warn', percent: 50 },
   gate: { tone: 'warn', percent: 80 },
   done: { tone: 'ok', percent: 100 },
+  cancelled: { tone: 'muted', percent: 0 },
+  skipped: { tone: 'muted', percent: 0 },
   failed: { tone: 'bad', percent: 0 },
   interrupted: { tone: 'bad', percent: 0 },
 }
@@ -652,7 +672,7 @@ export interface PlanStatusView {
 /**
  * `PlanStatus` 5 态 → 中文 + 颜色（AC-14 页头「完成 x/N + 计划状态」）。
  *
- * 放在 viewmodel 而不是 ui/组件里的理由：10 态中文标签的守卫判据是「只许出现在
+ * 放在 viewmodel 而不是 ui/组件里的理由：13 态中文标签的守卫判据是「只许出现在
  * viewmodel.ts」，而「已暂停」既是任务态也是计划态 —— 分两处写必然被守卫判红，也必然漂移。
  */
 const PLAN_STATUS: Record<PlanStatus, PlanStatusView> = {
@@ -667,4 +687,155 @@ const PLAN_STATUS: Record<PlanStatus, PlanStatusView> = {
 export function planStatusView(planStatus?: PlanStatus): PlanStatusView {
   if (!planStatus) return { label: '未启用', tone: 'muted' }
   return PLAN_STATUS[planStatus] ?? { label: '未启用', tone: 'muted' }
+}
+
+/* ──────── r11：单任务干预 / 写域占用 / 执行痕迹（F4~F7，DESIGN §3.3~§3.6） ──────── */
+
+/**
+ * 三个动作的按钮文案。**只允许出现在这里**：组件里再写一份「取消/跳过/验收」，
+ * aria-label 与按钮文字就会在第一次改文案时漂移。
+ */
+const TASK_ACTION_LABEL: Record<TaskActionName, string> = {
+  cancel: '取消',
+  skip: '跳过',
+  'edit-acceptance': '验收',
+}
+
+/** 按钮顺序：取消 → 跳过 → 改验收（破坏性弱的靠右，验收最靠右最不易误点）。 */
+const TASK_ACTION_ORDER: readonly TaskActionName[] = ['cancel', 'skip', 'edit-acceptance']
+
+/** 一行动作按钮的视图（disabled 与原因都从 shared 的允许表派生，客户端不再自己判状态）。 */
+export interface TaskActionView {
+  action: TaskActionName
+  label: string
+  /** 带任务 id 的全意可访问名（DESIGN §6：不能只读「取消」）。 */
+  ariaLabel: string
+  disabled: boolean
+  /** 仅 disabled 时给：宿主同一张表的拒绝文案，渲染成 title。 */
+  reason?: string
+}
+
+function actionAriaLabelOf(action: TaskActionName, taskId: string): string {
+  if (action === 'cancel') return `取消任务 ${taskId}`
+  if (action === 'skip') return `跳过任务 ${taskId}`
+  return `修改 ${taskId} 的验收命令`
+}
+
+/** 13 态 × 3 动作的 disabled 视图：**唯一来源是 `TASK_ACTION_ALLOW`**（AC-27）。 */
+export function taskActionsOf(task: PlanTask): TaskActionView[] {
+  const { status } = progressOf(task)
+  return TASK_ACTION_ORDER.map((action) => {
+    const allowed = taskActionAllowed(action, status)
+    const view: TaskActionView = {
+      action,
+      label: TASK_ACTION_LABEL[action],
+      ariaLabel: actionAriaLabelOf(action, task.id),
+      disabled: !allowed,
+    }
+    if (!allowed) {
+      const reason = taskActionDisabledReason(action, status)
+      view.reason = reason === '' ? '当前状态不允许该动作' : reason
+    }
+    return view
+  })
+}
+
+/**
+ * 等待条文案（AC-20）：**原样返回快照里的 `waitReason`**，不 trim、不拼接、不截断。
+ *
+ * 宿主已经写明「等待 t2 释放 src/host/bridge.ts」；客户端只要在它前面凑一个字，
+ * 逐字断言就会在无害重构后失效（DESIGN §0.1「零拼装」）。
+ */
+export function waitReasonOf(task: PlanTask): string {
+  const raw = (task as PlanTask & { waitReason?: unknown }).waitReason
+  return typeof raw === 'string' ? raw : ''
+}
+
+/** 写域占用里的一条等待者（label = `{taskId} · {member}（{reason}）`，reason 原文）。 */
+export interface ScopeLockWaiterView {
+  taskId: string
+  member: string
+  label: string
+  reason: string
+}
+
+/** 写域占用的一行（同一路径的多个等待者合并进 waiters，不重复渲染路径行）。 */
+export interface ScopeLockRowView {
+  path: string
+  holderTaskId: string
+  /** `{holderTaskId} · {holderMember ?? '未派成员'}` —— 客户端只做 id 与成员名的拼接。 */
+  holderLabel: string
+  waiters: ScopeLockWaiterView[]
+}
+
+function memberNameOf(member: unknown): string {
+  return typeof member === 'string' && member.trim() !== '' ? member : '未派成员'
+}
+
+/** 单条锁 → 行视图（ui.ts 的 `scopeLockRowView` 直接委托它，避免两份映射）。 */
+export function scopeLockRowOf(lock: ScopeLockView): ScopeLockRowView {
+  const holderMember = memberNameOf(lock.holderMember)
+  const waiters: ScopeLockWaiterView[] = []
+  const rawWaiters = Array.isArray(lock.waiters) ? lock.waiters : []
+  for (const waiter of rawWaiters) {
+    const taskId = str(waiter?.taskId)
+    const member = memberNameOf(waiter?.member)
+    const reason = str(waiter?.reason)
+    waiters.push({ taskId, member, label: `${taskId} · ${member}（${reason}）`, reason })
+  }
+  return {
+    path: str(lock.path),
+    holderTaskId: str(lock.holderTaskId),
+    holderLabel: `${str(lock.holderTaskId)} · ${holderMember}`,
+    waiters,
+  }
+}
+
+/** 快照 → 写域占用行；空数组返回 `[]`（组件据此渲染 0 节点，连组标题都不出现）。 */
+export function scopeLockRowsOf(snapshot: PanelSnapshot | null | undefined): ScopeLockRowView[] {
+  const locks = Array.isArray(snapshot?.scopeLocks) ? snapshot.scopeLocks : []
+  return locks.map((lock) => scopeLockRowOf(lock))
+}
+
+/** 执行痕迹的一行（时间 / 工具 / 路径 / ×N / 原因原文）。 */
+export interface DeviationRowView {
+  at: string
+  toolName: string
+  /** 多个路径用「、」连接（DESIGN §3.6）。 */
+  paths: string
+  count: number
+  /** `count > 1` 才是 `×N`，否则空串（组件据空串决定不渲染该 span）。 */
+  countLabel: string
+  reason: string
+}
+
+/** 单条留痕 → 行视图（ui.ts 的 `deviationRowView` 直接委托它）。 */
+export function deviationRowOf(record: DeviationView): DeviationRowView {
+  const paths = Array.isArray(record.paths) ? record.paths.filter((p): p is string => typeof p === 'string') : []
+  const rawCount = Number(record.count)
+  const count = Number.isFinite(rawCount) ? Math.max(1, Math.floor(rawCount)) : 1
+  return {
+    at: formatClock(record.at),
+    toolName: str(record.toolName),
+    paths: paths.join('、'),
+    count,
+    countLabel: count > 1 ? `×${count}` : '',
+    reason: str(record.reason),
+  }
+}
+
+/** 快照 → 执行痕迹行；空数组返回 `[]`（0 节点）。 */
+export function deviationRowsOf(snapshot: PanelSnapshot | null | undefined): DeviationRowView[] {
+  const records = Array.isArray(snapshot?.deviations) ? snapshot.deviations : []
+  return records.map((record) => deviationRowOf(record))
+}
+
+/**
+ * 组标题里的「亲手写了 N 次」：累加合并后的 `count`（不是记录条数）。
+ *
+ * `×N` 是「同一键 60 秒内合并了几次」的语义，所以标题的总次数必须是 `Σcount`；
+ * 用 `rows.length` 会让「10 次同键」显示成「1 次」，与 AC-24 的合并语义自相矛盾。
+ */
+export function deviationWriteCountOf(rows: readonly DeviationRowView[]): number {
+  return rows.reduce((sum, row) => sum + row.count, 0)
 }

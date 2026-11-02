@@ -44,6 +44,16 @@ export function settingsPath(home: string): string {
   return `${globalDataRoot(home)}/settings.json`
 }
 
+/**
+ * 队长留痕落点：`<home>/.dsh/auto-team/deviations.jsonl`（r11 F7）。
+ *
+ * 同样**不再拼 `.dsh`** —— `globalDataRoot` 已含；多拼一层会落到
+ * `~/.dsh/.dsh/auto-team/`，症状是「真有记录、面板永远是 0 条」。
+ */
+export function deviationsPath(home: string): string {
+  return `${globalDataRoot(home)}/deviations.jsonl`
+}
+
 /** 公共记忆目录（跨项目）。 */
 export function publicMemoryDir(home: string): string {
   return `${globalDataRoot(home)}/memory/public`

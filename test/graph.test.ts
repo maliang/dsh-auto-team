@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { blockedTasks, findCycle, readyTasks, topoLayers, validateGraph } from '../src/host/plan/graph.ts'
+import { blockedTasks, depSatisfied, findCycle, readyTasks, topoLayers, validateGraph } from '../src/host/plan/graph.ts'
 
 test('空计划被拒：给出中文原因而不是静默通过', () => {
   const result = validateGraph([])
@@ -82,3 +82,32 @@ test('topoLayers 同层可并行', () => {
   ])
   assert.deepEqual(layers, [['a', 'b'], ['c']])
 })
+
+// ── r11 · skipped 视为依赖满足（唯一判定口 depSatisfied）─────────────────────
+
+test('depSatisfied：done 与 skipped 满足，cancelled/failed/running 不满足（AC-26）', () => {
+  assert.equal(depSatisfied('done'), true)
+  assert.equal(depSatisfied('skipped'), true, '用户主动跳过 = 下游不必再等它')
+  assert.equal(depSatisfied('cancelled'), false, '取消是放弃，下游不能被顺带放行')
+  assert.equal(depSatisfied('failed'), false)
+  assert.equal(depSatisfied('interrupted'), false)
+  assert.equal(depSatisfied('running'), false)
+  assert.equal(depSatisfied('pending'), false)
+})
+
+test('readyTasks / blockedTasks：skipped 满足依赖，cancelled 不满足', () => {
+  const skipped = [
+    { id: 't1', dependsOn: [], status: 'skipped' },
+    { id: 't2', dependsOn: ['t1'], status: 'pending' },
+  ]
+  assert.deepEqual(readyTasks(skipped), ['t2'], '上游 skipped 时下游必须就绪')
+  assert.deepEqual(blockedTasks(skipped), [])
+
+  const cancelled = [
+    { id: 't1', dependsOn: [], status: 'cancelled' },
+    { id: 't2', dependsOn: ['t1'], status: 'pending' },
+  ]
+  assert.deepEqual(readyTasks(cancelled), [], '上游 cancelled 时下游保持阻塞')
+  assert.deepEqual(blockedTasks(cancelled), [{ id: 't2', waitingOn: ['t1'] }])
+})
+

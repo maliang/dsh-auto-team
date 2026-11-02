@@ -15,6 +15,7 @@ import { createWriteStream, existsSync, mkdirSync, writeFileSync } from 'node:fs
 import { join } from 'node:path'
 import type { GateEvidence, PlanTask } from '../../shared/types.ts'
 import { GATE_FLUSH_TIMEOUT_MS, GATE_TAIL_CHARS, GATE_TIMEOUT_MS } from '../config.ts'
+import { ACCEPTANCE_TEMPLATE_BLOCK } from '../plan/acceptance.ts'
 
 export interface GateOutcome {
   ok: boolean
@@ -40,8 +41,21 @@ export type GateExec = (
   opts: { cwd: string; timeoutMs: number; logPath: string },
 ) => Promise<{ code: number | null; tail: string }>
 
-/** 空验收命令的证据文案（与 bridge 的 GATE_FAILED 提示保持一致口径）。 */
-export const EMPTY_ACCEPTANCE_TAIL = '该任务没有验收命令，需要人工确认后放行'
+/**
+ * 空验收命令的**原始**文案（祖先版本逐字保留）。
+ *
+ * 单独抽出来是为了让「旧句逐字在最前」这一条成为结构事实：AC-7 要求旧句原文在前、
+ * 可直接抄的模板随后，两者拼成的才是证据尾部。
+ */
+export const EMPTY_ACCEPTANCE_SENTENCE = '该任务没有验收命令，需要人工确认后放行'
+
+/**
+ * 空验收时的完整证据尾部：旧句**逐字在最前**，随后追加三条可执行模板（AC-4/AC-7）。
+ *
+ * 模板原文只有 `ACCEPTANCE_TEMPLATE_BLOCK` 一份来源（工具提示、拒绝文案、门禁三处共用），
+ * 这里只做拼接 —— 复制第二份就会让「逐字断言」在第一次改模板时互相打架。
+ */
+export const EMPTY_ACCEPTANCE_TAIL = `${EMPTY_ACCEPTANCE_SENTENCE}\n${ACCEPTANCE_TEMPLATE_BLOCK}`
 
 /** 跑门禁：全量日志落盘，只把尾部带回内存。 */
 export async function runGate(task: PlanTask, deps: GateDeps): Promise<GateOutcome> {

@@ -29,6 +29,7 @@ import {
   type SpawnInput,
 } from '../src/host/team/dispatch.ts'
 import { HOST_MEMBER_NAME, HOST_MEMBER_NAME_MAX, MAX_ATTEMPTS } from '../src/host/config.ts'
+import { applyScopeWaits, releaseScopes } from '../src/host/team/scope-locks.ts'
 
 const now = 1_700_000_000_000
 
@@ -1128,4 +1129,227 @@ test('applyReceipt：返工上限可取 settings 值，缺省仍是 config.MAX_A
   const third = applyReceipt(second, 't1', { verdict: 'rework', evidence }, now)
   assert.equal(third.plan.tasks[0]?.status, MAX_ATTEMPTS <= 3 ? 'failed' : 'rework', `第 3 次按 MAX_ATTEMPTS(${MAX_ATTEMPTS}) 到顶`)
 })
+
+// ── r11 · 写域等待 / 释放 / 依赖语义（T2）────────────────────────────────────
+
+const SCOPED_PATH = 'src/host/bridge.ts'
+const WAIT_REASON = `等待 t1 释放 ${SCOPED_PATH}`
+
+/** 同域两条任务：t1 在飞持有写域，t2 正被它挡住。 */
+function waitingPair(): RunState {
+  return makeState(
+    [
+      makeTask('t1', { status: 'running', writeScopes: [SCOPED_PATH] }),
+      makeTask('t2', { status: 'waiting', writeScopes: [SCOPED_PATH], waitingOn: ['t1'], waitReason: WAIT_REASON }),
+    ],
+    { bindings: [bindingOf('t1', 'dev-t1'), bindingOf('t2', 'dev-t2')] },
+  )
+}
+
+/** 只数写域释放通知（`rel-` 前缀），与普通派发/回执消息区分。 */
+function releaseMessages(state: RunState) {
+  return state.messages.filter((message) => (message.messageId ?? '').startsWith('rel-'))
+}
+
+function statusOf(state: RunState, id: string) {
+  return state.plan.tasks.find((task) => task.id === id)?.status
+}
+
+function withStatus(tasks: RunState['plan']['tasks'], id: string, status: string) {
+  return tasks.map((task) => (task.id === id ? { ...task, status: status as (typeof task)['status'] } : task))
+}
+
+test('dispatch：写域被占用转 waiting，不 spawn、不占并发位（AC-14）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const state = makeState([
+      makeTask('t1', { status: 'running', writeScopes: [SCOPED_PATH] }),
+      makeTask('t2', { writeScopes: [SCOPED_PATH] }),
+      makeTask('t3', { writeScopes: ['src/host/tools.ts'] }),
+    ])
+    const { deps, spawned } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t3'], '同域任务必须排队，异域任务照常派发')
+    assert.equal(spawned.length, 1, 'waiting 不许 spawn 成员')
+    assert.equal(statusOf(result.state, 't2'), 'waiting')
+    assert.deepEqual(result.state.plan.tasks.find((task) => task.id === 't2')?.waitingOn, ['t1'])
+    assert.equal(
+      result.state.plan.tasks.find((task) => task.id === 't2')?.waitReason,
+      WAIT_REASON,
+      'AC-14 逐字样例：等待 t1 释放 src/host/bridge.ts',
+    )
+    assert.equal(runningCount(result.state.plan.tasks), 2, 'waiting 不计入在飞数（t1 + t3）')
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：同批写域重叠按计划顺序串行，第一个 running 其余 waiting（AC-17）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const state = makeState([
+      makeTask('t1', { writeScopes: [SCOPED_PATH] }),
+      makeTask('t2', { writeScopes: [SCOPED_PATH] }),
+    ])
+    const { deps, spawned } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t1'])
+    assert.equal(spawned.length, 1)
+    assert.equal(statusOf(result.state, 't2'), 'waiting')
+    assert.deepEqual(result.state.plan.tasks.find((task) => task.id === 't2')?.waitingOn, ['t1'])
+  } finally {
+    cleanup()
+  }
+})
+
+test('applyReceipt：done 释放写域 → 等待者恰一条通知，下一轮按计划顺序派出（AC-15/AC-18）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const released = applyReceipt(waitingPair(), 't1', { verdict: 'done' }, now)
+    const rel = releaseMessages(released)
+    assert.equal(rel.length, 1, '每个等待者恰一条释放通知')
+    assert.equal(rel[0]?.from, 'captain')
+    assert.equal(rel[0]?.to, 'dev-t2', 'to 是等待者成员名')
+    assert.equal(rel[0]?.taskId, 't2')
+    assert.equal(rel[0]?.body, `t1 已结束并释放 ${SCOPED_PATH}，你可以接着改（任务 t2）。`)
+
+    // 重放同一条回执：幂等键 rel-<holder>-<waiter>-<seq> 挡住第二条
+    const replay = applyReceipt(released, 't1', { verdict: 'done' }, now)
+    assert.equal(releaseMessages(replay).length, 1, '重放回执不许二次唤醒')
+
+    const { deps } = makeDeps(store)
+    const result = await dispatchReady(replay, deps)
+    assert.deepEqual(result.started, ['t2'], '释放后等待者转 pending 并被派出')
+    assert.equal(statusOf(result.state, 't2'), 'running')
+  } finally {
+    cleanup()
+  }
+})
+
+test('写域释放：五终态各释放一次，非终态（rework）不释放（AC-15）', () => {
+  const episodes: Array<{ label: string; release: (state: RunState) => RunState }> = [
+    { label: 'done', release: (state) => applyReceipt(state, 't1', { verdict: 'done' }, now) },
+    { label: 'failed', release: (state) => applyReceipt(state, 't1', { verdict: 'failed' }, now) },
+    { label: 'interrupted', release: (state) => reconcileMembers(state, [], now).state },
+    {
+      label: 'cancelled',
+      release: (state) => releaseScopes({ ...state, plan: { ...state.plan, tasks: withStatus(state.plan.tasks, 't1', 'cancelled') } }, 't1', now),
+    },
+    {
+      label: 'skipped',
+      release: (state) => releaseScopes({ ...state, plan: { ...state.plan, tasks: withStatus(state.plan.tasks, 't1', 'skipped') } }, 't1', now),
+    },
+  ]
+
+  for (const episode of episodes) {
+    const released = episode.release(waitingPair())
+    assert.equal(releaseMessages(released).length, 1, `${episode.label} 终态必须立即释放写域`)
+  }
+
+  const reworking = applyReceipt(waitingPair(), 't1', { verdict: 'rework' }, now)
+  assert.equal(statusOf(reworking, 't1'), 'rework', '前置条件：rework 不是终态')
+  assert.equal(releaseMessages(reworking).length, 0, 'rework 不许释放（否则「只在 done 释放」这个 bug 测不出来）')
+})
+
+test('写域释放：同一持有者的多个等待者各恰一条通知（AC-18）', () => {
+  const state = makeState(
+    [
+      makeTask('t1', { status: 'running', writeScopes: [SCOPED_PATH] }),
+      makeTask('t2', { status: 'waiting', writeScopes: [SCOPED_PATH], waitingOn: ['t1'], waitReason: WAIT_REASON }),
+      makeTask('t3', { status: 'waiting', writeScopes: [SCOPED_PATH], waitingOn: ['t1'], waitReason: WAIT_REASON }),
+    ],
+    { bindings: [bindingOf('t1', 'dev-t1'), bindingOf('t2', 'dev-t2'), bindingOf('t3', 'dev-t3')] },
+  )
+  const rel = releaseMessages(releaseScopes(state, 't1', now))
+
+  assert.equal(rel.length, 2)
+  assert.deepEqual(rel.map((message) => message.to).sort(), ['dev-t2', 'dev-t3'])
+  assert.deepEqual(rel.map((message) => message.taskId).sort(), ['t2', 't3'])
+  assert.equal(new Set(rel.map((message) => message.messageId)).size, 2, '幂等键两两不同')
+})
+
+test('重启：waiting 与写域字段原样存活，按计划顺序重算后可派发（AC-16）', async () => {
+  const { store, dir, cleanup } = makeStore()
+  try {
+    store.save(waitingPair())
+    const reloaded = new RunsStore(dir).load('run-1')
+    assert.ok(reloaded, '新 store 实例必须能读回同一份运行状态')
+
+    const waiter = reloaded.plan.tasks.find((task) => task.id === 't2')
+    assert.equal(waiter?.status, 'waiting', 'waiting 不在白名单里会被归回 pending，重启后互斥静默失效')
+    assert.deepEqual(waiter?.waitingOn, ['t1'])
+    assert.equal(waiter?.waitReason, WAIT_REASON)
+    assert.deepEqual(waiter?.writeScopes, [SCOPED_PATH], '写域必须存活')
+
+    // 无锁表：持有者一结束，下一轮从 plan 现算即可放行
+    const done = applyReceipt(reloaded, 't1', { verdict: 'done' }, now)
+    const { deps } = makeDeps(store)
+    const result = await dispatchReady(done, deps)
+    assert.deepEqual(result.started, ['t2'])
+  } finally {
+    cleanup()
+  }
+})
+
+test('applyScopeWaits：无变化时返回同一引用（幂等），解除后清空等待字段（AC-14）', () => {
+  const base = waitingPair()
+  assert.equal(applyScopeWaits(base, now), base, '没有变化必须返回同一引用，不制造无谓落盘')
+
+  const freed = { ...base, plan: { ...base.plan, tasks: withStatus(base.plan.tasks, 't1', 'done') } }
+  const revived = applyScopeWaits(freed, now)
+  const waiter = revived.plan.tasks.find((task) => task.id === 't2')
+  assert.equal(waiter?.status, 'pending', '写域空了就放回 pending')
+  assert.equal(waiter?.waitingOn, undefined)
+  assert.equal(waiter?.waitReason, undefined)
+  assert.equal(applyScopeWaits(revived, now), revived, '二次调用仍无变化')
+})
+
+test('dispatch：磁盘上残留的不一致等待关系被重算——持有者已 done、等待者仍 waiting（AC-16）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    // 场景：上一轮在「持有者转 done」与「等待者转 pending」之间崩掉/被杀，盘上就长这样。
+    // 没有锁表可修，唯一正确出路是每轮按 plan 现算 —— 这正是 AC-16 要的行为。
+    const state = makeState(
+      [
+        makeTask('t1', { status: 'done', writeScopes: [SCOPED_PATH] }),
+        makeTask('t2', { status: 'waiting', writeScopes: [SCOPED_PATH], waitingOn: ['t1'], waitReason: WAIT_REASON }),
+      ],
+      { bindings: [bindingOf('t2', 'dev-t2')] },
+    )
+    const { deps } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t2'], '重建等待关系后必须直接派发，而不是永远卡在 waiting')
+    assert.equal(statusOf(result.state, 't2'), 'running')
+  } finally {
+    cleanup()
+  }
+})
+
+test('dispatch：并发满的早退分支也必须落盘（否则这一轮的等待判定白算）', async () => {
+  const { store, dir, cleanup } = makeStore()
+  try {
+    // t1 占着唯一名额并把写域拿在手上；t3 的等待关系已失效（写域不冲突）→ 本轮会被放回 pending。
+    // 此时 slots=0 提前返回，若不保存，磁盘上 t3 仍是 waiting，面板会一直显示在等一条无关的路径。
+    const tasks = [
+      makeTask('t1', { status: 'running', writeScopes: [SCOPED_PATH] }),
+      makeTask('t2', { status: 'waiting', writeScopes: [SCOPED_PATH], waitingOn: ['t1'], waitReason: WAIT_REASON }),
+      makeTask('t3', { status: 'waiting', writeScopes: ['src/host/tools.ts'], waitingOn: ['t1'], waitReason: '等待 t1 释放 src/host/tools.ts' }),
+    ]
+    const state = makeState(tasks, { plan: makePlan(tasks, { maxConcurrent: 1 }) })
+    const { deps } = makeDeps(store)
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, [], '并发位已满，本轮不许起人')
+    assert.equal(statusOf(result.state, 't3'), 'pending')
+    const reloaded = new RunsStore(dir).load('run-1')
+    assert.equal(reloaded?.plan.tasks.find((task) => task.id === 't3')?.status, 'pending', '早退分支必须保存，否则等待关系停在盘上')
+    assert.equal(reloaded?.plan.tasks.find((task) => task.id === 't2')?.status, 'waiting', '真正冲突的等待者必须保持 waiting')
+  } finally {
+    cleanup()
+  }
+})
+
 

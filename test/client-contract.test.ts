@@ -478,12 +478,110 @@ test('渲染描述层必须真的被组件调用（防「逻辑写完、模板�
     ['src/client/HeaderButton.tsx', 'headerButtonView'],
     ['src/client/Panel.tsx', 'pauseButtonView'],
     ['src/client/tabs/PlanTab.tsx', 'taskRowView'],
+    ['src/client/tabs/PlanTab.tsx', 'scopeLockRowsOf'],
+    ['src/client/tabs/PlanTab.tsx', 'deviationRowsOf'],
     ['src/client/SettingsPage.tsx', 'settingsKeysView'],
   ]
   for (const [relPath, fn] of pairs) {
     const facts = codeFactsOf(relPath)
     assert.equal(facts.calls.has(fn), true, `${relPath} 必须调用 ${fn}（否则可见文案脱离单点来源）`)
   }
+})
+
+test('r11 计划页：五块新区域真落在模板里，且各带唯一 hook（AC-20 / AC-21 / AC-24 / AC-27）', () => {
+  const plan = codeOnlyOf('src/client/tabs/PlanTab.tsx')
+  for (const hook of [
+    'data-scope-locks',
+    'data-locks-head',
+    'data-lock-list',
+    'data-lock-row',
+    'data-lock-path',
+    'data-lock-holder',
+    'data-lock-waiters',
+    'data-lock-waiter',
+    'data-wait-reason',
+    'data-task-actions',
+    'data-task-action',
+    'data-acceptance-editor',
+    'data-acceptance-input',
+    'data-acceptance-hint',
+    'data-acceptance-actions',
+    'data-acceptance-save',
+    'data-deviation',
+    'data-deviation-list',
+    'data-deviation-row',
+    'data-deviation-at',
+    'data-deviation-paths',
+    'data-deviation-count',
+    'data-deviation-reason',
+  ]) {
+    assert.equal(plan.includes(hook), true, `PlanTab 模板缺少 ${hook}`)
+  }
+
+  // 顺序：写域区块在任务表之前、执行痕迹在任务表之后（DESIGN §2.3）
+  const lockAt = plan.indexOf('data-scope-locks')
+  const tableAt = plan.indexOf('data-plan-table')
+  const deviationAt = plan.indexOf('data-deviation')
+  assert.ok(lockAt > 0 && tableAt > lockAt, '写域占用必须在动作行与任务表之间')
+  assert.ok(deviationAt > tableAt, '执行痕迹必须在任务表之后（页面最末）')
+
+  // 空数组 0 节点：连组标题都不渲染（不是渲染一个空 section）
+  assert.match(plan, /locks\.length === 0 \? null/, '写域为空必须整块不渲染')
+  assert.match(plan, /deviations\.length === 0 \? null/, '执行痕迹为空必须整块不渲染')
+
+  // 等待条只在 waiting 且原因非空时渲染（AC-20），且文案逐字来自快照
+  assert.match(plan, /progress\.status === 'waiting' \? row\.waitReason : ''/, '等待条必须 status 守卫')
+  assert.match(plan, /waitReason === '' \? null/, '原因为空必须 0 节点')
+  assert.match(plan, /\{waitReason\}/, '等待条必须逐字渲染快照原文')
+  assert.equal(/等待 \$\{/.test(plan), false, '客户端不许自己拼等待文案（宿主生成）')
+
+  // 改验收浮层：卡内非模态 + 空值持久 disabled + 空值零请求 + 失败不关闭
+  assert.match(plan, /data-acceptance-editor[\s\S]{0,400}role="dialog"/, '浮层必须是 dialog')
+  assert.match(plan, /role="dialog"[\s\S]{0,200}aria-modal="false"/, '浮层不是模态（aria-modal=false）')
+  assert.match(plan, /disabled=\{savingEditor \|\| isBlankAcceptance\(editor\.draft\)\}/, '空值保存必须 disabled')
+  assert.match(plan, /if \(editor === null \|\| isBlankAcceptance\(editor\.draft\)\) return/, '空值不得发请求')
+  assert.match(plan, /trim\(\) === ''/, '空值判定必须 trim')
+  assert.match(plan, /data-error role="alert"/, '失败原因必须走面板既有 [data-error] 机制')
+})
+
+test('r11 样式层：五块新区域的选择器都在，且只用语义 token 的 font 简写', () => {
+  const css = sourceOf('src/client/styles.ts')
+  for (const selector of [
+    '[data-scope-locks]',
+    '[data-lock-list]',
+    '[data-lock-row]',
+    '[data-lock-path]',
+    '[data-lock-holder]',
+    '[data-lock-waiters]',
+    '[data-lock-waiter]',
+    '[data-wait-reason]',
+    '[data-task-actions]',
+    '[data-task-action]',
+    '[data-task-action-spinner]',
+    '[data-acceptance-editor]',
+    '[data-acceptance-input]',
+    '[data-acceptance-hint]',
+    '[data-acceptance-actions]',
+    '[data-acceptance-save]',
+    '[data-deviation]',
+    '[data-deviation-list]',
+    '[data-deviation-row]',
+    '[data-deviation-at]',
+    '[data-deviation-paths]',
+    '[data-deviation-count]',
+    '[data-deviation-reason]',
+  ]) {
+    assert.equal(css.includes(selector), true, `styles.ts 缺少 ${selector} 规则`)
+  }
+  // 既有面板字号铁律（本文件全局断言过；这里再保证新块没有偷偷写 font-size: var(--dsw-font-*)）
+  const start = css.indexOf('r11：写域占用')
+  const end = css.indexOf('成员页', start)
+  assert.ok(start > 0 && end > start, 'r11 段必须是一块可界定的样式块')
+  const block = css.slice(start, end)
+  assert.equal(/font-size:\s*var\(--dsw-font/.test(block), false, 'r11 新样式必须写 font 简写')
+  // 等待/取消/跳过不许用红：新块里红只允许出现在「取消 hover」这一处（选择器 + 颜色各一次）
+  const redUses = block.match(/--dsw-alias-state-error-primary/g)?.length ?? 0
+  assert.ok(redUses <= 2, `r11 新样式里红色 token 只用于 cancel hover（实际 ${redUses} 处）`)
 })
 
 test('四个新 hook 真出现在模板里，且旧前缀 0 命中', () => {

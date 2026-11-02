@@ -1,17 +1,27 @@
 /**
- * 队长可用工具（ctx.tools.register），共 7 个（TECHNICAL §4.3）。
+ * 队长可用工具（ctx.tools.register），共 8 个（TECHNICAL §5.1）。
  *
  * 纪律：
  *  - 未启用时**不能静默不干活**：必须返回明确中文错误（AC-12），用户才知道是「没打开开关」而不是「插件坏了」；
  *  - 动作型工具（message / receipt / memory 写 / role 写）一律走 `bridge.act`，
  *    与面板 HTTP 入口共用同一套语义与拒绝码 —— 否则就是「工具能用、面板不能用」这个历史高频缺陷；
  *  - `auto_team_dispatch` **强制带 runId**：这是 AC-30「计划条目早于首个成员创建」的机械保证，
- *    不靠提示词自律（提示词只是第二道保险）。
+ *    不靠提示词自律（提示词只是第二道保险）；
+ *  - **空验收与非法写域只在本文件的入口拦截**（plan / add_tasks，AC-6）：
+ *    `buildPlan` / `extendPlan` 保持宽容（既有样本直接构造 `acceptance:''`），
+ *    因为只有工具入口能在 `store.save` **之前**整批拒绝、做到「一条都不落盘」。
  */
-import type { ActResult, PanelSnapshot, PlanTask, RejectionCode, Result } from '../shared/types.ts'
+import type { ActResult, PanelSnapshot, Plan, PlanTask, RejectionCode, Result } from '../shared/types.ts'
 import { MEMORY_LINES_PER_TASK, TOOL_PREFIX } from './config.ts'
 import { blockedTasks, readyTasks } from './plan/graph.ts'
-import { buildPlan, progressOf, type PlanDraftTask } from './plan/plan.ts'
+import {
+  ACCEPTANCE_TEMPLATES,
+  emptyAcceptanceError,
+  suggestAcceptance,
+  type AcceptanceSuggestion,
+} from './plan/acceptance.ts'
+import { buildPlan, extendPlan, progressOf, type PlanDraftTask } from './plan/plan.ts'
+import { normalizeWriteScopes } from './plan/scope.ts'
 import { RUN_STATE_VERSION, uniqueRunId, type RunState, type RunsStore } from './store.ts'
 import type { Bridge } from './bridge.ts'
 import type { RoleRepo } from './roles/repo.ts'
@@ -22,6 +32,14 @@ export interface ToolsDeps {
   roles: RoleRepo
   bridge: Bridge
   now: () => number
+  /**
+   * 仓库 `package.json` 的 scripts 键名（可选注入）。
+   *
+   * 只影响「空验收拒绝文案里能不能直接给出一条 `pnpm <script>`」：纯函数 `suggestAcceptance`
+   * 不碰文件，装配层（`host/index.ts`）读一次传进来即可；缺省时退化为模板 ③
+   * （`test -n "$(git status --porcelain -- <路径>)"`），不会给出跑不起来的命令。
+   */
+  scripts?: readonly string[]
 }
 
 const NOT_ENABLED = '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。'
@@ -62,12 +80,126 @@ function rejectedOf(result: ActResult): Record<string, unknown> | null {
   return { ok: false, code: result.rejected.code, error: result.rejected.message, notices: result.notices }
 }
 
+/**
+ * 任务输入的 JSON Schema（`auto_team_plan` 与 `auto_team_add_tasks` **共用一份**）。
+ *
+ * 两个工具收的是同一种条目：分开写就会在「plan 有 writeScopes、add_tasks 忘了」这类
+ * 细枝末节上分叉，而模型看不见的字段等于不存在（它会照旧不声明写域）。
+ */
+const TASK_ITEM_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: '任务 id，缺省按 t1/t2… 生成（追加时不得与既有 id 重复）' },
+    title: { type: 'string' },
+    roleId: { type: 'string', description: '执行该任务的角色 id' },
+    dependsOn: {
+      type: 'array',
+      items: { type: 'string' },
+      description: '依赖的任务 id（可指向既有任务，也可指向同批新任务）',
+    },
+    acceptance: {
+      type: 'string',
+      description: '验收命令（门禁据此产出证据）；不能是空白字符串，空验收会整批拒绝',
+    },
+    writeScopes: {
+      type: 'array',
+      items: { type: 'string' },
+      description: '写域：本任务预计改动的文件或目录（目录边界互斥，冲突的任务排队等待，释放后通知）',
+    },
+  },
+  required: ['title', 'roleId'],
+}
+
+/**
+ * 草稿任务的「调用方认得出的标识」：显式 id 优先，否则按 `buildPlan` 的规则补 `t<index+1>`。
+ *
+ * 拒绝文案里必须出现任务 id（AC-6 的判据之一），而此刻 `buildPlan` 可能还没跑，
+ * 所以 id 生成规则要跟它一致——不一致就会出现「报 t2、实际落 t3」这种最难查的漂移。
+ */
+function draftIdOf(task: PlanDraftTask | undefined, index: number): string {
+  const id = typeof task?.id === 'string' ? task.id.trim() : ''
+  return id === '' ? `t${index + 1}` : id
+}
+
+/**
+ * 写域归一（工具侧唯一入口，AC-12/AC-13）：任一条非法 → 整批拒绝。
+ *
+ * 这里**必须**调 `plan/scope.ts`，不许内联 `startsWith` 之类的判据：
+ * 目录边界规则（`src/host` 冲突 `src/host/bridge.ts`、不冲突 `src/hostile.ts`）只有一处实现，
+ * 工具侧再写一份就会与 dispatch 侧的冲突判定分叉。
+ */
+function normalizeDraftScopes(
+  tasks: readonly PlanDraftTask[],
+): { ok: true; tasks: PlanDraftTask[] } | { ok: false; error: string } {
+  const out: PlanDraftTask[] = []
+  for (const [index, raw] of tasks.entries()) {
+    if (raw === null || typeof raw !== 'object') {
+      return { ok: false, error: `新增任务的第 ${index + 1} 条不是对象` }
+    }
+    const normalized = normalizeWriteScopes(raw.writeScopes)
+    if (!normalized.ok) {
+      return { ok: false, error: `写域不合法（任务 ${draftIdOf(raw, index)}）：${normalized.error}` }
+    }
+    const next: PlanDraftTask = { ...raw }
+    if (normalized.scopes.length > 0) next.writeScopes = normalized.scopes
+    else delete next.writeScopes
+    out.push(next)
+  }
+  return { ok: true, tasks: out }
+}
+
+/**
+ * 空验收整批拒绝文案（AC-6）：没有违规任务时返回 `null`。
+ *
+ * **所有**违规任务一次列全（不是报第一条就停）：模型下一轮要能一次改对，
+ * 否则会陷入「改一条、再被拒一条」的往返。可自动选中的任务顺带给出完整命令。
+ */
+function emptyAcceptanceOf(
+  tasks: readonly Pick<PlanTask, 'id' | 'title' | 'acceptance' | 'writeScopes'>[],
+  scripts: readonly string[] | undefined,
+): string | null {
+  const violations = tasks
+    .filter((task) => task.acceptance.trim() === '')
+    .map((task) => ({ id: task.id, title: task.title }))
+  if (violations.length === 0) return null
+
+  const suggestions = new Map<string, AcceptanceSuggestion>()
+  for (const violation of violations) {
+    const task = tasks.find((item) => item.id === violation.id)
+    suggestions.set(
+      violation.id,
+      suggestAcceptance({
+        title: task?.title ?? '',
+        writeScopes: task?.writeScopes,
+        scripts,
+      }),
+    )
+  }
+  return emptyAcceptanceError(violations, suggestions)
+}
+
+/**
+ * 已收口 run 的追加拒绝文案（AC-10）：含 runId 与当前状态中文。
+ *
+ * 判定权归 `extendPlan`（它才知道哪些状态算收口），这里只在它拒绝之后**补齐上下文**：
+ * 光有「计划已取消，不能再追加任务」模型不知道该换 runId 还是该开新计划。
+ */
+function closedRunReason(plan: Plan, runId: string): string | null {
+  if (plan.status !== 'cancelled' && plan.status !== 'terminated') return null
+  const label = plan.status === 'cancelled' ? '已取消' : '已终止'
+  return `该 run ${runId} ${label}，不能再追加任务（请先 auto_team_plan 开新计划）`
+}
+
 export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
   return [
     {
       name: `${TOOL_PREFIX}plan`,
       description:
-        '把一个目标拆成有依赖的任务图并生成执行计划（不创建任何成员）。每个任务需要 roleId 与 acceptance（可执行的验收命令）。返回 runId，派发时必须带上它。',
+        '把一个目标拆成有依赖的任务图并生成执行计划（不创建任何成员）。每个任务需要 roleId 与 acceptance（可执行的验收命令）。'
+        + '**单任务计划合法**：哪怕只有一件小事、只改一处，也必须走这里拆成 1 个任务并派 1 个成员去做——'
+        + '简单任务同样属于团队，队长不自己动手。'
+        + `验收命令必须真能执行（exit 0 才算过），可直接用：${ACCEPTANCE_TEMPLATES.join(' / ')}（尖括号换成实际值）。`
+        + '返回 runId，派发时必须带上它；后续要加任务用 auto_team_add_tasks，不要新开计划。',
       parameters: {
         type: 'object',
         properties: {
@@ -75,18 +207,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           maxConcurrent: { type: 'integer', description: '并发上限，默认 3，硬上限 8' },
           tasks: {
             type: 'array',
-            description: '任务列表（依赖必须指向同一列表里的 id）',
-            items: {
-              type: 'object',
-              properties: {
-                id: { type: 'string', description: '任务 id，缺省按 t1/t2… 生成' },
-                title: { type: 'string' },
-                roleId: { type: 'string', description: '执行该任务的角色 id' },
-                dependsOn: { type: 'array', items: { type: 'string' } },
-                acceptance: { type: 'string', description: '验收命令（门禁据此产出证据）' },
-              },
-              required: ['title', 'roleId'],
-            },
+            description: '任务列表（依赖必须指向同一列表里的 id；1 条也合法）',
+            items: TASK_ITEM_SCHEMA,
           },
         },
         required: ['goal', 'tasks'],
@@ -95,18 +217,28 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         const sessionId = sessionOf(meta)
         if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
 
+        const rawTasks = Array.isArray(args.tasks) ? (args.tasks as PlanDraftTask[]) : []
+        // 写域先归一（非法即整批拒绝）：buildPlan 只做轻量清洗，不管路径合法性。
+        const scoped = normalizeDraftScopes(rawTasks)
+        if (!scoped.ok) return { ok: false, code: 'BAD_REQUEST', error: scoped.error }
+
         const at = deps.now()
         const draft = buildPlan(
           {
             sessionId,
             goal: typeof args.goal === 'string' ? args.goal : '',
             maxConcurrent: typeof args.maxConcurrent === 'number' ? args.maxConcurrent : undefined,
-            tasks: Array.isArray(args.tasks) ? (args.tasks as PlanDraftTask[]) : [],
+            tasks: scoped.tasks,
           },
           uniqueRunId(deps.store, sessionId, at),
           at,
         )
-        if (!draft.ok) return { ok: false, error: draft.reason }
+        if (!draft.ok) return { ok: false, code: 'BAD_REQUEST', error: draft.reason }
+
+        // 空验收：**在 save 之前**整批拒绝（AC-6）。放到 buildPlan 里做会打红既有 484 例里
+        // 手工构造 acceptance:'' 的样本，所以拦截点只在这里。
+        const emptyAcceptance = emptyAcceptanceOf(draft.plan.tasks, deps.scripts)
+        if (emptyAcceptance !== null) return { ok: false, code: 'BAD_REQUEST', error: emptyAcceptance }
 
         const state: RunState = {
           version: RUN_STATE_VERSION,
@@ -447,6 +579,91 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         const rejected = rejectedOf(result)
         if (rejected) return rejected
         return { ok: true, role: deps.roles.get(role.id), notices: result.notices }
+      },
+    },
+    {
+      name: `${TOOL_PREFIX}add_tasks`,
+      description:
+        '往**已存在的**计划里追加任务（同一个 runId：不新建 run、面板不跳回空白）——'
+        + '任务跑到一半又想到新活时用它，不要重新 auto_team_plan。'
+        + '幂等：内容完全相同的条目进 skipped、added 为空、任务总数不变；'
+        + '原子：任一条验收为空 / 写域非法 / 依赖不存在或成环，整批拒绝且一条都不落盘。'
+        + '追加出来的任务一律处于待派发，下一次 auto_team_dispatch 会连它们一起捕获。'
+        + `验收命令必须真能执行（exit 0 才算过），可直接用：${ACCEPTANCE_TEMPLATES.join(' / ')}（尖括号换成实际值）。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string', description: 'auto_team_plan 返回的 runId（必填；追加不会新建 run）' },
+          tasks: {
+            type: 'array',
+            description: '要追加的任务（id 缺省按 t<next> 递增；依赖可指向既有任务或同批任务）',
+            items: TASK_ITEM_SCHEMA,
+          },
+        },
+        required: ['runId', 'tasks'],
+      },
+      async handler(args, meta) {
+        const sessionId = sessionOf(meta)
+        if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
+
+        const runId = typeof args.runId === 'string' ? args.runId.trim() : ''
+        if (runId === '') {
+          return {
+            ok: false,
+            code: 'NO_PLAN',
+            error:
+              'auto_team_add_tasks 必须带 runId：追加是「改变既有计划」而不是新建 run。先 auto_team_plan 拿 runId（或 auto_team_status 读当前的）。',
+          }
+        }
+        const state = deps.store.load(runId)
+        if (!state || state.plan.sessionId !== sessionId) {
+          return {
+            ok: false,
+            code: 'NOT_FOUND',
+            error: `找不到运行 ${runId}：当前会话没有这个 runId（本工具不会新建 run，请先 auto_team_plan）`,
+          }
+        }
+
+        const rawTasks = Array.isArray(args.tasks) ? (args.tasks as PlanDraftTask[]) : []
+        if (rawTasks.length === 0) {
+          return { ok: false, code: 'BAD_REQUEST', error: 'tasks 不能为空：追加至少要带 1 条任务' }
+        }
+
+        const scoped = normalizeDraftScopes(rawTasks)
+        if (!scoped.ok) return { ok: false, code: 'BAD_REQUEST', error: scoped.error }
+
+        // 空验收：整批拒绝，且**在 save 之前**返回 —— AC-6 的判据是「store 内容逐字不变」。
+        const emptyAcceptance = emptyAcceptanceOf(
+          scoped.tasks.map((task, index) => ({
+            id: draftIdOf(task, index),
+            title: (task.title ?? '').trim(),
+            acceptance: (task.acceptance ?? '').trim(),
+            writeScopes: task.writeScopes,
+          })),
+          deps.scripts,
+        )
+        if (emptyAcceptance !== null) return { ok: false, code: 'BAD_REQUEST', error: emptyAcceptance }
+
+        const extended = extendPlan(state.plan, scoped.tasks, deps.now())
+        if (!extended.ok) {
+          // 已取消/已终止的计划：extendPlan 的 reason 没有 runId，这里补齐（AC-10）。
+          return { ok: false, code: 'BAD_REQUEST', error: closedRunReason(state.plan, runId) ?? extended.reason }
+        }
+        // 全被跳过时**不动盘**：幂等判据是连文件字节都不变，而不是「写一遍相同内容」。
+        if (extended.added.length > 0) deps.store.save({ ...state, plan: extended.plan })
+
+        return {
+          ok: true,
+          runId: extended.plan.runId,
+          added: extended.added,
+          skipped: extended.skipped,
+          tasks: extended.plan.tasks.length,
+          ready: readyTasks(extended.plan.tasks),
+          note:
+            extended.added.length === 0
+              ? '所有条目与既有任务内容相同，已跳过（计划未改动，runId 不变）。'
+              : '已追加进同一个计划（runId 不变）；下一次 auto_team_dispatch 会连新任务一起捕获。',
+        }
       },
     },
   ]

@@ -12,7 +12,7 @@
  */
 import { homedir } from 'node:os'
 import { MODEL_CATALOG_TTL_MS, NOWAIT_THRESHOLD_MS } from './config.ts'
-import { globalDataRoot, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, settingsPath, skillsDir, systemSkillsDir } from './paths.ts'
+import { globalDataRoot, deviationsPath, projectArtifactsDir, projectMemoryDir, publicMemoryDir, rolesDir, runsDir, settingsPath, skillsDir, systemSkillsDir } from './paths.ts'
 import { RunsStore, type RunState } from './store.ts'
 import { createRoleRepo } from './roles/repo.ts'
 import { createSkillRepo } from './roles/skills-repo.ts'
@@ -35,6 +35,7 @@ import {
   listHostMembers,
   memberIdentityOf,
   onHostTriggerEvents,
+  onCaptainToolResult,
   onMemberProgress,
   readModelCatalog,
   registerAgentCreated,
@@ -54,6 +55,7 @@ import {
   type SpawnPort,
 } from './team/dispatch.ts'
 import { createMemberWatcher } from './team/watcher.ts'
+import { createDeviationRecorder } from './team/deviation.ts'
 import { touchProgress } from './team/stall.ts'
 import { auditRoute } from './team/route.ts'
 import { buildMemberPrompt } from './team/member-prompt.ts'
@@ -328,6 +330,18 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     watcherRef.start()
   }
 
+  /**
+   * 队长留痕记录器（r11 F7）：落 `<home>/.dsh/auto-team/deviations.jsonl`，与 runs 同根、仓库外。
+   *
+   * 构造不做 IO（读写在 `record()` 里且已 fail-open），所以这里不需要 try/catch；
+   * 真正必须被兜住的是**订阅**——见下面的 ④½。
+   */
+  const deviations = createDeviationRecorder({
+    file: deviationsPath(home),
+    sessionId: DEFAULT_SESSION,
+    warn: (text) => warn(ctx, text),
+  })
+
   const bridge = createBridge({
     store,
     roles,
@@ -341,6 +355,10 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     // （其缺省正是 GATE_TIMEOUT_MS），设置才能立刻生效；这里硬塞常量会把可配点做废。
     gate: { cwd: workspace, artifactsDir },
     hostConcurrency,
+    // r11 F7：快照里 `deviations` 的读取口（最近 50 条）；装配层给不出时面板空数组、不报错。
+    deviations,
+    // r11 AC-26：取消 running 任务时尽力中断成员（宿主没有 interrupt 时该端口缺省）。
+    ...(spawnPorts.interruptMember === undefined ? {} : { interruptMember: spawnPorts.interruptMember }),
     // 停滞阈值同理**不传**：bridge 每次快照按 settings 现算，面板与 watcher 同源同值。
     now,
     captainModel: () => captainView,
@@ -414,6 +432,18 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     registerEffect(ctx, () => progressSub.stop())
   } catch (error) {
     warn(ctx, `成员推进事件订阅失败：${messageOf(error)}`)
+  }
+
+  // ④½ 队长留痕（r11 F7）：只观察、不拦截。
+  //     订阅根作用域的 `tools/result`，监听器里按 `exec.agent` 缺省判队长（与 ⑤ 的 guard 同口径）；
+  //     记录器自己 fail-open，这里再兜一层 —— 留痕失败绝不能影响工具结果（AC-23）。
+  try {
+    const deviationSub = onCaptainToolResult(ctx, ({ toolName, args }) => {
+      deviations.record({ toolName, args })
+    })
+    registerEffect(ctx, deviationSub.stop)
+  } catch (error) {
+    warn(ctx, `队长留痕未装配（面板不显示执行痕迹）：${messageOf(error)}`)
   }
 
   // ⑤ noWait 守卫（AC-4）：只看队长的 bash 调用，拒绝前台同步长等待。

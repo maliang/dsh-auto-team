@@ -15,6 +15,7 @@ import { STALL_ALERTS_LIMIT } from '../store.ts'
 import type { ActivityEvent, PlanTask } from '../../shared/types.ts'
 import { MAX_ATTEMPTS, STALL_MS, WATCHER_INTERVAL_MS } from '../config.ts'
 import { appendMessage, makeMessage } from './messages.ts'
+import { releaseScopes } from './scope-locks.ts'
 import { clearAlerted, stallOf, stallSentence } from './stall.ts'
 
 /** 宿主成员行：只信任这三个字段，其余一律不读（宿主形状可能变，见 adapters）。 */
@@ -107,6 +108,9 @@ export function reconcileMembers(
         }),
       )
       changed += 1
+      // r11 AC-15：interrupted/failed 都是终态 → 立刻释放写域并通知等待者。
+      // 不释放的话，一个失联成员会让所有改同一批文件的任务永远 waiting（无锁表可查，只能眼看着卡住）。
+      next = releaseScopes(next, task.id, at)
       continue
     }
 
@@ -129,6 +133,8 @@ export function reconcileMembers(
         }),
       )
       changed += 1
+      // 同上：成员已死且次数用尽 → failed（终态），写域必须释放。
+      next = releaseScopes(next, task.id, at)
       continue
     }
 

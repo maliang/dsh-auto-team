@@ -491,6 +491,31 @@ export function resolveCaller(ctx: HostContext): HostAgent | undefined {
 
 const NO_CALLER = '当前没有活跃的队长会话：agentTeams 需要以 Agent 身份调用，请在会话内使用本工具。'
 
+/**
+ * `interrupt(caller, name)` 的返回形状**未核实**（只核实了宿主有这个方法），所以宽松归一
+ * 只能放在宿主边界这一处 —— bridge/dispatch 只消费 `{ ok, error? }`，端口不漂移。
+ *
+ * 口径：`void`/`undefined` 视为已受理（命令式 API 多数不返回值）；显式 `ok` 布尔优先；
+ * 只带 `error`/`message` 字符串视为失败；其余一律按已受理 —— `cancelled` 状态是权威，
+ * 成员是否真停由 watcher 对账，所以这里猜错也不会让状态机错。
+ */
+export function normalizeInterruptResult(value: unknown): { ok: boolean; error?: string } {
+  if (value === undefined || value === null) return { ok: true }
+  if (typeof value === 'boolean') return { ok: value }
+  if (typeof value === 'object') {
+    const row = value as { ok?: unknown; error?: unknown; message?: unknown }
+    const error =
+      typeof row.error === 'string' && row.error !== ''
+        ? row.error
+        : typeof row.message === 'string' && row.message !== ''
+          ? row.message
+          : undefined
+    if (typeof row.ok === 'boolean') return error === undefined ? { ok: row.ok } : { ok: row.ok, error }
+    if (error !== undefined) return { ok: false, error }
+  }
+  return { ok: true }
+}
+
 export interface SpawnPorts {
   spawn: (input: {
     prompt: string
@@ -512,6 +537,13 @@ export interface SpawnPorts {
     | { ok: false; error: string }
   >
   sendMessage: (memberId: string, text: string) => Promise<{ ok: boolean; error?: string }>
+  /**
+   * 尽力中断一个成员（r11 AC-26）：面板「取消任务」在任务 `running` 时调用。
+   *
+   * **可选**：宿主没有 `ctx.interrupt` 时不提供，调用方按「未装配」处理（只改任务状态）。
+   * 返回形状归一在这一层（见 `normalizeInterruptResult`），bridge 只消费 `{ ok, error? }`。
+   */
+  interruptMember?: (name: string) => Promise<{ ok: boolean; error?: string }>
 }
 
 /**
@@ -705,6 +737,26 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
         return { ok: false, error: `直达消息失败：${error instanceof Error ? error.message : String(error)}` }
       }
     },
+
+    /**
+     * 尽力中断（r11 AC-26）：只被「取消一个 running 任务」调用。
+     *
+     * 失败**不是**动作失败：bridge 把 `error` 折进一条 notice，任务状态照常落 `cancelled`
+     * —— 否则用户点一次「取消」会得到红字而状态没变，比不中断更糟。
+     */
+    async interruptMember(name) {
+      const interrupt = teams?.interrupt
+      if (typeof interrupt !== 'function') {
+        return { ok: false, error: '宿主未提供 interrupt 能力（成员不会被中断，任务状态照常取消）' }
+      }
+      const caller = resolveCaller(ctx)
+      if (!caller) return { ok: false, error: NO_CALLER }
+      try {
+        return normalizeInterruptResult(await interrupt.call(teams, caller, name))
+      } catch (error) {
+        return { ok: false, error: `中断成员失败：${error instanceof Error ? error.message : String(error)}` }
+      }
+    },
   }
 }
 
@@ -894,6 +946,57 @@ export function agentOfToolEvent(payload: unknown): unknown {
     if (isAgentLike(candidate)) return candidate
   }
   return undefined
+}
+
+/**
+ * 订阅「队长自己调用了工具」的结果（r11 F7 的唯一观察点）。
+ *
+ * 为什么订阅**根作用域**而不是 `captainAgentScopeOf(ctx)`：`ctx.agents.currentInitiator()`
+ * 在 `apply` 时刻往往还是空（那是工具执行期的异步链上下文），按队长作用域注册会得到
+ * 「注册时拿不到 → 一条都不记」——真机上的症状正是「面板永远没有执行痕迹」。
+ * 根作用域的 `tools/result` 会收到所有 agent 的调用，所以**在监听器里按 `exec.agent`
+ * 缺省过滤**：缺省即队长（与 `team/guard.ts` 的 `agentId===null → captain` 同口径），
+ * 有 `agent.id` 一律按成员跳过。这样判定只有一处，也不依赖装配时机。
+ *
+ * 只观察、不拦截：本函数不调用 `next()`、不改任何结果；监听器异常自己吞掉并 warn。
+ */
+export function onCaptainToolResult(
+  ctx: HostContext,
+  handler: (call: { toolName: string; args: unknown }) => void,
+): { stop: () => void } {
+  if (typeof ctx.on !== 'function') {
+    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：队长留痕不生效（面板不会显示执行痕迹）')
+    return { stop() {} }
+  }
+  let dispose: (() => void) | void = undefined
+  try {
+    const on = ctx.on.bind(ctx)
+    dispose = on('tools/result', (...args: unknown[]) => {
+      try {
+        const exec = args[0]
+        if (!exec || typeof exec !== 'object') return
+        // `exec.agent` 有值 ⇒ 成员调用，不是队长亲手写。
+        if (agentOfToolEvent(exec) !== undefined) return
+        const row = exec as { name?: unknown; arguments?: unknown }
+        if (typeof row.name !== 'string' || row.name === '') return
+        handler({ toolName: row.name, args: row.arguments })
+      } catch (error) {
+        // AC-23：留痕链上的任何异常都不得改变工具结果，也不得抛回宿主事件总线。
+        ctx.logger?.warn?.(`[auto-team] 队长留痕处理失败（已忽略，不影响工具结果）：${messageOf(error)}`)
+      }
+    })
+  } catch (error) {
+    ctx.logger?.warn?.(`[auto-team] 订阅 tools/result 失败（队长留痕不生效）：${messageOf(error)}`)
+  }
+  return {
+    stop() {
+      try {
+        dispose?.()
+      } catch {
+        /* disposer 失败不影响其余清理 */
+      }
+    },
+  }
 }
 
 /**

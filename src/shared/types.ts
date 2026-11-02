@@ -29,6 +29,17 @@ export type TaskStatus =
    * 且只允许通过 resume 动作恢复（不能自动重派，否则可能重复执行副作用）。
    */
   | 'interrupted'
+  /**
+   * r11 AC-14：写域被别的 `running`/`gate` 任务占着，**开跑之前**就停在这里。
+   *
+   * 不 spawn 成员、不占 `maxConcurrent` 名额、不计入 running 数；`waitingOn`（持锁任务 id）
+   * 与 `waitReason`（中文，宿主生成）说明在等谁、等哪条路径。
+   */
+  | 'waiting'
+  /** r11 AC-15：用户取消（终态，立即释放写域，下游转 blocked）。 */
+  | 'cancelled'
+  /** r11 AC-26：用户跳过（终态，释放写域，且被下游视为「依赖已满足」）。 */
+  | 'skipped'
 
 /** 一次运行的总体状态。 */
 export type PlanStatus = 'draft' | 'dispatching' | 'paused' | 'terminated' | 'cancelled'
@@ -80,6 +91,55 @@ export interface PlanTask {
   lastResumeAt?: number
   /** 上一次 resume 时任务的状态（与 lastResumeAt 一起构成幂等判据）。 */
   lastResumeStatus?: TaskStatus
+  /**
+   * r11 AC-12：写域 —— 本任务预计改动的路径（文件或目录，相对仓库根）。
+   *
+   * 归一（去 `./`、折叠 `//`、去尾 `/`）由 `host/plan/scope.ts` 单点做；空/缺省 = 不限，
+   * 不参与互斥。两个任务的写域相同或互为目录边界时互斥（AC-13）。
+   */
+  writeScopes?: string[]
+  /** r11 AC-14：正在等哪些任务的写域（必须全部指向 `running`/`gate` 的任务，AC-17）。 */
+  waitingOn?: string[]
+  /** r11 AC-14：等待原因（中文，**宿主生成**，面板原样渲染：「等待 t2 释放 src/host/bridge.ts」）。 */
+  waitReason?: string
+}
+
+/** 写域占用里的一条等待者（r11 AC-19/AC-20；`reason` 同样由宿主生成，客户端零拼装）。 */
+export interface ScopeLockWaiterView {
+  taskId: string
+  /** 等待者已派出的成员名（没有成员时缺省）。 */
+  member?: string
+  reason: string
+}
+
+/**
+ * 写域占用的一条锁视图（r11 AC-19）：谁占着哪条路径、谁在等它。
+ *
+ * **不落盘**（AC-16）：每次快照按 `plan.tasks` 的 `status + writeScopes` 现算，
+ * 因此重启、换 store 实例、从磁盘读回旧 run 之后等待关系都自动重建。
+ */
+export interface ScopeLockView {
+  path: string
+  holderTaskId: string
+  /** 持锁任务的成员名（未派出时缺省）。 */
+  holderMember?: string
+  /** 同一路径上的多个等待者合并在这一条里（不重复渲染路径行）。 */
+  waiters: ScopeLockWaiterView[]
+}
+
+/** 队长亲手写文件的留痕（r11 AC-23/AC-24）：60 秒内同一键合并成一条并累加 `count`。 */
+export interface DeviationView {
+  /** 记录时刻（毫秒）。 */
+  at: number
+  sessionId: string
+  /** 工具名（`write` / `edit`，可带命名空间前缀）。 */
+  toolName: string
+  /** 归一后的路径集合。 */
+  paths: string[]
+  /** 中文原因（宿主生成，面板原文渲染）。 */
+  reason: string
+  /** 合并次数（≥1；面板显示 `×N`）。 */
+  count: number
 }
 
 /** 一份计划（落盘时包在 RunState 里，见 src/host/store.ts）。 */
@@ -419,6 +479,14 @@ export interface PanelSnapshot {
    * 用户看到的就是一个空列表外加零解释（验收 R2 的原始缺陷）。
    */
   systemSkillsReason?: string
+  /**
+   * r11 AC-19：写域占用（谁占着哪条路径、谁在等）。**空数组必给**（面板据此渲染 0 节点）。
+   *
+   * 声明为可选只是为了让旧快照缺省即空；`bridge.snapshot` 一律给数组。
+   */
+  scopeLocks?: ScopeLockView[]
+  /** r11 AC-24：队长亲手写文件的最近留痕（新的在后），**空数组必给**。 */
+  deviations?: DeviationView[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -553,7 +621,7 @@ export interface ExpandPayload {
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
 
 /**
- * 面板动作全集（15 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 面板动作全集（18 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
  * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
  */
 export type PanelAction =
@@ -592,6 +660,15 @@ export type PanelAction =
   | { type: 'restoreDefaultRoles' }
   /** r7 AC-13：保存可配参数（`unknown`：校验在 host/settings.ts 单点做，非法即整份拒绝）。 */
   | { type: 'saveSettings'; settings: unknown }
+  /**
+   * r11 AC-25/AC-26：单任务取消（终态 → `cancelled`，running 时连带中断成员，释放写域）。
+   * 允许集与拒绝文案的唯一来源是 `src/shared/task-actions.ts`。
+   */
+  | { type: 'cancelTask'; taskId: string; reason?: string }
+  /** r11 AC-26：单任务跳过（终态 → `skipped`，其依赖视为满足，释放写域）。 */
+  | { type: 'skipTask'; taskId: string }
+  /** r11 AC-26：改验收命令（下次门禁生效；空串拒绝并回三条模板）。 */
+  | { type: 'updateAcceptance'; taskId: string; acceptance: string }
 
 /**
  * 拒绝码（12 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），

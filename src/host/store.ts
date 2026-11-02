@@ -273,18 +273,29 @@ const PLAN_STATUSES: readonly PlanStatus[] = ['draft', 'dispatching', 'paused', 
  *
  * `paused` 同理（r7 AC-9）：暂停期间任务被冻结成 paused，读盘若归回 pending，
  * 恢复时会把它当「待办」重派一次 —— 已完成的工作被重跑，是暂停功能最坏的事故形态。
+ *
+ * `waiting`（r11 AC-16）**必须**在白名单里：它的等待关系不落盘（无锁表），但状态本身要落盘，
+ * 否则重启后等待中的任务被归回 pending，下一轮把它当普通待办派发出去 —— 写域互斥静默失效。
+ * `cancelled` / `skipped`（r11 AC-15/AC-26）是终态：归回 pending 会让「已跳过」的任务复活，
+ * 而 skipped 同时是「依赖已满足」的判据（graph.depSatisfied），必须原样存活。
  */
 const TASK_STATUSES: readonly TaskStatus[] = [
   'pending',
   'blocked',
   'ready',
   'running',
+  /** r11 AC-14：写域被别人占着，等它释放（不占并发、不派成员）。 */
+  'waiting',
   'paused',
   'gate',
   'done',
   'rework',
   'failed',
   'interrupted',
+  /** r11 AC-15：用户取消（终态，释放写域）。 */
+  'cancelled',
+  /** r11 AC-26：用户跳过（终态，释放写域，并视为依赖已满足）。 */
+  'skipped',
 ]
 
 /** 消息账本裁剪：只保留最新 `MESSAGES_LIMIT` 条（顺序不变）。 */
@@ -422,7 +433,7 @@ function normalizePlan(raw: Record<string, unknown>): Plan | null {
 /** 单个任务的最小结构校验：旧文件里缺字段时补默认值，坏条目直接丢弃。 */
 function normalizeTask(raw: unknown): PlanTask | null {
   if (!isRecord(raw) || typeof raw.id !== 'string' || raw.id === '') return null
-  return {
+  const task: PlanTask = {
     ...(raw as unknown as PlanTask),
     id: raw.id,
     title: typeof raw.title === 'string' ? raw.title : raw.id,
@@ -433,6 +444,30 @@ function normalizeTask(raw: unknown): PlanTask | null {
     acceptance: typeof raw.acceptance === 'string' ? raw.acceptance : '',
     status: TASK_STATUSES.includes(raw.status as TaskStatus) ? (raw.status as TaskStatus) : 'pending',
   }
+
+  // r11 新增的三个可选字段：只有真的带内容才留在对象上（旧文件的形态保持不变）。
+  const writeScopes = stringList(raw.writeScopes)
+  if (writeScopes.length > 0) task.writeScopes = writeScopes
+  else delete task.writeScopes
+
+  const waitingOn = stringList(raw.waitingOn)
+  if (waitingOn.length > 0) task.waitingOn = waitingOn
+  else delete task.waitingOn
+
+  const waitReason = typeof raw.waitReason === 'string' ? raw.waitReason.trim() : ''
+  if (waitReason !== '') task.waitReason = waitReason
+  else delete task.waitReason
+
+  return task
+}
+
+/** 字符串数组清洗：丢非字符串、去首尾空白、丢空串（保持声明顺序）。 */
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
 }
 
 /** 并发上限统一夹到 [1, MAX_CONCURRENT_LIMIT]，缺失取默认 3。 */

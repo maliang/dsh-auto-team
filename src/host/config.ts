@@ -209,3 +209,23 @@ export const MODEL_CATALOG_MAX = 120
  * 之间的折中：面板每 2s 取一次快照，没有缓存就是每 2s 一次 `listProviders/listModels`。
  */
 export const MODEL_CATALOG_TTL_MS = 60_000
+
+/* ───────────────────────── r11：队长亲手写文件的留痕（F7，四常量各只此一处） ───────────────────────── */
+
+/**
+ * 同一 (toolName, 归一路径集合) 的留痕合并窗口（毫秒，AC-24）。
+ *
+ * 60s 的取值理由：队长一次「顺手改两行」通常是连续几次 write/edit（间隔秒级），
+ * 合并成一条并累加 `count` 才能让面板的 `×N` 有意义；窗口再长就会把两次无关的
+ * 会话阶段并成一条，反而看不出「什么时候动的手」。
+ */
+export const DEVIATION_MERGE_MS = 60_000
+
+/** 留痕文件的物理行上限（超出按时间轮转掉最旧的行，防无限增长）。 */
+export const DEVIATION_LINE_LIMIT = 500
+
+/** 快照里最多投影多少条留痕（面板滚动列表的上限；文件本身保留更多）。 */
+export const DEVIATION_SNAPSHOT_LIMIT = 50
+
+/** 留痕原因的最大字符数（超出截断，防止一条原因把整块面板撑破）。 */
+export const DEVIATION_REASON_MAX = 120

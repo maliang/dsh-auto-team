@@ -5,7 +5,7 @@
  * 它们在 `apply()` 里是否真的被接上**。历史缺陷形态是「每个模块都绿，插件装进宿主后工具在、
  * 面板不动」——因为装配点漏了一个端口、或者注册段抛错被静默吞掉。所以这里用一个假 ctx 跑一遍
  * 真实 `apply()`，断言：
- *   1. 7 个工具 / 3 条面板接口 / 1 段队长提示词都真的注册上了；
+ *   1. 8 个工具 / 3 条面板接口 / 1 段队长提示词都真的注册上了；
  *   2. 一条完整主链路跑到底：plan → dispatch（起成员）→ receipt（过门禁）→ 下游 ready 再派发；
  *   3. watcher 真的在跑（杀成员后任务转 interrupted）且能被 ctx.effect 清理；
  *   4. `agent/created` 的实际模型与声明不一致时落 drift 审计（AC-22，不静默回退）。
@@ -194,7 +194,7 @@ function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> 
   })
 }
 
-test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链路 plan→dispatch→receipt→下游 ready 跑通', async () => {
+test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链路 plan→dispatch→receipt→下游 ready 跑通', async () => {
   const home = mkdtempSync(join(tmpdir(), 'auto-team-wire-'))
   const previousHome = process.env.HOME
   // apply() 用 os.homedir() 解析数据根：把 HOME 指到临时目录，测试不污染真实 ~/.dsh/auto-team。
@@ -215,6 +215,7 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.deepEqual(
     h.tools.map((tool) => tool.name).sort(),
     [
+      `${TOOL_PREFIX}add_tasks`,
       `${TOOL_PREFIX}dispatch`,
       `${TOOL_PREFIX}memory`,
       `${TOOL_PREFIX}message`,
@@ -223,7 +224,7 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
       `${TOOL_PREFIX}role`,
       `${TOOL_PREFIX}status`,
     ],
-    `必须注册 7 个工具，实际 ${h.tools.length}：${h.tools.map((tool) => tool.name).join(',')}`,
+    `必须注册 8 个工具，实际 ${h.tools.length}：${h.tools.map((tool) => tool.name).join(',')}`,
   )
   assert.equal(h.sections.length, 1, '队长提示词只注册一段')
   const sectionText = h.sections[0]?.text() ?? ''
@@ -233,14 +234,15 @@ test('apply() 装配：7 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(h.routes.length, 1, '宿主 WebRoute 没有 method 字段，四条能力合并成一条 prefix 路由')
   assert.equal(h.routes[0]?.path, '/api/auto-team')
   assert.equal(h.routes[0]?.kind, 'prefix')
-  // 四份清理：watcher 的 setInterval、成员推进事件订阅（T2 的 onMemberProgress）、
-  // noWait 守卫（T5 的 tools/pre-execute）、Trigger 事件订阅（T5 的事件流）都必须在卸载时停掉。
+  // 五份清理：watcher 的 setInterval、成员推进事件订阅（T2 的 onMemberProgress）、
+  // noWait 守卫（T5 的 tools/pre-execute）、Trigger 事件订阅（T5 的事件流）、
+  // 队长留痕订阅（r11 F7 的 tools/result → deviation recorder）都必须在卸载时停掉。
   // 队长的模型撤销（registerEffect at index.ts:187）走不到这里：测试 harness 不提供
   // 主 session 作用域，装配时走 capability='unsupported' 分支，不注册 disposer。
   assert.equal(
     h.disposers.length,
-    4,
-    `watcher / 进度订阅 / noWait 守卫 / Trigger 订阅 都必须挂 ctx.effect 清理，实际 ${h.disposers.length}`,
+    5,
+    `watcher / 进度订阅 / noWait 守卫 / Trigger 订阅 / 留痕订阅 都必须挂 ctx.effect 清理，实际 ${h.disposers.length}`,
   )
 
   // 三条面板接口都在（第 4 条未知路径必须是 404，证明分发真的在路由表里查）
@@ -536,7 +538,7 @@ test('r5 缺省装配：没注入三个新端口时快照与今天完全一致�
  * 这里守的是「装配之后宿主**真的**只看到 1 条 prefix 路由、3 条内部路径可用、第 4 条 404」。
  * 源码看着对但装配顺序/前缀写错时，只有这一层能红。
  */
-test('形态冻结：apply 后 3 面板接口 / 1 条 prefix 路由 / 4 项 inject / 7 工具（r7 只加 action.type）', async () => {
+test('形态冻结：apply 后 3 面板接口 / 1 条 prefix 路由 / 4 项 inject / 8 工具（r11 只加 add_tasks + 3 个 action.type）', async () => {
   const home = mkdtempSync(join(tmpdir(), 'auto-team-freeze-'))
   const previousHome = process.env.HOME
   process.env.HOME = home
@@ -548,7 +550,15 @@ test('形态冻结：apply 后 3 面板接口 / 1 条 prefix 路由 / 4 项 inje
   }
 
   assert.deepEqual(inject, ['tools', 'systemPrompt', 'agents', 'agentTeams'], 'inject 冻结为 4 项硬依赖')
-  assert.equal(h.tools.length, 7, `工具面冻结为 7 个（r7 不加工具），实际 ${h.tools.map((tool) => tool.name).join(', ')}`)
+  // 工具面按**名字集**冻结（不是只数个数）：数量断言在加工具时只给一句「7 → 8」，
+  // 而名字集能钉住「加的是哪一个」，也让 AC-28 的形状扩张登记可执行。
+  assert.deepEqual(
+    h.tools.map((tool) => tool.name).sort(),
+    ['add_tasks', 'dispatch', 'memory', 'message', 'plan', 'receipt', 'role', 'status'].map(
+      (name) => `${TOOL_PREFIX}${name}`,
+    ),
+    `工具面冻结为 8 个（r11 加 add_tasks），实际 ${h.tools.map((tool) => tool.name).join(', ')}`,
+  )
   assert.equal(h.routes.length, 1, '宿主只注册 1 条 prefix 路由（3 条内部路由合成 1 条）')
   assert.equal(h.routes[0]?.path, BRIDGE_ROUTE, `prefix 必须是 ${BRIDGE_ROUTE}`)
   assert.equal(h.routes[0]?.kind, 'prefix')

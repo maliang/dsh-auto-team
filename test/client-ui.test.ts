@@ -9,24 +9,39 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  deviationRowView,
   headerButtonView,
   modelPickerLabel,
   optionView,
   pauseButtonView,
   restoreConfirmView,
+  scopeLockRowView,
   settingsKeysView,
   skillRowView,
   skillSourceLabel,
   taskRowView,
 } from '../src/client/ui.ts'
-import { progressOf } from '../src/client/viewmodel.ts'
+import {
+  deviationRowOf,
+  deviationRowsOf,
+  deviationWriteCountOf,
+  progressOf,
+  scopeLockRowOf,
+  scopeLockRowsOf,
+  statusBadge,
+  taskActionsOf,
+  waitReasonOf,
+} from '../src/client/viewmodel.ts'
+import { TASK_ACTION_ALLOW, TASK_STATUS_LABELS, taskActionDisabledReason } from '../src/shared/task-actions.ts'
 import type {
   AutoTeamSettings,
   PlanStatus,
   PlanTask,
   Role,
+  ScopeLockView,
   SkillInfo,
   SkillSource,
+  DeviationView,
   TaskStatus,
 } from '../src/shared/types.ts'
 
@@ -273,26 +288,174 @@ test('任务行：标题 / 内容 / 状态 / 角色 / 门禁证据五项齐全',
   assert.equal(row.evidence, '退出码 0')
 })
 
-test('任务行：状态标签唯一来自 progressOf（10 态全覆盖，组件不得自写映射）', () => {
-  const statuses: TaskStatus[] = [
-    'pending',
-    'ready',
-    'blocked',
-    'rework',
-    'running',
-    'paused',
-    'gate',
-    'done',
-    'failed',
-    'interrupted',
-  ]
-  for (const status of statuses) {
+/** 13 态全集（r11 从 10 扩到 13；数组长度本身就是 AC-28 的形状判据）。 */
+const ALL_TASK_STATUSES: TaskStatus[] = [
+  'pending',
+  'ready',
+  'blocked',
+  'waiting',
+  'rework',
+  'running',
+  'paused',
+  'gate',
+  'done',
+  'cancelled',
+  'skipped',
+  'failed',
+  'interrupted',
+]
+
+test('任务行：状态标签唯一来自 progressOf（13 态全覆盖，组件不得自写映射）', () => {
+  assert.equal(ALL_TASK_STATUSES.length, 13, 'TaskStatus 必须是 13 值（AC-28）')
+  for (const status of ALL_TASK_STATUSES) {
     const row = taskRowView(taskOf('t', status), ROLES)
     const progress = progressOf(taskOf('t', status))
     assert.equal(row.statusLabel, progress.label, `${status}：任务行标签必须与 progressOf 一致`)
     assert.equal(row.statusTone, progress.tone)
     assert.notEqual(row.statusLabel, status, `${status} 不得回显英文原文`)
+    assert.equal(row.statusLabel, TASK_STATUS_LABELS[status], `${status}：徽标文案必须读共享标签表`)
   }
+
+  const badges = ALL_TASK_STATUSES.map((status) => statusBadge(status))
+  assert.equal(new Set(badges.map((badge) => badge.text)).size, 13, '13 个中文标签必须互不重复')
+  assert.equal(statusBadge('waiting').tone, 'warn', '等待是琥珀（被挡住，不是失败）')
+  assert.equal(statusBadge('cancelled').tone, 'neutral', '取消是中性，不能标红')
+  assert.equal(statusBadge('skipped').tone, 'neutral', '跳过是中性，不能标红')
+  assert.equal(statusBadge('failed').tone, 'danger')
+  assert.equal(statusBadge('interrupted').tone, 'danger')
+})
+
+/* ───────────────── ⑤b 三动作 disabled 矩阵（AC-27，13 × 3 = 39 格） ───────────────── */
+
+const ACTION_TO_ALLOW_KEY = {
+  cancel: 'cancel',
+  skip: 'skip',
+  'edit-acceptance': 'acceptance',
+} as const
+
+test('三动作：39 格 disabled 与 TASK_ACTION_ALLOW 逐格一致，禁用必须带原因（AC-27）', () => {
+  let cells = 0
+  for (const status of ALL_TASK_STATUSES) {
+    const actions = taskActionsOf(taskOf('t2', status))
+    assert.deepEqual(
+      actions.map((action) => action.action),
+      ['cancel', 'skip', 'edit-acceptance'],
+      `${status}：按钮顺序必须是 取消 → 跳过 → 验收`,
+    )
+    assert.deepEqual(
+      actions.map((action) => action.label),
+      ['取消', '跳过', '验收'],
+      `${status}：按钮文案逐字`,
+    )
+    for (const action of actions) {
+      cells += 1
+      const allowed = TASK_ACTION_ALLOW[status][ACTION_TO_ALLOW_KEY[action.action]]
+      assert.equal(action.disabled, !allowed, `${status}/${action.action}：disabled 必须与允许表一致`)
+      assert.match(action.ariaLabel, /t2/, `${status}/${action.action}：可访问名必须带任务 id`)
+      if (allowed) {
+        assert.equal(action.reason, undefined, `${status}/${action.action}：允许时不应有禁用原因`)
+      } else {
+        assert.equal(action.reason, taskActionDisabledReason(action.action, status), '禁用原因必须读共享表')
+        assert.notEqual((action.reason ?? '').trim(), '', `${status}/${action.action}：disabled 不得空原因`)
+      }
+    }
+  }
+  assert.equal(cells, 39, 'AC-27 判据：13 态 × 3 动作 = 39 格')
+})
+
+/* ───────────────── ⑤c 等待原因：逐字取快照（AC-20，零拼装） ───────────────── */
+
+test('等待条：waitReason 逐字返回快照原文，不 trim 不拼接（AC-20）', () => {
+  const raw = '等待 t2 释放 src/host/bridge.ts'
+  const waiting = taskOf('t3', 'waiting', { waitReason: raw, waitingOn: ['t2'] })
+  assert.equal(waitReasonOf(waiting), raw)
+  assert.equal(taskRowView(waiting, ROLES).waitReason, raw)
+  assert.equal(taskRowView(waiting, ROLES).statusLabel, TASK_STATUS_LABELS.waiting)
+
+  // 首尾空白也必须原样保留：客户端一旦 trim，宿主的逐字断言就会在无害重构后失效
+  const spaced = '  等待 t2 释放 src/host/bridge.ts  '
+  assert.equal(waitReasonOf(taskOf('t4', 'waiting', { waitReason: spaced })), spaced)
+
+  assert.equal(waitReasonOf(taskOf('t5', 'pending')), '')
+  // 非 waiting 态即使残留字段也不该渲染（组件侧的渲染判据在 client-contract 里断言）
+  assert.equal(waitReasonOf(taskOf('t6', 'running', { waitReason: '残留' })), '残留')
+})
+
+/* ───────────────── ⑤d 写域占用行（AC-20，reason 原文 + 成员兜底） ───────────────── */
+
+test('写域占用：行视图 = 路径 + 持锁者 + 等待者，reason 原文，空数组 0 行', () => {
+  const lock: ScopeLockView = {
+    path: 'src/host/bridge.ts',
+    holderTaskId: 't2',
+    holderMember: '开发',
+    waiters: [
+      { taskId: 't3', member: '测试', reason: '等待 t2 释放 src/host/bridge.ts' },
+      { taskId: 't4', reason: '等待 t2 释放 src/host/bridge.ts' },
+    ],
+  }
+  const rows = scopeLockRowsOf({ scopeLocks: [lock], deviations: [] } as unknown as Parameters<typeof scopeLockRowsOf>[0])
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.path, 'src/host/bridge.ts')
+  assert.equal(rows[0]?.holderLabel, 't2 · 开发')
+  assert.equal(rows[0]?.waiters.length, 2)
+  assert.equal(rows[0]?.waiters[0]?.label, 't3 · 测试（等待 t2 释放 src/host/bridge.ts）')
+  assert.equal(rows[0]?.waiters[0]?.reason, '等待 t2 释放 src/host/bridge.ts', '原因必须原文透传')
+  assert.equal(rows[0]?.waiters[1]?.label, 't4 · 未派成员（等待 t2 释放 src/host/bridge.ts）')
+
+  assert.deepEqual(scopeLockRowsOf(undefined), [], '无快照 → 0 行（组件据此不渲染整块）')
+  assert.deepEqual(scopeLockRowsOf({ scopeLocks: [], deviations: [] } as unknown as Parameters<typeof scopeLockRowsOf>[0]), [])
+
+  const noHolder = scopeLockRowsOf({
+    scopeLocks: [{ path: 'a.ts', holderTaskId: 't9', waiters: [] }],
+    deviations: [],
+  } as unknown as Parameters<typeof scopeLockRowsOf>[0])
+  assert.equal(noHolder[0]?.holderLabel, 't9 · 未派成员')
+  assert.equal(scopeLockRowView(lock).holderLabel, scopeLockRowOf(lock).holderLabel, 'ui 层必须委托 viewmodel')
+})
+
+/* ───────────────── ⑤e 执行痕迹行（AC-24，时间 / 路径 / ×N / 原因） ───────────────── */
+
+test('执行痕迹：时间格式化、多路径「、」、×N 只在 count>1 时给，原因原文', () => {
+  const at = new Date(2026, 10, 2, 10, 41, 7).getTime()
+  const merged: DeviationView = {
+    at,
+    sessionId: 's1',
+    toolName: 'write',
+    paths: ['src/host/bridge.ts', 'src/client/ui.ts'],
+    reason: '补一处类型守卫后立刻派成员',
+    count: 4,
+  }
+  const single: DeviationView = {
+    at,
+    sessionId: 's1',
+    toolName: 'edit',
+    paths: ['src/client/ui.ts'],
+    reason: '修正文案',
+    count: 1,
+  }
+  const rows = deviationRowsOf({ scopeLocks: [], deviations: [merged, single] } as unknown as Parameters<
+    typeof deviationRowsOf
+  >[0])
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0]?.at, '10:41:07')
+  assert.equal(rows[0]?.toolName, 'write')
+  assert.equal(rows[0]?.paths, 'src/host/bridge.ts、src/client/ui.ts', '多路径用「、」连接')
+  assert.equal(rows[0]?.countLabel, '×4')
+  assert.equal(rows[0]?.reason, '补一处类型守卫后立刻派成员', '原因原文透传')
+  assert.equal(rows[1]?.countLabel, '', 'count=1 不给 ×N')
+  assert.equal(deviationWriteCountOf(rows), 5, '组标题 N 次 = Σcount，不是记录条数')
+
+  assert.deepEqual(deviationRowsOf(undefined), [])
+  assert.deepEqual(deviationRowsOf({ scopeLocks: [], deviations: [] } as unknown as Parameters<typeof deviationRowsOf>[0]), [])
+  assert.equal(deviationWriteCountOf([]), 0)
+  assert.equal(deviationRowView(merged).paths, deviationRowOf(merged).paths, 'ui 层必须委托 viewmodel')
+
+  // 缺字段不许抛：非法 count 归 1，paths 非数组当空（宁少不崩）
+  const broken = deviationRowOf({ at: 0, sessionId: '', toolName: '', paths: null, reason: '', count: Number.NaN } as unknown as DeviationView)
+  assert.equal(broken.at, '—')
+  assert.equal(broken.paths, '')
+  assert.equal(broken.count, 1)
+  assert.equal(broken.countLabel, '')
 })
 
 test('任务行：角色缺失显示「未分配」，证据缺失为空串（整块不渲染，不写「—」）', () => {

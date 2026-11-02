@@ -3,8 +3,9 @@
  *
  * 三件事：
  *  1. validateGraph：结构合法性（空、重复 id、未知依赖、自依赖、环）；
- *  2. readyTasks：当前可派发的集合（依赖全部 done 且自身未开始）；
- *  3. blockedTasks：依赖未全部 done 的集合（面板显示「被谁挡着」）。
+ *  2. readyTasks：当前可派发的集合（依赖全部满足且自身未开始）；
+ *  3. blockedTasks：依赖未满足的集合（面板显示「被谁挡着」）。
+ *  4. depSatisfied：「依赖是否已满足」的唯一判定（done 与 skipped 满足，cancelled 不满足）。
  */
 
 export interface GraphNode {
@@ -99,23 +100,37 @@ export interface TaskLike extends GraphNode {
   status: string
 }
 
-/** 可派发集合：自身状态为 pending/ready/rework，且所有依赖都是 done。 */
+/**
+ * 依赖是否已满足 —— 全仓唯一判定口（AC-26「skipped 视为依赖满足」）。
+ *
+ * - skipped 满足：用户显式跳过一条任务，语义就是「不再执行它、下游照常推进」；
+ * - cancelled 不满足：取消的语义是「这条做不了了」，下游留在 blocked 由人决定；
+ * - done 满足；其余（pending/running/...）都不满足。
+ *
+ * 为什么必须是函数：dispatch 的下游解锁、readyTasks、blockedTasks 三处都要判，
+ * 各写一遍 `status === 'done'` 的话，第一次改语义（加 skipped）就会分叉。
+ */
+export function depSatisfied(status: string): boolean {
+  return status === 'done' || status === 'skipped'
+}
+
+/** 可派发集合：自身状态为 pending/ready/rework，且所有依赖都已满足。 */
 export function readyTasks(tasks: TaskLike[]): string[] {
-  const doneIds = new Set(tasks.filter((task) => task.status === 'done').map((task) => task.id))
+  const satisfiedIds = new Set(tasks.filter((task) => depSatisfied(task.status)).map((task) => task.id))
   return tasks
     .filter((task) => task.status === 'pending' || task.status === 'ready' || task.status === 'rework')
-    .filter((task) => (task.dependsOn ?? []).every((dep) => doneIds.has(dep)))
+    .filter((task) => (task.dependsOn ?? []).every((dep) => satisfiedIds.has(dep)))
     .map((task) => task.id)
 }
 
-/** 被阻塞集合 → 阻挡它的未完成依赖列表。 */
+/** 被阻塞集合 → 阻挡它的未满足依赖列表。 */
 export function blockedTasks(tasks: TaskLike[]): Array<{ id: string; waitingOn: string[] }> {
-  const doneIds = new Set(tasks.filter((task) => task.status === 'done').map((task) => task.id))
+  const satisfiedIds = new Set(tasks.filter((task) => depSatisfied(task.status)).map((task) => task.id))
   return tasks
     .filter((task) => task.status === 'pending' || task.status === 'ready' || task.status === 'rework')
     .map((task) => ({
       id: task.id,
-      waitingOn: (task.dependsOn ?? []).filter((dep) => !doneIds.has(dep)),
+      waitingOn: (task.dependsOn ?? []).filter((dep) => !satisfiedIds.has(dep)),
     }))
     .filter((entry) => entry.waitingOn.length > 0)
 }

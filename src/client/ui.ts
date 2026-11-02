@@ -7,7 +7,7 @@
  * **禁止再写第二份文案**（同一状态两处文案必然漂移，是本项目的历史 bug 族）。
  *
  * 纪律：
- *  1. 状态中文标签一律来自 `./viewmodel.ts`（10 态唯一出处），本文件不写任务/计划状态中文。
+ *  1. 状态中文标签一律来自 `./viewmodel.ts`（13 态唯一出处），本文件不写任务/计划状态中文。
  *  2. 不 import host（`grep -rn "from '\.\./host/" src/client` 必须 0 命中）：client 与
  *     host 只通过 HTTP 通信。因此设置项的取值范围只能在这里写死一份字面量 —— 见
  *     `settingsKeysView` 的注释（真值在 `src/host/config.ts` 的 SETTINGS_LIMITS）。
@@ -15,15 +15,28 @@
  */
 import type {
   AutoTeamSettings,
+  DeviationView,
   GateEvidence,
   PlanStatus,
   PlanTask,
   Role,
   RoleModelRoute,
+  ScopeLockView,
   SkillInfo,
   SkillSource,
 } from '../shared/types.ts'
-import { planStatusView, progressOf, routeTextOf } from './viewmodel.ts'
+import {
+  deviationRowOf,
+  planStatusView,
+  progressOf,
+  routeTextOf,
+  scopeLockRowOf,
+  taskActionsOf,
+  waitReasonOf,
+  type DeviationRowView,
+  type ScopeLockRowView,
+  type TaskActionView,
+} from './viewmodel.ts'
 
 /* ───────────────────── 输入框内胶囊选项（AC-3 / AC-6） ───────────────────── */
 
@@ -198,13 +211,20 @@ export interface TaskRowView {
   title: string
   /** ② 任务内容 = `acceptance`（标题另列；截断交给 CSS 的两行 clamp，不在这里砍字）。 */
   content: string
-  /** ③ 状态中文标签，唯一来自 `progressOf(task)`（10 态全覆盖）。 */
+  /** ③ 状态中文标签，唯一来自 `progressOf(task)`（13 态全覆盖）。 */
   statusLabel: string
   statusTone: 'ok' | 'warn' | 'bad' | 'muted'
   /** ④ 所属角色名；缺失显示「未分配」。 */
   roleLabel: string
   /** 门禁证据摘要；空串 = 无证据，组件整块不渲染（**不写「—」**）。 */
   evidence: string
+  /**
+   * ⑤ 等待原因（AC-20）：**快照原文**，空串 = 没有等待条（非 waiting 态一律空串）。
+   * 组件只在 `status === 'waiting'` 且它非空时渲染 `[data-wait-reason]`。
+   */
+  waitReason: string
+  /** ⑥ 三个单任务动作（含 disabled 与原因，派生自 shared 的允许表，AC-27）。 */
+  actions: TaskActionView[]
 }
 
 /** 一条任务行的全部可核验文案。 */
@@ -218,7 +238,21 @@ export function taskRowView(task: PlanTask, roles: Role[]): TaskRowView {
     statusTone: progress.tone,
     roleLabel: roleLabelOf(task, roles),
     evidence: evidenceOf(task),
+    waitReason: waitReasonOf(task),
+    actions: taskActionsOf(task),
   }
+}
+
+/* ───────── r11：写域占用行 / 执行痕迹行（DESIGN §3.5 / §3.6，映射只在 viewmodel） ───────── */
+
+/** 写域占用的一行（`[data-lock-row]`）——委托 viewmodel，组件不自己拼文案。 */
+export function scopeLockRowView(lock: ScopeLockView): ScopeLockRowView {
+  return scopeLockRowOf(lock)
+}
+
+/** 执行痕迹的一行（`[data-deviation-row]`）——委托 viewmodel。 */
+export function deviationRowView(record: DeviationView): DeviationRowView {
+  return deviationRowOf(record)
 }
 
 const UNASSIGNED_ROLE = '未分配'
