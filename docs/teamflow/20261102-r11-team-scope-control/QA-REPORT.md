@@ -1,103 +1,122 @@
-# QA-REPORT · r11 团队写域 / 续派 / 单任务干预
+# QA-REPORT · r11 团队写域 / 续派 / 单任务干预（复验轮 round 2）
 
 - 需求：docs/teamflow/20261102-r11-team-scope-control（PRD 40 条 AC：P0 33 / P1 7）
-- 分支：feat/auto-team-plugin ｜ HEAD：7843d3c ｜ 工作树：26 M + 13 ??（r11 全部改动未提交）
-- 结论：**不可进入验收** —— 3 个 P1 阻断（类型门禁红、回归线 2 条旧断言红、产物与提交未收口）；功能面 37/40 条 AC 有实测证据，3 条待真机/收口。
-- 环境：macOS，Node 22，沙箱内**无法启动浏览器**（宿主 token 限制，非交付缺陷）→ UI 以「静态契约 + 纯函数视图 + DOM 无关断言」验证，真机项进「人工补测清单」。
+- 分支：feat/auto-team-plugin ｜ HEAD：`bdba5f8` ｜ 交付提交后工作树 = 0（本轮唯一待入库改动即本报告 `M QA-REPORT.md`，由验收阶段随收口提交）
+- 结论：**可进入验收** —— 上轮 3 个 P1（D1/D2/D3）全部关闭，本轮无 P0/P1/P2 开放；3 条 P3 观察保留；真机 7 项进「人工补测清单」（环境限制，非交付缺陷）。
+- 环境：macOS，Node 22；沙箱内**无法启动浏览器与第二宿主**（宿主 token 限制）→ UI/安装类改用「产物级 node:vm 装配 + 纯函数视图断言」，真机项如实列清单。
 
-## 1. 门禁实测（2026-11-02 14:2x–15:0x）
+## 1. 门禁实测（2026-11-02 15:3x–16:0x，全部本轮实跑）
 
 | 命令 | 结果 |
 |---|---|
-| `pnpm -s typecheck` | **exit 2，9 条 TS 错**（见 D1） |
-| `pnpm -s test` | **exit 1，tests 562 / pass 560 / fail 2**（均在 test/wire.test.ts） |
-| `pnpm -s build` | exit 0，lib/index.js 364827B + lib/client.js 273697B（35ms） |
-| `node --input-type=module -e "await import('./lib/index.js'); await import('./lib/client.js'); console.log('IMPORT_OK')"` | exit 0，`IMPORT_OK`（两产物顶层不抛） |
-| `npm pack --dry-run \| grep -E 'lib/(index\|client)\.js\|cordis\.patch\.yml'` | 命中 3 件（364.8kB / 273.7kB / 646B） |
-| `node logs/teamflow/tf-mvynaqhi-o4q3jo/scripts/qa-r11-probe.mjs` | **21/21 PASS**（独立 apply() 起假 ctx，走 8 工具 + 3 路由） |
-| 关键单测子集：scope/acceptance/task-actions/deviation/tools/dispatch/graph/gate/bridge/host-contract | 179/179 pass |
-| client 子集：client-contract/client-ui/viewmodel | 91/91 pass |
-| 变异：`scopesConflict` 目录边界改回裸 `startsWith` | test/scope.test.ts **2 fail**（`src/host` vs `src/hostile.ts`）；还原后 10/10 pass、`git diff` 空 |
+| `pnpm -s typecheck` | **exit 0**，`grep -c 'error TS'` = **0** |
+| `pnpm -s test` | **exit 0，562 / 562 pass，0 fail**（4126ms，回归线 ≥484） |
+| `pnpm -s build` | exit 0，`lib/index.js` 364.83 kB + `lib/client.js` 273.70 kB（构建后 `git status` 仍 0，产物确定） |
+| `node --input-type=module -e "await import('./lib/index.js'); await import('./lib/client.js')"` | exit 0，`IMPORT_OK`（两产物顶层不抛） |
+| `npm pack --dry-run` | 命中 3 件：`lib/index.js` 364.8kB / `lib/client.js` 273.7kB / `cordis.patch.yml` 646B（total 5） |
+| `find src -name '*.ts*' -newer lib/index.js \| wc -l` | **0**（产物与源码同步） |
+| `git status --porcelain --untracked-files=all \| wc -l` | **0** |
+| `git log --oneline -1` | `bdba5f8 feat(r11): 团队写域互斥排队 + 计划续派 + 单任务取消/跳过/改验收 + 队长留痕` |
 
 ## 2. 交付形态契约（8 条，逐条可执行判据）
 
-| # | 判据 | 实测 |
+| # | 判据 | 本轮实测 |
 |---|---|---|
-| 1 | 宿主半加载入口 `name` = 包根名 | `cordis.patch.yml`：`- insert: - id: auto-team-host / name: 'dsh-auto-team'` ✅ |
-| 2 | client 声明字段集与同仓样本一致 + 产物含包 id | `dsh.client = {platform, inject, immediately}`（与 profile 内 dsh-better-sidebar 等同类字段集一致，无自造字段）；`grep -c "dsh-auto-team" lib/client.js` = 15 ✅ |
-| 3 | UI 挂载点 `name` 逐字等于 slot 名 | `src/client/slots.ts:350-387` 五处 `slots.inject(X, () => slots.register({ name: X, … }))`，`inject` 与 `name` 同一常量 ✅ |
+| 1 | 宿主半加载入口 `name` = 包根名 | `cordis.patch.yml`：`- insert: - id: auto-team-host / name: 'dsh-auto-team'`（grep 命中 1 处）✅ |
+| 2 | client 声明字段集与样本一致 + 产物含包 id | `dsh.client = {platform:"web", inject:[7 包], immediately:false}`；`grep -c 'dsh-auto-team' lib/client.js` = **15** ✅ |
+| 3 | UI 挂载点 `name` 逐字等于 slot 名 | 产物级抓取（A6）：5 处 `slots.inject(X, () => register({ name: X, … }))`，`inject` 参数与 `name` 同一字符串；插件标识只进 `id`/`key` ✅ |
 | 4 | 入口声明与产物进 files | `files = ["lib","cordis.patch.yml","README.md"]` ✅ |
-| 5 | 依赖协议可被 profile 解析 | `grep -c "workspace:" package.json` = 0 ✅ |
-| 6 | 宿主运行期依赖按 peer 声明 | peerDependencies 与 peerDependenciesMeta 各 8 项（7 个 @deepseek-ai/dsh-client-* + react）✅ |
-| 7 | 产物与源码同步 | QA 起始 **22 个 src 比 lib/index.js 新**（D3）；QA 重跑 build 后 `find src -name '*.ts*' -newer lib/index.js \| wc -l` = 0 |
-| 8 | 装载安全（顶层不抛） | 双产物 import exit 0 ✅ |
+| 5 | 依赖协议可被 profile 解析 | `grep -c 'workspace:' package.json` = **0** ✅ |
+| 6 | 宿主依赖按 peer/可选 peer 声明 | `peerDependencies` 8 项、`peerDependenciesMeta` 8 项（全 optional）✅ |
+| 7 | 构建产物与源码同步 | 上表 `find` = 0；且 A1–A5 直接跑 `lib/index.js` 而非 src，行为与源码一致 ✅ |
+| 8 | 装载安全：两产物顶层不抛 | 双 import exit 0（见 §1）✅ |
 
-## 3. 功能用例与结果
+## 3. 回归契约重跑（上轮遗留 4 个探针，逐项原始 pass 数）
 
-| AC | 判据 | 结果 | 证据 |
+| 探针（logs/teamflow/tf-mvynaqhi-o4q3jo/scripts/） | 结果 |
+|---|---|
+| `qa-r11-probe.mjs`（假 ctx 起 apply，8 工具 + 3 路由） | **21/21 PASS** |
+| `t3-tools-gate.mjs`（空验收整批拒绝 / add_tasks 幂等） | exit 0，**6 PASS** |
+| `t4-e2e-deviation-actions.mjs`（留痕 + 三动作端到端） | exit 0，**6/6 PASS**（终态 t1:cancelled, t2:blocked, t3:skipped） |
+| `t5-panel-flow.mjs`（面板写域/等待/痕迹流程） | exit 0，**10 PASS**（`TERMINAL {"tasks":3,"done":1,"cancelled":1,"skipped":1,"locks":0,"deviations":1,"writes":3}`） |
+
+## 4. 本轮新增覆盖面（上轮未覆盖，两脚本已落 scripts/）
+
+**`qa-r11-artifact-probe.mjs` → 6/6 PASS, exit 0**：跑**已交付产物**（`lib/index.js` + `lib/client.js`），并用真实宿主形状 `{ agent: { id: session } }` 调用工具（上轮全走 `{sessionId}` 兜底分支，恰是 r11 真机事故点）。
+
+| 编号 | 断言 |
+|---|---|
+| A1 | 宿主产物：entry name / inject 4 项 / 8 工具名全表 / 1 条 prefix 路由 `/api/auto-team` / 1 提示词段 / 清理回调 5 份 |
+| A2 | 默认 `enabled=false`；未知路径 404（分发真查路由表） |
+| A3 | 用真实 `exec.agent.id` 建计划 → 同 sessionId 快照见 3 条、他会话 0 条（会话口径修复生效） |
+| A4 | t1/t2 写域冲突（无依赖）→ t2 `waiting`、`waitingOn=['t1']`、`waitReason='等待 t1 释放 src/host'`、只 spawn 2 个；快照 `scopeLocks` 含 t1 行且 waiter 原因逐字 |
+| A5 | t1 receipt done → t2 回 `pending`、`messages` 中 `rel-t1-t2-` **恰 1 条**且 body 含「t1 已结束并释放 src/host」、t1 不再占锁、再 dispatch 后 t2 running 且 **runId 不变** |
+| A6 | client 产物经 `window.__ModuleLoader__.load` 真装配：id='dsh-auto-team'、inject=['slots']、5 处 inject 逐字（conversation.input.left / conversation.session.header.actions / sidebar.right.pane.tab / sidebar.right.pane.tab.title / settings.section）、panel 与 title 同 key 且 key≠slot 名、sidebarRightTabs 注册 1 个 definition 且包在 scope.effect |
+
+**`qa-r11-interface-sweep.mjs` → 3/3 PASS, exit 0**（QA 要求 0a）：I1 蓝图 15 个模块的 API 名逐个 import 核对 `typeof`（含 scope/acceptance/plan/graph/scope-locks/deviation/dispatch/tools/bridge/adapters/config/paths/gate/viewmodel/ui）；I2 13 态标签与允许表各 13 项、`statusBadge(status).text` 逐态等于 `TASK_STATUS_LABELS`（单源）、`progressOf` 每态 percent 为数字；I3 `waitReasonOf('t1','src/host')` === `'等待 t1 释放 src/host'`，client 只透传。
+
+## 5. AC 覆盖（40 条，按需求分组）
+
+| 需求 | AC | 本轮证据 | 结论 |
 |---|---|---|---|
-| AC-1 | 两条硬规则可 grep + 段落 ≤2600 | PASS | probe C9：`CAPTAIN_CONSTRAINTS` 命中「不亲自干细活/只做三件事」；段落 text 长度 ≤2600；无「当前会话已/未启用」断言 |
-| AC-2 | plan description 明示单任务合法 | PASS | probe C9 正则 `单任务计划合法` 命中 |
-| AC-3 | 单任务计划可 dispatch 出 1 成员 | PASS | probe E4（maxConcurrent=2 只起 2 人，含单任务路径）+ dispatch 用例 |
-| AC-4 | 三条模板真跑（应过 0 / 应败非 0） | PASS | probe C6：`pnpm typecheck`(exit 0 基线见 D1 说明)、`grep -RIn -F`、`git status --porcelain` 三类各跑正/负样本 |
-| AC-5 | 选不出 → `command:null` + 「选不出」+ 三条原文 | PASS | probe C5 |
-| AC-6 | plan/add_tasks 空验收整批拒绝不落盘 | PASS | probe E2/E9：拒绝后 store 目录文件集合与内容字节不变 |
-| AC-7 | gate 空验收旧句逐字在前 + 模板随后 | PASS | probe C7 |
-| AC-8 | 第 8 个工具 add_tasks；sessionOf 单一口径 | PASS | probe E1（8 工具名逐字）；`grep` sessionOf 定义 1 处、8 个工具各调 1 次；**但类型层有 D1** |
-| AC-9 | 幂等/原子/id 规则/跨批依赖 | PASS | probe E8（第二次 added=0、runId 不变、文件字节不变）、E9 |
-| AC-10 | 已终止 run 追加被拒且 store 不变 | PASS | probe E11 |
-| AC-11 | 追加后快照 tasks 增加且 runId 不变 | PASS | probe E8 |
-| AC-12 | writeScopes 归一与非法拒绝 | PASS | probe C3（合法 5 组/非法 5 组） |
-| AC-13 | 冲突=相等或目录边界前缀 | PASS | probe C4 真值表 + 变异（裸 `startsWith` → 2 红） |
-| AC-14 | waiting 不占并发 + waitingOn/waitReason | PASS | probe E4（maxConcurrent=2 只起 2 人，第三任务 waiting） |
-| AC-15 | 5 种终态释放写域并唤醒 | PASS | test/dispatch.test.ts:1231「五终态各释放一次，rework 不释放」 |
-| AC-16 | 无锁表，重启按计划顺序重算 | PASS | probe E6（新 store 载入 + `deriveScopeLocks` 重算，t1 仍是持有者） |
-| AC-17 | 等待边只指 running（无死锁）+ 同批重叠串行 | PASS | test/dispatch.test.ts:1188 同批串行；probe E4 顺序断言 |
-| AC-18 | 每次释放每等待者恰 1 条，重放不重复 | PASS | probe E7（`rel-t1-t2` 恰 1 条、waiting→pending、下一轮派出）+ dispatch 用例 |
-| AC-19 | 快照 scopeLocks + waitReason，宿主生成 | PASS | probe E5（文案 `等待 t1 释放 src/host` 与宿主生成逐字一致） |
-| AC-20 | 面板区块与 wait-reason 逐字、空矩阵 0 节点 | PASS（静态） | test/client-contract.test.ts 25/25（hook 与顺序、空数组 0 节点、零拼装）；真机见补测 |
-| AC-21 | 零新增槽位注册，name 逐字=slot | PASS | `grep -c "slots.register\|slots.inject" src/client/slots.ts` = 13 = HEAD 13 |
-| AC-22 | deviation 字段 + jsonl 落点 + 不记正文 | PASS | probe E12（write/edit 各 1 条、bash 不记、paths 逐字、reason ≤120、落 `~/.dsh/auto-team/deviations.jsonl`） |
-| AC-23 | fail-open：记录失败不影响工具结果 | PASS | test/deviation.test.ts（注入坏 writer 后 record 不抛）+ index.ts 订阅外层 try/catch |
-| AC-24 | 60s 同键合并计数 + 面板可查 | PASS | probe E12（连续两次 write → count=2；被不同键打断 → 新成一条；文件行数与快照条数一致） |
-| AC-25 | PanelAction 15→18 走既有 /act | PASS | `PanelAction` 成员 18；probe E10 三动作全走 `POST /api/auto-team/act` |
-| AC-26 | cancel/skip/updateAcceptance 允许与拒绝面 | PASS | probe E10（运行中拒绝 skip 且文案含 id+状态中文；空验收拒绝含模板） |
-| AC-27 | 39 格 disabled 矩阵 + 改验收弹层 | PASS（静态） | test/client-ui.test.ts:363 `cells === 39`；PlanTab 浮层 `role=dialog aria-modal=false`、Esc/外部点击/焦点归还 |
-| AC-28 | 形状扩张登记；kind9/路由3/setInterval1 不变 | PASS | TaskStatus 13、PanelAction 18、工具 8、kind 9、路由 3、`setInterval` 1、DEVIATION_ 常量 4 |
-| AC-29 | pnpm test ≥484 且 typecheck 0 | **FAIL** | 见 D1、D2 |
-| AC-30 | 入口 name=包根名 | PASS | 见交付形态 #1 |
-| AC-31/32 | dsh.client 字段一致 + 挂载点 name=slot、标识进 id/key | PASS | 见 #2、#3（keyed slot 带 `key: PANEL_KEY`） |
-| AC-33/34/35/36 | files 含 lib 与 patch、无 workspace:、peer 覆盖、双产物同步且顶层不抛 | PASS | 见 #4–#8 |
-| AC-37 | 安装与回滚步骤可照做 | **未完成** | PRD:173 有步骤；ACCEPTANCE.md 尚未生成（验收阶段产出），本轮不计缺陷 |
-| AC-38 | 真机：占用区块/等待文案/add_tasks 前后快照 | **未验证** | 沙箱无法起宿主/浏览器 → 人工补测清单 |
-| AC-39 | memory.md 回填四条，AGENTS.md 不动正文 | PASS | `git diff AGENTS.md` 空；memory.md:37 含七条 r11 约定 |
-| AC-40 | 单笔提交 + 工作树 clean | **FAIL** | 见 D3 |
+| F1 简单任务 | 1–3 | `qa-r11-probe` C9/C10/C11：两条硬规则可 grep、段落 ≤2600、plan description 明示单任务合法、单任务计划 dispatch 出 1 成员 | ✅ |
+| F2 验收模板 | 4–7 | `test/acceptance.test.ts` 6 次 `bash -c` 真跑（应过 exit 0 / 应败非 0）；`test/gate.test.ts` 原文案逐字 + 追加模板；`t3-tools-gate` 空验收整批拒绝且 store 字节不变 | ✅ |
+| F3 续派 | 8–11 | `t3-tools-gate`：8 工具、二次 `added=0`、runId 不变、已终止 run 拒绝；`test/tools.test.ts` | ✅ |
+| F4 写域 | 12–17 | `test/scope.test.ts`（归一/目录边界/`src/hostile.ts` 反例）；A4/A5 产物级 waiting+释放；`test/dispatch.test.ts`（不占并发、5 终态各释放一次、重启重算、无死锁） | ✅ |
+| F5 通知 | 18 | A5：每等待者恰 1 条、重放不重复；`t4` 端到端 | ✅ |
+| F6 面板 | 19–21 | A4/A6 + `t5-panel-flow` 10 PASS + `test/client-ui.test.ts`（13 态徽标/39 格/等待条原文）；槽位注册数不变（A6 5 处） | ✅ |
+| F7 留痕 | 22–24 | `t4` 6/6：落 `~/.dsh/auto-team/deviations.jsonl`（仓库外）、fail-open、60s 同键合并计数、快照 deviations 可查 | ✅（sessionId 口径见 D4） |
+| F8 干预 | 25–27 | `t4` 三动作端到端；`test/client-contract.test.ts`（disabled 矩阵与允许表一致、改验收浮层空值 0 请求） | ✅ |
+| 形状登记 | 28 | 13 态 / 8 工具 / 18 动作 / kind **9** / 路由 1 条 prefix（3 路由面）/ setInterval 1 处 / sessionOf 1 处 / 四常量各 1 | ✅ |
+| 门禁 | 29 | typecheck 0 + 562/562（≥484） | ✅ |
+| 分发形态 | 30–36 | §2 八条全绿 | ✅ |
+| 安装/回滚 | 37 | 步骤可照做，需主 agent 执行 | 人工补测 |
+| 真机面板 | 38 | 需第二宿主 + 浏览器 | 人工补测 |
+| 文档回填 | 39 | `docs/teamflow/memory.md:37` 四条约定齐全且随 HEAD 提交 | ✅ |
+| 收口 | 40 | 单笔提交 `bdba5f8`、工作树 clean、门禁数字见 §1 | ✅ |
 
-## 4. 缺陷表
+## 6. 缺陷表（仅列本轮复验后仍 OPEN 的项）
 
 | 编号 | 严重级(P0/P1/P2/P3) | 功能模块 | 复现步骤 | 期望行为 | 实际行为 | 关联验收项 | 检测命令 | 通过判据 |
 |---|---|---|---|---|---|---|---|---|
-| D1 | P1 | 类型契约（host 编排） | 1) `cd` 仓库根 2) `pnpm -s typecheck` | 0 条类型错误 | exit 2，9 条：`src/host/team/scope-locks.ts(10,55): TS2305 Module '"../../shared/types.ts"' has no exported member 'RunState'` + 同文件 85/103/129/130/163/168/181 TS7006 + `test/dispatch.test.ts(1302,43)` TS7006 | AC-29、AC-8 | `pnpm -s typecheck 2>&1 \| grep -c "error TS"` | 输出 `0`，且 `pnpm -s typecheck` exit 0 |
-| D2 | P1 | 回归线（旧断言未随 7→8 更新） | 1) `node --test test/wire.test.ts` | 5/5 pass | 2 fail：`:226` AssertionError「必须注册 7 个工具，实际 8：…auto_team_add_tasks」；`:551`「工具面冻结为 7 个（r7 不加工具）」 | AC-29、AC-28 | `node --test test/wire.test.ts 2>&1 \| grep -c "^✖"` | 输出 `0`（`pnpm -s test` 562/562 pass） |
-| D3 | P1 | 交付产物与收口 | 1) `git status --porcelain --untracked-files=all \| wc -l` 2) `find src -name '*.ts*' -newer lib/index.js \| wc -l` | 工作树 0 项、lib 与 src 同步（0 个新于产物） | 交付时 39 项未提交；QA 起始 22 个 src 新于 lib（lib 停在 12:04 的 r10 产物）——QA 为验证构建已重跑 `pnpm build`（现为 0），但源码一旦再改必须重跑 | AC-40、AC-33、AC-36 | `git status --porcelain --untracked-files=all \| wc -l` 与 `find src -name '*.ts*' -newer lib/index.js \| wc -l` | 两者均输出 `0`（含 `lib/` 双产物与任务夹文档的单笔提交） |
-| D4 | P3（观察，不阻断） | 留痕会话归因（M4） | 1) 触发队长 `write` 2) 读快照 `deviations[].sessionId` 3) 用另一 sessionId 读快照 | 记录归属真实会话、面板按会话隔离 | `sessionId` 恒为 `DEFAULT_SESSION='current'`；快照 `deviations` 不按会话过滤，多会话下互见（TECHNICAL:138 已明示该口径，属设计取舍） | AC-22、AC-24 | `node logs/teamflow/tf-mvynaqhi-o4q3jo/scripts/qa-r11-probe.mjs 2>&1 \| grep -c "sessionId"`（E12 断言现值 'current' 与跨会话可见） | - |
+| D4 | P3 | 留痕/面板 | 会话 A 中队长写文件后打开会话 B 的面板 | deviations 按会话隔离或标注会话 | 记录器 sessionId 恒 `'current'`（`src/host/index.ts:86,341`），快照 deviations 不过滤（TECHNICAL:138 已登记取舍） | AC-22 | `grep -n "sessionId: DEFAULT_SESSION" src/host/index.ts` | - |
+| D5 | P3 | UI craft | 面板空闲态（无写域占用、无痕迹）观察 | 常驻「0 占用 / 0 痕迹」状态指示 | 空数组整块不渲染（`PlanTab.tsx:250,489`，与 AC-21 的 0 节点一致，但与 craft「持久信息可见」相反） | AC-20/24 | `grep -n "locks.length === 0 ? null" src/client/tabs/PlanTab.tsx` | - |
+| D6 | P3 | UI craft | 悬停/聚焦 disabled 的三动作按钮 | 禁用原因可见（非仅悬停） | 原因只在 `title` 与 `aria-label`，无可见文本 | AC-27 | `grep -n "title={title}" src/client/tabs/PlanTab.tsx` | - |
 
-## 5. 架构核查（M3，非功能项）
+## 7. 上轮缺陷复验对照（round-1 级；非开放缺陷）
 
-- 蓝图模块**全部落地且职责未漂移**：`src/host/plan/scope.ts`（纯函数零 IO）、`src/host/plan/acceptance.ts`、`src/shared/task-actions.ts`（13×3 单表）、`src/host/team/scope-locks.ts`、`src/host/team/deviation.ts`；`dispatch/graph/plan/store/watcher/gate/bridge/tools/adapters/index/paths/config/viewmodel/ui/PlanTab/styles` 均按蓝图接线。
-- **单一来源成立**（抽查均只有一处定义）：13 态中文只在 `task-actions.ts`（bridge:852/1083/1156/1182 与 viewmodel:56-59 均引用同一表）；模板原文只在 `acceptance.ts:21`；等待文案只在 `scope.ts:151`；冲突判定只经 `conflictingScopes`（`scope-locks.ts:11` 导入，无第二份 `startsWith` 语义）；`DEVIATION_*` 四常量各 1 处；`interruptMember` 归一只在 `adapters.ts:747`。
-- **未发现重复实现/该抽未抽**：无 host→client 越界（`grep -rn "from '\.\./host/" src/client` = 0）、无 client 侧第二份状态 switch、无自造 slot 文案拼装（`viewmodel.waitReasonOf` 为纯透传）。
-- 一处**结构边界例外**（非缺陷）：`scopeLocks[].waiters[].label` 由 client 用宿主 `reason` 原文加 `{taskId} · {member}（…）` 包装，同时保留 `reason` 原字段；逐字断言应取 `reason`。
+| 编号 | round-1 级 | 本轮复验命令 | 实测 | 状态 |
+|---|---|---|---|---|
+| D1 | P1 | `pnpm -s typecheck 2>&1 \| grep -c 'error TS'` | **0**（exit 0） | 关闭 |
+| D2 | P1 | `node --test test/wire.test.ts 2>&1 \| grep -c '^✖'` | **0**（562/562 全绿） | 关闭 |
+| D3 | P1 | `git status --porcelain --untracked-files=all \| wc -l` + `find src -name '*.ts*' -newer lib/index.js \| wc -l` | 0 / 0（HEAD `bdba5f8` 含 `lib/` 双产物） | 关闭 |
+| D4 | P3 | `grep -n "sessionId: DEFAULT_SESSION" src/host/index.ts` | 仍 341 行命中 | 保持（观察） |
 
-## 6. 人工补测清单（环境限制，非交付缺陷）
+同类残留扫描（复算命中数，与修复摘要一致）：`RunState` 从非 store 模块导入 = **0**；`test/src` 中「7 个工具」字样 = **0**；未提交改动 = **0**。
 
-1. **AC-38 真机**：主 agent 用克隆 profile 起第二宿主（REAL-HOST-VERIFY.md），`GET /api/auto-team/snapshot?sessionId=<真实>` 前后两次对比 `tasks` 数（add_tasks）；面板 `[data-scope-locks]` 与 `[data-wait-reason]` 截图；单任务派发后成员数 1。方法：curl + 浏览器；工具：宿主 + 浏览器。
-2. **AC-37 安装/回滚**：`cd ~/.dsh/profiles/desktop && pnpm add file:<repo>` → 重启 → 采样；回滚 `pnpm remove dsh-auto-team` + 还原 `dsh.profile.bundles`。仅主 agent 可执行（子代理写不了工作区外）。
-3. **三动作真机点击**：改验收浮层 Esc / 外部点击 / 焦点归还、失败不关闭（沙箱无 react-dom，只能静态断言）。
-4. **右栏 320px 视觉**：写域区块与等待条在窄栏是否挤压（DESIGN §1 备有副行方案），截图比对。
-5. **无障碍播报**：`[data-deviation]` 头部计数变化、`[data-error]` 已用 `role=alert`，deviation 计数无 live 区（P3 观察）。
+## 8. 架构核查（蓝图对齐，非缺陷）
 
-## 7. 结论
+- 模块与 API：15 个蓝图模块的导出名与类型逐项命中（I1），无「文件在、符号不在」。
+- 单源约束成立：写域归一与冲突只在 `src/host/plan/scope.ts`（`startsWith` 仅用于归一与 `${left}/` 目录边界）；等待文案只在 `waitReasonOf`；验收模板只在 `acceptance.ts`（`gate.ts` 追加同一常量）；允许表与中文标签只在 `src/shared/task-actions.ts`（client 经 `statusBadge/progressOf` 派生）。
+- 零重复实现：无第二份状态中文表（I2）；`src/client` 对 `src/host` 直接 import = 0；`setInterval` 仍仅 `src/host/team/watcher.ts:296` 一处真实定时器。
+- 与蓝图的两处可见性偏差（**非缺陷**）：① 蓝图列出的 `BADGES`/`TASK_PROGRESS` 实为 `viewmodel.ts` 模块私有 const（:55/:72/:637），对外只经 `statusBadge()`/`progressOf()`，功能单源成立；② deviation 记录器用 `DEFAULT_SESSION`（见 D4）。
 
-- 功能实现与蓝图一致，37/40 条 AC 有实测证据（probe 21/21、关键单测 270 例、变异可红可绿）。
-- **不可进入验收**：D1（typecheck 9 错，导入符号不存在于目标模块——正是「存在性检查能过、编译不过」的那类）、D2（两条 r7 旧断言与 8 工具面冲突）、D3（产物与提交未收口）。三项修完重跑 `pnpm -s typecheck && pnpm -s test && pnpm -s build` + 双产物 import + pack + 工作树 clean 后，可直接进验收；D4 为设计取舍的 P3 观察。
+## 9. Craft 观察（P3，仅记录不阻断）
+
+交互反馈齐备：三动作 `:hover/:active/:focus-visible/:disabled` 四态（`styles.ts:703-722`）、busy 整组 disabled + spinner、改验收浮层非模态/Esc 关闭/空值 0 请求、错误 `role=alert`、等待条 `role=note`。缺口即 D5（空闲无常驻指示）与 D6（禁用原因仅悬停可见）。
+
+## 10. 人工补测清单（环境限制，非交付缺陷）
+
+| # | 项 | 判据 | 方法/工具 |
+|---|---|---|---|
+| 1 | 安装与回滚（AC-37） | 装后宿主启动无 unresolved peer 告警、面板出现、8 工具可见；`pnpm remove` 后无残留 | 主 agent：`cd ~/.dsh/profiles/desktop && pnpm add file:<repo>` + `dsh.profile.bundles` 同步，回滚反之 |
+| 2 | 真机面板（AC-38） | 占用区块/等待文案/痕迹计数与 `/snapshot` 逐字一致；`add_tasks` 前后 tasks 增加且 runId 不变 | 第二宿主 51890（REAL-HOST-VERIFY.md）+ 浏览器 |
+| 3 | 三动作真机点击（AC-27） | cancel/skip/updateAcceptance 各点一次：状态迁移、消息、disabled 矩阵与允许表一致 | 同上 |
+| 4 | 320px 右栏视觉 | 写域区块/等待条/浮层不溢出（`scrollWidth ≤ clientWidth`） | 浏览器 DevTools 或截图 |
+| 5 | 无障碍播报 | 等待条/错误/三动作禁用原因可被读屏读出 | VoiceOver |
+| 6 | 重启等待重算（AC-16） | 重启后 waiting 按计划顺序重算，无锁表残留 | 第二宿主重启 |
+| 7 | 空闲态可读性（D5） | 无锁/无痕迹时面板仍有可理解的状态 | 人眼 |
+
+## 11. 结论
+
+**可进入验收。** 门禁：typecheck 0、562/562、build exit 0、双产物 import exit 0、pack 3 件、源码/产物同步 0、工作树 clean（HEAD `bdba5f8`）。功能面 38/40 条 AC 有本轮实测证据（A1–A6、I1–I3 + 4 个回归探针 + 全量单测），AC-37/38 属真机项已列人工补测；开放缺陷仅 3 条 P3 观察（D4/D5/D6），无 P0/P1/P2。
