@@ -90,8 +90,22 @@ function sumByMember(record: UsageRecord): TokenTotals | undefined {
   return acc
 }
 
-/** 把宿主 payload 归一成 {@link UsageEventInput}；不是「assistant 消息带用量」就返回 null。 */
+/**
+ * 把宿主 payload 归一成 {@link UsageEventInput}；不是「assistant 消息带用量」就返回 null。
+ *
+ * 真实宿主签名（`cordis_inspect_query(platform=host, provider=Event, method=listEvents,
+ * input={"event":"session/event"})` 的原文）：
+ *   `'session/event'(this: Scoped<Session>, session: Session, event: SessionEvent): void`
+ * 即监听器收到**两个参数**：会话对象（`session.id` 是 SessionId）与事件对象
+ * （`{ type, seq, time, data }`，用量在 `event.data.usage`，类型是 `assistant/message`）。
+ *
+ * r13 初版只按「单参数对象」解析，真实形状下一条都取不到 → 归属恒为 `unavailable`、
+ * 面板整列显示「不可得」。这里**优先**按真实签名解析，旧形状继续兼容（历史单测 +
+ * 宿主将来换壳不至于整块失效）。
+ */
 export function usageOfSessionEvent(payload: unknown): UsageEventInput | null {
+  const hostShape = usageOfHostArgs(payload)
+  if (hostShape !== undefined) return hostShape
   if (!isRecord(payload)) return null
   // 事件包裹层：宿主可能给 { type, event } / { type, message } / 直接就是事件体。
   const body = isRecord(payload.event) ? payload.event : isRecord(payload.message) ? payload.message : payload
@@ -117,6 +131,60 @@ export function usageOfSessionEvent(payload: unknown): UsageEventInput | null {
 
 function firstString(...values: unknown[]): string | undefined {
   for (const value of values) if (typeof value === 'string' && value !== '') return value
+  return undefined
+}
+
+/**
+ * 真实宿主形状解析；`undefined` = 不是这个形状（交给旧逻辑），`null` = 是但没用量。
+ *
+ * 三种包裹都见过：监听器数组 `[session, event]`、对象 `{ session, event }`、
+ * 以及直接给事件本身（`{ type, seq, data }`）。
+ */
+function usageOfHostArgs(payload: unknown): UsageEventInput | null | undefined {
+  const pair = hostPairOf(payload)
+  if (pair === undefined) return undefined
+  const type = typeof pair.event.type === 'string' ? pair.event.type : undefined
+  if (type === undefined || !MESSAGE_EVENT_TYPES.has(type)) return null
+  const data = isRecord(pair.event.data) ? pair.event.data : undefined
+  const usage = tokenTotalsOf(data?.usage ?? pair.event.usage)
+  if (!usage) return null
+
+  const sessionId = firstString(
+    isRecord(pair.session) ? firstString(pair.session.id) : undefined,
+    data?.sessionId,
+    pair.event.sessionId,
+    data?.agentId,
+  )
+  const seq = firstNumber(pair.event.seq, data?.seq)
+  const eventId = firstString(pair.event.eventId, pair.event.id)
+  const eventKey = eventId ?? (sessionId !== undefined ? `${sessionId}:${seq ?? '?'}` : undefined)
+  const taskId = firstString(data?.taskId, pair.event.taskId)
+
+  const input: UsageEventInput = { usage }
+  if (sessionId !== undefined) input.sessionId = sessionId
+  if (taskId !== undefined) input.taskId = taskId
+  if (eventKey !== undefined) input.eventKey = eventKey
+  return input
+}
+
+function hostPairOf(
+  payload: unknown,
+): { session?: Record<string, unknown>; event: Record<string, unknown> } | undefined {
+  if (Array.isArray(payload)) {
+    const [first, second] = payload as unknown[]
+    if (isRecord(second) && typeof second.type === 'string') {
+      return { session: isRecord(first) ? first : undefined, event: second }
+    }
+    if (isRecord(first) && typeof first.type === 'string') return { event: first }
+    return undefined
+  }
+  if (!isRecord(payload)) return undefined
+  // `{ session, event }`：只有当 event 自己带 type 才认，否则会把旧的 `{ type, event }` 抢走。
+  if (isRecord(payload.event) && typeof payload.event.type === 'string') {
+    return { session: isRecord(payload.session) ? payload.session : undefined, event: payload.event }
+  }
+  // 事件本体：`{ type, seq, data: {...} }`
+  if (typeof payload.type === 'string' && isRecord(payload.data)) return { event: payload }
   return undefined
 }
 

@@ -305,3 +305,41 @@ test('RunsStore.load：坏 JSON 与坏字段都不会让读取抛错', () => {
   assert.equal(loaded.taskTimes, undefined)
   assert.equal(loaded.pendingConfirmation, undefined)
 })
+
+/* ─────────── 真实宿主签名：'session/event'(session, event) ─────────── */
+
+test('usageOfSessionEvent：真实宿主两参形状（session, event）能取到用量与成员会话 id', () => {
+  // 形状逐字取自 cordis_inspect_query(host, Event, listEvents, {"event":"session/event"})
+  const session = { id: '3f1c2b0a-member', header: { id: '3f1c2b0a-member' } }
+  const event = {
+    type: 'assistant/message',
+    seq: 12,
+    time: 1793667060702,
+    data: {
+      turn: 1,
+      step: 1,
+      message: { role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' } },
+      stream: [],
+      usage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500, cacheReadTokens: 900 },
+    },
+  }
+  // ① 监听器收到的参数数组
+  const tuple = usageOfSessionEvent([session, event])
+  assert.deepEqual(tuple, {
+    usage: { total: 1500, input: 1200, output: 300 },
+    sessionId: '3f1c2b0a-member',
+    eventKey: '3f1c2b0a-member:12',
+  })
+  // ② 包成对象 { session, event } 也要认
+  assert.deepEqual(usageOfSessionEvent({ session, event }), tuple)
+  // ③ 只给事件本身（拿不到身份 → 只能进 aggregate-only）
+  assert.deepEqual(usageOfSessionEvent(event), {
+    usage: { total: 1500, input: 1200, output: 300 },
+  }, '无 session 时不给身份，但用量要取到')
+})
+
+test('usageOfSessionEvent：真实宿主形状下，非 assistant 消息或无 usage 一律 null', () => {
+  const session = { id: 's-1' }
+  assert.equal(usageOfSessionEvent([session, { type: 'tool/result', seq: 3, data: {} }]), null)
+  assert.equal(usageOfSessionEvent([session, { type: 'assistant/message', seq: 4, data: { stream: [] } }]), null)
+})
