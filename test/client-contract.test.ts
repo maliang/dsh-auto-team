@@ -22,8 +22,13 @@ import {
   HEADER_ACTIONS_SLOT,
   HEADER_ID,
   INPUT_LEFT_SLOT,
+  MAIN_SLOT,
+  OPEN_LIBRARY_EVENT,
   OPTION_ID,
   PANEL_KEY,
+  PANELLIST_ID,
+  PANELLIST_LABEL,
+  PANELLIST_SLOT,
   PANEL_SLOT,
   PANEL_TAB_KIND,
   PANEL_TAB_LABEL,
@@ -35,6 +40,7 @@ import {
   createPanelCommands,
   panelTabDefinition,
   registerPanelTab,
+  registerPanellist,
   registerSlots,
 } from '../src/client/slots.ts'
 import { PLUGIN_ID } from '../src/shared/const.ts'
@@ -476,11 +482,17 @@ test('渲染描述层必须真的被组件调用（防「逻辑写完、模板�
   const pairs: Array<[string, string]> = [
     ['src/client/Option.tsx', 'optionView'],
     ['src/client/HeaderButton.tsx', 'headerButtonView'],
-    ['src/client/Panel.tsx', 'pauseButtonView'],
-    ['src/client/tabs/PlanTab.tsx', 'taskRowView'],
-    ['src/client/tabs/PlanTab.tsx', 'scopeLockRowsOf'],
-    ['src/client/tabs/PlanTab.tsx', 'deviationRowsOf'],
     ['src/client/SettingsPage.tsx', 'settingsKeysView'],
+    // r13：三页与左栏的可见文本都来自 viewmodel 单点（AC-7/AC-18 的模板侧证据）
+    ['src/client/tabs/TasksTab.tsx', 'buildRunDetail'],
+    ['src/client/tabs/HistoryTab.tsx', 'buildRunDetail'],
+    ['src/client/LibraryPage.tsx', 'buildRunDetail'],
+    ['src/client/views/RunHeader.tsx', 'runHeadOf'],
+    ['src/client/views/RoleStrip.tsx', 'roleChipsOf'],
+    ['src/client/views/TaskTable.tsx', 'taskRowOf'],
+    ['src/client/views/FlowGraph.tsx', 'flowLayoutOf'],
+    ['src/client/views/MemoryList.tsx', 'memoryRowOf'],
+    ['src/client/views/ConfirmDialog.tsx', 'confirmDialogOf'],
   ]
   for (const [relPath, fn] of pairs) {
     const facts = codeFactsOf(relPath)
@@ -488,60 +500,86 @@ test('渲染描述层必须真的被组件调用（防「逻辑写完、模板�
   }
 })
 
-test('r11 计划页：五块新区域真落在模板里，且各带唯一 hook（AC-20 / AC-21 / AC-24 / AC-27）', () => {
-  const plan = codeOnlyOf('src/client/tabs/PlanTab.tsx')
-  for (const hook of [
-    'data-scope-locks',
-    'data-locks-head',
-    'data-lock-list',
-    'data-lock-row',
-    'data-lock-path',
-    'data-lock-holder',
-    'data-lock-waiters',
-    'data-lock-waiter',
-    'data-wait-reason',
-    'data-task-actions',
-    'data-task-action',
-    'data-acceptance-editor',
-    'data-acceptance-input',
-    'data-acceptance-hint',
-    'data-acceptance-actions',
-    'data-acceptance-save',
-    'data-deviation',
-    'data-deviation-list',
-    'data-deviation-row',
-    'data-deviation-at',
-    'data-deviation-paths',
-    'data-deviation-count',
-    'data-deviation-reason',
-  ]) {
-    assert.equal(plan.includes(hook), true, `PlanTab 模板缺少 ${hook}`)
+test('r13 三页：页签单源恰三项，三页模板各自绑定视图组件（AC-1 / AC-13 / AC-14）', () => {
+  const panel = codeOnlyOf('src/client/Panel.tsx')
+
+  // ① TabKey 只有三个值，且 TABS 恰好三条（旧计划/成员/角色页签必须消失）
+  assert.match(panel, /type TabKey = 'tasks' \| 'history' \| 'memory'/, 'TabKey 必须恰好三值')
+  const tabsBlock = panel.slice(panel.indexOf('const TABS'), panel.indexOf('const TABS') + 600)
+  assert.equal((tabsBlock.match(/key:\s*'/g) ?? []).length, 3, 'TABS 必须恰好三项')
+  for (const gone of ['plan', 'members', 'roles']) {
+    assert.equal(tabsBlock.includes(`'${gone}'`), false, `TABS 里不许再有 ${gone} 页签`)
   }
 
-  // 顺序：写域区块在任务表之前、执行痕迹在任务表之后（DESIGN §2.3）
-  const lockAt = plan.indexOf('data-scope-locks')
-  const tableAt = plan.indexOf('data-plan-table')
-  const deviationAt = plan.indexOf('data-deviation')
-  assert.ok(lockAt > 0 && tableAt > lockAt, '写域占用必须在动作行与任务表之间')
-  assert.ok(deviationAt > tableAt, '执行痕迹必须在任务表之后（页面最末）')
+  // ② 三页各自把视图组件真绑进模板（不是「逻辑写完、模板没绑」）
+  const tasksTab = codeOnlyOf('src/client/tabs/TasksTab.tsx')
+  for (const view of ['RunHeader', 'RoleStrip', 'TaskTable', 'FlowGraph']) {
+    assert.equal(tasksTab.includes(`<${view}`), true, `任务页必须渲染 ${view}`)
+  }
+  assert.equal(/buildRunDetail\(\{/.test(tasksTab), true,
+    '任务页的详情必须由 buildRunDetail 装配（AC-18 单点）')
 
-  // 空数组 0 节点：连组标题都不渲染（不是渲染一个空 section）
-  assert.match(plan, /locks\.length === 0 \? null/, '写域为空必须整块不渲染')
-  assert.match(plan, /deviations\.length === 0 \? null/, '执行痕迹为空必须整块不渲染')
+  const historyTab = codeOnlyOf('src/client/tabs/HistoryTab.tsx')
+  for (const view of ['DetailPane', 'RunHeader', 'TaskTable', 'FlowGraph']) {
+    assert.equal(historyTab.includes(`<${view}`), true, `历史详情必须复用 ${view}（AC-18：左右两处同一套）`)
+  }
+  assert.match(historyTab, /HISTORY_PAGE_SIZE/, '历史列表必须按常量分页（50/页）')
+  assert.match(historyTab, /data-history-open=\{/, '历史行必须是可点开的按钮（不是死的 li）')
 
-  // 等待条只在 waiting 且原因非空时渲染（AC-20），且文案逐字来自快照
-  assert.match(plan, /progress\.status === 'waiting' \? row\.waitReason : ''/, '等待条必须 status 守卫')
-  assert.match(plan, /waitReason === '' \? null/, '原因为空必须 0 节点')
-  assert.match(plan, /\{waitReason\}/, '等待条必须逐字渲染快照原文')
-  assert.equal(/等待 \$\{/.test(plan), false, '客户端不许自己拼等待文案（宿主生成）')
+  const memoryTab = codeOnlyOf('src/client/tabs/MemoryTab.tsx')
+  assert.equal(memoryTab.includes('<MemoryList'), true, '记忆页必须复用 MemoryList')
+  assert.match(memoryTab, /track="project"/, '记忆页只列项目轨（公共记忆在左栏「全局」）')
 
-  // 改验收浮层：卡内非模态 + 空值持久 disabled + 空值零请求 + 失败不关闭
-  assert.match(plan, /data-acceptance-editor[\s\S]{0,400}role="dialog"/, '浮层必须是 dialog')
-  assert.match(plan, /role="dialog"[\s\S]{0,200}aria-modal="false"/, '浮层不是模态（aria-modal=false）')
-  assert.match(plan, /disabled=\{savingEditor \|\| isBlankAcceptance\(editor\.draft\)\}/, '空值保存必须 disabled')
-  assert.match(plan, /if \(editor === null \|\| isBlankAcceptance\(editor\.draft\)\) return/, '空值不得发请求')
-  assert.match(plan, /trim\(\) === ''/, '空值判定必须 trim')
-  assert.match(plan, /data-error role="alert"/, '失败原因必须走面板既有 [data-error] 机制')
+  // ③ 左栏：项目列表 + 详情两块区域，全局首行、未知项目末位由 rows.ts 的排序保证
+  const library = codeOnlyOf('src/client/LibraryPage.tsx')
+  for (const hook of [
+    'data-region="project-list"',
+    'data-region="project-detail"',
+    'data-auto-team-nav',
+    'data-nav-kind="global"',
+    'data-library-project-head',
+    'data-region="history-list"',
+    'data-auto-team-panellist',
+    'data-auto-team-library',
+  ]) {
+    assert.equal(library.includes(hook), true, `左栏模板缺少 ${hook}`)
+  }
+  const rows = codeOnlyOf('src/client/tabs/rows.ts')
+  assert.match(rows, /unknown === true/, '未知项目必须单独归类（末位）')
+  // 分组排序在左栏装配里（known 在前、unknown 末位；PRD §11 默认值）
+  assert.match(library, /known/, '项目列表必须先列 known 项目')
+  assert.match(library, /unknown/, 'unknown 项目必须单独放在末位')
+
+  // ④ 不可逆动作走同一个执行体：面板只发 confirmPending / rejectPending，带 pendingId
+  assert.match(panel, /'confirmPending'/, '面板必须能确认挂起的不可逆动作')
+  assert.match(panel, /'rejectPending'/, '面板必须能取消挂起的不可逆动作')
+  assert.match(panel, /pendingId/, '确认/取消必须带 pendingId（服务端据此辨认哪一个）')
+  assert.match(panel, /<ConfirmDialog/, '弹窗必须用共享组件，不许内联第二份')
+})
+
+test('r13 客户端零格式化：时长/千分位/token 文本只来自宿主下发的 cell（AC-7）', () => {
+  const files = [
+    'src/client/views/RunHeader.tsx',
+    'src/client/views/TaskTable.tsx',
+    'src/client/views/FlowGraph.tsx',
+    'src/client/tabs/TasksTab.tsx',
+    'src/client/tabs/HistoryTab.tsx',
+    'src/client/tabs/rows.ts',
+    'src/client/LibraryPage.tsx',
+  ]
+  for (const relPath of files) {
+    const code = codeOnlyOf(relPath)
+    assert.equal(code.includes('toLocaleString'), false, `${relPath} 不许自己加千分位（宿主 formatTokens 单点）`)
+    assert.equal(/Math\.(round|floor)\([^)]*\/\s*1000\s*\)/.test(code), false, `${relPath} 不许自己把 ms 换算成秒/分`)
+    assert.equal(/(\d+\s*小时|分钟)/.test(code), false, `${relPath} 不许自己拼时长文案（用 DurationCell.text）`)
+  }
+  // 视图层只消费宿主下发的文本：token/用时的两个 cell 必须原样渲染 text 字段
+  const table = codeOnlyOf('src/client/views/TaskTable.tsx')
+  assert.match(table, /row\.tokenText/, '任务行的 token 文本必须来自 usage cell')
+  assert.match(table, /row\.durationText/, '任务行的用时文本必须来自 duration cell')
+  // 三态（真实/降级/不可得）靠 data-usage-source 区分，不能让「不可得」长得像 0
+  assert.match(table, /data-usage-source/, 'token 单元格必须带 data-usage-source（AC-7 三态可辨）')
+  assert.match(table, /data-duration-state/, '用时单元格必须带 data-duration-state')
 })
 
 test('r11 样式层：五块新区域的选择器都在，且只用语义 token 的 font 简写', () => {
@@ -584,14 +622,16 @@ test('r11 样式层：五块新区域的选择器都在，且只用语义 token 
   assert.ok(redUses <= 2, `r11 新样式里红色 token 只用于 cancel hover（实际 ${redUses} 处）`)
 })
 
-test('四个新 hook 真出现在模板里，且旧前缀 0 命中', () => {
+test('r13 新 hook 真出现在模板里，且旧前缀 0 命中', () => {
   const hooks: Array<[string, string]> = [
     ['src/client/Option.tsx', 'data-auto-team-option'],
     ['src/client/HeaderButton.tsx', 'data-auto-team-header-button'],
-    ['src/client/Panel.tsx', 'data-auto-team-pause'],
+    ['src/client/views/RunHeader.tsx', 'data-auto-team-pause'],
     ['src/client/SettingsPage.tsx', 'data-auto-team-settings'],
     ['src/client/TabTitle.tsx', 'data-auto-team-panel-tab'],
     ['src/client/RoleEditor.tsx', 'data-role-card'],
+    ['src/client/LibraryPage.tsx', 'data-auto-team-panellist'],
+    ['src/client/LibraryPage.tsx', 'data-auto-team-library'],
   ]
   for (const [relPath, hook] of hooks) {
     // hook 以属性名形式出现（JSX 属性不是字符串字面量，用源码匹配）
@@ -662,6 +702,108 @@ test('样式层：r10 新增四族（技能行 / 模型气泡 / 弹层 / 恢复�
   assert.match(css, /\[data-roles-restore-ok\]\[data-confirm-tone="warn"\][^}]*warn/, '恢复默认确认键必须是琥珀')
 })
 
+test('r13 左栏栏目 + 主区页面：两个槽位各注册一次，main 带 key 且失败能降级（AC-24）', () => {
+  // ① 正常路径：栏目非 keyed（带 id/label），主区 keyed（key 与栏目 id 同值）
+  const injected: string[] = []
+  const metas: Array<Record<string, unknown>> = []
+  const components: unknown[] = []
+  const ctx = {
+    slots: {
+      inject(name: string, run: () => void) {
+        injected.push(name)
+        run()
+      },
+      register(meta: Record<string, unknown>, component: unknown) {
+        metas.push(meta)
+        components.push(component)
+      },
+    },
+  }
+  const deps = { PanellistEntry: 'panellist-stub', LibraryPage: 'library-stub' }
+  const result = registerPanellist(ctx as never, deps as never)
+  assert.deepEqual(result, { panellist: true, main: true }, '两个槽位都注册上时必须如实返回 true')
+
+  // 槽名是 AC-24 的判据，逐字锁死（文档 UI-SLOTS.md 同值）
+  assert.deepEqual(injected, [PANELLIST_SLOT], '栏目必须经 slots.inject 注册（inject 的 name 与 register 的 name 同值）')
+  assert.equal(PANELLIST_SLOT, 'sidebar.panellist')
+  assert.equal(MAIN_SLOT, 'main')
+  assert.equal(PANELLIST_ID, `${PLUGIN_ID}-panellist`)
+  assert.equal(OPEN_LIBRARY_EVENT, 'auto-team:open-library')
+
+  const panellist = metas.find((meta) => meta.name === PANELLIST_SLOT)
+  assert.ok(panellist, '栏目座位必须先注册')
+  assert.equal(panellist.key, undefined, '非 keyed 座位不许带 key（真机直接抛错）')
+  assert.equal(panellist.id, PANELLIST_ID, '栏目 id 就是 main 的 key（同一个值）')
+  assert.equal(panellist.label, PANELLIST_LABEL, '栏目文案必须逐字来自常量')
+  assert.equal(components[0], 'panellist-stub', '栏目座位必须挂 PanellistEntry')
+
+  const main = metas.find((meta) => meta.name === MAIN_SLOT)
+  assert.ok(main, '主区座位也必须注册')
+  assert.equal(main.key, PANELLIST_ID, 'main 是 keyed 座位，key 必须与栏目 id 同值')
+  assert.equal(main.id, undefined, 'keyed 座位不许带 id')
+  assert.equal(components[1], 'library-stub', '主区座位必须挂整页 LibraryPage')
+
+  // 两个座位的 inject 都要把 sessionId 与「打开左栏」动作交给组件
+  const bag = bagOf({ injected, metas, components }, PANELLIST_SLOT)
+  assert.equal(bag.sessionId, 'sess-1', 'inject 必须下发 sessionId')
+  assert.equal(typeof bag.openLibrary, 'function', '栏目要能主动打开主区项目库')
+
+  // ② 降级一：main 拒不接受 keyed 时，退成非 keyed 再试一次（宿主形状未验证）
+  const retry: Array<Record<string, unknown>> = []
+  const degrading = {
+    slots: {
+      inject(_name: string, run: () => void) {
+        run()
+      },
+      register(meta: Record<string, unknown>) {
+        if (meta.name === MAIN_SLOT && meta.key !== undefined) throw new Error('main is not a keyed slot')
+        retry.push(meta)
+      },
+    },
+  }
+  const degraded = registerPanellist(degrading as never, deps as never)
+  assert.equal(degraded.main, true, '非 keyed 重试成功时必须算挂上')
+  assert.equal(retry.some((meta) => meta.name === MAIN_SLOT && meta.key === undefined), true, '必须真的重试过非 keyed 形状')
+
+  // ③ 降级二：两个槽位都不可用 → 不抛错，如实返回 false（面板内联项目库兜底）
+  const broken = {
+    slots: {
+      inject(_name: string, run: () => void) {
+        // 槽位存在、回调也跑了 —— 但 register 抛错（宿主拒绝这个座位）
+        run()
+      },
+      register() {
+        throw new Error('slot unavailable')
+      },
+    },
+  }
+  const failed = registerPanellist(broken as never, deps as never)
+  assert.deepEqual(failed, { panellist: false, main: false }, '槽位不可用必须降级而不是拖死整条 entry')
+})
+
+test('r13 项目库按需加载：refresh 不碰 library，同 key 单飞 + 5s 缓存（AC-23）', () => {
+  const state = codeOnlyOf('src/client/state.ts')
+
+  // ① refresh 的实现体里不许出现任何 library 取数（AC-23：轮询期间零 library 装配）
+  const refreshStart = state.indexOf('function refresh()')
+  const refreshEnd = state.indexOf('function act(', refreshStart)
+  assert.ok(refreshStart > 0 && refreshEnd > refreshStart, 'state.ts 必须能切出 refresh() 的实现体')
+  const refreshBody = state.slice(refreshStart, refreshEnd)
+  assert.equal(/library/.test(refreshBody), false, 'refresh() 里不许出现 library —— 快照轮询绝不装配项目库')
+  assert.match(refreshBody, /api\s*\.\s*snapshot|api\.snapshot/, 'refresh() 只应打快照接口')
+
+  // ② 单飞 + 缓存 + 失败保留上次内容
+  assert.match(state, /libraryInflight/, 'loadLibrary 必须单飞（同一 key 并发只发一次请求）')
+  assert.match(state, /LIBRARY_CACHE_MS/, '缓存窗口必须用共享常量 LIBRARY_CACHE_MS')
+  assert.match(state, /setView\(\{ libraryError: result\.error \}\)/, '失败只写 libraryError（保留上次成功的 library）')
+  assert.match(state, /detailCache\.set/, '历史详情必须进缓存（来回切页签不重复打接口）')
+  assert.match(state, /libraryAt\.clear\(\)/, '动作后缓存必须作废（但不在 act 里主动重取）')
+
+  // ③ 左栏/历史详情只在「真的打开」时取数：LibraryPage 挂载 effect + openRun
+  assert.match(codeOnlyOf('src/client/LibraryPage.tsx'), /void loadLibrary\(\)/, '左栏挂载时才装配项目库')
+  assert.match(codeOnlyOf('src/client/tabs/HistoryTab.tsx'), /openRun/, '历史列表点开某条 run 才取详情')
+})
+
 test('client 半不许用 ctx.get 取可选服务（与 host 半同一纪律）', () => {
   for (const relPath of [
     'src/client/index.ts',
@@ -688,8 +830,16 @@ test('client 与 host 零直接 import（只许 import type 共享契约）', ()
     'src/client/TabTitle.tsx',
     'src/client/SettingsPage.tsx',
     'src/client/RoleEditor.tsx',
-    'src/client/tabs/PlanTab.tsx',
-    'src/client/tabs/RolesTab.tsx',
+    'src/client/api.ts',
+    'src/client/state.ts',
+    'src/client/LibraryPage.tsx',
+    'src/client/tabs/TasksTab.tsx',
+    'src/client/tabs/HistoryTab.tsx',
+    'src/client/tabs/MemoryTab.tsx',
+    'src/client/tabs/rows.ts',
+    'src/client/views/RunHeader.tsx',
+    'src/client/views/TaskTable.tsx',
+    'src/client/views/FlowGraph.tsx',
   ]
   for (const relPath of files) {
     const code = codeOnlyOf(relPath)

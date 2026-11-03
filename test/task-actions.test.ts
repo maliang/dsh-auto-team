@@ -51,7 +51,8 @@ const MATRIX: Record<TaskStatus, [boolean | string, boolean | string, boolean | 
   interrupted: ['已中断：请续聊或改验收后重跑', '已中断：请续聊', true],
   gate: ['门禁执行中，等门禁结束', '门禁执行中', true],
   paused: ['已暂停：先点页头『继续任务』', '已暂停：先继续任务', true],
-  done: ['已完成，无需取消', '已完成', '已完成的任务证据不改写'],
+  // r13 PRD 取代 r11#AC-26：done 允许改验收（宿主确认后落新命令并重跑门禁）
+  done: ['已完成，无需取消', '已完成', true],
   cancelled: ['已取消', '已取消', '已取消'],
   skipped: ['已跳过', '已跳过', '已跳过'],
 }
@@ -88,7 +89,7 @@ test('39 格允许矩阵逐格一致：TASK_ACTION_ALLOW / taskActionAllowed / �
   assert.equal(cells, 39, 'AC-27 判据：13 态 × 3 动作 = 39 格')
 })
 
-test('允许集白名单（AC-26）：cancel 含 running/rework/failed，skip 只到 waiting，done 三动作全拒', () => {
+test('允许集白名单（AC-26）：cancel 含 running/rework/failed，skip 只到 waiting，done 仅放开改验收', () => {
   for (const status of ['pending', 'blocked', 'ready', 'waiting', 'running', 'rework', 'failed'] as TaskStatus[]) {
     assert.equal(taskActionAllowed('cancel', status), true, `${status} 应允许取消`)
   }
@@ -101,13 +102,15 @@ test('允许集白名单（AC-26）：cancel 含 running/rework/failed，skip �
   for (const status of ['running', 'rework', 'failed', 'done', 'cancelled', 'skipped'] as TaskStatus[]) {
     assert.equal(taskActionAllowed('skip', status), false, `${status} 不应允许跳过`)
   }
-  for (const status of ['done', 'cancelled', 'skipped'] as TaskStatus[]) {
+  for (const status of ['cancelled', 'skipped'] as TaskStatus[]) {
     assert.equal(taskActionAllowed('edit-acceptance', status), false, `${status} 不应允许改验收`)
   }
-  // 只要不是终态（done/cancelled/skipped），改验收都允许 —— 这是 interrupted/gate/paused 的出路
-  for (const status of STATUSES.filter((item) => !['done', 'cancelled', 'skipped'].includes(item))) {
+  // 除 cancelled/skipped 外改验收都允许 —— done 也在内（r13 取代 r11#AC-26，确认后重跑门禁）
+  for (const status of STATUSES.filter((item) => !['cancelled', 'skipped'].includes(item))) {
     assert.equal(taskActionAllowed('edit-acceptance', status), true, `${status} 应允许改验收`)
   }
+  // 单独钉住 done：这一格是 r13 的需求本体，被顺手改回去必须立刻红
+  assert.equal(taskActionAllowed('edit-acceptance', 'done'), true, 'done 必须允许改验收（r13 取代 r11#AC-26）')
 })
 
 test('13 条中文标签互不重复、不是英文原文、且徽标用词与状态语义一致', () => {

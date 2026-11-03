@@ -1559,6 +1559,57 @@ export function onHostTriggerEvents(
   }
 }
 
+/** 根作用域 `session/event` 订阅结果；`degraded` 供装配层如实标注「用量不可得」。 */
+export interface SessionEventSubscription {
+  stop(): void
+  degraded: boolean
+}
+
+/**
+ * 订阅根作用域 `session/event`（后提交追加流，r13 AC-3 的用量事件源）。
+ *
+ * 为什么不在这里解析字段：payload 形状**未实测**（U1），归一化全部交给纯函数
+ * `team/usage.ts` 的 `usageOfSessionEvent`（可单测、可 fail-open）；本文件只负责订阅本身。
+ *
+ * fail-open 语义（与 `onHostTriggerEvents` 同一纪律）：
+ *   - `ctx.on` 不存在 → warn + `degraded: true`，用量显示「不可得」，装配继续；
+ *   - 订阅抛错 → warn + `degraded: true`，绝不冒泡到 entry（否则整条插件不激活）；
+ *   - 监听器内 handler 抛错 → warn，不影响宿主事件链（宿主虽隔离，自己兜一层才看得到原因）。
+ */
+export function onSessionEvents(
+  ctx: HostContext,
+  handler: (payload: unknown) => void,
+): SessionEventSubscription {
+  if (typeof ctx.on !== 'function') {
+    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：session/event 不可用，token 用量显示「不可得」')
+    return { stop() {}, degraded: true }
+  }
+  let dispose: (() => void) | void
+  try {
+    dispose = ctx.on('session/event', (...args: unknown[]) => {
+      try {
+        handler(args.length <= 1 ? args[0] : args)
+      } catch (error) {
+        ctx.logger?.warn?.(`[auto-team] 用量事件处理失败（session/event：${messageOf(error)}）`)
+      }
+    })
+  } catch (error) {
+    ctx.logger?.warn?.(`[auto-team] 订阅 session/event 失败：token 用量显示「不可得」（${messageOf(error)}）`)
+    return { stop() {}, degraded: true }
+  }
+  return {
+    degraded: false,
+    stop() {
+      if (typeof dispose !== 'function') return
+      try {
+        dispose()
+      } catch {
+        /* 单个 disposer 失败不影响清理 */
+      }
+    },
+  }
+}
+
 /** 事件 payload 归一化：只做「参数位序 → 具名对象」，不解析业务字段（U2 未实测，读字段等于猜）。 */
 function payloadOfEvent(name: TriggerEventName, args: unknown[]): unknown {
   if (name === 'tools/result') return { exec: args[0], result: args[1] }

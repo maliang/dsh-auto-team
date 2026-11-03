@@ -24,6 +24,7 @@ import { buildPlan, extendPlan, progressOf, type PlanDraftTask } from './plan/pl
 import { normalizeWriteScopes } from './plan/scope.ts'
 import { RUN_STATE_VERSION, uniqueRunId, type RunState, type RunsStore } from './store.ts'
 import type { Bridge } from './bridge.ts'
+import type { AutoDispatchCause } from './team/auto-dispatch.ts'
 import type { RoleRepo } from './roles/repo.ts'
 import { registerTool, type HostContext, type ToolSpec } from './adapters.ts'
 
@@ -40,6 +41,14 @@ export interface ToolsDeps {
    * （`test -n "$(git status --porcelain -- <路径>)"`），不会给出跑不起来的命令。
    */
   scripts?: readonly string[]
+  /**
+   * 计划变更通知（r13 AC-8 的前两个触发点）：`plan` 落盘 / `add_tasks` 追加成功后各调一次。
+   *
+   * 工具层只报「计划变了」；是否真派发、派给谁、会不会被并发/依赖/写域/暂停拦住，全部由
+   * `createAutoDispatcher` 复用 `dispatchReady` 判定 —— 工具里绝不长出第二套调度。
+   * 缺省（单测桩）= 不自动派发，行为退回 r12 的手动派发。
+   */
+  autoDispatch?: (sessionId: string, runId: string | undefined, cause: AutoDispatchCause) => void
 }
 
 const NOT_ENABLED = '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。'
@@ -249,6 +258,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           routeAudits: [],
         }
         deps.store.save(state)
+        // r13 AC-8：计划落盘后**零点击**自动派发（notice 文案同步改成「已自动派发」，不再要求用户手动确认）。
+        deps.autoDispatch?.(sessionId, draft.plan.runId, 'plan-saved')
 
         return {
           ok: true,
@@ -259,7 +270,7 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           ready: readyTasks(draft.plan.tasks),
           blocked: blockedTasks(draft.plan.tasks),
           members: 0,
-          note: '计划已保存，尚未创建任何成员；用户确认后调用 auto_team_dispatch（必须带 runId）。',
+          note: '计划已保存；符合依赖与并发条件的任务会自动派发，无需再手动调用 dispatch。',
         }
       },
     },
@@ -651,6 +662,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         }
         // 全被跳过时**不动盘**：幂等判据是连文件字节都不变，而不是「写一遍相同内容」。
         if (extended.added.length > 0) deps.store.save({ ...state, plan: extended.plan })
+        // r13 AC-8：追加成功后同样零点击自动派发（新任务立刻进入就绪队列）。
+        if (extended.added.length > 0) deps.autoDispatch?.(sessionId, extended.plan.runId, 'tasks-added')
 
         return {
           ok: true,

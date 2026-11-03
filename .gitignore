@@ -17,7 +17,8 @@ dist/
 # 打包与 pnpm 噪声（`npm pack --dry-run` 会在根目录留 .tgz、pnpm 偶发写 debug log）：
 # 都是本机命令产物而非交付物；注意这里的规则不得连带忽略 lib/（上面的约定优先）。
 *.tgz
-pnpm-debug.log*
+*.log
+.pnpm-store/
 
 # 编辑器 / 操作系统 / 本机密钥：个人偏好与本机配置，不属于交付物
 .vscode/

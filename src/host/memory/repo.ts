@@ -10,8 +10,9 @@
  * （角色/任务/时间）——来源标注由纯函数 formatSourcedLine 生成，可被 `node --test` 逐字断言。
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import type { MemoryFileInfo, MemoryTrack } from '../../shared/types.ts'
+import type { MemoryFileInfo, MemoryItemView, MemoryTrack } from '../../shared/types.ts'
 import { MEMORY_LINES_PER_TASK } from '../config.ts'
+import { memoryTokenEstimate } from '../format.ts'
 
 /** 双轨根：由调用方注入（便于单测与跨平台，模块内不读环境）。 */
 export interface MemoryRoots {
@@ -65,6 +66,67 @@ export function listMemory(track: MemoryTrack, roots: MemoryRoots): MemoryFileIn
     })
   }
   return out.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/**
+ * 目录 → 记忆索引（r13 AC-17：左栏项目页与右栏记忆页**共用**这一份，禁止各写一份扫描）。
+ *
+ * token 只能是**估算**：记忆是用户手写的 md，宿主没有 provider 的 tokenizer，
+ * 因此按 `ceil(chars/2)`（`format.memoryTokenEstimate` 单点）并强制带 `tokenBasis:'estimate'`，
+ * 界面必须显示 `≈`。这里不返回正文 —— 索引进快照，正文点开时再读（否则每次轮询拖几十 KB）。
+ *
+ * 排序：`updatedAt` 倒序（最近改过的在前），同毫秒按文件名稳序，保证快照可复现。
+ */
+export function listMemoryItems(dir: string, track: MemoryTrack): MemoryItemView[] {
+  if (!existsSync(dir)) return []
+  const out: MemoryItemView[] = []
+  for (const entry of readdirSync(dir)) {
+    // 与读/写/删共用同一把名字闸：目录里手放的怪文件不进索引，也不会被当成可点开的条目。
+    // 只收磁盘上本来就是 `.md` 的名字：safeMemoryName 会给 'notes.txt' 补成
+    // 'notes.txt.md'，索引里这样一条点开读的是不存在的文件（界面「点了没反应」）。
+    const name = safeMemoryName(entry)
+    if (name === null || name !== entry) continue
+    const path = `${dir}/${entry}`
+    let stat: ReturnType<typeof statSync>
+    let body: string
+    try {
+      stat = statSync(path)
+      if (!stat.isFile()) continue
+      body = readFileSync(path, 'utf8')
+    } catch {
+      // 单个文件读不到（权限/刚被删）不能让整页空白：跳过这一条即可。
+      continue
+    }
+    const item: MemoryItemView = {
+      track,
+      name,
+      title: memoryTitleOf(body, name),
+      updatedAt: stat.mtimeMs,
+      tokenEstimate: memoryTokenEstimate(body.length),
+      tokenBasis: 'estimate',
+    }
+    // birthtimeMs 在部分文件系统上是 0：只给真实值，缺省 = 界面不显示「创建于」。
+    if (Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0) item.createdAt = stat.birthtimeMs
+    out.push(item)
+  }
+  return out.sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name))
+}
+
+/**
+ * 记忆标题：优先正文里的第一个 `# 标题`，否则退化成文件名（去 `.md`）。
+ *
+ * 不取正文首行：本项目的记忆首行通常是 `- [pm/t2 · 10-30 14:02] …` 来源标注，
+ * 拿它当标题会出现一列以「- [」开头的条目，等于没标题。
+ */
+function memoryTitleOf(body: string, fileName: string): string {
+  for (const line of body.split('\n').slice(0, 20)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('#')) {
+      const heading = trimmed.replace(/^#+\s*/, '').trim()
+      if (heading !== '') return heading
+    }
+  }
+  return fileName.replace(/\.md$/i, '')
 }
 
 /** 读一条记忆正文；不存在或非法名返回空串（面板显示「暂无内容」而非报错）。 */

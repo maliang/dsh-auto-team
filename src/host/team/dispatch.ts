@@ -15,6 +15,7 @@
 import type { Plan, PlanTask, RejectionCode, Role, RoleModelRoute } from '../../shared/types.ts'
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
+import type { TaskTimeRecord } from '../store.ts'
 import type { RoleRepo } from '../roles/repo.ts'
 import type { HostMember } from '../adapters.ts'
 import {
@@ -354,6 +355,18 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     return { state: next, started, skipped, errors, renamed }
   }
 
+  // r13 AC-11：已获准「强制并行」的任务必须先从写域等待里放出来。
+  //
+  // 只绕过下面的 `waitFor` 不够：`waiting` 不在 `readyTasks` 的口径里（graph.ts:121），
+  // 任务会停在 waiting 永远进不了派发循环。用户确认过的那条授权是持久授权（记在 run 上），
+  // 所以这里按 `state.forceParallel` 直接把它放回待办 —— 除此之外仍走四道闸的其余三闸。
+  const forced = new Set(next.forceParallel ?? [])
+  const revived = reviveForcedWaits(next, forced)
+  if (revived !== next) {
+    next = revived
+    changed = true
+  }
+
   // r11 F4：先把等待关系按当前持锁情况重算一遍（幂等）。
   // 放在派发闸门**之后**：暂停/终止的计划不允许被改状态（恢复时按原状态还原，AC-10）。
   // 放在成员名单**之前**：等待判定只看 plan.tasks 的 status + writeScopes，与成员死活无关。
@@ -437,7 +450,10 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     // 位置刻意在「依赖校验」之后、「并发位判定」之前：
     //  - 依赖没满足的任务该显示 blocked，不是 waiting（waiting 的语义是「轮到我了但文件被占」）；
     //  - 等待不是「并发满了」，面板要能回答「在等谁、等哪条路径」，所以必须先于 slots 判定。
-    const conflict = waitFor(next, task, started)
+    //
+    // r13 AC-11：用户在确认弹窗里显式点过「强制并行」的 task 跳过这道闸（写入 `state.forceParallel`），
+    // 否则确认完仍会停在 waiting —— 那等于弹窗点了没用。其余三闸照旧生效。
+    const conflict = forced.has(taskId) ? null : waitFor(next, task, started)
     if (conflict) {
       next = patchTask(next, taskId, {
         status: 'waiting',
@@ -560,6 +576,10 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
         memberId: spawned.memberId,
         attempts: task.attempts ?? 0,
       })
+      // r13 AC-20：spawn 成功 = 任务真的开始了，计时起点**只在这里**写。
+      // 刻意不覆盖已有的 `startedAt`：返工后重派属于同一段用时（AC-20 要求重读逐毫秒相同，
+      // 起点漂移会让面板上的用时每次返工都「重新计时」）。
+      next = stampTaskTime(next, taskId, { startedAt: at })
       // 步 f：逐角色模型漂移审计（AC-22）。
       //
       // 时序是这条审计的全部难点：宿主在 `spawnTeammate()` **内部**先 await `agent/created`
@@ -752,6 +772,8 @@ export function applyReceipt(
   const settledTask = next.plan.tasks.find((item) => item.id === taskId)
   if (!wasTerminal && settledTask && isTerminalTaskStatus(settledTask.status)) {
     next = releaseScopes(next, taskId, at)
+    // r13 AC-20：终点同样只在「首次进入终态」时写，重放回执不刷新（同一份证据重读必须逐毫秒相同）。
+    next = stampTaskTime(next, taskId, { endedAt: at })
   }
 
   // done 后解锁下游：blocked → pending，让下一轮 dispatch 自然取到。
@@ -825,6 +847,49 @@ function gateSummary(task: PlanTask, evidence: PlanTask['evidence'], prefix: str
 
 function liveBinding(state: RunState, taskId: string) {
   return state.bindings.find((item) => item.taskId === taskId && !item.retired)
+}
+
+/**
+ * r13 AC-11：把「已获准强制并行」的 waiting 任务放回待办。
+ *
+ * 只动 `waiting`：pending/ready 本来就能进派发循环；running/gate 不能被强行并行改写状态。
+ * 清掉 `waitingOn` / `waitReason`（与 `applyScopeWaits` 的 waiting → pending 同口径），
+ * 否则面板会显示「在等 t1」可任务已经在跑了 —— 等待文案与事实不一致比没有文案更糟。
+ */
+function reviveForcedWaits(state: RunState, forced: ReadonlySet<string>): RunState {
+  if (forced.size === 0) return state
+  let changed = false
+  const tasks = state.plan.tasks.map((task) => {
+    if (task.status !== 'waiting' || !forced.has(task.id)) return task
+    changed = true
+    const revived: PlanTask = { ...task, status: 'pending' }
+    delete revived.waitingOn
+    delete revived.waitReason
+    return revived
+  })
+  if (!changed) return state
+  return { ...state, plan: { ...state.plan, tasks } }
+}
+
+/**
+ * r13 AC-20：任务计时的**唯一**写入 helper（起点由 dispatch 写、终点由 applyReceipt 写）。
+ *
+ * 两条不变量：
+ *  - `startedAt` / `endedAt` 都是「首次写入生效」——重派、重放回执、续跑都不得让用时漂移；
+ *  - 没有 `startedAt` 就不写 `endedAt`（任务从未开始就被跳过时，用时口径是「未开始」而不是 0）。
+ */
+function stampTaskTime(state: RunState, taskId: string, patch: TaskTimeRecord): RunState {
+  const current = state.taskTimes?.[taskId] ?? {}
+  const next: TaskTimeRecord = { ...current }
+  if (patch.startedAt !== undefined && next.startedAt === undefined) next.startedAt = patch.startedAt
+  if (patch.endedAt !== undefined && next.endedAt === undefined && next.startedAt !== undefined) {
+    next.endedAt = Math.max(patch.endedAt, next.startedAt)
+  }
+  // 无可写内容（例如从未开始的任务被跳过）或无变化时返回原对象：
+  // dispatch 用 `changed` 决定是否落盘，凭空换新对象会多写一次盘。
+  if (next.startedAt === undefined && next.endedAt === undefined) return state
+  if (next.startedAt === current.startedAt && next.endedAt === current.endedAt) return state
+  return { ...state, taskTimes: { ...(state.taskTimes ?? {}), [taskId]: next } }
 }
 
 /**

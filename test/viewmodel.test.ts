@@ -743,4 +743,520 @@ test('计划状态：5 态全映射为中文，无计划走「未启用」', () 
   assert.equal(planStatusView('paused').label, progressOf(taskOf('t', 'paused')).label)
 })
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * r13 视图装配层：token / 用时 / 流转图 / run 详情 / 确认弹窗 / 记忆行
+ *
+ * 这一批断言的共同主题是「不造假」：取不到的用量必须显示「不可得」而不是 0/-、
+ * 用时文本必须逐字来自宿主（客户端不许自己拼「分/小时」）、左右栏必须走同一个
+ * `buildRunDetail` 才能 deep equal。任何一条红都意味着面板会开始说假话。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+import {
+  FLOW_COLUMN_STEP,
+  FLOW_NODE_HEIGHT,
+  FLOW_NODE_WIDTH,
+  FLOW_PADDING,
+  FLOW_ROW_STEP,
+  NOT_STARTED_TEXT,
+  TASK_TABLE_HEADER,
+  UNAVAILABLE_TEXT,
+  buildFlow,
+  buildRunDetail,
+  buildTaskDetail,
+  compactTokenTextOf,
+  confirmDialogOf,
+  confirmVerbOf,
+  durationTextOf,
+  durationTitleOf,
+  flowLayoutOf,
+  flowNodeViewOf,
+  inflightOf,
+  memoryRowOf,
+  roleChipsOf,
+  roleUsageOf,
+  runHeadOf,
+  taskDetailOf,
+  taskRowOf,
+  tokenTextOf,
+  tokenTitleOf,
+  usageCellOr,
+} from '../src/client/viewmodel.ts'
+import type {
+  DurationCell,
+  FlowView,
+  MemoryItemView,
+  PendingConfirmationView,
+  Role,
+  RunDetailView,
+  TaskDetailView,
+  UsageCell,
+} from '../src/shared/types.ts'
+
+const providerCell = (total: number, input?: number, output?: number): UsageCell => ({
+  source: 'provider',
+  tokens: { total, ...(input === undefined ? {} : { input }), ...(output === undefined ? {} : { output }) },
+})
+const unavailableCell = (reason = '没有用量来源'): UsageCell => ({ source: 'unavailable', reason })
+const durationCell = (text: string, state: DurationCell['state'] = 'done'): DurationCell => ({
+  state,
+  text,
+  startAt: 1_760_000_000_000,
+  endAt: 1_760_000_010_000,
+  ms: 10_000,
+})
+
+/* ──────────────────── token：三态必须一眼可分 ──────────────────── */
+
+test('token 文本：0 是真数字、缺失是不可得、千分位与宿主逐字一致', () => {
+  // 「花了 0 token」是真话，不能和「不可得」混为一谈（AC-6 的反面）
+  assert.equal(tokenTextOf(providerCell(0)), '0')
+  assert.equal(tokenTextOf(providerCell(999)), '999')
+  assert.equal(tokenTextOf(providerCell(1_234_567)), '1,234,567')
+  assert.equal(tokenTextOf(providerCell(12_345, 10_000, 2_345)), '12,345')
+  assert.equal(tokenTextOf(unavailableCell()), UNAVAILABLE_TEXT)
+  assert.equal(tokenTextOf(undefined), UNAVAILABLE_TEXT)
+  // 有来源但没有 total：宁可不给数，也不补 0
+  assert.equal(tokenTextOf({ source: 'provider' }), UNAVAILABLE_TEXT)
+  assert.notEqual(tokenTextOf(providerCell(0)), tokenTextOf(unavailableCell()), '0 与不可得必须不同')
+})
+
+test('token title：可得给输入/输出明细，不可得给原因', () => {
+  assert.equal(tokenTitleOf(providerCell(1_000, 700, 300)), '合计 1,000 token · 输入 700 · 输出 300')
+  assert.equal(tokenTitleOf(providerCell(42)), '合计 42 token')
+  assert.equal(tokenTitleOf(unavailableCell('宿主未上报 usage')), '宿主未上报 usage')
+  assert.equal(tokenTitleOf(undefined), '该处没有用量来源')
+})
+
+test('token 紧凑文本：流转节点 128px 内的量级缩写', () => {
+  assert.equal(compactTokenTextOf(providerCell(999)), '999')
+  assert.equal(compactTokenTextOf(providerCell(1_234)), '1.2k')
+  assert.equal(compactTokenTextOf(providerCell(12_000)), '12k')
+  assert.equal(compactTokenTextOf(providerCell(1_500_000)), '1.5M')
+  assert.equal(compactTokenTextOf(unavailableCell()), UNAVAILABLE_TEXT)
+})
+
+test('usageCellOr：缺单元格时保留原因，绝不冒充 0', () => {
+  assert.equal(usageCellOr(undefined, '没有事件').source, 'unavailable')
+  assert.equal(usageCellOr(undefined, '没有事件').reason, '没有事件')
+  assert.equal(usageCellOr(providerCell(7), '没有事件').tokens?.total, 7)
+})
+
+/* ──────────────────── 用时：只读宿主文本 ──────────────────── */
+
+test('用时文本逐字来自宿主：客户端不拼「分/小时」，缺单元格是不可得', () => {
+  assert.equal(durationTextOf(durationCell('3 分 12 秒')), '3 分 12 秒')
+  assert.equal(durationTextOf(durationCell('1 小时 05 分')), '1 小时 05 分')
+  // 未开始是状态而不是时长 —— 直接透传，不被重新计算
+  assert.equal(durationTextOf({ state: 'not-started', text: NOT_STARTED_TEXT }), NOT_STARTED_TEXT)
+  assert.equal(durationTextOf(undefined), UNAVAILABLE_TEXT)
+  // 即便宿主给了怪文本也照抄：客户端一旦「修正」就会与门禁证据里的时间对不上
+  assert.equal(durationTextOf({ state: 'done', text: '0 秒' }), '0 秒')
+})
+
+test('用时 title：四种状态各说各的前提', () => {
+  assert.equal(durationTitleOf({ state: 'not-started', text: NOT_STARTED_TEXT }), '任务尚未开始')
+  assert.equal(durationTitleOf({ state: 'running', text: '12 秒' }), '正在计时')
+  assert.equal(durationTitleOf({ state: 'unavailable', text: UNAVAILABLE_TEXT }), '没有开始时间，算不出用时')
+  assert.equal(durationTitleOf(undefined), '没有用时记录')
+  assert.match(durationTitleOf(durationCell('10 秒')), /^开始 .+ · 结束 /)
+})
+
+/* ──────────────────── 任务行 / 任务详情 ──────────────────── */
+
+test('任务行：两行式字段齐全，token 与用时同源于同一单元格', () => {
+  const detail = buildTaskDetail(taskOf('t1', 'running'), {
+    roleName: '全栈工程师',
+    usage: providerCell(12_345),
+    duration: durationCell('2 分 03 秒', 'running'),
+    messageCount: 3,
+  })
+  assert.equal(detail.roleName, '全栈工程师')
+  assert.equal(detail.usage.source, 'provider')
+  assert.equal(detail.duration.state, 'running')
+
+  const collapsed = taskRowOf(detail, false)
+  assert.equal(collapsed.expanded, false)
+  assert.equal(collapsed.tokenText, '12,345')
+  assert.equal(collapsed.durationText, '2 分 03 秒')
+  assert.deepEqual(collapsed.badge, statusBadge('running'), '行内 badge 与状态词表同源')
+  assert.equal(collapsed.tokenSource, 'provider')
+  assert.equal(collapsed.durationState, 'running')
+  assert.equal(taskRowOf(detail, true).expanded, true)
+  // 两行式：标题行与 meta 行的字段集合固定（DESIGN §2.1）
+  assert.deepEqual(TASK_TABLE_HEADER, { left: '任务 · 角色 · 状态', token: 'token', duration: '用时' })
+})
+
+test('任务详情：没有计时/用量的任务显式说不可得，未开始的任务说未开始', () => {
+  const notStarted = buildTaskDetail(taskOf('t1', 'pending'), { roleName: 'dev', messageCount: 0 })
+  assert.equal(notStarted.usage.source, 'unavailable')
+  assert.equal(notStarted.usage.reason, '该任务没有可用用量事件')
+  assert.equal(notStarted.duration.state, 'not-started')
+  assert.equal(notStarted.duration.text, NOT_STARTED_TEXT)
+
+  const blocked = buildTaskDetail(taskOf('t2', 'blocked', { waitReason: '等待 t1 完成' }), {
+    roleName: 'dev',
+    messageCount: 0,
+  })
+  assert.equal(blocked.duration.state, 'not-started')
+  assert.ok(blocked.waitReason, '阻塞任务必须带等待原因')
+
+  // 已结束但没有计时来源 → 不可得（不是「未开始」，也不是 0 秒）
+  const done = buildTaskDetail(taskOf('t3', 'done'), { roleName: 'dev', messageCount: 0 })
+  assert.equal(done.duration.state, 'unavailable')
+  assert.equal(done.duration.text, UNAVAILABLE_TEXT)
+})
+
+test('任务详情：门禁证据保留退出码、命令与输出尾部，不美化', () => {
+  const detail = buildTaskDetail(
+    taskOf('t1', 'done', {
+      evidence: {
+        taskId: 't1',
+        command: 'pnpm -s typecheck',
+        exitCode: 0,
+        tail: 'ok\n'.repeat(20),
+        artifacts: ['logs/a.txt'],
+        at: 1_760_000_000_000,
+      },
+    }),
+    { roleName: 'dev', messageCount: 2 },
+  )
+  const panel = taskDetailOf(detail)
+  assert.ok(panel.evidence)
+  assert.equal(panel.evidence.command, 'pnpm -s typecheck')
+  assert.equal(panel.evidence.exitText, '退出码 0')
+  assert.equal(panel.evidence.exitOk, true)
+  assert.equal(panel.evidence.tail.length <= 6, true, '输出尾部最多 6 行')
+  assert.deepEqual(panel.evidence.artifacts, ['logs/a.txt'])
+
+  const timeout = buildTaskDetail(
+    taskOf('t2', 'failed', {
+      evidence: { taskId: 't2', command: 'sleep 999', exitCode: null, tail: '', artifacts: [], at: 1 },
+    }),
+    { roleName: 'dev', messageCount: 0 },
+  )
+  assert.equal(taskDetailOf(timeout).evidence?.exitText, '超时或被信号终止')
+  assert.equal(taskDetailOf(timeout).evidence?.exitOk, false)
+})
+
+/* ──────────────────── 流转图：拓扑列 + 几何 ──────────────────── */
+
+test('buildFlow：列 = 最长依赖深度，行 = 同列顺序，边标记上游是否完成', () => {
+  const tasks = [
+    taskOf('t1', 'done'),
+    taskOf('t2', 'running', { dependsOn: ['t1'] }),
+    taskOf('t3', 'pending', { dependsOn: ['t2'] }),
+    taskOf('t4', 'pending'),
+  ]
+  const flow = buildFlow(tasks)
+  const byId = new Map(flow.nodes.map((node) => [node.id, node]))
+  assert.equal(byId.get('t1')?.column, 0)
+  assert.equal(byId.get('t2')?.column, 1)
+  assert.equal(byId.get('t3')?.column, 2)
+  assert.equal(byId.get('t4')?.column, 0)
+  assert.equal(byId.get('t1')?.row, 0)
+  assert.equal(byId.get('t4')?.row, 1, '同列第二个任务往下排一行')
+  assert.equal(flow.columns, 3)
+  assert.equal(flow.rows, 2)
+  const edges = new Map(flow.edges.map((edge) => [`${edge.from}->${edge.to}`, edge]))
+  assert.equal(edges.get('t1->t2')?.upstreamDone, true)
+  assert.equal(edges.get('t2->t3')?.upstreamDone, false)
+  // 不存在的依赖不允许画边（脏数据不能让图崩）
+  assert.equal(flow.edges.length, 2)
+})
+
+test('buildFlow：环形依赖不死循环，仍能产出完整节点', () => {
+  const flow = buildFlow([
+    taskOf('a', 'pending', { dependsOn: ['b'] }),
+    taskOf('b', 'pending', { dependsOn: ['a'] }),
+  ])
+  assert.equal(flow.nodes.length, 2)
+  assert.equal(flow.edges.length, 2)
+  for (const node of flow.nodes) assert.equal(Number.isFinite(node.column), true)
+})
+
+test('flowLayoutOf：节点 148×56、列距 188、行距 72，边是三次贝塞尔', () => {
+  const flow: FlowView = buildFlow([
+    taskOf('t1', 'done'),
+    taskOf('t2', 'running', { dependsOn: ['t1'] }),
+  ])
+  const layout = flowLayoutOf(flow)
+  assert.equal(FLOW_NODE_WIDTH, 148)
+  assert.equal(FLOW_NODE_HEIGHT, 56)
+  assert.equal(FLOW_COLUMN_STEP, 188)
+  assert.equal(FLOW_ROW_STEP, 72)
+  const t1 = layout.nodes.find((entry) => entry.node.id === 't1')!
+  const t2 = layout.nodes.find((entry) => entry.node.id === 't2')!
+  assert.equal(t1.x, FLOW_PADDING)
+  assert.equal(t1.y, FLOW_PADDING)
+  assert.equal(t2.x, FLOW_PADDING + FLOW_COLUMN_STEP)
+  assert.equal(layout.width, FLOW_PADDING * 2 + FLOW_NODE_WIDTH + FLOW_COLUMN_STEP)
+  assert.equal(layout.height, FLOW_PADDING * 2 + FLOW_NODE_HEIGHT)
+  assert.equal(layout.edges.length, 1)
+  assert.match(layout.edges[0].d, /^M [\d.]+ [\d.]+ C /)
+  // 边的终点在目标节点左侧内缩 2px，起点在上游节点右边缘
+  assert.equal(layout.edges[0].d.startsWith(`M ${t1.x + FLOW_NODE_WIDTH} ${t1.y + FLOW_NODE_HEIGHT / 2} C `), true)
+  assert.equal(layout.edges[0].d.endsWith(` ${t2.x - 2} ${t2.y + FLOW_NODE_HEIGHT / 2}`), true)
+})
+
+test('flowLayoutOf：缺端的边被跳过，不产生 NaN 坐标', () => {
+  const layout = flowLayoutOf({
+    nodes: [],
+    edges: [{ from: 'ghost', to: 'ghost2', upstreamDone: false }],
+    columns: 0,
+    rows: 0,
+  })
+  assert.equal(layout.edges.length, 0)
+  assert.equal(layout.width, FLOW_PADDING * 2 + FLOW_NODE_WIDTH)
+  assert.equal(layout.height, FLOW_PADDING * 2 + FLOW_NODE_HEIGHT)
+})
+
+test('flowNodeViewOf：长 token 数字降级到紧凑写法，title 保留全文', () => {
+  const flow = buildFlow([taskOf('t1', 'done')], {
+    usage: { t1: providerCell(1_234_567) },
+    durations: { t1: durationCell('1 小时 02 分') },
+  })
+  const view = flowNodeViewOf(flow.nodes[0])
+  assert.equal(view.tokenText, '1.2M', '节点内超 7 字符必须降级，否则撑破 128px')
+  assert.equal(view.durationText, '1 小时 02 分')
+  assert.equal(view.text, '1.2M · 1 小时 02 分')
+  assert.equal(view.title.includes('1,234,567'), true, '全文只放在 title 里')
+  assert.equal(view.label.includes('任务 t1'), true)
+})
+
+/* ──────────────────── 角色条：部分缺来源不合计 ──────────────────── */
+
+test('roleUsageOf：只列有任务的角色，全有来源才合计', () => {
+  const roles: Role[] = [
+    { id: 'dev', name: '全栈工程师' },
+    { id: 'qa', name: 'QA' },
+    { id: 'ops', name: '运维' },
+  ] as Role[]
+  const tasks: TaskDetailView[] = [
+    buildTaskDetail(taskOf('t1', 'done', { roleId: 'dev' }), {
+      roleName: '全栈工程师',
+      usage: providerCell(1_000),
+      duration: durationCell('10 秒'),
+      messageCount: 0,
+    }),
+    buildTaskDetail(taskOf('t2', 'running', { roleId: 'dev' }), {
+      roleName: '全栈工程师',
+      usage: providerCell(2_500),
+      duration: durationCell('20 秒'),
+      messageCount: 0,
+    }),
+    buildTaskDetail(taskOf('t3', 'running', { roleId: 'qa' }), {
+      roleName: 'QA',
+      usage: providerCell(800),
+      duration: durationCell('5 秒'),
+      messageCount: 0,
+    }),
+  ]
+  const usage = roleUsageOf(tasks, roles)
+  assert.equal(usage.length, 2, '同角色任务合并成一条，没任务的角色不占位置')
+  assert.equal(usage[0].roleId, 'dev')
+  assert.equal(usage[0].name, '全栈工程师', '角色名以角色表为准')
+  assert.equal(usage[0].tasks, 2)
+  assert.equal(usage[0].usage.source, 'provider')
+  assert.equal(usage[0].usage.tokens?.total, 3_500)
+  assert.equal(usage[1].roleId, 'qa')
+  assert.equal(usage[1].tasks, 1)
+  // ops 在任务里没有出现 → 不占位置
+  assert.equal(usage.some((row) => row.roleId === 'ops'), false)
+  const chips = roleChipsOf(usage)
+  assert.equal(chips[0].usageText, '3,500')
+  assert.equal(chips[0].taskCount, 2)
+})
+
+test('roleUsageOf：部分任务缺用量时给「不可得」，不给出偏小的合计', () => {
+  const tasks: TaskDetailView[] = [
+    buildTaskDetail(taskOf('t1', 'done'), { roleName: 'dev', usage: providerCell(1_000), messageCount: 0 }),
+    buildTaskDetail(taskOf('t2', 'running'), { roleName: 'dev', usage: unavailableCell(), messageCount: 0 }),
+  ]
+  const [row] = roleUsageOf(tasks, [])
+  assert.equal(row.usage.source, 'unavailable')
+  assert.equal(tokenTextOf(row.usage), UNAVAILABLE_TEXT)
+  assert.equal(row.usage.tokens, undefined, '不能只把已知的一半加起来冒充合计')
+  assert.equal(row.name, 'dev', '角色表查不到时回落到任务上的 roleId')
+})
+
+/* ──────────────────── run 详情：三源优先级 ──────────────────── */
+
+/** r13 用的快照：带 runId + 一个任务 + 角色表（不影响文件顶部的通用 snapshotOf）。 */
+function runSnapshotOf(extra: Partial<PanelSnapshot> = {}): PanelSnapshot {
+  return {
+    enabled: true,
+    runId: 'run-1',
+    planStatus: 'dispatching',
+    tasks: [taskOf('t1', 'running')],
+    members: [],
+    messages: [],
+    roles: [{ id: 'dev', name: '全栈工程师' } as Role],
+    ...extra,
+  } as PanelSnapshot
+}
+
+test('buildRunDetail：snapshot → 详情，任务用量/用时逐条对齐', () => {
+  const detail = buildRunDetail({
+    snapshot: runSnapshotOf({
+      taskUsage: { t1: providerCell(321) },
+      taskDurations: { t1: durationCell('4 分 05 秒', 'running') },
+      runUsage: providerCell(321),
+      runDuration: durationCell('4 分 05 秒', 'running'),
+      plannedAt: 1_760_000_000_000,
+      project: 'dsh-auto-team',
+    }),
+  })
+  assert.ok(detail)
+  assert.equal(detail.runId, 'run-1')
+  assert.equal(detail.tasks.length, 1)
+  assert.equal(tokenTextOf(detail.tasks[0].usage), '321')
+  assert.equal(detail.tasks[0].duration.text, '4 分 05 秒')
+  assert.equal(detail.tasks[0].roleName, '全栈工程师')
+  assert.equal(detail.roles.length, 1)
+  assert.equal(detail.flow.nodes.length, 1)
+  assert.equal(detail.project, 'dsh-auto-team')
+  assert.equal(detail.plannedAt, 1_760_000_000_000)
+})
+
+test('buildRunDetail：显式 runDetail > library.detail > snapshot', () => {
+  const direct = { runId: 'run-9', sessionId: 's', planStatus: 'draft' } as unknown as RunDetailView
+  const fromLibrary = { runId: 'run-8', sessionId: 's', planStatus: 'draft' } as unknown as RunDetailView
+  const library = { projects: [], global: { memories: [] }, detail: fromLibrary }
+
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf(), runDetail: direct })?.runId, 'run-9')
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf(), library })?.runId, 'run-8')
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf() })?.runId, 'run-1')
+})
+
+test('buildRunDetail：runId 不匹配时返回 null，绝不把 A 的详情贴到 B 的标题下', () => {
+  const direct = { runId: 'run-9', sessionId: 's', planStatus: 'draft' } as unknown as RunDetailView
+  // 显式详情指向别的 run、快照也对不上 → null（宁可不显示，也不贴错内容）
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf({ runId: 'run-7' }), runDetail: direct }, 'run-1'), null)
+  // 快照本身是 run-1 时可用快照兜底，但绝不借用 direct 的内容
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf(), runDetail: direct }, 'run-1')?.runId, 'run-1')
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf() }, 'run-2'), null)
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf() }, 'run-1')?.runId, 'run-1')
+  // 没有 run 的快照（未启用）不伪造详情
+  assert.equal(buildRunDetail({ snapshot: runSnapshotOf({ runId: undefined }) }), null)
+  assert.equal(buildRunDetail({ snapshot: null }), null)
+})
+
+test('buildRunDetail：run 用量缺失时聚合任务用量，全部缺失才说不可得', () => {
+  const partial = buildRunDetail({
+    snapshot: runSnapshotOf({
+      taskUsage: { t1: providerCell(100) },
+      tasks: [taskOf('t1', 'done'), taskOf('t2', 'done')],
+    }),
+  })!
+  assert.equal(partial.usage.source, 'unavailable')
+  assert.equal(partial.usage.reason, '部分任务没有可用用量事件')
+
+  const merged = buildRunDetail({
+    snapshot: runSnapshotOf({ taskUsage: { t1: providerCell(100) } }),
+  })!
+  assert.equal(merged.usage.source, 'provider')
+  assert.equal(merged.usage.tokens?.total, 100)
+
+  const missing = buildRunDetail({ snapshot: runSnapshotOf() })!
+  assert.equal(missing.usage.source, 'unavailable')
+  assert.equal(missing.duration.state, 'unavailable')
+  assert.equal(runHeadOf(missing).downgrade, `token ${UNAVAILABLE_TEXT}（无用量来源）`)
+})
+
+/* ──────────────────── run 头 / 在途派发 ──────────────────── */
+
+test('runHeadOf：无用量来源时给一行降级说明，可得时不显示', () => {
+  const detail = buildRunDetail({ snapshot: runSnapshotOf() })!
+  const head = runHeadOf(detail, 'dispatching')
+  assert.equal(head.inflightState, 'dispatching')
+  assert.equal(head.inflightText, '正在派发…')
+  assert.equal(head.usageSource, 'unavailable')
+  assert.equal(head.usageText, UNAVAILABLE_TEXT)
+  assert.equal(head.downgrade, 'token 不可得（无用量来源）')
+  assert.equal(head.windowText.endsWith('进行中'), true)
+
+  const withUsage = buildRunDetail({
+    snapshot: runSnapshotOf({ runUsage: providerCell(1_234), runDuration: durationCell('2 分 00 秒') }),
+  })!
+  const head2 = runHeadOf(withUsage)
+  assert.equal(head2.usageText, '1,234')
+  assert.equal(head2.downgrade, undefined)
+  assert.equal(head2.durationText, '2 分 00 秒')
+  assert.equal(head2.inflightText, '自动派发已开启')
+})
+
+test('inflightOf：三态文案与圆点，未知值回落 idle', () => {
+  assert.deepEqual(inflightOf('dispatching'), { state: 'dispatching', text: '正在派发…', dot: true })
+  assert.deepEqual(inflightOf('dispatched'), { state: 'dispatched', text: '已派发', dot: true })
+  assert.deepEqual(inflightOf('idle'), { state: 'idle', text: '自动派发已开启', dot: false })
+  assert.equal(inflightOf('bogus' as never).state, 'idle')
+})
+
+/* ──────────────────── 确认弹窗 ──────────────────── */
+
+test('confirmDialogOf：五类不可逆动作各自有动词短语，绝不用「确定」', () => {
+  const base = (action: string, taskId?: string): PendingConfirmationView => ({
+    id: `pending-${action}`,
+    action,
+    taskId,
+    runId: 'run-1',
+    createdAt: 1_760_000_000_000,
+    summary: '将中断 2 个运行中成员',
+    irreversible: true,
+    waitedText: '已等待 2 分',
+  })
+
+  const cancel = confirmDialogOf(base('cancel'))
+  assert.equal(cancel.title, '确认终止运行？')
+  assert.equal(cancel.confirmLabel, '终止运行')
+  assert.equal(cancel.objectText, '运行 run-1')
+  assert.equal(cancel.rejectLabel, '取消')
+  assert.equal(cancel.waitedText, '已等待 2 分')
+  assert.equal(cancel.summary, '将中断 2 个运行中成员')
+
+  for (const [action, title] of [
+    ['cancelTask', '确认中断成员？'],
+    ['skipTask', '确认跳过任务？'],
+    ['updateAcceptance', '确认重新门禁？'],
+    ['forceParallel', '确认强制并行？'],
+  ] as const) {
+    const view = confirmDialogOf(base(action, 't2'))
+    assert.equal(view.title, title)
+    assert.equal(view.objectText, '任务 t2')
+    assert.notEqual(view.confirmLabel, '确定', `${action} 的确认按钮必须是动词短语`)
+    assert.equal(view.irreversibleText, '此操作不可撤销')
+    assert.equal(confirmVerbOf(action).object, 'task')
+  }
+
+  // 未知动作不崩，也不冒充成某个具体动作
+  assert.equal(confirmVerbOf('whatever').title, '不可逆操作')
+  assert.equal(confirmDialogOf({ ...base('whatever'), waitedText: '' }).waitedText, '刚刚')
+})
+
+/* ──────────────────── 记忆行 ──────────────────── */
+
+test('memoryRowOf：token 一律带 ≈ 且说明是估算，不是 provider 上报', () => {
+  const item: MemoryItemView = {
+    track: 'project',
+    name: 'conventions.md',
+    title: '项目约定',
+    createdAt: 1_760_000_000_000,
+    updatedAt: 1_760_000_500_000,
+    tokenEstimate: 1_234,
+    tokenBasis: 'estimate',
+  }
+  const row = memoryRowOf(item)
+  assert.equal(row.key, 'project/conventions.md')
+  assert.equal(row.title, '项目约定')
+  assert.equal(row.tokenText, '≈1,234 token')
+  assert.equal(row.tokenTitle.includes('估算'), true)
+  assert.equal(row.timeText.startsWith('建立 '), true)
+
+  // 标题缺失时用文件名（不能让列表出现空白行）
+  assert.equal(memoryRowOf({ ...item, title: '' }).title, 'conventions.md')
+  // 没有建立时间时只显示修改时间
+  const noCreated = memoryRowOf({ ...item, createdAt: undefined })
+  assert.equal(noCreated.timeText.startsWith('修改 '), true)
+})
+
 

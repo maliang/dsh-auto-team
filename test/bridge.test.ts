@@ -14,7 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { MemberBinding, MessageRecord, PanelAction, Plan, PlanTask, Role } from '../src/shared/types.ts'
+import type { GateEvidence, MemberBinding, MessageRecord, PanelAction, Plan, PlanTask, Role } from '../src/shared/types.ts'
 import { createBridge, type Bridge, type BridgeDeps, type ReceiptInput } from '../src/host/bridge.ts'
 import { buildHttpRoutes } from '../src/host/http.ts'
 import { BUILTIN_ROLES } from '../src/host/roles/builtin.ts'
@@ -23,6 +23,7 @@ import { createSettingsRepo } from '../src/host/settings.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { NOT_ENABLED_MESSAGE, buildToolSpecs, sessionOf } from '../src/host/tools.ts'
 import { createDeviationRecorder } from '../src/host/team/deviation.ts'
+import { applyReceipt as applyReceiptReal } from '../src/host/team/dispatch.ts'
 
 const NOW = 1_700_000_000_000
 const SESSION = 'sess-t4'
@@ -53,6 +54,11 @@ function taskOf(id: string, over: Partial<PlanTask> = {}): PlanTask {
 
 function bindingOf(over: Partial<MemberBinding> = {}): MemberBinding {
   return { taskId: 't1', roleId: 'dev', memberId: 'member-1', name: '开发-1', spawnedAt: NOW + 1000, ...over }
+}
+
+/** 旧证据夹具（r13：done 改验收后必须被本次门禁的新证据替换）。 */
+function evidenceOf(command: string, exitCode: number): GateEvidence {
+  return { taskId: 't1', command, exitCode, tail: '', artifacts: [], at: NOW }
 }
 
 function planOf(over: Partial<Plan> = {}): Plan {
@@ -120,6 +126,19 @@ function setup(overrides: Partial<BridgeDeps> = {}): Harness {
 async function enable(bridge: Bridge): Promise<void> {
   const result = await bridge.act(SESSION, { type: 'toggle', enabled: true })
   assert.equal(result.rejected, undefined, '启用动作本身不应被拒')
+}
+
+/**
+ * r13 AC-11：5 类不可逆动作现在**必须先确认**。
+ *
+ * 单任务动作的老用例断言的是「执行体」的语义（BAD_REQUEST / 状态迁移 / 释放写域），
+ * 那部分没有变：这里先拿 `pendingId` 再确认，把「确认后的结果」交给原断言。
+ * 纯拒绝型用例同理 —— 确认后才轮到执行体拒绝，pending 随之清空。
+ */
+async function actConfirmed(bridge: Bridge, action: PanelAction): Promise<Awaited<ReturnType<Bridge['act']>>> {
+  const first = await bridge.act(SESSION, action)
+  if (first.pendingId === undefined) return first
+  return bridge.act(SESSION, { type: 'confirmPending', pendingId: first.pendingId })
 }
 
 test('未启用时除 toggle 外全部动作被拒 NOT_ENABLED，快照仍可读', async () => {
@@ -433,14 +452,20 @@ test('记忆与角色写入：非法名/未知角色分别被拒，正常路径�
   assert.match(builtinDelete.rejected?.message ?? '', /内置角色不可删除/)
 })
 
-test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
+test('http：四条路由 + GET /memory 校验 + {data} 包装', async () => {
   const { bridge, store } = setup()
   await enable(bridge)
 
   const routes = buildHttpRoutes({ bridge, defaultSessionId: () => SESSION })
+  // r13 AC-22：路由恰 4 条（新增 `GET /library`，历史详情走它的 `?runId=`，不新开第 5 条）。
   assert.deepEqual(
     routes.map((route) => `${route.method} ${route.path}`),
-    ['GET /api/auto-team/snapshot', 'GET /api/auto-team/memory', 'POST /api/auto-team/act'],
+    [
+      'GET /api/auto-team/snapshot',
+      'GET /api/auto-team/library',
+      'GET /api/auto-team/memory',
+      'POST /api/auto-team/act',
+    ],
   )
 
   const get = (url: string): { method: string; pathname: string; url: string; json: () => Promise<unknown> } => ({
@@ -449,22 +474,35 @@ test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
     url,
     json: async () => ({}),
   })
+  // 按路径取路由而不是按下标：插入 `/library` 后下标会整体后移，按下标写死的用例会
+  // 「换一条路由的错误信息去命中另一条断言」，红得莫名其妙。
+  const routeOf = (path: string) => {
+    const found = routes.find((route) => route.path === path)
+    assert.ok(found, `缺少路由 ${path}`)
+    return found
+  }
 
-  const snapshot = (await routes[0].handle(get(`/api/auto-team/snapshot?sessionId=${SESSION}`))) as {
+  const snapshot = (await routeOf('/api/auto-team/snapshot').handle(
+    get(`/api/auto-team/snapshot?sessionId=${SESSION}`),
+  )) as {
     data?: { enabled?: boolean; messages?: unknown[] }
   }
   assert.equal(snapshot.data?.enabled, true)
   assert.deepEqual(snapshot.data?.messages, [])
 
-  const badName = (await routes[1].handle(get('/api/auto-team/memory?track=public&name=..%2Fx'))) as {
+  const badName = (await routeOf('/api/auto-team/memory').handle(
+    get('/api/auto-team/memory?track=public&name=..%2Fx'),
+  )) as {
     error?: string
   }
   assert.equal(badName.error, '非法文件名')
 
-  const badTrack = (await routes[1].handle(get('/api/auto-team/memory?track=nope&name=a'))) as { error?: string }
+  const badTrack = (await routeOf('/api/auto-team/memory').handle(get('/api/auto-team/memory?track=nope&name=a'))) as {
+    error?: string
+  }
   assert.equal(badTrack.error, 'track 必须是 public、project 或 skill')
 
-  const acted = (await routes[2].handle({
+  const acted = (await routeOf('/api/auto-team/act').handle({
     method: 'POST',
     pathname: '/api/auto-team/act',
     url: '/api/auto-team/act',
@@ -473,7 +511,7 @@ test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
   assert.equal(acted.data?.rejected?.code, 'NO_PLAN', '业务拒绝放在 data.rejected，HTTP 仍 200')
   assert.equal(acted.data?.snapshot?.enabled, true)
 
-  const badJson = (await routes[2].handle({
+  const badJson = (await routeOf('/api/auto-team/act').handle({
     method: 'POST',
     pathname: '/api/auto-team/act',
     url: '/api/auto-team/act',
@@ -482,6 +520,13 @@ test('http：三条路由 + GET /memory 校验 + {data} 包装', async () => {
     },
   })) as { error?: string }
   assert.equal(badJson.error, '请求体不是合法 JSON')
+
+  // r13 AC-22：第 4 条路由就是把项目库装配交给 bridge（客户端零拼接），返回 `{data: LibraryView}`。
+  const library = (await routeOf('/api/auto-team/library').handle(
+    get(`/api/auto-team/library?sessionId=${SESSION}`),
+  )) as { data?: { projects?: unknown[]; global?: { memories?: unknown[] } } }
+  assert.ok(Array.isArray(library.data?.projects), 'GET /library 必须返回 projects 数组')
+  assert.ok(Array.isArray(library.data?.global?.memories), 'GET /library 必须返回 global.memories 数组')
 
   store.save(stateOf())
 })
@@ -994,12 +1039,19 @@ test('r10：restoreDefaultRoles 连带把内置技能恢复出厂，三条 notic
   assert.match(notices[2] ?? '', /1 个自建角色未受影响/)
 })
 
-test('r10：GET /memory?track=skill 读技能正文（复用同一条正文通道，路由仍是 3 条）', async () => {
+test('r10：GET /memory?track=skill 读技能正文（复用同一条正文通道，不新开技能路由）', async () => {
   const skills = fakeSkills([skillRecordOf({ id: 'review', title: '代码审查', body: '# 审查\n- 看边界' })])
   const { bridge } = setup({ skills: skills.repo })
   await enable(bridge)
   const routes = buildHttpRoutes({ bridge, defaultSessionId: () => SESSION })
-  assert.equal(routes.length, 3, '技能正文不许新开路由')
+  // r13 AC-22 定稿路由恰 4 条；技能正文仍走 /memory 的 `track=skill`，这里断言的是
+  // 「没有 /skill 之类的第 5 条路由」，而不是把数字锁回 r10 时期的 3。
+  assert.equal(routes.length, 4, '技能正文不许新开路由（路由仍恰 4 条）')
+  assert.equal(
+    routes.filter((route) => /skill/i.test(route.path)).length,
+    0,
+    '技能正文不许新开 /skill 路由',
+  )
 
   const get = (url: string): { method: string; pathname: string; url: string; json: () => Promise<unknown> } => ({
     method: 'GET',
@@ -1008,7 +1060,11 @@ test('r10：GET /memory?track=skill 读技能正文（复用同一条正文通�
     json: async () => ({}),
   })
 
-  const body = (await routes[1].handle(get('/api/auto-team/memory?track=skill&name=review'))) as {
+  // 按路径取（r13 新增 `GET /library` 后下标整体后移，写死下标会拿错路由）。
+  const memoryRoute = routes.find((route) => route.path === '/api/auto-team/memory')
+  assert.ok(memoryRoute, '缺少 GET /memory 路由')
+
+  const body = (await memoryRoute.handle(get('/api/auto-team/memory?track=skill&name=review'))) as {
     data?: { id?: string; title?: string; body?: string; chars?: number }
     error?: string
   }
@@ -1017,7 +1073,7 @@ test('r10：GET /memory?track=skill 读技能正文（复用同一条正文通�
   assert.equal(body.data?.body, '# 审查\n- 看边界')
   assert.equal(body.data?.chars, '# 审查\n- 看边界'.length)
 
-  const missing = (await routes[1].handle(get('/api/auto-team/memory?track=skill&name=ghost'))) as { error?: string }
+  const missing = (await memoryRoute.handle(get('/api/auto-team/memory?track=skill&name=ghost'))) as { error?: string }
   assert.match(missing.error ?? '', /找不到技能/)
 })
 
@@ -1166,7 +1222,14 @@ test('r11 cancelTask 允许：pending → cancelled，下游转 blocked 且带�
   await enable(bridge)
   store.save(pairState({ status: 'pending' }, { status: 'blocked' }))
 
-  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1', reason: '需求方撤回' })
+  // r13 AC-11：cancelTask 不可逆 → 先挂 pending（同一 run 只一条），确认后才执行。
+  const requested = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1', reason: '需求方撤回' })
+  assert.equal(requested.rejected?.code, 'CONFIRM_REQUIRED', '未确认前必须被拦')
+  assert.ok(requested.pendingId !== undefined, '必须带回 pendingId')
+  assert.equal(requested.snapshot.tasks.find((task) => task.id === 't1')?.status, 'pending', '未确认时状态不变')
+  assert.equal(requested.snapshot.pendingConfirmation?.action, 'cancelTask', '快照必须暴露未决确认')
+
+  const result = await actConfirmed(bridge, { type: 'cancelTask', taskId: 't1', reason: '需求方撤回' })
   assert.equal(result.rejected, undefined)
   assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'cancelled')
   const downstream = result.snapshot.tasks.find((task) => task.id === 't2')
@@ -1191,7 +1254,7 @@ test('r11 cancelTask 允许：running → cancelled 并按成员名尽力中断'
   await enable(bridge)
   store.save(pairState({ status: 'running' }, { status: 'blocked' }))
 
-  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'cancelTask', taskId: 't1' })
   assert.equal(result.rejected, undefined)
   assert.deepEqual(interrupted, ['开发-1'], 'running 任务取消必须中断对应成员')
   assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'cancelled')
@@ -1220,7 +1283,7 @@ test('r11 cancelTask 释放写域：等待者收到一条释放消息并回到 p
     }),
   )
 
-  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'cancelTask', taskId: 't1' })
   const waiter = result.snapshot.tasks.find((task) => task.id === 't2')
   assert.equal(waiter?.status, 'pending', '持有者取消后等待者必须被放回 pending')
   assert.equal(waiter?.waitReason, undefined)
@@ -1233,7 +1296,7 @@ test('r11 cancelTask 拒绝：done 不可取消，文案含任务 id 与状态�
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'done' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'cancelTask', taskId: 't1' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   assert.match(result.rejected?.message ?? '', /t1/)
   assert.match(result.rejected?.message ?? '', /已通过/)
@@ -1245,7 +1308,7 @@ test('r11 cancelTask 拒绝：gate 正在跑门禁不可取消（出路是改验
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'gate' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'cancelTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'cancelTask', taskId: 't1' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   assert.match(result.rejected?.message ?? '', /t1/)
   assert.match(result.rejected?.message ?? '', /门禁中/)
@@ -1256,7 +1319,7 @@ test('r11 skipTask 允许：pending → skipped，依赖它的下游解除阻塞
   await enable(bridge)
   store.save(pairState({ status: 'pending' }, { status: 'blocked' }))
 
-  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'skipTask', taskId: 't1' })
   assert.equal(result.rejected, undefined)
   assert.equal(result.snapshot.tasks.find((task) => task.id === 't1')?.status, 'skipped')
   assert.equal(result.snapshot.tasks.find((task) => task.id === 't2')?.status, 'pending', '依赖视为满足')
@@ -1267,7 +1330,7 @@ test('r11 skipTask 允许：waiting → skipped（等待中可直接跳过）', 
   await enable(bridge)
   store.save(pairState({ status: 'waiting', waitingOn: ['t2'], waitReason: '等待 t2 释放 a.ts' }, { status: 'running' }))
 
-  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'skipTask', taskId: 't1' })
   assert.equal(result.rejected, undefined)
   const skipped = result.snapshot.tasks.find((task) => task.id === 't1')
   assert.equal(skipped?.status, 'skipped')
@@ -1279,7 +1342,7 @@ test('r11 skipTask 拒绝：running 请先取消', async () => {
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'running' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'skipTask', taskId: 't1' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   assert.match(result.rejected?.message ?? '', /t1/)
   assert.match(result.rejected?.message ?? '', /运行中/)
@@ -1290,7 +1353,7 @@ test('r11 skipTask 拒绝：failed 不可跳过（请重跑或取消）', async 
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'failed' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'skipTask', taskId: 't1' })
+  const result = await actConfirmed(bridge, { type: 'skipTask', taskId: 't1' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   assert.match(result.rejected?.message ?? '', /t1/)
   assert.match(result.rejected?.message ?? '', /失败/)
@@ -1301,7 +1364,7 @@ test('r11 updateAcceptance 允许：pending 改写验收命令并 trim', async (
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'pending' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: '  pnpm typecheck  ' })
+  const result = await actConfirmed(bridge, { type: 'updateAcceptance', taskId: 't1', acceptance: '  pnpm typecheck  ' })
   assert.equal(result.rejected, undefined)
   assert.equal(result.snapshot.tasks[0]?.acceptance, 'pnpm typecheck')
 })
@@ -1311,7 +1374,7 @@ test('r11 updateAcceptance 允许：interrupted 可改验收后重派', async ()
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'interrupted' })] }) }))
 
-  const result = await bridge.act(SESSION, {
+  const result = await actConfirmed(bridge, {
     type: 'updateAcceptance',
     taskId: 't1',
     acceptance: "grep -RIn --fixed-strings 'deriveScopeLocks' src/host >/dev/null",
@@ -1320,15 +1383,79 @@ test('r11 updateAcceptance 允许：interrupted 可改验收后重派', async ()
   assert.match(result.snapshot.tasks[0]?.acceptance ?? '', /deriveScopeLocks/)
 })
 
-test('r11 updateAcceptance 拒绝：done 不可改（不改已完成证据）', async () => {
-  const { bridge, store } = setup()
+test('r13 updateAcceptance 允许：done 改验收 → 确认后重跑门禁，通过保持 done 并刷新证据', async () => {
+  const { bridge, store, calls } = setup()
   await enable(bridge)
-  store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'done' })] }) }))
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [taskOf('t1', { status: 'done', acceptance: 'exit 9', evidence: evidenceOf('exit 9', 9) })],
+      }),
+    }),
+  )
 
-  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
-  assert.equal(result.rejected?.code, 'BAD_REQUEST')
-  assert.match(result.rejected?.message ?? '', /t1/)
-  assert.match(result.rejected?.message ?? '', /已通过/)
+  const first = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
+  assert.equal(first.rejected?.code, 'CONFIRM_REQUIRED', 'done 改验收必须先确认（不可逆动作）')
+  assert.equal(store.load('run-t4')?.plan.tasks[0]?.acceptance, 'exit 9', '确认前不改验收命令')
+  const pendingId = first.pendingId
+  assert.ok(pendingId, 'CONFIRM_REQUIRED 必须带 pendingId')
+
+  const result = await bridge.act(SESSION, { type: 'confirmPending', pendingId })
+  assert.equal(result.rejected, undefined)
+  const task = result.snapshot.tasks[0]
+  assert.equal(task?.acceptance, 'exit 0', '确认后落新验收命令')
+  assert.equal(task?.status, 'done', '门禁通过 → 保持 done')
+  assert.equal(task?.evidence?.command, 'exit 0', '证据必须是本次门禁的')
+  assert.equal(task?.evidence?.exitCode, 0)
+  assert.equal(calls.receipts[0]?.receipt.verdict, 'done')
+})
+
+test('r13 updateAcceptance 允许：done 改验收后门禁失败 → 转 rework（不得静默保留 done）', async () => {
+  const { bridge, store, calls } = setup()
+  await enable(bridge)
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [taskOf('t1', { status: 'done', acceptance: 'exit 0', evidence: evidenceOf('exit 0', 0) })],
+      }),
+    }),
+  )
+
+  const result = await actConfirmed(bridge, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 7' })
+  assert.equal(result.rejected, undefined)
+  const task = result.snapshot.tasks[0]
+  assert.equal(task?.acceptance, 'exit 7')
+  assert.equal(task?.status, 'rework', '门禁失败必须转返工')
+  assert.equal(task?.evidence?.exitCode, 7)
+  assert.equal(calls.receipts[0]?.receipt.verdict, 'rework')
+})
+
+test('r13 updateAcceptance：done 改验收接真实 applyReceipt —— 门禁结论由状态机落盘，不是 mock 语义', async () => {
+  const { bridge, store } = setup({
+    applyReceipt: (state, taskId, receipt, now, maxAttempts) =>
+      applyReceiptReal(state, taskId, receipt, now, maxAttempts),
+  })
+  await enable(bridge)
+  store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [taskOf('t1', { status: 'done', acceptance: 'exit 0', evidence: evidenceOf('exit 0', 0) })],
+      }),
+    }),
+  )
+
+  const result = await actConfirmed(bridge, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 7' })
+  assert.equal(result.rejected, undefined)
+  const task = result.snapshot.tasks[0]
+  assert.equal(task?.status, 'rework', '真实 applyReceipt 必须把门禁失败落成 rework')
+  assert.equal(task?.evidence?.command, 'exit 7')
+  assert.equal(task?.evidence?.exitCode, 7)
+  assert.equal(task?.acceptance, 'exit 7')
+  // 落盘也要是同一结论（不能只改内存里的快照）
+  assert.equal(store.load('run-t4')?.plan.tasks[0]?.status, 'rework')
 })
 
 test('r11 updateAcceptance 拒绝：cancelled 不可改', async () => {
@@ -1336,7 +1463,7 @@ test('r11 updateAcceptance 拒绝：cancelled 不可改', async () => {
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'cancelled' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
+  const result = await actConfirmed(bridge, { type: 'updateAcceptance', taskId: 't1', acceptance: 'exit 0' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   assert.match(result.rejected?.message ?? '', /已取消/)
 })
@@ -1346,7 +1473,7 @@ test('r11 updateAcceptance 拒绝：空白验收返回三条模板且不落盘',
   await enable(bridge)
   store.save(stateOf({ plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'pending' })] }) }))
 
-  const result = await bridge.act(SESSION, { type: 'updateAcceptance', taskId: 't1', acceptance: '   ' })
+  const result = await actConfirmed(bridge, { type: 'updateAcceptance', taskId: 't1', acceptance: '   ' })
   assert.equal(result.rejected?.code, 'BAD_REQUEST')
   const message = result.rejected?.message ?? ''
   assert.match(message, /t1/)
@@ -1355,9 +1482,11 @@ test('r11 updateAcceptance 拒绝：空白验收返回三条模板且不落盘',
   assert.equal(result.snapshot.tasks[0]?.acceptance, 'exit 0', '被拒时原验收命令不变')
 })
 
-test('r11 三动作都走既有 POST /act 路由（不新增路由）', () => {
+test('r11 三动作都走既有 POST /act 路由（r13 后路由恰 4 条，不因动作增加）', () => {
   const routes = buildHttpRoutes({ bridge: createBridge(setup().deps), defaultSessionId: () => SESSION })
-  assert.equal(routes.length, 3, '路由数必须仍是 3')
+  // r13 AC-22：r11 的 3 个任务动作 + r13 的 3 个新动作（confirmPending/rejectPending/forceParallel）
+  // 都挤在同一条 POST /act 上，路由数仍是 4（snapshot/library/memory/act）。
+  assert.equal(routes.length, 4, '路由数必须仍是 4（r13 只新增 GET /library）')
   const paths = routes.map((route) => route.path)
   assert.deepEqual(paths.filter((path) => path.includes('/act')).length, 1)
 })

@@ -146,6 +146,8 @@ export interface SidebarRightFace {
 export interface ServiceScope {
   sidebarRightTabs?: TabsFace
   sidebarRight?: SidebarRightFace
+  /** r13：主区页面服务（**未验证**，形状只按 `open(id)` 猜测，失败即事件降级）。 */
+  mainArea?: MainAreaFace
   effect?(fn: () => unknown, label?: string): unknown
 }
 
@@ -426,4 +428,142 @@ export function registerPanelTab(ctx: SlotsContext): boolean {
 export function createOpenPanel(ctx: SlotsContext): () => boolean {
   const commands = createPanelCommands(ctx)
   return () => commands.open('current')
+}
+
+/* ─────────────────── r13 左栏「自动团队」栏目 + 主区页面（AC-24） ─────────────────── */
+
+/**
+ * 左栏栏目槽位（非 keyed）：宿主侧栏里的一个可折叠条目。
+ *
+ * 判定依据是 `docs/teamflow/architecture/UI-SLOTS.md`（106 个槽位里唯一一个侧栏「列表」座位），
+ * 字段集合沿用同机样本 `dsh-better-sidebar`（非 keyed → `{ name, id, order, label, inject }`）。
+ */
+export const PANELLIST_SLOT = 'sidebar.panellist'
+
+/**
+ * 主区页面槽位（**keyed**，key 与栏目 id 同值）：点左栏条目后在主区展开整页项目库。
+ *
+ * **未验证**（TECHNICAL §0 U2）：`main` 对第三方插件是否开放只有真机才知道。
+ * 因此注册整段 try/catch，失败只 warn 并降级为「面板内联项目库」，绝不连累其它槽位。
+ */
+export const MAIN_SLOT = 'main'
+
+/** 左栏栏目的 id，同时用作 `main` 槽位的 key（同一个值，两处不复述）。 */
+export const PANELLIST_ID = `${PLUGIN_ID}-panellist`
+
+/** 左栏栏目文案（宿主侧栏里那一行显示它）。 */
+export const PANELLIST_LABEL = '自动团队'
+
+/**
+ * 「左栏项目库」的窗口事件名（降级通道）。
+ *
+ * 正常路径是 `mainArea.open(PANELLIST_ID)`；拿不到主区服务时退化成这个事件，
+ * 由 `Panel.tsx` 监听后在右栏内联渲染同一份项目库（同一套组件、同一份 `LibraryView`）。
+ * 常量放这里而不是组件文件：`slots.ts` 不 import 任何 `.tsx`，
+ * 组件与测试都能引它，且不会形成 `slots ↔ LibraryPage` 的运行时环。
+ */
+export const OPEN_LIBRARY_EVENT = 'auto-team:open-library'
+
+/** 主区服务的只声明用到的成员（形状未验证，故整段 try/catch）。 */
+export interface MainAreaFace {
+  open?(id: string): unknown
+}
+
+export interface PanellistComponents {
+  /** 左栏栏目（`LibraryPage.tsx` 的 `PanellistEntry`）。 */
+  PanellistEntry: unknown
+  /** `main` 槽位的整页版本（`LibraryPage.tsx` 的 `LibraryPage`）。 */
+  LibraryPage: unknown
+}
+
+function warnSlot(name: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error)
+  if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+    console.warn(`[dsh-auto-team] 槽位「${name}」注册失败，已降级：${message}`)
+  }
+}
+
+/**
+ * 生成「打开左栏项目库」动作。
+ *
+ * 两级：先 `mainArea.open(PANELLIST_ID)`；没有该服务（或它抛错）时派发 `OPEN_LIBRARY_EVENT`。
+ * 返回 `false` 表示走了事件降级 —— 调用方可据此提示「在右栏打开」而不是假装成功。
+ */
+export function createOpenLibrary(ctx: SlotsContext): () => boolean {
+  let face: MainAreaFace | undefined
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['mainArea'], (scope) => {
+        const service = scope.mainArea
+        if (service !== undefined) face = service
+      })
+    } catch {
+      // 服务不存在时 cordis 会一直 pending；这里只是少一条快路径，事件降级仍然可用。
+      face = undefined
+    }
+  }
+  return () => {
+    if (face !== undefined && typeof face.open === 'function') {
+      try {
+        face.open(PANELLIST_ID)
+        return true
+      } catch {
+        // 宿主拒绝打开主区 → 落到事件降级（面板内联），不要静默什么都不做。
+      }
+    }
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.dispatchEvent === 'function' &&
+      typeof CustomEvent === 'function'
+    ) {
+      window.dispatchEvent(new CustomEvent(OPEN_LIBRARY_EVENT, { detail: { id: PANELLIST_ID } }))
+    }
+    return false
+  }
+}
+
+/**
+ * 注册左栏栏目（`sidebar.panellist`）与主区页面（`main`，keyed）。
+ *
+ * 返回两个布尔值而不是 void：`index.ts` 与 QA 探针都要能判断「这次是不是真的挂上了」，
+ * 也能在真机日志里区分「槽位缺失」与「组件没渲染」。
+ */
+export function registerPanellist(
+  ctx: SlotsContext,
+  deps: PanellistComponents,
+): { panellist: boolean; main: boolean } {
+  const result = { panellist: false, main: false }
+  if (ctx === undefined || ctx === null || ctx.slots === undefined) return result
+
+  const openLibrary = createOpenLibrary(ctx)
+  const injectOf = (sessionId: string): Record<string, unknown> => sessionIdBag(sessionId, { openLibrary })
+
+  // 左栏栏目：非 keyed → name/id/order/label/inject（不带 key）。
+  try {
+    ctx.slots.inject(PANELLIST_SLOT, () => {
+      ctx.slots.register(
+        { name: PANELLIST_SLOT, id: PANELLIST_ID, order: 20, label: PANELLIST_LABEL, inject: injectOf },
+        deps.PanellistEntry,
+      )
+    })
+    result.panellist = true
+  } catch (error) {
+    warnSlot(PANELLIST_SLOT, error)
+  }
+
+  // 主区页面：先按 keyed 注册（蓝图形状 { name, key, inject }）；宿主若说「这不是 keyed 槽位」，
+  // 就退一步按非 keyed 再试一次。两条都失败 = 能力不存在，降级为面板内联项目库。
+  try {
+    ctx.slots.register({ name: MAIN_SLOT, key: PANELLIST_ID, inject: injectOf }, deps.LibraryPage)
+    result.main = true
+  } catch (error) {
+    try {
+      ctx.slots.register({ name: MAIN_SLOT, inject: injectOf }, deps.LibraryPage)
+      result.main = true
+    } catch (inner) {
+      warnSlot(MAIN_SLOT, inner)
+    }
+  }
+
+  return result
 }

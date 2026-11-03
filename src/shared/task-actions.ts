@@ -38,7 +38,8 @@ function deny(reason: string): Cell {
  * 口径来源（PRD AC-26 + 技术方案 §7.1）：
  *  - `cancel`：pending/blocked/ready/waiting/running/rework/failed 允许；
  *  - `skip`：只有还没开跑的 pending/blocked/ready/waiting 允许（running 要先取消）；
- *  - `edit-acceptance`：除 done/cancelled/skipped 之外都允许（改的是下次门禁的命令）。
+ *  - `edit-acceptance`：除 cancelled/skipped 之外都允许；`done` 也允许（r13 PRD 取代
+ *    r11#AC-26）—— 宿主对 `done` 走「确认 → 落新命令 → 重跑门禁」，不在允许表里一刀切拒绝。
  * `paused` / `gate` / `interrupted` 的取消与跳过不改：门禁在跑时有回执写回竞态，
  * 暂停有页头统一还原，中断的出路是续聊或改验收后重派。
  */
@@ -64,7 +65,8 @@ const MATRIX: Record<TaskStatus, Record<TaskActionKey, Cell>> = {
   done: {
     cancel: deny('已完成，无需取消'),
     skip: deny('已完成'),
-    acceptance: deny('已完成的任务证据不改写'),
+    // r13：done 允许改验收，但执行体必须重跑门禁（否则「完成」的含义可被静默改写）。
+    acceptance: ALLOW,
   },
   cancelled: { cancel: deny('已取消'), skip: deny('已取消'), acceptance: deny('已取消') },
   skipped: { cancel: deny('已跳过'), skip: deny('已跳过'), acceptance: deny('已跳过') },

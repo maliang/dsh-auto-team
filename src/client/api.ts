@@ -3,8 +3,13 @@
  *
  * 契约与 host/http.ts 一一对应（改一边必须改另一边）：
  *   GET  {BRIDGE_ROUTE}/snapshot?sessionId=…                    → PanelSnapshot
- *   GET  {BRIDGE_ROUTE}/memory?track=&name=[&sessionId=]         → {track,name,body,chars}（新增，修 D7）
+ *   GET  {BRIDGE_ROUTE}/memory?track=&name=[&sessionId=][&workspace=] → {track,name,body,chars}（新增，修 D7）
+ *   GET  {BRIDGE_ROUTE}/library?[sessionId=][&runId=]           → LibraryView（r13：左栏 + 历史详情）
  *   POST {BRIDGE_ROUTE}/act  { sessionId, action }              → ActResult
+ *
+ * r13 为什么历史详情也走 `/library`：路由条数被 AC-22 冻结为 4，历史详情是
+ * `library(runId=…)` 的一个分支（返回 `detail: RunDetailView`），不新开第 5 条路由 ——
+ * 每多一条路由就多一个解包点、多一套失败文案。
  *
  * 纪律（本项目历史踩坑）：
  *  1. 返回一定是 `{ data }` 或 `{ error }` 的**包装**，调用方必须解构 —— 整包赋值就是
@@ -14,6 +19,7 @@
  */
 import type {
   ActResult,
+  LibraryView,
   MemoryTrack,
   PanelAction,
   PanelSnapshot,
@@ -54,7 +60,20 @@ export interface PanelApi {
    */
   act(sessionId: string, action: PanelAction): Promise<Result<ActResult>>
   /** 读记忆正文：编辑已有文件前必须先读，否则保存会把已有内容清空（D7）。 */
-  readMemory(sessionId: string, track: MemoryTrack, name: string): Promise<Result<MemoryBodyPayload>>
+  readMemory(
+    sessionId: string,
+    track: MemoryTrack,
+    name: string,
+    /** r13：左栏读的是**别的项目**的记忆，必须带上目标工作区（缺省 = 当前会话的项目）。 */
+    workspace?: string,
+  ): Promise<Result<MemoryBodyPayload>>
+  /**
+   * 项目库（r13 AC-23）：左栏项目列表 / 项目详情 / 历史 run 详情共用这一个出口。
+   *
+   * `runId` 非空 ⇒ 宿主额外装配 `detail: RunDetailView`（历史详情不新开路由，AC-22 冻结 4 条）。
+   * 只在**左栏真的被打开**或**用户点开某条历史**时调用；snapshot 轮询期间绝不触发它（AC-23）。
+   */
+  library(sessionId: string, runId?: string): Promise<Result<LibraryView>>
   /**
    * 读技能正文（r10 AC-17）：编辑弹层打开时才读，读完才把 textarea 从骨架换成正文。
    * 走的是 memory 路由的 `track=skill` 分支（auth 与错误处理完全复用）。
@@ -111,9 +130,17 @@ export function createPanelApi(options: ApiOptions = {}): PanelApi {
         body: JSON.stringify({ sessionId, action }),
       })
     },
-    readMemory(sessionId: string, track: MemoryTrack, name: string) {
-      const query = `track=${encodeURIComponent(track)}&name=${encodeURIComponent(name)}&sessionId=${encodeURIComponent(sessionId)}`
+    readMemory(sessionId: string, track: MemoryTrack, name: string, workspace?: string) {
+      const query = `track=${encodeURIComponent(track)}&name=${encodeURIComponent(name)}&sessionId=${encodeURIComponent(sessionId)}${
+        workspace === undefined || workspace === '' ? '' : `&workspace=${encodeURIComponent(workspace)}`
+      }`
       return request<MemoryBodyPayload>(`${BRIDGE_ROUTE}/memory?${query}`)
+    },
+    library(sessionId: string, runId?: string) {
+      const query = `sessionId=${encodeURIComponent(sessionId)}${
+        runId === undefined || runId === '' ? '' : `&runId=${encodeURIComponent(runId)}`
+      }`
+      return request<LibraryView>(`${BRIDGE_ROUTE}/library?${query}`)
     },
     readSkill(sessionId: string, id: string) {
       // track=skill 是 host/http.ts 里同一个自述式 body 读取口的分支（路由条数不变）

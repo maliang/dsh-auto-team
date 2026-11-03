@@ -20,11 +20,20 @@ import type {
   PlanTask,
   ProgressRecord,
   RouteAudit,
+  RunSummary,
   TaskStatus,
+  TokenTotals,
   TriggerKind,
   TriggerRecord,
 } from '../shared/types.ts'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_KINDS, TRIGGER_LOG_LIMIT } from './config.ts'
+
+/**
+ * 运行列表的一行：定义单点在 `shared/types.ts`（`LibraryView.runs` 也是它）。
+ *
+ * 这里只转出 —— client 不允许 import host，共享契约必须住在 shared。
+ */
+export type { RunSummary }
 
 /**
  * Trigger 账本上限（`TRIGGER_LOG_LIMIT = 100`）。
@@ -102,16 +111,67 @@ export interface RunState {
    * 与 `plan.status === 'paused'` 的区别：这里是**可还原的原状态**，`plan.status` 只是对外的当前态。
    */
   pause?: PauseRecord
+  /** r13：本 run 所属项目（工作区 basename）；缺省 = 旧 run，左栏归入「未知项目」。 */
+  project?: string
+  /** r13 AC-20：进入终态（全部任务终态 / 取消）的时刻；进行中缺省。 */
+  finishedAt?: number
+  /** r13 AC-19：token 用量累加（宿主事件投喂，见 `team/usage.ts`）。缺省 = 从未收到用量事件。 */
+  usage?: UsageRecord
+  /** r13 AC-20：任务计时（key = taskId，起点由 dispatch 写入、终点由 receipt 写入）。 */
+  taskTimes?: Record<string, TaskTimeRecord>
+  /** r13 AC-13：未决确认（同一 run 只允许一条；不设 TTL，由用户显式确认/拒绝）。 */
+  pendingConfirmation?: PendingConfirmation
+  /**
+   * r13 AC-11：用户已确认过「强制并行」的 taskId 集合。
+   *
+   * 记在 run 上而不是进程内：确认是一次**持久授权**，重启后再撞同一写域不应再弹窗。
+   */
+  forceParallel?: string[]
 }
 
-/** 运行列表的一行（面板/恢复入口用，不含消息账本等大字段）。 */
-export interface RunSummary {
+/** 用量归属三态（降级只允许单向：`per-member → aggregate-only → unavailable`）。 */
+export type UsageAttribution = 'per-member' | 'aggregate-only' | 'unavailable'
+
+/** r13 AC-19：一次 run 的用量累加记录（落盘；`total` 是合计，分项只在来源真的给分项时才写）。 */
+export interface UsageRecord {
+  attribution: UsageAttribution
+  /** key = memberId（同一成员续聊会累加）。 */
+  byMember: Record<string, TokenTotals>
+  /** key = taskId（同一任务返工会累加）。 */
+  byTask: Record<string, TokenTotals>
+  /** run 合计；缺省 = 还没有任何数字（与 `total: 0` 不同）。 */
+  total?: TokenTotals
+  updatedAt: number
+}
+
+/** r13 AC-20：一个任务的计时区间；只有起点 = 正在跑，两端都有 = 已结束。 */
+export interface TaskTimeRecord {
+  startedAt?: number
+  endedAt?: number
+}
+
+/**
+ * r13 AC-11：需要用户确认的 5 类不可逆动作。
+ *
+ * 用 `PanelAction` 的变体而不是字符串：确认后要**原样重放**这条动作，
+ * 存成字符串就得再解析一次，解析漏一个字段就是另一条执行路径。
+ */
+export type IrreversiblePanelAction =
+  | { type: 'cancel' }
+  | { type: 'cancelTask'; taskId: string; reason?: string }
+  | { type: 'skipTask'; taskId: string }
+  | { type: 'updateAcceptance'; taskId: string; acceptance: string }
+  | { type: 'forceParallel'; taskId: string }
+
+/** r13 AC-13：一条待确认记录（`summary` 是宿主生成的影响面文案，逐字展示）。 */
+export interface PendingConfirmation {
+  id: string
+  action: IrreversiblePanelAction
   runId: string
-  sessionId: string
   createdAt: number
-  status: PlanStatus
-  tasks: number
-  done: number
+  summary: string
+  irreversible: true
+  taskId?: string
 }
 
 export class RunsStore {
@@ -151,6 +211,13 @@ export class RunsStore {
       triggers: capTriggers(state.triggers ?? []),
       // 暂停记账也走归一化：桥里手搓的 PauseRecord 合法与否不应该决定盘上是什么形状。
       pause: normalizePause(state.pause),
+      // r13 追加字段同样归一：坏数据（NaN / 负数 / 缺字段）只能被丢掉，不能让落盘失败。
+      project: normalizeLabel(state.project),
+      finishedAt: finiteOptional(state.finishedAt),
+      usage: normalizeUsage(state.usage),
+      taskTimes: normalizeTaskTimes(state.taskTimes),
+      pendingConfirmation: normalizePending(state.pendingConfirmation),
+      forceParallel: normalizeIdList(state.forceParallel),
     }
     const tmp = `${path}.tmp`
     writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
@@ -181,6 +248,12 @@ export class RunsStore {
         status: plan.status,
         tasks: plan.tasks.length,
         done: plan.tasks.filter((task) => task.status === 'done').length,
+        // r13：左栏项目页/历史页要的四个可选量；拿不到就不写（面板显示「不可得」而不是 0）。
+        ...(normalizeLabel(state.project) !== undefined ? { project: normalizeLabel(state.project) } : {}),
+        plannedAt: state.plannedAt,
+        ...(state.finishedAt !== undefined ? { finishedAt: state.finishedAt } : {}),
+        ...(state.usage?.total !== undefined ? { usageTotals: state.usage.total } : {}),
+        active: plan.tasks.some((task) => !SUMMARY_TERMINAL_STATUSES.has(task.status)),
       })
     }
     return out.sort((a, b) => b.createdAt - a.createdAt)
@@ -223,6 +296,13 @@ export function wrapLegacy(raw: unknown): RunState | null {
     triggers: normalizeTriggers(raw.triggers),
     // v2 老文件没有 pause 字段：归一后是 undefined = 未暂停（向后兼容，不需要迁移脚本）。
     pause: normalizePause(raw.pause),
+    // r13：旧 v3 文件没有这些字段，归一后是 undefined —— 面板按「不可得」显示，load 绝不抛。
+    project: normalizeLabel(raw.project),
+    finishedAt: finiteOptional(raw.finishedAt),
+    usage: normalizeUsage(raw.usage),
+    taskTimes: normalizeTaskTimes(raw.taskTimes),
+    pendingConfirmation: normalizePending(raw.pendingConfirmation),
+    forceParallel: normalizeIdList(raw.forceParallel),
   }
 }
 
@@ -414,6 +494,161 @@ function normalizePause(raw: unknown): PauseRecord | undefined {
     tasks[taskId] = status as TaskStatus
   }
   return { at: raw.at, planStatus: raw.planStatus as PlanStatus, tasks }
+}
+
+/* ──────────── r13 追加字段的归一（坏数据只能被丢掉，绝不能让 load/save 抛） ──────────── */
+
+/**
+ * 列表摘要用的终态集合：必须与 `team/dispatch.ts` 的 `TERMINAL_TASK_STATUSES` 一致。
+ *
+ * 不直接 import 那个模块是为了让 `store.ts`（落盘层）保持零运行时依赖 ——
+ * 这里只服务「左栏是否标活跃」这一件事，语义偏差的后果只是多一个圆点，不是派发错误。
+ */
+const SUMMARY_TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  'done',
+  'failed',
+  'cancelled',
+  'skipped',
+  'interrupted',
+])
+
+/** 可选毫秒值：有限、非负、取整；其余（含 `NaN` / `-1` / 字符串）一律视为缺失。 */
+function finiteOptional(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined
+}
+
+/** 可选标签（项目名 / id / reason）：非空字符串才留，去首尾空白。 */
+function normalizeLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const text = value.trim()
+  return text === '' ? undefined : text
+}
+
+/** id 列表（`forceParallel`）：去空、去重、保序；空数组归一成 `undefined`（= 没有授权）。 */
+function normalizeIdList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  for (const entry of value) {
+    const text = normalizeLabel(entry)
+    if (text !== undefined && !out.includes(text)) out.push(text)
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** 一组 token 数字：丢非有限/负数；`total` 缺失时按 `input + output` 补（tech §2.5）。 */
+export function normalizeTokenTotals(raw: unknown): TokenTotals | undefined {
+  if (!isRecord(raw)) return undefined
+  const input = finiteOptional(raw.input)
+  const output = finiteOptional(raw.output)
+  const declared = finiteOptional(raw.total)
+  if (declared === undefined && input === undefined && output === undefined) return undefined
+  const totals: TokenTotals = { total: declared ?? (input ?? 0) + (output ?? 0) }
+  if (input !== undefined) totals.input = input
+  if (output !== undefined) totals.output = output
+  return totals
+}
+
+function normalizeTotalsMap(raw: unknown): Record<string, TokenTotals> {
+  const out: Record<string, TokenTotals> = {}
+  if (!isRecord(raw)) return out
+  for (const [key, value] of Object.entries(raw)) {
+    const totals = normalizeTokenTotals(value)
+    if (totals !== undefined) out[key] = totals
+  }
+  return out
+}
+
+/**
+ * 用量记录归一（AC-19）：分项逐条校验，`attribution` 非法时按「有什么推什么」重推。
+ *
+ * 一个数字都没有的记录归成 `undefined`（= 没收到用量），而不是 `total: 0` ——
+ * 后者会让面板诚实地显示「0 token」，而事实是从没拿到过数据。
+ */
+export function normalizeUsage(raw: unknown): UsageRecord | undefined {
+  if (!isRecord(raw)) return undefined
+  const byMember = normalizeTotalsMap(raw.byMember)
+  const byTask = normalizeTotalsMap(raw.byTask)
+  const total = normalizeTokenTotals(raw.total)
+  if (total === undefined && Object.keys(byMember).length === 0 && Object.keys(byTask).length === 0) return undefined
+  const declared = raw.attribution
+  const attribution: UsageAttribution =
+    declared === 'per-member' || declared === 'aggregate-only' || declared === 'unavailable'
+      ? declared
+      : Object.keys(byMember).length > 0
+        ? 'per-member'
+        : 'aggregate-only'
+  const record: UsageRecord = { attribution, byMember, byTask, updatedAt: finiteOptional(raw.updatedAt) ?? 0 }
+  if (total !== undefined) record.total = total
+  return record
+}
+
+/** 任务计时归一（AC-20）：只留毫秒整数；`endedAt < startedAt` 的整条丢弃（时间倒流是坏数据）。 */
+export function normalizeTaskTimes(raw: unknown): Record<string, TaskTimeRecord> | undefined {
+  if (!isRecord(raw)) return undefined
+  const out: Record<string, TaskTimeRecord> = {}
+  for (const [taskId, value] of Object.entries(raw)) {
+    if (!isRecord(value)) continue
+    const startedAt = finiteOptional(value.startedAt)
+    const endedAt = finiteOptional(value.endedAt)
+    if (startedAt === undefined && endedAt === undefined) continue
+    if (startedAt !== undefined && endedAt !== undefined && endedAt < startedAt) continue
+    const record: TaskTimeRecord = {}
+    if (startedAt !== undefined) record.startedAt = startedAt
+    if (endedAt !== undefined) record.endedAt = endedAt
+    out[taskId] = record
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/** 待确认动作归一：只认 5 类不可逆动作，且必须补齐该动作执行所需的最小字段。 */
+function normalizeIrreversibleAction(raw: unknown): IrreversiblePanelAction | undefined {
+  if (!isRecord(raw) || typeof raw.type !== 'string') return undefined
+  switch (raw.type) {
+    case 'cancel':
+      return { type: 'cancel' }
+    case 'cancelTask': {
+      const taskId = normalizeLabel(raw.taskId)
+      if (taskId === undefined) return undefined
+      const reason = normalizeLabel(raw.reason)
+      return reason === undefined ? { type: 'cancelTask', taskId } : { type: 'cancelTask', taskId, reason }
+    }
+    case 'skipTask': {
+      const taskId = normalizeLabel(raw.taskId)
+      return taskId === undefined ? undefined : { type: 'skipTask', taskId }
+    }
+    case 'updateAcceptance': {
+      const taskId = normalizeLabel(raw.taskId)
+      if (taskId === undefined || typeof raw.acceptance !== 'string') return undefined
+      return { type: 'updateAcceptance', taskId, acceptance: raw.acceptance }
+    }
+    case 'forceParallel': {
+      const taskId = normalizeLabel(raw.taskId)
+      return taskId === undefined ? undefined : { type: 'forceParallel', taskId }
+    }
+    default:
+      return undefined
+  }
+}
+
+/** 未决确认归一（AC-13）：缺 `id` / `action` / `runId` 整条丢弃（残缺记录无法被确认或拒绝）。 */
+export function normalizePending(raw: unknown): PendingConfirmation | undefined {
+  if (!isRecord(raw)) return undefined
+  const id = normalizeLabel(raw.id)
+  const runId = normalizeLabel(raw.runId)
+  const action = normalizeIrreversibleAction(raw.action)
+  const createdAt = finiteOptional(raw.createdAt)
+  if (id === undefined || runId === undefined || action === undefined || createdAt === undefined) return undefined
+  const pending: PendingConfirmation = {
+    id,
+    action,
+    runId,
+    createdAt,
+    summary: typeof raw.summary === 'string' ? raw.summary : '',
+    irreversible: true,
+  }
+  const taskId = normalizeLabel(raw.taskId)
+  if (taskId !== undefined) pending.taskId = taskId
+  return pending
 }
 
 function normalizePlan(raw: Record<string, unknown>): Plan | null {

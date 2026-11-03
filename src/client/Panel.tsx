@@ -1,30 +1,39 @@
 /**
  * 自动团队右栏面板容器（`sidebar.right.pane.tab` + `.title`，DESIGN §1.1 E3）。
  *
- * 页头是这轮改造的门面，四条硬规矩：
- *  1. **`完成 x/N` + 计划状态 chip + 暂停/继续按钮** 一行（高度 40px，DESIGN §0.2）。
- *     数字全部由快照派生，组件里不存第二份计数。
- *  2. **暂停按钮非乐观更新**：点击只发 `act({type:'pause'|'resumeTeam'})` + 本地 busy，
- *     文案切换等宿主快照回来（`pauseButtonView` 的 label 只吃 `snapshot.paused`）。
- *     乐观改文案会让「点了没生效」看起来像生效，是本项目反复踩的坑。
- *  3. **暂停时不清门禁证据、不重排列表**（DESIGN §0.4）：任务行只由 PlanTab 按原顺序渲染。
- *  4. 页头几何在 320px 下限可读：`完成 999/999` 约 79px + badge + 按钮 ≈ 190px < 320px。
+ * r13 的三条硬规矩：
+ *  1. **三个页签**：任务 / 历史 / 记忆（`TABS` 是唯一来源，DOM 里的 `data-tab` 数量就由它产生）。
+ *     角色管理已迁到设置页，所以旧的角色/成员/计划三个页签文件与 DOM 一并删除 —— 不保留隐藏页签。
+ *  2. **页头（`[data-panel-head]` 3 个直系子）与元信息（`[data-panel-meta]` 三段）不动**：
+ *     这两块是 r7 定稿的几何，挤进去的一切状态都下沉到页签内容里（如 `RunHeader`）。
+ *     进度与暂停按钮随任务页的 `RunHeader` 走，所以本文件不再有 `[data-panel-progress-row]`。
+ *  3. **快照是唯一数据源**，library/历史详情是**按需**的（AC-23）：本文件只在用户点开历史行时
+ *     才调 `openRun`，`refresh()` 永不触发 `/library`。
  *
- * 本文件只做「容器 + 页头 + 四个页签」，可见文案尽量下沉到 `ui.ts` / `viewmodel.ts`。
+ * 本文件只做「容器 + 页头 + 三个页签 + 确认弹窗」，可见文案尽量下沉到 `ui.ts` / `viewmodel.ts`。
  */
 import * as React from 'react'
 import { useAutoTeamStyle } from './styles.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
 import { panelApi } from './api.ts'
-import { capsuleOf, captainModelLabelOf, planStatusView } from './viewmodel.ts'
+import { capsuleOf, captainModelLabelOf } from './viewmodel.ts'
 import type { ClientAction } from './viewmodel.ts'
-import { pauseButtonView } from './ui.ts'
 import { OPEN_PANEL_EVENT, PANEL_CLOSE_EVENT } from './HeaderButton.tsx'
-import { PlanTab } from './tabs/PlanTab.tsx'
-import { MembersTab } from './tabs/MembersTab.tsx'
+import { TasksTab } from './tabs/TasksTab.tsx'
+import { HistoryTab } from './tabs/HistoryTab.tsx'
 import { MemoryTab } from './tabs/MemoryTab.tsx'
-import { RolesTab } from './tabs/RolesTab.tsx'
-import type { MemoryTrack, PanelAction, PanelSnapshot, PlanStatus, Result } from '../shared/types.ts'
+import { AUTO_TEAM_OPEN_LIBRARY_EVENT, LibraryPage } from './LibraryPage.tsx'
+import { ConfirmDialog } from './views/ConfirmDialog.tsx'
+import { EmptyState } from './views/EmptyState.tsx'
+import type {
+  LibraryView,
+  MemoryTrack,
+  PanelAction,
+  PanelSnapshot,
+  PendingConfirmationView,
+  Result,
+  RunDetailView,
+} from '../shared/types.ts'
 
 export interface PanelProps {
   sessionId?: string
@@ -40,22 +49,39 @@ export interface MemoryBody {
   chars: number
 }
 
-export type ReadMemoryFn = (track: MemoryTrack, name: string) => Promise<Result<MemoryBody>>
+export type ReadMemoryFn = (track: MemoryTrack, name: string, workspace?: string) => Promise<Result<MemoryBody>>
 
+/**
+ * 页签 props：右栏三页共用。
+ *
+ * `library` / `detail` 相关字段是**历史页与左栏共用**的按需数据（AC-23），tasks 页不看它们；
+ * 这样三页拿到的都是同一份 store 快照，不会出现「历史页与左栏显示不同的项目列表」。
+ */
 export interface TabProps {
   sessionId: string
   snapshot: PanelSnapshot | undefined
   act: (action: ClientAction) => Promise<unknown>
   readMemory: ReadMemoryFn
+  loadLibrary: (runId?: string) => Promise<void>
+  openRun: (runId: string) => Promise<void>
+  closeRun: () => void
+  library: LibraryView | null
+  libraryError: string | null
+  detail: RunDetailView | null
+  detailRunId: string | null
+  /** 暂停态由面板统一派生（暂停影响所有页签，不能只在任务页可见）。 */
+  paused: boolean
+  pauseBusy: boolean
+  onTogglePause: () => void
 }
 
-type TabKey = 'plan' | 'members' | 'memory' | 'roles'
+export type TabKey = 'tasks' | 'history' | 'memory'
 
-const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
-  { key: 'plan', label: '计划' },
-  { key: 'members', label: '成员' },
+/** 页签的唯一来源：AC-1 的 `data-tab` 计数直接由它产生（不在 JSX 里手写第二份）。 */
+export const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
+  { key: 'tasks', label: '任务' },
+  { key: 'history', label: '历史' },
   { key: 'memory', label: '记忆' },
-  { key: 'roles', label: '角色' },
 ]
 
 /** 计划状态 / 语义色 → 宿主 tone 名（只做映射，文案与音调由 viewmodel 单点给）。 */
@@ -77,43 +103,55 @@ export function Panel(props: PanelProps): React.ReactElement {
   const sessionId = sessionIdOf(props)
   const view = usePanelState(sessionId)
   const snapshot: PanelSnapshot | undefined = view.snapshot ?? undefined
-  const [tab, setTab] = React.useState<TabKey>('plan')
+  const [tab, setTab] = React.useState<TabKey>('tasks')
   const [pauseBusy, setPauseBusy] = React.useState(false)
+  const [confirmBusy, setConfirmBusy] = React.useState(false)
+  /** 宿主没提供主区入口（或 `main` 槽位对第三方插件不开放）时的降级：面板内联左栏。 */
+  const [inlineLibrary, setInlineLibrary] = React.useState(false)
 
   const act = view.act as (action: ClientAction) => Promise<unknown>
   const error = view.error
 
   const readMemory = React.useCallback<ReadMemoryFn>(
-    async (track, name) => {
+    async (track, name, workspace) => {
       const api = panelApi
       if (typeof api.readMemory !== 'function') {
         return { error: '宿主未提供记忆读取接口' } as unknown as Result<MemoryBody>
       }
-      const result = (await api.readMemory(sessionId, track, name)) as unknown as Result<MemoryBody>
+      const result = (await api.readMemory(sessionId, track, name, workspace)) as unknown as Result<MemoryBody>
       return result
     },
     [sessionId],
   )
 
-  // 计划一就位就切到「计划」页：用户点开面板最想看的是任务流转，不是空着的上一页。
+  // 计划一就位就切回「任务」页：用户点开面板最想看的是任务流转。
   const planReady = snapshot?.planStatus !== undefined
   React.useEffect(() => {
-    if (planReady) setTab('plan')
+    if (planReady) setTab('tasks')
   }, [planReady])
 
-  // 会话头按钮点「开面板」但宿主没提供 openTab 时会派发这个事件；收到就切到计划页。
+  // 会话头按钮点「开面板」但宿主没提供 openTab 时会派发这个事件；收到就切到任务页。
   React.useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
-    const onOpen = (): void => setTab('plan')
+    const onOpen = (): void => setTab('tasks')
     window.addEventListener(OPEN_PANEL_EVENT, onOpen)
     return () => window.removeEventListener(OPEN_PANEL_EVENT, onOpen)
+  }, [])
+
+  // 左栏「打开」按钮在拿不到主区服务时派发该事件：面板内联渲染项目库（AC-24 的降级路径）。
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    const onOpenLibrary = (): void => setInlineLibrary(true)
+    window.addEventListener(AUTO_TEAM_OPEN_LIBRARY_EVENT, onOpenLibrary)
+    return () => window.removeEventListener(AUTO_TEAM_OPEN_LIBRARY_EVENT, onOpenLibrary)
   }, [])
 
   // 头部按钮三级回退都关不掉时派发 PANEL_CLOSE_EVENT：这里给一句人能看懂的原因，
   // 而不是让按钮静默什么都不做（AC-11 的「非乐观」配套：状态没变就必须说明为什么）。
   React.useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
-    const onCloseRefused = (): void => setCloseFailure('收起面板失败：宿主未提供关闭入口，请从页签上的 × 关闭')
+    const onCloseRefused = (): void =>
+      setCloseFailure('收起面板失败：宿主未提供关闭入口，请从页签上的 × 关闭')
     window.addEventListener(PANEL_CLOSE_EVENT, onCloseRefused)
     return () => window.removeEventListener(PANEL_CLOSE_EVENT, onCloseRefused)
   }, [])
@@ -130,28 +168,59 @@ export function Panel(props: PanelProps): React.ReactElement {
   const running = snapshot?.concurrency?.running ?? 0
   const limit = snapshot?.concurrency?.limit ?? 0
   const paused = snapshot?.paused === true
-  const pauseView = pauseButtonView({ paused, busy: pauseBusy })
   // 头部按钮「关不掉」时经由窗口事件把原因送到这里 —— 这是它唯一能说话的地方
   // （工具栏上不许出现红字，AC-5；面板的 `[data-error]` 是全插件错误文案的归口）。
   const [closeFailure, setCloseFailure] = React.useState<string | undefined>(undefined)
   const shownError = typeof error === 'string' && error !== '' ? error : closeFailure
-  // 计划状态一律走 viewmodel 的 5 态表（暂停时按 `paused` 归一，不在这里写第二套中文）
-  const effectivePlanStatus: PlanStatus | undefined = paused ? 'paused' : snapshot?.planStatus
-  const planStatus = effectivePlanStatus === undefined ? undefined : planStatusView(effectivePlanStatus)
 
   async function togglePause(): Promise<void> {
     if (pauseBusy) return
     setPauseBusy(true)
     try {
       // 非乐观：不发本地翻转，只发动作；文案/几何等 snapshot.paused 回来再变。
-      await act({ type: pauseView.action } as ClientAction)
+      await act({ type: paused ? 'resumeTeam' : 'pause' } as ClientAction)
     } finally {
       setPauseBusy(false)
     }
   }
 
+  /** 确认/取消待确认动作：**非乐观** —— 弹窗只在快照里 pending 消失后才关。 */
+  async function resolvePending(action: 'confirmPending' | 'rejectPending', pendingId: string): Promise<void> {
+    if (confirmBusy) return
+    setConfirmBusy(true)
+    try {
+      await act({ type: action, pendingId } as PanelAction as ClientAction)
+    } finally {
+      setConfirmBusy(false)
+    }
+  }
+
+  const pending: PendingConfirmationView | undefined =
+    snapshot?.pendingConfirmation ?? view.detail?.pendingConfirmation
+
+  const tabProps: TabProps = {
+    sessionId,
+    snapshot,
+    act,
+    readMemory,
+    loadLibrary: view.loadLibrary,
+    openRun: view.openRun,
+    closeRun: view.closeRun,
+    library: view.library,
+    libraryError: view.libraryError,
+    detail: view.detail,
+    detailRunId: view.detailRunId,
+    paused,
+    pauseBusy,
+    onTogglePause: () => void togglePause(),
+  }
+
   return (
-    <div data-auto-team-panel data-enabled={snapshot?.enabled === true ? 'true' : 'false'} data-paused={paused ? 'true' : 'false'}>
+    <div
+      data-auto-team-panel
+      data-enabled={snapshot?.enabled === true ? 'true' : 'false'}
+      data-paused={paused ? 'true' : 'false'}
+    >
       {/* AC-9：`[data-panel-head]` 的直系子节点**恰好 3 个**（标题 / 状态胶囊 / 刷新）。
           挤进来的一切状态信息都下沉到下面的 `[data-panel-meta]` —— 混排会让 320px 宽度下
           标题被压成省略号、胶囊换行，这是 r7 面板头部被直接吐槽的根因。 */}
@@ -187,31 +256,6 @@ export function Panel(props: PanelProps): React.ReactElement {
         </span>
       </div>
 
-      <div data-panel-progress-row>
-        <span data-panel-progress data-done={done} data-total={total}>
-          完成 {done}/{total}
-        </span>
-        {planStatus === undefined ? null : (
-          <span data-panel-plan-status data-tone={planStatus.tone}>
-            {planStatus.label}
-          </span>
-        )}
-        <span data-panel-progress-spacer />
-        <button
-          type="button"
-          data-auto-team-pause
-          data-action={pauseView.action}
-          data-tone={pauseView.tone}
-          disabled={pauseView.disabled || snapshot === undefined}
-          aria-busy={pauseBusy ? 'true' : 'false'}
-          title={paused ? '从中断处继续推进（不重跑已完成任务）' : '暂停派发与推进（在跑成员不被打断）'}
-          onClick={() => void togglePause()}
-        >
-          {pauseBusy ? <span data-pause-spinner aria-hidden="true" /> : null}
-          <span data-pause-label>{pauseView.label}</span>
-        </button>
-      </div>
-
       {paused ? (
         <div data-panel-paused-banner role="status">
           <span data-paused-icon aria-hidden="true">
@@ -224,41 +268,70 @@ export function Panel(props: PanelProps): React.ReactElement {
         </div>
       ) : null}
 
-      <div data-panel-tabs role="tablist">
-        {TABS.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            role="tab"
-            data-panel-tab={item.key}
-            aria-selected={tab === item.key}
-            onClick={() => setTab(item.key)}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
-      {shownError === undefined ? null : (
-        <div data-error role="alert">
-          {shownError}
+      {inlineLibrary ? (
+        <div data-panel-library-inline>
+          <div data-panel-library-bar>
+            <button type="button" data-library-inline-back onClick={() => setInlineLibrary(false)}>
+              ← 返回面板
+            </button>
+            <span data-panel-library-hint>主区未开放，项目库在面板内展开</span>
+          </div>
+          <LibraryPage sessionId={sessionId} inline />
         </div>
+      ) : (
+        <>
+          <div data-panel-tabs data-tab-bar role="tablist" aria-label="自动团队视图">
+            {TABS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="tab"
+                id={`auto-team-tab-${item.key}`}
+                aria-controls={`auto-team-tabpanel-${item.key}`}
+                data-panel-tab={item.key}
+                data-tab={item.key}
+                data-active={tab === item.key ? 'true' : 'false'}
+                aria-selected={tab === item.key}
+                onClick={() => setTab(item.key)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          {shownError === undefined ? null : (
+            <div data-error role="alert">
+              {shownError}
+            </div>
+          )}
+
+          <div
+            data-panel-body
+            data-active-tab={tab}
+            role="tabpanel"
+            id={`auto-team-tabpanel-${tab}`}
+            aria-labelledby={`auto-team-tab-${tab}`}
+          >
+            {tab === 'tasks' ? <TasksTab {...tabProps} /> : null}
+            {tab === 'history' ? <HistoryTab {...tabProps} /> : null}
+            {tab === 'memory' ? <MemoryTab {...tabProps} /> : null}
+            {snapshot === undefined && view.loading ? (
+              <EmptyState title="正在读取面板数据…" hint="宿主首次响应通常不到 1 秒" />
+            ) : null}
+          </div>
+        </>
       )}
 
-      <div data-panel-body data-active-tab={tab}>
-        {tab === 'plan' ? (
-          <PlanTab sessionId={sessionId} snapshot={snapshot} act={act} readMemory={readMemory} />
-        ) : null}
-        {tab === 'members' ? (
-          <MembersTab sessionId={sessionId} snapshot={snapshot} act={act} readMemory={readMemory} />
-        ) : null}
-        {tab === 'memory' ? (
-          <MemoryTab sessionId={sessionId} snapshot={snapshot} act={act} readMemory={readMemory} />
-        ) : null}
-        {tab === 'roles' ? (
-          <RolesTab sessionId={sessionId} snapshot={snapshot} act={act} readMemory={readMemory} />
-        ) : null}
-      </div>
+      {/* 确认闸（AC-13）：待确认动作在快照里时**必须**挡住界面；关闭只有两条路 ——
+          宿主接受（pending 消失）或用户取消（rejectPending）。点击遮罩不关闭：不可逆动作不做手滑关闭。 */}
+      {pending === undefined ? null : (
+        <ConfirmDialog
+          pending={pending}
+          busy={confirmBusy}
+          onConfirm={() => void resolvePending('confirmPending', pending.id)}
+          onReject={() => void resolvePending('rejectPending', pending.id)}
+        />
+      )}
     </div>
   )
 }
@@ -272,5 +345,5 @@ function formatClock(at: number): string {
 
 export default Panel
 
-/** 计划状态文案的唯一出处仍是 `viewmodel.planStatusView`；此处仅做音调补强。 */
+/** 计划状态文案的唯一出处仍是 `viewmodel.planStatusView`；此处仅做类型再导出。 */
 export type { PanelAction }

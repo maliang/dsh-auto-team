@@ -19,10 +19,11 @@
  * 而 client **不允许** import host 半的任何模块 —— 从 host/config.ts 取值会把宿主代码拖进
  * 浏览器产物，是本脚手架真实的断点之一。
  */
-import { createOpenPanel, registerPanelTab, registerSlots } from './slots.ts'
+import { createOpenPanel, registerPanelTab, registerPanellist, registerSlots } from './slots.ts'
 import type { SlotsContext } from './slots.ts'
 import { AutoTeamOption as Option } from './Option.tsx'
 import { AutoTeamHeaderButton as HeaderButton } from './HeaderButton.tsx'
+import { LibraryPage, PanellistEntry } from './LibraryPage.tsx'
 import { Panel } from './Panel.tsx'
 import { TabTitle } from './TabTitle.tsx'
 import { SettingsSection } from './SettingsPage.tsx'
@@ -48,4 +49,8 @@ export function apply(ctx: ClientContext): void {
     // 只有会话头按钮需要「原生打开面板」；其余座位拿到的是 no-op（见 slots.ts 的 bag）。
     openPanel: createOpenPanel(ctx),
   })
+
+  // r13 左栏栏目 + 主区项目库。两步各自 try/catch（见 slots.ts），
+  // 主区不可用时降级为面板内联项目库，不影响右栏页签。
+  registerPanellist(ctx, { PanellistEntry, LibraryPage })
 }

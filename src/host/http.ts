@@ -1,19 +1,21 @@
 /**
  * 面板 HTTP 桥（host → client 的唯一通道）。
  *
- * 三条路由（契约与 src/client/api.ts 一一对应，改动必须两边同步）：
+ * 四条路由（契约与 src/client/api.ts 一一对应，改动必须两边同步）：
  *   GET  /api/auto-team/snapshot?sessionId=...                  → { data: PanelSnapshot }
- *   GET  /api/auto-team/memory?track=&name=[&sessionId=]        → { data: {track,name,body,chars} } | { error }
+ *   GET  /api/auto-team/library?sessionId=&runId=               → { data: LibraryView }
+ *   GET  /api/auto-team/memory?track=&name=[&sessionId=][&workspace=] → { data: {track,name,body,chars} } | { error }
  *   POST /api/auto-team/act  { sessionId, action }              → { data: ActResult }
  *
  * 约定：
  *  - 传输层永远是 200 + `{ data }` 或 `{ error }`；**业务拒绝**放在 `data.rejected` 里（code + 中文原因），
  *    这样面板既能显示「为什么没做成」，又不会把业务规则当成 HTTP 故障；
  *  - GET /memory 是新增路由，修「编辑已有记忆点保存会把正文清空」这个缺陷（D7）：先读正文再写。
+ *  - r13 把「历史 run 详情」并进 GET /library 的 runId 参数，**不新增第 5 条路由**（AC-22）。
  *
  * 传输层形状（WebRoute 字段、handler 入参与返回值）由 adapters 归一，本文件只关心「输入是什么、输出是什么」。
  */
-import type { MemoryTrack, PanelAction, PanelSnapshot } from '../shared/types.ts'
+import type { LibraryView, MemoryTrack, PanelAction, PanelSnapshot } from '../shared/types.ts'
 import { BRIDGE_ROUTE } from './config.ts'
 import type { Bridge } from './bridge.ts'
 import { registerHttpRoutes, type HostContext, type HttpRoute } from './adapters.ts'
@@ -22,6 +24,11 @@ export interface HttpDeps {
   bridge: Bridge
   /** 无 sessionId 参数时的默认会话（单会话场景的兜底；多会话必须由 client 显式带）。 */
   defaultSessionId: () => string
+  /**
+   * r13：项目库装配（带缓存，由 `index.ts` 注入）。
+   * 缺省时回落到 `bridge.library()` —— 两者是同一个端口，杜绝「一条通一条不通」。
+   */
+  library?: (query: { sessionId?: string; runId?: string }) => LibraryView
 }
 
 export function buildHttpRoutes(deps: HttpDeps): HttpRoute[] {
@@ -38,6 +45,18 @@ export function buildHttpRoutes(deps: HttpDeps): HttpRoute[] {
     },
     {
       method: 'GET',
+      path: `${BRIDGE_ROUTE}/library`,
+      async handle(request) {
+        const query = parseQuery(request.url)
+        const sessionId = query.get('sessionId') ?? deps.defaultSessionId()
+        const runId = query.get('runId')
+        const call = { ...(sessionId === '' ? {} : { sessionId }), ...(runId === undefined ? {} : { runId }) }
+        const view = deps.library !== undefined ? deps.library(call) : deps.bridge.library(call)
+        return { data: view }
+      },
+    },
+    {
+      method: 'GET',
       path: `${BRIDGE_ROUTE}/memory`,
       async handle(request) {
         const query = parseQuery(request.url)
@@ -50,7 +69,9 @@ export function buildHttpRoutes(deps: HttpDeps): HttpRoute[] {
         const track = raw === 'public' ? 'public' : raw === 'project' ? 'project' : null
         if (track === null) return { error: 'track 必须是 public、project 或 skill' }
         // 合法性判定与读写删共用 safeMemoryName（在 bridge.readMemoryFile 内部），这里不重复实现。
-        return deps.bridge.readMemoryFile(track as MemoryTrack, name)
+        // r13 AC-16：项目记忆要能按项目读，workspace 白名单校验在 bridge 里做（不在路由层重复一份）。
+        const workspace = query.get('workspace')
+        return deps.bridge.readMemoryFile(track as MemoryTrack, name, workspace)
       },
     },
     {

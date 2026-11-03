@@ -48,3 +48,26 @@ export const SKILL_DESCRIPTION_MAX = 200
  * 不能因为用户塞了几千条 md 就把整帧撑爆（宿主按内置序 + 标题序截断）。
  */
 export const SKILL_LIST_LIMIT = 200
+
+/**
+ * 自动派发连续失败的重试上限（次，r13 AC-8/AC-10）。
+ *
+ * 达到上限后**停止自动重试**并写一条状态活动（「自动派发连续失败，需人工处理」），
+ * 直到用户显式动作（`auto_team_dispatch` / 确认 / 继续）才 `reset()` —— 否则一个坏计划
+ * 会在 watcher 每 1.5s 的 tick 上无限重试，把宿主日志与成员配额一起烧掉。
+ */
+export const AUTO_DISPATCH_RETRY_LIMIT = 3
+
+/**
+ * 左栏项目库的装配缓存 TTL（毫秒，r13 AC-23）。
+ *
+ * 左栏与右栏会各自按需请求 `/library`；不缓存时每次请求都要把 runs/ 全量读一遍。
+ * 5s 是「用户切换项目能看到新状态」与「不重复扫盘」的折中，且 snapshot 路径**不走**它。
+ */
+export const LIBRARY_CACHE_MS = 5_000
+
+/** 历史页一页的 run 条数（r13 AC-21）：左栏与右栏历史页共用同一个数。 */
+export const HISTORY_PAGE_SIZE = 50
+
+/** 左栏每个项目最多展示的最近 run 条数（r13 AC-21）：再多也读不出重点。 */
+export const PROJECT_RUN_LIMIT = 20

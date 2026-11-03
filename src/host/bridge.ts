@@ -26,7 +26,8 @@
  *   saveSettings         → NOT_ENABLED / BAD_REQUEST（任一项非法 → 磁盘一字不改）
  *   cancelTask           → NO_PLAN / NOT_FOUND / BAD_REQUEST（允许集只从 shared/task-actions.ts 派生）
  *   skipTask             → NO_PLAN / NOT_FOUND / BAD_REQUEST（下游 blocked → pending）
- *   updateAcceptance     → NO_PLAN / NOT_FOUND / BAD_REQUEST（空串 → 三条模板全文）
+ *   updateAcceptance     → NO_PLAN / NOT_FOUND / BAD_REQUEST（空串 → 三条模板全文）；
+ *                          `done` 允许（r13 取代 r11#AC-26）并当场重跑门禁，结论走 applyReceipt
  *
  * **PAUSED 闸门**（r7 AC-16）：计划处于暂停态时，`dispatch` / `resume` / `receipt` 一律被拒
  * （这三个都会推进状态机），其余动作放行。闸门就在 `act()` 的入口处一处判断，不散落到组件。
@@ -37,8 +38,10 @@ import type {
   ActivityEvent,
   AutoTeamSettings,
   CaptainModelView,
+  DurationCell,
   ExpandPayload,
   GateEvidence,
+  LibraryView,
   MemberStatus,
   MemberView,
   MemoryTrack,
@@ -49,11 +52,14 @@ import type {
   RejectionCode,
   Result,
   Role,
+  RunSummary,
   SkillDraft,
   SkillInfo,
   SkillMutation,
   TaskStatus,
+  UsageCell,
 } from '../shared/types.ts'
+import { HISTORY_PAGE_SIZE, LIBRARY_CACHE_MS } from '../shared/const.ts'
 import {
   TASK_STATUS_LABELS,
   taskActionAllowed,
@@ -67,8 +73,12 @@ import {
   STALL_MS,
 } from './config.ts'
 import { runGate } from './gate/gate.ts'
+import { durationCellOf, usageCellOf } from './format.ts'
+import type { AutoDispatchCause } from './team/auto-dispatch.ts'
 import { selectMemory } from './memory/inject.ts'
 import { deleteMemory, listMemory, readMemory, safeMemoryName, writeMemory } from './memory/repo.ts'
+import type { MemoryRoots } from './memory/repo.ts'
+import { normalizeWorkspace, projectMemoryDir } from './paths.ts'
 import { emptyAcceptanceError } from './plan/acceptance.ts'
 import { blockedTasks, depSatisfied, readyTasks } from './plan/graph.ts'
 import { progressOf } from './plan/plan.ts'
@@ -81,6 +91,8 @@ import { defaultSettings, type SettingsRepo } from './settings.ts'
 import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
 import type { DeviationRecorder } from './team/deviation.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
+import { isIrreversibleAction, pendingFor, pendingViewOf } from './team/confirm.ts'
+import { runUsageOf, taskUsageOf } from './team/usage.ts'
 import { releaseScopes } from './team/scope-locks.ts'
 import { secondsText, stallOf } from './team/stall.ts'
 
@@ -241,6 +253,28 @@ export interface BridgeDeps {
    * 缺省 = 空数组：`BridgeDeps` 在多处测试夹具里被直接构造，那些用例不该被迫造一个可写目录。
    */
   deviations?: DeviationRecorder
+  /**
+   * r13 AC-21/AC-23：左栏项目库装配端口（实现在 `host/library.ts`，由 `index.ts` 注入）。
+   *
+   * 缺省 = 空库（`projects: []` + 空全局记忆）：装配层漏接线时左栏显示「还没有项目」，
+   * 而不是在 bridge 里长第二份装配逻辑（PRD 重复风险清单点名禁止）。
+   */
+  libraryView?: (query: { sessionId?: string; runId?: string }) => LibraryView
+  /**
+   * r13 AC-23：工作区白名单（`library.isKnownWorkspace`）。
+   *
+   * `readMemoryFile(..., workspace)` 允许跨项目读记忆，但**目录名来自调用方输入**：
+   * 没有白名单时一次 `workspace=/etc` 就能把任意 `.auto-team/memory/*.md` 读出来。
+   * 缺省 = 只允许当前工作区（`memoryRoots.projectDir` 对应的那个）。
+   */
+  isKnownWorkspace?: (path: string) => boolean
+  /**
+   * r13 AC-8：run 状态变化通知（计划保存 / 任务终态 / 成员退出 …）。
+   *
+   * bridge 只在**自己改完状态**后调它，真正的派发语义在装配层的 auto dispatcher 里；
+   * 桥不直接派发，否则就出现第二条派发路径（绕过四道闸）。
+   */
+  onRunChanged?: (sessionId: string, runId: string, cause: 'plan-saved' | 'task-terminal' | 'member-exit' | 'tasks-added' | 'tick') => void
 }
 
 export interface Bridge {
@@ -248,8 +282,19 @@ export interface Bridge {
   setEnabled(sessionId: string, enabled: boolean): void
   snapshot(sessionId: string): PanelSnapshot
   act(sessionId: string, action: PanelAction): Promise<ActResult>
+  /**
+   * r13 AC-21/AC-22：左栏项目库（含 `?runId=` 时的历史详情）。
+   *
+   * 走的是与 `GET /library` 同一条装配（`BridgeDeps.libraryView`），
+   * 因此「右栏看到的 run」与「左栏点开的历史 run」是同一份 `RunDetailView`。
+   */
+  library(query: { sessionId?: string; runId?: string }): LibraryView
   /** 面板记忆页：先读正文再编辑（否则保存会把已有记忆清空，缺陷 D7）。 */
-  readMemoryFile(track: MemoryTrack, name: string): Promise<Result<{ track: MemoryTrack; name: string; body: string; chars: number }>>
+  readMemoryFile(
+    track: MemoryTrack,
+    name: string,
+    workspace?: string,
+  ): Promise<Result<{ track: MemoryTrack; name: string; body: string; chars: number }>>
   /**
    * 面板技能编辑弹层：按需读技能正文（r10 AC-17）。
    *
@@ -389,8 +434,22 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return deps.store.latestForSession(sessionId)
   }
 
-  function saveState(state: RunState): RunState {
+  function saveState(state: RunState, cause: AutoDispatchCause = 'plan-saved'): RunState {
     deps.store.save(state)
+    // r13 AC-8：状态变了就通知装配层（自动派发的触发点之一）。回调由装配层提供，
+    // 这里只负责「说一声」——派发语义不进入 bridge，否则就是第二条派发路径。
+    //
+    // `cause` 必须由**产生这次变化的动作**给出（任务终态 = `task-terminal`，其余默认
+    // `plan-saved`）：dispatcher 的 kick 会带着 cause 出报告与退避统计，统一写成
+    // `plan-saved` 会让「任务刚跑完」和「刚保存计划」在诊断里无法区分。
+    const notify = deps.onRunChanged
+    if (typeof notify === 'function') {
+      try {
+        notify(state.plan.sessionId, state.plan.runId, cause)
+      } catch {
+        // 通知失败不能让保存失败：盘上状态才是权威，下一轮 tick 会补上。
+      }
+    }
     return state
   }
 
@@ -647,6 +706,20 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return at
   }
 
+  /**
+   * 记忆根（r13 AC-23）：默认当前工作区；带 `workspace` 时换 projectDir，public 永远全局。
+   *
+   * 白名单是硬闸：`workspace` 来自 HTTP 查询参数，没有 `isKnownWorkspace` 时只允许当前
+   * 工作区 —— 否则一次 `workspace=/etc` 就能把任意目录下 `.auto-team/memory/*.md` 读出来。
+   */
+  function rootsFor(workspace: string | undefined): MemoryRoots | null {
+    if (workspace === undefined || workspace.trim() === '') return deps.memoryRoots
+    const requested = normalizeWorkspace(workspace)
+    const known = deps.isKnownWorkspace
+    if (typeof known !== 'function' || !known(requested)) return null
+    return { publicDir: deps.memoryRoots.publicDir, projectDir: projectMemoryDir(requested) }
+  }
+
   function memoryFiles(): MemorySnapshotFiles {
     const files = [...listMemory('project', deps.memoryRoots), ...listMemory('public', deps.memoryRoots)]
     return {
@@ -752,6 +825,80 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return detached
   }
 
+  /* ───────────── r13：用量/用时/历史 的装配（文本一律在宿主算好） ───────────── */
+
+  /**
+   * run 级用时（快照 `runDuration`）：起点取 `plannedAt`（计划落盘时刻，永远是事实）。
+   *
+   * 终态但旧 run 没有 `finishedAt` → `unavailable`（不拿「现在」冒充结束时刻，否则一条
+   * 昨天跑完的 run 会显示成「跑了两天」）。
+   */
+  function runDurationOf(state: RunState | null, at: number): DurationCell {
+    if (!state) return durationCellOf({ state: 'unavailable', now: at })
+    const ended = state.finishedAt !== undefined
+    if (!ended && (state.plan.status === 'cancelled' || state.plan.status === 'terminated')) {
+      return durationCellOf({ startAt: state.plannedAt, state: 'unavailable', now: at })
+    }
+    return durationCellOf({
+      startAt: state.plannedAt,
+      ...(ended ? { endAt: state.finishedAt } : {}),
+      state: ended ? 'done' : 'running',
+      now: at,
+    })
+  }
+
+  /** 任务级用时（快照 `taskDurations`，key = taskId）：没有起点 = 未开始，不是 0 秒。 */
+  function taskDurationsOf(state: RunState | null, at: number): Record<string, DurationCell> {
+    const out: Record<string, DurationCell> = {}
+    if (!state) return out
+    for (const task of state.plan.tasks) {
+      const time = state.taskTimes?.[task.id]
+      const startAt = time?.startedAt
+      const endAt = time?.endedAt
+      const finished = endAt !== undefined || isTerminalTaskStatus(task.status)
+      const cellState = startAt === undefined ? 'not-started' : finished ? 'done' : 'running'
+      out[task.id] = durationCellOf({
+        ...(startAt === undefined ? {} : { startAt }),
+        ...(endAt === undefined ? {} : { endAt }),
+        state: cellState,
+        now: at,
+      })
+    }
+    return out
+  }
+
+  /** 任务级用量（快照 `taskUsage`，key = taskId）：优先任务归属，其次该任务的成员。 */
+  function taskUsageMapOf(state: RunState | null): Record<string, UsageCell> {
+    const out: Record<string, UsageCell> = {}
+    if (!state) return out
+    for (const task of state.plan.tasks) {
+      const memberId = bindingFor(state, task.id)?.memberId ?? task.memberId
+      out[task.id] = taskUsageOf(state.usage, task.id, memberId)
+    }
+    return out
+  }
+
+  /**
+   * 历史列表（AC-21，≤50）：每个会话自己的 run，最近的在前。
+   *
+   * 5 秒 memo（与 `LIBRARY_CACHE_MS` 同量级、独立对象）：`store.list()` 会读**每一个** run 文件，
+   * 面板 2 秒一刷时不该把历史列表变成每刷一次的磁盘风暴；新建的 run 最多晚 5 秒出现，
+   * 而当前 run 本身来自 `latestForSession`，不受影响。
+   */
+  let historyMemo: { sessionId: string; at: number; runs: RunSummary[] } | null = null
+  function historyOf(sessionId: string): RunSummary[] {
+    const at = now()
+    if (historyMemo && historyMemo.sessionId === sessionId && at - historyMemo.at < LIBRARY_CACHE_MS) {
+      return historyMemo.runs
+    }
+    const runs = deps.store
+      .list()
+      .filter((run) => run.sessionId === sessionId)
+      .slice(0, HISTORY_PAGE_SIZE)
+    historyMemo = { sessionId, at, runs }
+    return runs
+  }
+
   function snapshot(sessionId: string): PanelSnapshot {
     const state = loadState(sessionId)
     const roles = deps.roles.list()
@@ -774,6 +921,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // store.normalizePause 丢掉，但 plan.status 一定还在）。
     const paused = state?.plan.status === 'paused'
     const pausedAt = state?.pause?.at
+    // r13：一次快照只取一次时间，所有「已等待 / 运行中用时」都基于同一个 now ——
+    // 否则同一份快照里两条时间文本会差几毫秒，左栏右栏对不上。
+    const at = now()
+    const pending = pendingViewOf(state?.pendingConfirmation, at)
 
     return {
       enabled: flags[sessionId]?.enabled === true,
@@ -821,6 +972,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // r11 AC-22：执行痕迹只读最近 N 条（DEVIATION_SNAPSHOT_LIMIT）；未装配 = 空数组，
       // 面板据此渲染 0 节点（AC-24 的「0 条不渲染」），而不是显示一块空白标题。
       deviations: deps.deviations?.recent(DEVIATION_SNAPSHOT_LIMIT) ?? [],
+      // r13：用量/用时/pending/项目/历史。**文本全部在这里算好**（AC-7 要求右栏与左栏逐字相等，
+      // 客户端零拼接）；拿不到就是 `unavailable` + 原因，绝不用字数估算补位。
+      ...(state?.project === undefined ? {} : { project: state.project }),
+      runUsage: runUsageOf(state?.usage),
+      runDuration: runDurationOf(state, at),
+      taskUsage: taskUsageMapOf(state),
+      taskDurations: taskDurationsOf(state, at),
+      ...(pending === undefined ? {} : { pendingConfirmation: pending }),
+      // AC-21：历史列表来自快照（≤50），详情走 library(runId) —— 不新增第 5 条路由。
+      runs: historyOf(sessionId),
     }
   }
 
@@ -861,20 +1022,103 @@ export function createBridge(deps: BridgeDeps): Bridge {
     )
   }
 
-  async function act(sessionId: string, action: PanelAction): Promise<ActResult> {
-    try {
-      // 开关是唯一的例外：它必须在「未启用」时也能把开关打开。
-      if (action.type !== 'toggle' && flags[sessionId]?.enabled !== true) {
-        return reject('NOT_ENABLED', NOT_ENABLED_TEXT, sessionId)
-      }
+  /**
+   * 前置闸（r13 提取）：未启用 / 暂停。
+   *
+   * 提取出来是因为入口 `act` 与执行体 `executeAction` 都要过同一道闸 —— 确认后重放的动作
+   * 期间用户可能已经把插件关掉或暂停了，那时**确认也不该放行**（拒绝语义与直接调用完全一致）。
+   */
+  function preflightGate(sessionId: string, action: PanelAction): ActResult | null {
+    // 开关是唯一的例外：它必须在「未启用」时也能把开关打开。
+    if (action.type !== 'toggle' && flags[sessionId]?.enabled !== true) {
+      return reject('NOT_ENABLED', NOT_ENABLED_TEXT, sessionId)
+    }
+    // PAUSED 闸门（r7 AC-16）：**只拦推进类动作**，一个判断点，不散落到各个 case 与组件里。
+    // 放行的动作（toggle/cancel/message/saveRole/pause/resumeTeam/confirmPending/...）在暂停时仍然可用：
+    // 用户暂停后还得能停用、能发消息问成员、能改角色、能继续、能处理已挂起的确认。见 TECHNICAL §2.3。
+    if (PAUSED_BLOCKED.has(action.type)) {
+      const paused = loadState(sessionId)
+      if (paused?.plan.status === 'paused') return reject('PAUSED', PAUSED_TEXT, sessionId)
+    }
+    return null
+  }
 
-      // PAUSED 闸门（r7 AC-16）：**只拦推进类动作**，一个判断点，不散落到各个 case 与组件里。
-      // 放行的动作（toggle/cancel/message/saveRole/pause/resumeTeam/...）在暂停时仍然可用：
-      // 用户暂停后还得能停用、能发消息问成员、能改角色、能继续。暂停语义见 TECHNICAL §2.3。
-      if (PAUSED_BLOCKED.has(action.type)) {
-        const paused = loadState(sessionId)
-        if (paused?.plan.status === 'paused') return reject('PAUSED', PAUSED_TEXT, sessionId)
+  /**
+   * 确认/拒绝一条未决动作（AC-13）。
+   *
+   * 两条纪律：
+   *  - **先落状态再执行**：确认后 pending 立刻消失，即使执行体抛错也不会复活 —— 否则用户会
+   *    被同一条确认反复拦住（同一件事被做了两次，比失败严重得多）。
+   *  - **执行走 `executeAction`**：与直接调用共用同一个执行体，不存在「确认后行为不一样」。
+   */
+  async function resolvePending(
+    sessionId: string,
+    action: { type: 'confirmPending' | 'rejectPending'; pendingId: string },
+  ): Promise<ActResult> {
+    const state = loadState(sessionId)
+    if (!state) return reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
+    const pending = state.pendingConfirmation
+    if (!pending || pending.id !== action.pendingId) {
+      return reject('NOT_FOUND', '该确认已失效（可能已被处理或已刷新），请重新操作', sessionId)
+    }
+    const cleared: RunState = { ...state, pendingConfirmation: undefined }
+    if (action.type === 'rejectPending') {
+      saveState(cleared)
+      return accept(sessionId, ['已取消该操作：状态未做任何改动'])
+    }
+    if (pending.action.type === 'forceParallel') {
+      const ids = cleared.forceParallel ?? []
+      saveState({
+        ...cleared,
+        forceParallel: ids.includes(pending.action.taskId) ? ids : [...ids, pending.action.taskId],
+      })
+    } else {
+      saveState(cleared)
+    }
+    return executeAction(sessionId, pending.action)
+  }
+
+  /**
+   * 动作入口（r13 AC-11 / AC-12 / AC-13）：先过确认闸，再走**同一执行体**。
+   *
+   * 顺序是刻意的：前置闸（未启用/暂停）在挂 pending **之前**跑 —— 用户不该去确认一个
+   * 注定被拒绝的动作。可逆动作（AC-12 的 7 类）在这里不产生任何 pending，直接执行。
+   */
+  async function act(sessionId: string, action: PanelAction): Promise<ActResult> {
+    if (action.type === 'confirmPending' || action.type === 'rejectPending') {
+      return resolvePending(sessionId, action)
+    }
+    const blocked = preflightGate(sessionId, action)
+    if (blocked) return blocked
+    if (!isIrreversibleAction(action)) return executeAction(sessionId, action)
+
+    const state = loadState(sessionId)
+    // 没有运行：交给执行体产出原来的 NO_PLAN / NOT_FOUND 语义（不在这里编第二套码）。
+    if (!state) return executeAction(sessionId, action)
+    // 已授权过的强制并行：同一任务不再弹第二次（`RunState.forceParallel` 是持久授权）。
+    if (action.type === 'forceParallel' && (state.forceParallel ?? []).includes(action.taskId)) {
+      return executeAction(sessionId, action)
+    }
+    const existing = state.pendingConfirmation
+    if (existing) {
+      return {
+        ...reject('CONFIRM_REQUIRED', `已有待确认操作，请先处理：${existing.summary}`, sessionId),
+        pendingId: existing.id,
       }
+    }
+    const pending = pendingFor(state, action, now())
+    saveState({ ...state, pendingConfirmation: pending })
+    return {
+      ...reject('CONFIRM_REQUIRED', `该操作不可逆，需确认：${pending.summary}`, sessionId),
+      pendingId: pending.id,
+    }
+  }
+
+  /** 执行体：所有 Action 的唯一实现（确认闸确认后也回到这里）。 */
+  async function executeAction(sessionId: string, action: PanelAction): Promise<ActResult> {
+    try {
+      const blocked = preflightGate(sessionId, action)
+      if (blocked) return blocked
 
       switch (action.type) {
         case 'toggle': {
@@ -1044,6 +1288,34 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return accept(sessionId, ['已取消本次运行：不会再有新的派发（已创建的成员仍可对话）'])
         }
 
+        /**
+         * 强制并行（r13 AC-11，不可逆 → 必过确认闸）。
+         *
+         * 只做两件事：记下**持久授权**（`forceParallel` 落盘，重启后仍有效）、把在等写域的任务
+         * 放回 `ready` 并清掉等待文案。真正的准入仍由下一次 `dispatchReady` 判定 ——
+         * 这里绝不能自己起人，否则就出现第二条派发路径（绕过并发/依赖/暂停四道闸）。
+         */
+        case 'forceParallel': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          const ids = state.forceParallel ?? []
+          const authorized = ids.includes(task.id) ? ids : [...ids, task.id]
+          const wasWaiting = (task.waitingOn ?? []).length > 0
+          saveState(
+            withTask({ ...state, forceParallel: authorized }, task.id, (item) => {
+              const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+              return { ...rest, status: 'ready' as const }
+            }),
+          )
+          return accept(sessionId, [
+            wasWaiting
+              ? `任务 ${task.id} 已强制并行：不再等待写域释放，下一次派发放行`
+              : `任务 ${task.id} 已记录强制并行（当前未在等待写域，后续冲突时直接放行）`,
+          ])
+        }
+
         case 'setTaskRole': {
           const state = loadState(sessionId)
           if (!state) return reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
@@ -1114,7 +1386,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
           }
 
           next = releaseScopes(next, task.id, at)
-          saveState(withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })))
+          // 任务进入终态（cancelled）→ cause 用 `task-terminal`：自动派发据此知道「有人腾了位置」。
+          saveState(withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })), 'task-terminal')
           return accept(sessionId, notices)
         }
 
@@ -1155,15 +1428,22 @@ export function createBridge(deps: BridgeDeps): Bridge {
           next = releaseScopes(next, task.id, at)
           const notices = [`任务 ${task.id} 已跳过（${TASK_STATUS_LABELS[task.status]} → ${TASK_STATUS_LABELS.skipped}）`]
           if (released.length > 0) notices.push(`下游 ${released.join('、')} 解除阻塞（依赖视为满足）`)
-          saveState(withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })))
+          // skipped 同样是终态（依赖语义里视为满足）→ `task-terminal`。
+          saveState(
+            withMessage(next, recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') })),
+            'task-terminal',
+          )
           return accept(sessionId, notices)
         }
 
         /**
-         * 改验收命令（r11 AC-26）：空串拒绝并返回三条模板全文（`emptyAcceptanceError` 单点生成，
-         * 与工具入口 `tools.ts` 的整批拒绝是同一份文案）。
+         * 改验收命令（r11 AC-26；r13 取代：允许面扩到 `done`）：空串拒绝并返回三条模板全文
+         * （`emptyAcceptanceError` 单点生成，与工具入口 `tools.ts` 的整批拒绝是同一份文案）。
          *
-         * 只改 `acceptance`：已落盘的 `evidence` 一字不动 —— 那是「上次门禁跑的是什么」的历史事实。
+         * 非 `done` 状态只改 `acceptance`：已落盘的 `evidence` 一字不动 —— 那是「上次门禁跑的是什么」
+         * 的历史事实。`done` 改验收会改变「完成」的含义，所以**当场重跑门禁**：通过则保持 `done`
+         * 并刷新证据，失败转 `rework`。状态写回仍走 `deps.applyReceipt`（done/rework 的唯一写点），
+         * 不在这里长出第二条状态机路径。
          */
         case 'updateAcceptance': {
           const state = loadState(sessionId)
@@ -1177,9 +1457,58 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (acceptance === '') {
             return reject('BAD_REQUEST', emptyAcceptanceError([{ id: task.id, title: task.title }]), sessionId)
           }
-          saveState(withTask(state, task.id, (item) => ({ ...item, acceptance })))
+
+          const nextState = withTask(state, task.id, (item) => ({ ...item, acceptance }))
+          if (task.status !== 'done') {
+            saveState(nextState)
+            return accept(sessionId, [
+              `任务 ${task.id} 的验收命令已更新（当前状态：${TASK_STATUS_LABELS[task.status]}）`,
+            ])
+          }
+
+          // `done` 的重跑：门禁期间任务保持终态（不写 gate）—— 它没有被「重开」，只是证据需要重新成立，
+          // 这样自动派发不会把下游重新排一遍；结论仍由 applyReceipt 一次落定。
+          const settings = settingsOf()
+          const gateTask = nextState.plan.tasks.find((item) => item.id === task.id) ?? task
+          let outcome: { ok: boolean; evidence: GateEvidence }
+          try {
+            outcome = await enqueueGate(() =>
+              Promise.resolve(
+                runGate(gateTask, {
+                  cwd: deps.gate.cwd,
+                  artifactsDir: deps.gate.artifactsDir,
+                  timeoutMs: deps.gate.timeoutMs ?? settings.gateTimeoutMs,
+                  now,
+                }),
+              ),
+            )
+          } catch (error) {
+            // 队列满等：nextState 未落盘，任务仍是 done、验收仍是旧值，不产生半截状态。
+            return reject(
+              'BAD_REQUEST',
+              `门禁重跑失败：${error instanceof Error ? error.message : String(error)}`,
+              sessionId,
+            )
+          }
+
+          const passed = outcome.ok
+          const next = deps.applyReceipt(
+            nextState,
+            task.id,
+            {
+              verdict: passed ? 'done' : 'rework',
+              note: '已完成的任务改验收后重跑门禁',
+              evidence: outcome.evidence,
+            },
+            now(),
+            settings.maxAttempts,
+          )
+          saveState(next, 'task-terminal')
           return accept(sessionId, [
-            `任务 ${task.id} 的验收命令已更新（当前状态：${TASK_STATUS_LABELS[task.status]}）`,
+            passed
+              ? `门禁重跑通过（退出码 ${outcome.evidence.exitCode}）：任务 ${task.id} 保持已完成，证据已更新`
+              : `门禁重跑未通过（退出码 ${outcome.evidence.exitCode}）：任务 ${task.id} 转返工`,
+            `验收命令：${acceptance}`,
           ])
         }
 
@@ -1334,7 +1663,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (updated?.status === 'failed') {
             notices.push(`任务 ${action.taskId} 已返工 ${attemptsOf(updated)} 次仍未通过，转人工处理`)
           }
-          saveState(next)
+          // receipt 是本任务的状态机出口（done / rework / failed）→ `task-terminal`，
+          // 下游被解锁后自动派发应立即补位（不必等 3s tick）。
+          saveState(next, 'task-terminal')
           return accept(sessionId, notices)
         }
 
@@ -1489,12 +1820,24 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
     act,
 
-    async readMemoryFile(track: MemoryTrack, name: string) {
+    /**
+     * r13 AC-21/AC-22：左栏项目库。装配在 `host/library.ts`（带缓存），这里只转派；
+     * 未装配时返回空库 —— 空库是「没有数据」，不是「假装没有项目」（PRD 反模式）。
+     */
+    library(query: { sessionId?: string; runId?: string }) {
+      const view = deps.libraryView
+      if (typeof view === 'function') return view(query)
+      return { projects: [], global: { memories: [] } }
+    },
+
+    async readMemoryFile(track: MemoryTrack, name: string, workspace?: string) {
       const safe = safeMemoryName(name)
       if (safe === null) return { error: '非法文件名' }
-      const exists = listMemory(track, deps.memoryRoots).some((file) => file.name === safe)
+      const roots = rootsFor(workspace)
+      if (roots === null) return { error: `未授权的工作区：${workspace ?? ''}` }
+      const exists = listMemory(track, roots).some((file) => file.name === safe)
       if (!exists) return { error: `记忆文件不存在：${track}/${safe}` }
-      const body = readMemory(track, safe, deps.memoryRoots)
+      const body = readMemory(track, safe, roots)
       return { data: { track, name: safe, body, chars: body.length } }
     },
 

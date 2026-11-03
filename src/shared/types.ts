@@ -318,6 +318,12 @@ export interface MemoryFileInfo {
   name: string
   chars: number
   updatedAt: number
+  /** r13：文件创建时间（取不到就不给，界面显示「—」，不拿 updatedAt 冒充）。 */
+  createdAt?: number
+  /** r13：token 估算值（`ceil(chars/2)`，见 host/format.ts 的 `memoryTokenEstimate`）。 */
+  tokenEstimate?: number
+  /** r13：估算口径标记 —— 有值即表示这是**估算**，界面必须带 `≈` 前缀。 */
+  tokenBasis?: 'estimate'
 }
 
 /** 门禁证据（AC-19）：命令行退出码 + 输出尾部 + 全量日志路径，三者都要可核验。 */
@@ -412,6 +418,213 @@ export interface ConcurrencyView {
   clamped: boolean
 }
 
+/* ───────────────────── r13 视图类型（宿主装配，客户端只渲染、零格式化） ───────────────────── */
+
+/**
+ * token 合计（AC-3/AC-19）：`total` 必给，`input/output` 只在来源真的分项时才给。
+ *
+ * `total: 0` 是**合法值**（provider 明确说这次没花钱），与「不可得」必须靠
+ * {@link UsageCell.source} 区分 —— 用 `0` 冒充不可得、或用估算填 0 都是造假。
+ */
+export interface TokenTotals {
+  input?: number
+  output?: number
+  total: number
+}
+
+/** 用量来源（AC-19 三态归一后的两种可交付形态）：`provider` 有值，`unavailable` 无值。 */
+export type UsageSource = 'provider' | 'unavailable'
+
+/**
+ * 一个用量单元格（任务行 / 流转节点 / run 头共用同一形状）。
+ *
+ * `text` 是**宿主生成**的展示文本（`format.ts` 的 `usageCellOf`），客户端只许读不许拼：
+ * 千分位、`不可得` 这些文案一旦在客户端再实现一遍，就会与宿主出现第二套口径
+ * （r13 的历史教训：`tokenTextOf` 曾逐字镜像 `groupDigits`，行为对但多一处实现）。
+ *
+ * 字段是可选的：旧 run 的落盘数据与旧快照没有它，客户端退化为按 `source` 显示。
+ * `source==='unavailable'` 时 `tokens` 必须缺省、`reason` 给一句人话
+ * （面板据此显示「不可得」+ title 解释）。
+ */
+export interface UsageCell {
+  tokens?: TokenTotals
+  source: UsageSource
+  reason?: string
+  /** 宿主生成的展示文本（`1,234` / `不可得`）；缺省表示旧数据，客户端自行降级。 */
+  text?: string
+}
+
+/** 用时状态（AC-20）：未开始 / 进行中 / 已结束 / 不可得，四态互斥。 */
+export type DurationState = 'done' | 'running' | 'not-started' | 'unavailable'
+
+/** 一个用时单元格：`text` 由宿主 `formatDuration` 生成（AC-7 要求客户端零拼接）。 */
+export interface DurationCell {
+  startAt?: number
+  endAt?: number
+  ms?: number
+  text: string
+  state: DurationState
+}
+
+/** run 头的角色条：该角色在本 run 里承担几个任务、合计多少 token。 */
+export interface RoleUsageView {
+  roleId: string
+  name: string
+  tasks: number
+  usage: UsageCell
+}
+
+/** 任务表一行（右栏任务页与左栏项目页**共用**这一份形状，AC-18 的 deep equal 靠它）。 */
+export interface TaskDetailView {
+  id: string
+  title: string
+  roleId: string
+  roleName: string
+  status: TaskStatus
+  dependsOn: string[]
+  acceptance: string
+  writeScopes?: string[]
+  evidence?: GateEvidence
+  usage: UsageCell
+  duration: DurationCell
+  /** 返工次数（缺省 = 0 次，界面不显示 0）。 */
+  attempts?: number
+  /** 写域等待原因（宿主生成的人话；缺省 = 没在等）。 */
+  waitReason?: string
+  /** 该任务名下的直达消息条数（面板「消息」徽标用）。 */
+  messageCount: number
+}
+
+/** 流转图的一个节点（纯展示坐标，客户端不自算布局以外的东西）。 */
+export interface FlowNodeView {
+  id: string
+  title: string
+  status: TaskStatus
+  /** 列 = 依赖深度（0 起）；行 = 同列内序号。 */
+  column: number
+  row: number
+  usage: UsageCell
+  duration: DurationCell
+}
+
+/** 流转图的一条边：`upstreamDone` 决定它画实线还是虚线（下游为什么还没动）。 */
+export interface FlowEdgeView {
+  from: string
+  to: string
+  upstreamDone: boolean
+}
+
+export interface FlowView {
+  nodes: FlowNodeView[]
+  edges: FlowEdgeView[]
+  columns: number
+  rows: number
+}
+
+/** 未决确认的视图（AC-13）：`waitedText` 每次快照重算，不落盘 TTL。 */
+export interface PendingConfirmationView {
+  id: string
+  /** 动作名（`cancel`/`cancelTask`/…，界面翻成动词短语，不用「确定」）。 */
+  action: string
+  taskId?: string
+  runId: string
+  createdAt: number
+  /** 影响面一句话（宿主 `confirmSummaryOf` 生成，逐字）。 */
+  summary: string
+  irreversible: true
+  /** 「已等待 N 分」的文本（宿主格式化，客户端不拼）。 */
+  waitedText: string
+}
+
+/** 一个 run 的完整详情：**右栏任务页与左栏项目页的唯一数据形状**（AC-18）。 */
+export interface RunDetailView {
+  runId: string
+  sessionId: string
+  project?: string
+  planStatus: PlanStatus
+  plannedAt?: number
+  finishedAt?: number
+  usage: UsageCell
+  duration: DurationCell
+  roles: RoleUsageView[]
+  tasks: TaskDetailView[]
+  flow: FlowView
+  pendingConfirmation?: PendingConfirmationView
+}
+
+/** 记忆索引一条（左栏项目记忆与右栏记忆页共用；token 是**估算**，必须带 ≈）。 */
+export interface MemoryItemView {
+  track: MemoryTrack
+  name: string
+  title: string
+  createdAt?: number
+  updatedAt: number
+  tokenEstimate: number
+  tokenBasis: 'estimate'
+}
+
+/** 项目里最近一个 run 的一行（左栏项目页「最近运行」用，不展开任务）。 */
+export interface ProjectRunSummaryView {
+  runId: string
+  planStatus: PlanStatus
+  plannedAt?: number
+  finishedAt?: number
+  tasks: number
+  done: number
+  usage: UsageCell
+  duration: DurationCell
+}
+
+/** 左栏项目列表的一项：该项目最近 run 聚合 + 记忆索引。 */
+export interface ProjectView {
+  id: string
+  name: string
+  path?: string
+  /** true = 没有 `project` 字段的历史 run 聚成的「未知项目」（固定末位）。 */
+  unknown?: boolean
+  runs: number
+  usage: UsageCell
+  lastActiveAt?: number
+  recentRuns: ProjectRunSummaryView[]
+  memories: MemoryItemView[]
+}
+
+/** 左栏整页数据（`GET /library` 的载荷；带 `runId` 时 `detail` 为该 run 的详情）。 */
+export interface LibraryView {
+  projects: ProjectView[]
+  global: { memories: MemoryItemView[] }
+  currentProject?: string
+  /** 历史页用的 run 列表（`HISTORY_PAGE_SIZE` 条，createdAt 倒序）。 */
+  runs?: RunSummary[]
+  /** 历史详情（`?runId=` 时才有；AC-22 靠它避免新增第 5 条路由）。 */
+  detail?: RunDetailView
+}
+
+/**
+ * 运行列表的一行（面板/恢复入口/左栏历史用，不含消息账本等大字段）。
+ *
+ * 放 shared 而不是 store：`LibraryView.runs` 是共享契约，而 client 不允许 import host。
+ * store.ts 只做 `export type { RunSummary }`，定义单点仍在 shared。
+ */
+export interface RunSummary {
+  runId: string
+  sessionId: string
+  createdAt: number
+  status: PlanStatus
+  tasks: number
+  done: number
+  /** r13：项目（工作区路径的 basename）；旧 run 缺失 = 「未知项目」。 */
+  project?: string
+  /** r13：计划写入时间（AC-30 证据）。 */
+  plannedAt?: number
+  /** r13：进入终态的时间；进行中缺省。 */
+  finishedAt?: number
+  /** r13：run 合计用量（`aggregation` 三态见 UsageCell）。 */
+  usageTotals?: TokenTotals
+  /** r13：是否还有非终态任务（左栏「活跃」标记）。 */
+  active?: boolean
+}
+
 /* ─────────────────────────────── 面板快照（HTTP / 工具共用） ─────────────────────────────── */
 
 /** 面板快照：`GET {BRIDGE_ROUTE}/snapshot` 的载荷，也是每个动作返回的同一份形状。 */
@@ -487,6 +700,20 @@ export interface PanelSnapshot {
   scopeLocks?: ScopeLockView[]
   /** r11 AC-24：队长亲手写文件的最近留痕（新的在后），**空数组必给**。 */
   deviations?: DeviationView[]
+  /** r13：未决确认（AC-13）。缺省 = 没有待确认动作，界面不渲染弹窗。 */
+  pendingConfirmation?: PendingConfirmationView
+  /** r13 AC-3/AC-19：run 合计用量（文本由宿主生成；`source` 区分 0 与不可得）。 */
+  runUsage?: UsageCell
+  /** r13 AC-20：run 用时（`plannedAt → finishedAt`，未结束取 now 且 `state='running'`）。 */
+  runDuration?: DurationCell
+  /** r13：本 run 所属项目（工作区 basename）；旧 run 缺失 = 「未知项目」。 */
+  project?: string
+  /** r13 AC-3：任务级用量（key = taskId；文本已在宿主格式化）。 */
+  taskUsage?: Record<string, UsageCell>
+  /** r13 AC-20：任务级用时（key = taskId）。 */
+  taskDurations?: Record<string, DurationCell>
+  /** r13 AC-21：历史 run 列表（`HISTORY_PAGE_SIZE` 条，createdAt 倒序）。 */
+  runs?: RunSummary[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -669,6 +896,20 @@ export type PanelAction =
   | { type: 'skipTask'; taskId: string }
   /** r11 AC-26：改验收命令（下次门禁生效；空串拒绝并回三条模板）。 */
   | { type: 'updateAcceptance'; taskId: string; acceptance: string }
+  /**
+   * r13 AC-13：确认一条待确认动作（`pendingId` 必须命中当前未决记录，否则 NOT_FOUND）。
+   *
+   * 确认后**复用同一个执行体**（`executeAction`），因此行为与直接调用完全一致 ——
+   * 这里不复制分支，只多一道闸。
+   */
+  | { type: 'confirmPending'; pendingId: string }
+  /** r13 AC-13：拒绝一条待确认动作（清空 pending，状态一字不改）。 */
+  | { type: 'rejectPending'; pendingId: string }
+  /**
+   * r13 AC-11：强制并行（不可逆，需确认）。确认一次后记住该 `taskId`，
+   * 复用同一任务的写域闸不再弹窗（`RunState.forceParallel`）。
+   */
+  | { type: 'forceParallel'; taskId: string }
 
 /**
  * 拒绝码（12 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
@@ -699,6 +940,13 @@ export type RejectionCode =
    * 语义是「先继续再做事」，所以面板必须把这条码翻成一句带「继续」的动作指引。
    */
   | 'PAUSED'
+  /**
+   * r13 AC-13：该动作不可逆，已被确认闸拦下（`ActResult.pendingId` 指向 `pendingConfirmation`）。
+   *
+   * 语义是「去面板点确认」，不是失败：面板必须把它翻成带确认入口的提示，
+   * 工具面则把 `pendingId` 一并返回，让队长知道该等用户确认而不是反复重试。
+   */
+  | 'CONFIRM_REQUIRED'
 
 /** 一次动作的结果：无论成功失败都带可读快照（界面不会因为没有数据而白屏）。 */
 export interface ActResult {
@@ -707,6 +955,8 @@ export interface ActResult {
   notices?: string[]
   /** 被拒绝时同时给码与文案；码供断言，文案供界面。 */
   rejected?: { code: RejectionCode; message: string }
+  /** r13 AC-13：`rejected.code === 'CONFIRM_REQUIRED'` 时指向刚挂起的待确认记录。 */
+  pendingId?: string
 }
 
 /* ───────────────────────────────── 通用返回包装 ───────────────────────────────── */

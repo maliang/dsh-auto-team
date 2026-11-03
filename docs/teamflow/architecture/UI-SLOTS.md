@@ -23,6 +23,7 @@
 | `settings.general.item` | list | root | none | One preference row inside the General section — the additive seat for a single preference. | 见宿主契约 |
 | `settings.action` | list | root | none | Optional actions rendered in the content-column header before Close. | `id*` / `order?` / `label?` |
 | `sidebar.panellist` | list | root | none | Global panel icons. | `id*` / `order?` / `label?` |
+| `main` ⚠️**未验证** | keyed（按注册样本推断） | root（推断） | 未知（推断为整页替换） | 主内容区座位：r13 左栏「项目库」整页（`{ name: 'main', key: PANELLIST_ID }`）。**未验证**：宿主是否对第三方插件开放、是否需要额外 `inject`、`replaceRisk` 取值均未实测（U2）；实现按 keyed 注册整段 `try/catch`，失败降级为 `auto-team:open-library` 事件 → 面板内联 library，只是左栏入口消失，弹窗与右栏不受影响。 | `key*`（推断） |
 | `sidebar.footer.action` | list | root | none | Optional actions beside Settings at the sidebar foot. | `id*` / `order?` / `label?` |
 | `shell.leading` | single | root | **shadows-shipped-ui** | Window-chrome seat at the frame's top-left, over every main panel. | — |
 

@@ -37,6 +37,7 @@ import {
   onHostTriggerEvents,
   onCaptainToolResult,
   onMemberProgress,
+  onSessionEvents,
   readModelCatalog,
   registerAgentCreated,
   registerEffect,
@@ -65,6 +66,17 @@ import { createTriggerBus, type TriggerBus } from './team/trigger-bus.ts'
 import { readCaptainModel, captainModelView } from './team/captain.ts'
 import { triggerFromMemberExit } from './team/trigger.ts'
 import { createExpander } from './memory/expand.ts'
+import { listMemoryItems } from './memory/repo.ts'
+// r13 五个新模块里的三个装配点：自动派发 / 项目库缓存 / 用量记录（判定都在纯模块，这里只接线）。
+import { createAutoDispatcher } from './team/auto-dispatch.ts'
+import { createLibraryCache, isKnownWorkspace, type LibraryDeps } from './library.ts'
+import {
+  applyUsage,
+  createUsageDeduper,
+  memberIdOf,
+  usageOfSessionEvent,
+  type UsageEventInput,
+} from './team/usage.ts'
 import type { CaptainModelView } from '../shared/types.ts'
 
 export const name = 'auto-team'
@@ -226,6 +238,21 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     }
   }
 
+  /**
+   * 自动派发（r13 AC-8）：计划落盘即派发，**直调上面的 `dispatch` 端口**，绝不再走
+   * `bridge.act({type:'dispatch'})` —— AC-8 断言 dispatch 动作调用为 0，而四道闸（并发/依赖/
+   * 写域/暂停）全部已收口在 `dispatchReady`，从这条闭包进去与手动派发行为完全一致。
+   *
+   * 单飞状态放在 dispatcher 自己的 Map 里（不落 RunState）：跨进程重启后不能残留「正在派发」。
+   * 失败在 `onStatus` 里只记 warn：`stallAlerts` 的归一化只接受 kind='tool'，写进去会被丢弃。
+   */
+  const autoDispatcher = createAutoDispatcher({
+    store,
+    dispatch,
+    now,
+    onStatus: (_runId, text) => warn(ctx, text),
+  })
+
   /** 恢复端口：只处理 running/gate/interrupted，重复调用必须幂等（AC-17）。 */
   const resume: ResumePort = async (state: RunState) => {
     const result = await resumeRun(state, { store, listMembers, sendMessage: spawnPorts.sendMessage, now })
@@ -322,7 +349,14 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       // AC-13 生效点⑤：返工上限同样可配（缺省 = config.MAX_ATTEMPTS）。
       maxAttempts: settings.maxAttempts,
       // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
+      // r13 AC-8 第五个触发点：每轮 tick 先驱动一次自动派发（补成员退出/漏 kick 的窗口），
+      // 派发语义仍在 dispatcher 里，这里只是「顺手推一下」。
       onPoll: async (state) => {
+        try {
+          await autoDispatcher.tick()
+        } catch (error) {
+          warn(ctx, `自动派发 tick 失败（下一轮重试）：${messageOf(error)}`)
+        }
         if (bus === null) return
         await bus.poll(state)
       },
@@ -341,6 +375,21 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     sessionId: DEFAULT_SESSION,
     warn: (text) => warn(ctx, text),
   })
+
+  /**
+   * 左栏项目库（r13 AC-15/AC-23）：装配放在**独立缓存对象**里 —— snapshot 期间零 library 装配，
+   * 所以右栏轮询再密也不会把项目表拖慢。记忆索引只经 `listMemoryItems` 一个来源（两轨同实现）。
+   */
+  const libraryDeps: LibraryDeps = {
+    store,
+    workspace,
+    now,
+    publicMemories: () => listMemoryItems(memoryRoots.publicDir, 'public'),
+    projectMemories: (target) => listMemoryItems(projectMemoryDir(target), 'project'),
+    roles: () => roles.list().map((role) => ({ id: role.id, name: role.name })),
+    runsDir: runsDir(home),
+  }
+  const libraryCache = createLibraryCache(libraryDeps)
 
   const bridge = createBridge({
     store,
@@ -376,6 +425,18 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     // 未装配总线 = 没有任何事件源可用：如实报降级，面板可见（AC-18）。
     triggerHealth: () =>
       bus === null ? { degraded: true, reason: 'Trigger 总线未装配，推进只剩轮询兜底' } : bus.health(),
+    // r13：左栏项目库的读口（缓存对象在装配层持有，bridge 只转发查询参数）+ workspace 白名单。
+    libraryView: (query) => libraryCache.view(query),
+    isKnownWorkspace: (path) => isKnownWorkspace(libraryDeps, path),
+    /**
+     * 落盘后的统一通知点（AC-8 的「任务终态」触发点）：bridge 每次 save 都会经过这里，
+     * 因此 receipt / cancelTask / skipTask / 门禁回写全都自动补派发，不需要每个动作各接一次。
+     * 同时清掉 library 缓存：项目列表里的 run 状态必须与刚落盘的真值一致。
+     */
+    onRunChanged: (sessionId, runId, cause) => {
+      libraryCache.invalidate()
+      autoDispatcher.kick(sessionId, runId, cause)
+    },
     ...(expander === null ? {} : { expander: (id: string, depth?: number) => expander!.expand(id, depth) }),
   })
 
@@ -387,7 +448,15 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
 
   // ① 工具：队长用它拆解/派发/查状态/发消息/读写记忆与角色（7 个 auto_team_*）
   try {
-    const toolsDeps: ToolsDeps = { store, roles, bridge, now }
+    const toolsDeps: ToolsDeps = {
+      store,
+      roles,
+      bridge,
+      now,
+      // r13 AC-8 的前两个触发点（plan 落盘 / add_tasks 追加）直接由工具层通知；
+      // 工具只知道「计划变了」，派发语义留在 dispatcher 里（不在工具里长出第二套调度）。
+      autoDispatch: (sessionId, runId, cause) => autoDispatcher.kick(sessionId, runId, cause),
+    }
     registerTools(ctx, toolsDeps)
   } catch (error) {
     warn(ctx, `工具注册失败：${messageOf(error)}`)
@@ -484,6 +553,9 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
             if (!ids.has(binding.memberId) && !ids.has(binding.name)) continue
             const trigger = triggerFromMemberExit(state.plan.runId, binding.memberId, eventName, at)
             void bus.push(trigger).catch((error: unknown) => warn(ctx, `成员退出推进失败：${messageOf(error)}`))
+            // r13 AC-8 第四个触发点：成员退出会空出一个并发位，立刻让下一条就绪任务补上。
+            // 与总线推进并存：这里只「叫一次 dispatcher」，能不能派仍由 dispatchReady 的四道闸决定。
+            autoDispatcher.kick(state.plan.sessionId, state.plan.runId, 'member-exit')
           }
         }
       } catch (error) {
@@ -501,6 +573,50 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     registerEffect(ctx, () => subscription.stop())
   } catch (error) {
     warn(ctx, `Trigger 事件订阅失败（推进只剩轮询兜底）：${messageOf(error)}`)
+  }
+
+  /**
+   * 用量记录（r13 AC-3/AC-19，U1 fail-open）：根作用域 `session/event` → 累加进所属 run。
+   *
+   * 归属判定只用**已落盘事实**（不猜宿主字段路径）：
+   *   ① 事件里的会话 id 命中某 run 的 `bindings[].memberId` → 成员级（per-member）；
+   *   ② 命中某 run 的 `plan.sessionId` → run 级合计（aggregate-only，成员级显示「不可得」）；
+   *   ③ 都不命中 → 丢弃，绝不往无关 run 上记账。
+   * 事件可能重复投递：去重键由纯模块给出（`eventKey`），去重表在装配层持有、不落盘。
+   */
+  const usageDeduper = createUsageDeduper()
+  function recordUsage(event: UsageEventInput): void {
+    const at = now()
+    for (const summary of store.list()) {
+      const state = store.load(summary.runId)
+      if (!state) continue
+      const memberId = memberIdOf(state.bindings, event.sessionId)
+      const sessionHit = event.sessionId !== undefined && event.sessionId === state.plan.sessionId
+      if (memberId === undefined && !sessionHit) continue
+      const key =
+        event.eventKey ??
+        `${state.plan.runId}:${event.sessionId ?? ''}:${at}:${event.usage.input ?? ''}:${event.usage.output ?? ''}:${event.usage.total ?? ''}`
+      if (usageDeduper.seen(state.plan.runId, key)) continue
+      const attributed = memberId === undefined ? event : { ...event, memberId }
+      store.save({ ...state, usage: applyUsage(state.usage, attributed, at) })
+    }
+  }
+
+  // ⑥½ 用量事件源（AC-3）：订阅失败只降级成「不可得」，绝不让整条 entry 不激活（U1 fail-open）。
+  try {
+    const sessionSub = onSessionEvents(ctx, (payload) => {
+      try {
+        const event = usageOfSessionEvent(payload)
+        if (event === null) return
+        recordUsage(event)
+      } catch (error) {
+        warn(ctx, `用量记录失败（面板显示不可得）：${messageOf(error)}`)
+      }
+    })
+    if (sessionSub.degraded) warn(ctx, '用量事件源降级：token 用量显示「不可得」')
+    registerEffect(ctx, () => sessionSub.stop())
+  } catch (error) {
+    warn(ctx, `用量事件订阅失败（token 用量显示不可得）：${messageOf(error)}`)
   }
 
   // ⑦ 运行时对账：成员存活轮询（AC-18 的反面目标只能由 host 侧发现）+ 实际路由回填（AC-22）

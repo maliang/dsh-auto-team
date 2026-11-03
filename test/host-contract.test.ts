@@ -337,14 +337,14 @@ test('setInterval 全仓只有 1 处调用，且必须在成员看护器里（AC
   )
 })
 
-test('面板 HTTP 桥恰好 3 条路由（r7 只加动作，不加路由），且经 1 条宿主 prefix 路由暴露', () => {
+test('面板 HTTP 桥恰好 4 条路由（r13 AC-22：历史详情走 /library?runId=，不新增第 5 条），且经 1 条宿主 prefix 路由暴露', () => {
   assert.deepEqual(
     httpRouteTable().sort(),
-    ['GET /memory', 'GET /snapshot', 'POST /act'],
-    `面板接口必须仍是这 3 条（新增能力走 act 的 action.type），实际 ${httpRouteTable().join('、')}`,
+    ['GET /library', 'GET /memory', 'GET /snapshot', 'POST /act'],
+    `面板接口必须恰是这 4 条（历史详情复用 /library 的 runId 参数，不新增第 5 条），实际 ${httpRouteTable().join('、')}`,
   )
   const prefixes = prefixRegistrations()
-  assert.equal(prefixes.length, 1, `宿主只许注册 1 条 prefix 路由（3 条内部路由合成 1 条），实际 ${prefixes.join('、')}`)
+  assert.equal(prefixes.length, 1, `宿主只许注册 1 条 prefix 路由（4 条内部路由合成 1 条），实际 ${prefixes.join('、')}`)
   assert.ok(
     prefixes[0]?.startsWith('src/host/adapters.ts:'),
     `宿主路由的唯一注册处必须是 src/host/adapters.ts（其余模块不许直接碰 ctx.webServer），实际 ${prefixes[0]}`,

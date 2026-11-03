@@ -16,15 +16,30 @@ import type { TaskActionName } from '../shared/task-actions.ts'
 import type {
   CaptainModelView,
   DeviationView,
+  DurationCell,
+  DurationState,
+  FlowEdgeView,
+  FlowNodeView,
+  FlowView,
+  LibraryView,
   MemberStatus,
   MemberView,
+  MemoryItemView,
   PanelAction,
   PanelSnapshot,
+  PendingConfirmationView,
   PlanStatus,
   PlanTask,
+  Role,
   RoleModelRoute,
+  RoleUsageView,
+  RunDetailView,
   ScopeLockView,
+  TaskDetailView,
   TaskStatus,
+  TokenTotals,
+  UsageCell,
+  UsageSource,
 } from '../shared/types.ts'
 
 /** dock 胶囊的 5 种 tone（DESIGN §2：关/待派发=idle，计划就绪=plan，在跑=run，失败=fail，全绿=done）。 */
@@ -838,4 +853,634 @@ export function deviationRowsOf(snapshot: PanelSnapshot | null | undefined): Dev
  */
 export function deviationWriteCountOf(rows: readonly DeviationRowView[]): number {
   return rows.reduce((sum, row) => sum + row.count, 0)
+}
+
+/* ═══════════════════ r13：run 详情唯一装配（AC-7 / AC-18） ═══════════════════ */
+
+/**
+ * 状态词常量（**不是格式化**）：宿主 `format.ts` 负责算文本，这里只负责在宿主没给文本时
+ * 不发明、不补 0 —— 「不可得」与「未开始」是两种不同的事实，混用会让人以为计划没跑。
+ */
+export const UNAVAILABLE_TEXT = '不可得'
+export const NOT_STARTED_TEXT = '未开始'
+
+/** 千分位分组：与宿主 `format.ts` 的 `groupDigits` 逐字一致（客户端唯一的数字分组实现）。 */
+function groupDigits(digits: string): string {
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+/** 可用数字（有限、非负）。`0` 合法 —— 「花了 0 token」是真话，不是缺失。 */
+function usableNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+function fullTokenText(total: number | undefined): string {
+  if (!usableNumber(total)) return UNAVAILABLE_TEXT
+  return groupDigits(String(Math.round(total)))
+}
+
+function oneDecimal(value: number): string {
+  const text = value.toFixed(1)
+  return text.endsWith('.0') ? text.slice(0, -2) : text
+}
+
+function compactTokenText(total: number | undefined): string {
+  if (!usableNumber(total)) return UNAVAILABLE_TEXT
+  const value = Math.round(total)
+  if (value < 1_000) return String(value)
+  if (value < 1_000_000) return `${oneDecimal(value / 1_000)}k`
+  return `${oneDecimal(value / 1_000_000)}M`
+}
+
+/**
+ * token 单元格文本：`provider` 走千分位，`unavailable` 一律「不可得」。
+ *
+ * 为什么不显示 `-` 或 `0`：`-` 会被读成「还没跑」，`0` 会被读成「跑了但没花 token」，
+ * 两者都是假话；「不可得」是唯一诚实的第三种状态（DESIGN §2.2）。
+ */
+export function tokenTextOf(cell: UsageCell | null | undefined): string {
+  if (!cell || cell.source !== 'provider') return UNAVAILABLE_TEXT
+  return fullTokenText(cell.tokens?.total)
+}
+
+/** 流转节点第二行用的紧凑 token（宽 128px）；超过 7 字符时由调用方降级到它。 */
+export function compactTokenTextOf(cell: UsageCell | null | undefined): string {
+  if (!cell || cell.source !== 'provider') return UNAVAILABLE_TEXT
+  return compactTokenText(cell.tokens?.total)
+}
+
+/** token 单元格的 `title`：不可得时给原因，可得时给输入/输出明细。 */
+export function tokenTitleOf(cell: UsageCell | null | undefined): string {
+  if (!cell || cell.source !== 'provider') return cell?.reason ?? '该处没有用量来源'
+  const parts: string[] = [`合计 ${fullTokenText(cell.tokens?.total)} token`]
+  if (usableNumber(cell.tokens?.input)) parts.push(`输入 ${fullTokenText(cell.tokens?.input)}`)
+  if (usableNumber(cell.tokens?.output)) parts.push(`输出 ${fullTokenText(cell.tokens?.output)}`)
+  return parts.join(' · ')
+}
+
+/** 用时文本：**只读**宿主下发的 `text`，客户端不拼「分 / 小时」（AC-7 的 grep 断言靠这条成立）。 */
+export function durationTextOf(cell: DurationCell | null | undefined): string {
+  return cell?.text ?? UNAVAILABLE_TEXT
+}
+
+/** 用时单元格的 `title`。 */
+export function durationTitleOf(cell: DurationCell | null | undefined): string {
+  if (!cell) return '没有用时记录'
+  switch (cell.state) {
+    case 'not-started':
+      return '任务尚未开始'
+    case 'running':
+      return '正在计时'
+    case 'unavailable':
+      return '没有开始时间，算不出用时'
+    default:
+      return `开始 ${formatStamp(cell.startAt)} · 结束 ${formatStamp(cell.endAt)}`
+  }
+}
+
+/** 缺单元格时的兜底：保留原因，不冒充 0。 */
+export function usageCellOr(cell: UsageCell | null | undefined, reason: string): UsageCell {
+  return cell ?? { source: 'unavailable', reason }
+}
+
+/** 派发在途三态（DESIGN §2.5：`dispatching` 即时、`dispatched` 保留 3s、之后回 idle）。 */
+export type InflightState = 'dispatching' | 'dispatched' | 'idle'
+
+const INFLIGHT_TEXT: Record<InflightState, string> = {
+  dispatching: '正在派发…',
+  dispatched: '已派发',
+  idle: '自动派发已开启',
+}
+
+export interface InflightView {
+  state: InflightState
+  text: string
+  /** 前两态显示脉动圆点，idle 显示静态勾。 */
+  dot: boolean
+}
+
+export function inflightOf(state: InflightState): InflightView {
+  const normalized: InflightState = state in INFLIGHT_TEXT ? state : 'idle'
+  return { state: normalized, text: INFLIGHT_TEXT[normalized], dot: normalized !== 'idle' }
+}
+
+/* ───────────── run 头 ───────────── */
+
+export interface RunHeadView {
+  runId: string
+  planStatusLabel: string
+  planStatusTone: PlanStatusTone
+  plannedAtText: string
+  /** 起止时钟（`10:21:03 → 进行中`）；时钟不是时长，允许客户端用 formatClock。 */
+  windowText: string
+  durationText: string
+  durationState: DurationState
+  usageText: string
+  usageSource: UsageSource
+  usageTitle: string
+  inflightText: string
+  inflightState: InflightState
+  /** 用量拿不到时的降级说明（有数据但拿不到该量，**不复用空态**）。 */
+  downgrade?: string
+}
+
+export function runHeadOf(detail: RunDetailView, inflight: InflightState = 'idle'): RunHeadView {
+  const status = planStatusView(detail.planStatus)
+  const inflightView = inflightOf(inflight)
+  const head: RunHeadView = {
+    runId: detail.runId,
+    planStatusLabel: status.label,
+    planStatusTone: status.tone,
+    plannedAtText: detail.plannedAt ? `计划于 ${formatStamp(detail.plannedAt)}` : '计划时间未记录',
+    windowText: `${detail.plannedAt ? formatClock(detail.plannedAt) : '--:--:--'} → ${
+      detail.finishedAt ? formatClock(detail.finishedAt) : '进行中'
+    }`,
+    durationText: durationTextOf(detail.duration),
+    durationState: detail.duration?.state ?? 'unavailable',
+    usageText: tokenTextOf(detail.usage),
+    usageSource: detail.usage?.source ?? 'unavailable',
+    usageTitle: tokenTitleOf(detail.usage),
+    inflightText: inflightView.text,
+    inflightState: inflightView.state,
+  }
+  if (head.usageSource !== 'provider') head.downgrade = `token ${UNAVAILABLE_TEXT}（无用量来源）`
+  return head
+}
+
+/* ───────────── 角色条 ───────────── */
+
+export interface RoleChipView {
+  roleId: string
+  name: string
+  taskCount: number
+  usageText: string
+  usageSource: UsageSource
+  usageTitle: string
+}
+
+export function roleChipsOf(roles: readonly RoleUsageView[]): RoleChipView[] {
+  return roles.map((role) => ({
+    roleId: role.roleId,
+    name: role.name,
+    taskCount: role.tasks,
+    usageText: tokenTextOf(role.usage),
+    usageSource: role.usage?.source ?? 'unavailable',
+    usageTitle: `${role.name} · ${role.tasks} 个任务 · ${tokenTitleOf(role.usage)}`,
+  }))
+}
+
+/* ───────────── 任务行 ───────────── */
+
+/** 任务表表头文案（表头与第二行共用同一网格，见 DESIGN §2.1）。 */
+export const TASK_TABLE_HEADER = {
+  left: '任务 · 角色 · 状态',
+  token: 'token',
+  duration: '用时',
+} as const
+
+export interface TaskRowView {
+  id: string
+  title: string
+  badge: Badge
+  roleName: string
+  tokenText: string
+  tokenSource: UsageSource
+  tokenTitle: string
+  durationText: string
+  durationState: DurationState
+  durationTitle: string
+  expanded: boolean
+}
+
+export function taskRowOf(task: TaskDetailView, expanded: boolean): TaskRowView {
+  return {
+    id: task.id,
+    title: task.title,
+    badge: statusBadge(task.status),
+    roleName: task.roleName || task.roleId,
+    tokenText: tokenTextOf(task.usage),
+    tokenSource: task.usage.source,
+    tokenTitle: tokenTitleOf(task.usage),
+    durationText: durationTextOf(task.duration),
+    durationState: task.duration.state,
+    durationTitle: durationTitleOf(task.duration),
+    expanded,
+  }
+}
+
+export interface GateEvidenceView {
+  command: string
+  exitText: string
+  exitOk: boolean
+  tail: string[]
+  artifacts: string[]
+  atText: string
+}
+
+export interface TaskDetailPanelView {
+  acceptance: string
+  dependsText: string
+  scopeText: string
+  messageText: string
+  attemptsText?: string
+  waitReason?: string
+  usageReason?: string
+  durationReason?: string
+  evidence?: GateEvidenceView
+}
+
+/** 展开区的内容（键值行）。没有的东西给「未声明 / 无」，不留空行。 */
+export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
+  const panel: TaskDetailPanelView = {
+    acceptance: task.acceptance?.trim() || '（未声明验收命令）',
+    dependsText: task.dependsOn.length > 0 ? task.dependsOn.join(' / ') : '无前置任务',
+    scopeText: task.writeScopes && task.writeScopes.length > 0 ? task.writeScopes.join(' / ') : '未声明写域',
+    messageText: `${task.messageCount} 条直接消息`,
+  }
+  if (typeof task.attempts === 'number' && task.attempts > 1) panel.attemptsText = `第 ${task.attempts} 次尝试`
+  if (task.waitReason) panel.waitReason = task.waitReason
+  if (task.usage.source !== 'provider') panel.usageReason = task.usage.reason ?? '该任务没有可用用量事件'
+  if (task.duration.state === 'unavailable') panel.durationReason = '没有开始时间，算不出用时'
+  const evidence = task.evidence
+  if (evidence) {
+    panel.evidence = {
+      command: evidence.command,
+      exitText: evidence.exitCode === null ? '超时或被信号终止' : `退出码 ${evidence.exitCode}`,
+      exitOk: evidence.exitCode === 0,
+      tail: tailLines(evidence.tail, 6),
+      artifacts: evidence.artifacts ?? [],
+      atText: formatStamp(evidence.at),
+    }
+  }
+  return panel
+}
+
+/* ───────────── 流转图 ───────────── */
+
+/** 节点几何（DESIGN §2.4：行高 = 8+20+4+16+8 = 56，宽 148 按最长 ID + 状态文案核算）。 */
+export const FLOW_NODE_WIDTH = 148
+export const FLOW_NODE_HEIGHT = 56
+export const FLOW_COLUMN_STEP = 188
+export const FLOW_ROW_STEP = 72
+export const FLOW_PADDING = 12
+
+export interface FlowNodeCellView {
+  tokenText: string
+  durationText: string
+  /** 节点第二行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
+  text: string
+  title: string
+  label: string
+}
+
+export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
+  const full = tokenTextOf(node.usage)
+  const tokenText = full.length > 7 ? compactTokenTextOf(node.usage) : full
+  const durationText = durationTextOf(node.duration)
+  return {
+    tokenText,
+    durationText,
+    text: `${tokenText} · ${durationText}`,
+    title: `${node.id} ${node.title}\ntoken ${full} · 用时 ${durationText}`,
+    label: `任务 ${node.id} ${node.title}，${statusBadge(node.status).text}，token ${full}，用时 ${durationText}`,
+  }
+}
+
+export interface FlowLayoutNode {
+  node: FlowNodeView
+  cell: FlowNodeCellView
+  x: number
+  y: number
+}
+
+export interface FlowLayoutEdge {
+  key: string
+  d: string
+  upstreamDone: boolean
+}
+
+export interface FlowLayout {
+  width: number
+  height: number
+  nodes: FlowLayoutNode[]
+  edges: FlowLayoutEdge[]
+}
+
+/** 节点左上角坐标 → 三次贝塞尔（水平出入，避免折线穿过节点）。 */
+export function flowLayoutOf(flow: FlowView): FlowLayout {
+  const columns = Math.max(1, flow.columns)
+  const rows = Math.max(1, flow.rows)
+  const nodes: FlowLayoutNode[] = flow.nodes.map((node) => ({
+    node,
+    cell: flowNodeViewOf(node),
+    x: FLOW_PADDING + node.column * FLOW_COLUMN_STEP,
+    y: FLOW_PADDING + node.row * FLOW_ROW_STEP,
+  }))
+  const byId = new Map(nodes.map((entry) => [entry.node.id, entry]))
+  const edges: FlowLayoutEdge[] = []
+  for (const edge of flow.edges as readonly FlowEdgeView[]) {
+    const from = byId.get(edge.from)
+    const to = byId.get(edge.to)
+    if (!from || !to) continue
+    const x1 = from.x + FLOW_NODE_WIDTH
+    const y1 = from.y + FLOW_NODE_HEIGHT / 2
+    const x2 = to.x - 2
+    const y2 = to.y + FLOW_NODE_HEIGHT / 2
+    const bend = Math.max(24, Math.abs(x2 - x1) / 2)
+    edges.push({
+      key: `${edge.from}->${edge.to}`,
+      d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
+      upstreamDone: edge.upstreamDone,
+    })
+  }
+  return {
+    width: FLOW_PADDING * 2 + FLOW_NODE_WIDTH + (columns - 1) * FLOW_COLUMN_STEP,
+    height: FLOW_PADDING * 2 + FLOW_NODE_HEIGHT + (rows - 1) * FLOW_ROW_STEP,
+    nodes,
+    edges,
+  }
+}
+
+/* ───────────── 记忆行 ───────────── */
+
+export interface MemoryRowView {
+  key: string
+  name: string
+  title: string
+  tokenText: string
+  tokenTitle: string
+  timeText: string
+}
+
+/** 记忆行：token 一律带 `≈`（估算口径），并解释它是按字符数推的、不是 provider 上报值。 */
+export function memoryRowOf(item: MemoryItemView): MemoryRowView {
+  const estimate = usableNumber(item.tokenEstimate) ? Math.round(item.tokenEstimate) : 0
+  return {
+    key: `${item.track}/${item.name}`,
+    name: item.name,
+    title: item.title || item.name,
+    tokenText: `≈${groupDigits(String(estimate))} token`,
+    tokenTitle: '按字符数估算（≈ 字符数 / 2），不是 provider 上报值',
+    timeText: item.createdAt
+      ? `建立 ${formatStamp(item.createdAt)} · 修改 ${formatStamp(item.updatedAt)}`
+      : `修改 ${formatStamp(item.updatedAt)}`,
+  }
+}
+
+/* ───────────── 确认弹窗 ───────────── */
+
+export interface ConfirmVerb {
+  title: string
+  action: string
+  confirm: string
+  object: 'task' | 'run'
+}
+
+const CONFIRM_VERBS: Record<string, ConfirmVerb> = {
+  cancel: { title: '终止运行', action: '取消运行', confirm: '终止运行', object: 'run' },
+  cancelTask: { title: '中断成员', action: '中断成员', confirm: '中断成员', object: 'task' },
+  skipTask: { title: '跳过任务', action: '跳过任务', confirm: '跳过任务', object: 'task' },
+  updateAcceptance: { title: '重新门禁', action: '重跑门禁', confirm: '重新门禁', object: 'task' },
+  forceParallel: { title: '强制并行', action: '强制并行', confirm: '强制并行', object: 'task' },
+}
+
+const FALLBACK_VERB: ConfirmVerb = { title: '不可逆操作', action: '执行动作', confirm: '确认执行', object: 'task' }
+
+/** 弹窗标题/按钮文案：动词短语，绝不用「确定」（DESIGN §2.6）。 */
+export function confirmVerbOf(action: string): ConfirmVerb {
+  return CONFIRM_VERBS[action] ?? FALLBACK_VERB
+}
+
+export interface ConfirmDialogView {
+  title: string
+  actionLabel: string
+  objectText: string
+  summary: string
+  waitedText: string
+  confirmLabel: string
+  rejectLabel: string
+  irreversibleText: string
+}
+
+export function confirmDialogOf(pending: PendingConfirmationView): ConfirmDialogView {
+  const verb = confirmVerbOf(pending.action)
+  return {
+    title: `确认${verb.title}？`,
+    actionLabel: `${verb.action}（${pending.action}）`,
+    objectText: verb.object === 'task' ? `任务 ${pending.taskId ?? '（未知）'}` : `运行 ${pending.runId}`,
+    summary: pending.summary,
+    waitedText: pending.waitedText || '刚刚',
+    confirmLabel: verb.confirm,
+    rejectLabel: '取消',
+    irreversibleText: '此操作不可撤销',
+  }
+}
+
+/* ───────────── 装配：任务 / 流转 / 角色 / run 详情 ───────────── */
+
+export interface TaskDetailContext {
+  roleName: string
+  usage?: UsageCell
+  duration?: DurationCell
+  messageCount: number
+}
+
+/** 没有计时来源时的兜底：未开始的状态词 = 未开始，其余 = 不可得。 */
+function fallbackDurationOf(status: TaskStatus): DurationCell {
+  switch (status) {
+    case 'pending':
+    case 'blocked':
+    case 'ready':
+    case 'waiting':
+      return { state: 'not-started', text: NOT_STARTED_TEXT }
+    default:
+      return { state: 'unavailable', text: UNAVAILABLE_TEXT }
+  }
+}
+
+/**
+ * 逐任务详情装配。
+ *
+ * 第二参故意**不叫 `ctx`**：宿主的 `ctx` 是服务定位器，client 侧有守卫断言
+ * 「client 里出现的 `ctx.<x>` 必须是 inject 过的服务」（test/host-contract.test.ts），
+ * 这里只是普通的装配入参，用 `ctx` 会被静态守卫误判成服务访问。
+ */
+export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskDetailView {
+  const detail: TaskDetailView = {
+    id: task.id,
+    title: task.title,
+    roleId: task.roleId,
+    roleName: parts.roleName || task.roleId,
+    status: progressOf(task).status,
+    dependsOn: [...(task.dependsOn ?? [])],
+    acceptance: task.acceptance ?? '',
+    usage: usageCellOr(parts.usage, '该任务没有可用用量事件'),
+    duration: parts.duration ?? fallbackDurationOf(progressOf(task).status),
+    messageCount: parts.messageCount,
+  }
+  if (task.writeScopes) detail.writeScopes = [...task.writeScopes]
+  if (task.evidence) detail.evidence = task.evidence
+  if (typeof task.attempts === 'number') detail.attempts = task.attempts
+  const waitReason = waitReasonOf(task)
+  if (waitReason) detail.waitReason = waitReason
+  return detail
+}
+
+export interface FlowCells {
+  usage?: Record<string, UsageCell>
+  durations?: Record<string, DurationCell>
+}
+
+/**
+ * 依赖拓扑 → 流转图。列 = 最长依赖深度（0 起），行 = 同列内计划顺序。
+ *
+ * 环（坏计划 / 历史脏数据）不能让渲染死循环：遇到回边按深度 0 处理，图仍然画得出来。
+ */
+export function buildFlow(tasks: PlanTask[], cells: FlowCells = {}): FlowView {
+  const byId = new Map(tasks.map((task) => [task.id, task]))
+  const depth = new Map<string, number>()
+  const visiting = new Set<string>()
+  const depthOf = (id: string): number => {
+    const cached = depth.get(id)
+    if (cached !== undefined) return cached
+    if (visiting.has(id)) return 0
+    const task = byId.get(id)
+    if (!task) return 0
+    visiting.add(id)
+    let value = 0
+    for (const dep of task.dependsOn ?? []) {
+      if (!byId.has(dep)) continue
+      value = Math.max(value, depthOf(dep) + 1)
+    }
+    visiting.delete(id)
+    depth.set(id, value)
+    return value
+  }
+  const rowCursor = new Map<number, number>()
+  const nodes: FlowNodeView[] = []
+  for (const task of tasks) {
+    const column = depthOf(task.id)
+    const row = rowCursor.get(column) ?? 0
+    rowCursor.set(column, row + 1)
+    const node: FlowNodeView = {
+      id: task.id,
+      title: task.title,
+      status: progressOf(task).status,
+      column,
+      row,
+      usage: usageCellOr(cells.usage?.[task.id], '该任务没有可用用量事件'),
+      duration: cells.durations?.[task.id] ?? fallbackDurationOf(progressOf(task).status),
+    }
+    nodes.push(node)
+  }
+  const edges: FlowEdgeView[] = []
+  for (const task of tasks) {
+    for (const dep of task.dependsOn ?? []) {
+      const upstream = byId.get(dep)
+      if (!upstream) continue
+      edges.push({ from: dep, to: task.id, upstreamDone: progressOf(upstream).status === 'done' })
+    }
+  }
+  const columns = nodes.reduce((max, node) => Math.max(max, node.column + 1), 0)
+  const rows = nodes.reduce((max, node) => Math.max(max, node.row + 1), 0)
+  return { nodes, edges, columns, rows }
+}
+
+/**
+ * 用量合计：全部任务都有来源才敢给一个数。
+ *
+ * 部分缺失时**不**把已知项加起来 —— 那会得出一个比真实值小的数字，比「不可得」更误导。
+ */
+function sumUsage(cells: readonly UsageCell[], missingReason: string): UsageCell {
+  let total = 0
+  let available = 0
+  for (const cell of cells) {
+    if (cell.source === 'provider' && cell.tokens) {
+      total += cell.tokens.total
+      available += 1
+    }
+  }
+  if (available === 0) return { source: 'unavailable', reason: missingReason }
+  if (available < cells.length) return { source: 'unavailable', reason: '部分任务没有可用用量事件' }
+  return { source: 'provider', tokens: { total } }
+}
+
+/** 逐角色聚合：只列真正有任务的角色（没任务的角色不占位置）。 */
+export function roleUsageOf(tasks: readonly TaskDetailView[], roles: readonly Role[]): RoleUsageView[] {
+  const order: string[] = []
+  const groups = new Map<string, TaskDetailView[]>()
+  for (const task of tasks) {
+    const list = groups.get(task.roleId)
+    if (list) list.push(task)
+    else {
+      groups.set(task.roleId, [task])
+      order.push(task.roleId)
+    }
+  }
+  return order.map((roleId) => {
+    const list = groups.get(roleId) ?? []
+    const known = roles.find((role) => role.id === roleId)
+    return {
+      roleId,
+      name: known?.name ?? list[0]?.roleName ?? roleId,
+      tasks: list.length,
+      usage: sumUsage(
+        list.map((task) => task.usage),
+        '该角色没有可用用量事件',
+      ),
+    }
+  })
+}
+
+/** 左右栏（snapshot / library）共用的装配输入。 */
+export interface RunDetailSource {
+  snapshot: PanelSnapshot | null
+  runDetail?: RunDetailView
+  library?: LibraryView | null
+}
+
+/**
+ * **唯一**的 run 详情装配入口（AC-18）：右栏传 snapshot，左栏传 library / 历史详情。
+ *
+ * 三源优先级：显式 `runDetail` → `library.detail` → `snapshot`。带 `runId` 时只有明确
+ * 指向该 run 的来源才可用，否则返回 `null`（渲染空态），绝不把 A 的详情贴到 B 的标题下。
+ */
+export function buildRunDetail(source: RunDetailSource, runId?: string): RunDetailView | null {
+  const direct = source.runDetail ?? source.library?.detail
+  if (direct && (runId === undefined || direct.runId === runId)) return direct
+
+  const snapshot = source.snapshot
+  const snapshotRunId = snapshot?.runId
+  if (!snapshot || typeof snapshotRunId !== 'string' || snapshotRunId === '') return null
+  if (runId !== undefined && snapshotRunId !== runId) return null
+
+  const tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : []
+  const roles = Array.isArray(snapshot.roles) ? snapshot.roles : []
+  const messages = Array.isArray(snapshot.messages) ? snapshot.messages : []
+  const roleNameOf = (roleId: string): string => roles.find((role) => role.id === roleId)?.name ?? roleId
+  const taskViews = tasks.map((task) =>
+    buildTaskDetail(task, {
+      roleName: roleNameOf(task.roleId),
+      usage: snapshot.taskUsage?.[task.id],
+      duration: snapshot.taskDurations?.[task.id],
+      messageCount: messages.filter((message) => message.taskId === task.id).length,
+    }),
+  )
+  const duration: DurationCell = snapshot.runDuration ?? { state: 'unavailable', text: UNAVAILABLE_TEXT }
+  const detail: RunDetailView = {
+    runId: snapshotRunId,
+    // 快照不带会话 id（会话是请求维度而非 run 维度）；T7 在需要时由 api 层补齐。
+    sessionId: '',
+    planStatus: snapshot.planStatus ?? 'draft',
+    usage: snapshot.runUsage ?? sumUsage(taskViews.map((task) => task.usage), '该 run 没有可用用量事件'),
+    duration,
+    roles: roleUsageOf(taskViews, roles),
+    tasks: taskViews,
+    flow: buildFlow(tasks, { usage: snapshot.taskUsage, durations: snapshot.taskDurations }),
+  }
+  if (snapshot.project) detail.project = snapshot.project
+  if (snapshot.plannedAt) detail.plannedAt = snapshot.plannedAt
+  if (duration.endAt) detail.finishedAt = duration.endAt
+  if (snapshot.pendingConfirmation) detail.pendingConfirmation = snapshot.pendingConfirmation
+  return detail
 }

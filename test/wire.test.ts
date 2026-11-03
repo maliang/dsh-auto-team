@@ -58,6 +58,8 @@ interface Harness {
   sections: Array<{ name: string; order: number; text: () => string }>
   routes: PanelRoute[]
   listeners: Array<(payload: unknown) => void>
+  /** r13：根作用域 `session/event` 订阅（用量记录的唯一事件源），由用例手动投递。 */
+  sessionEvents: Array<(payload: unknown) => void>
   disposers: Array<() => void | Promise<void>>
   warnings: string[]
   members: Array<{ id: string; name: string; status: string }>
@@ -72,6 +74,7 @@ function makeHarness(): Harness {
   const sections: Harness['sections'] = []
   const routes: PanelRoute[] = []
   const listeners: Harness['listeners'] = []
+  const sessionEvents: Harness['sessionEvents'] = []
   const disposers: Harness['disposers'] = []
   const warnings: string[] = []
   const members: Harness['members'] = []
@@ -119,11 +122,13 @@ function makeHarness(): Harness {
     // 否则 `listeners[0]` 会指错人，把推进信号当路由事件喂进去。
     on: (event: string, listener: (payload: unknown) => void) => {
       if (event === 'agent/created') listeners.push(listener)
+      // r13 的用量事件源单列一处：混进 `listeners` 会让 `listeners[0]` 指错人（见上一条注释）。
+      if (event === 'session/event') sessionEvents.push(listener)
     },
     logger: { warn: (text: string) => void warnings.push(text), info: () => {} },
   }
 
-  return { ctx, tools, sections, routes, listeners, disposers, warnings, members, spawned, sent, memberListCalls: () => listCalls }
+  return { ctx, tools, sections, routes, listeners, sessionEvents, disposers, warnings, members, spawned, sent, memberListCalls: () => listCalls }
 }
 
 /** 面板接口的真实调用方式（宿主给的是单条 prefix 路由，method + path 由适配层分发）。 */
@@ -234,15 +239,16 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(h.routes.length, 1, '宿主 WebRoute 没有 method 字段，四条能力合并成一条 prefix 路由')
   assert.equal(h.routes[0]?.path, '/api/auto-team')
   assert.equal(h.routes[0]?.kind, 'prefix')
-  // 五份清理：watcher 的 setInterval、成员推进事件订阅（T2 的 onMemberProgress）、
+  // 六份清理：watcher 的 setInterval、成员推进事件订阅（T2 的 onMemberProgress）、
   // noWait 守卫（T5 的 tools/pre-execute）、Trigger 事件订阅（T5 的事件流）、
-  // 队长留痕订阅（r11 F7 的 tools/result → deviation recorder）都必须在卸载时停掉。
+  // 队长留痕订阅（r11 F7 的 tools/result → deviation recorder）、
+  // 用量事件订阅（r13 的根作用域 session/event）都必须在卸载时停掉。
   // 队长的模型撤销（registerEffect at index.ts:187）走不到这里：测试 harness 不提供
   // 主 session 作用域，装配时走 capability='unsupported' 分支，不注册 disposer。
   assert.equal(
     h.disposers.length,
-    5,
-    `watcher / 进度订阅 / noWait 守卫 / Trigger 订阅 / 留痕订阅 都必须挂 ctx.effect 清理，实际 ${h.disposers.length}`,
+    6,
+    `watcher / 进度订阅 / noWait 守卫 / Trigger 订阅 / 留痕订阅 / 用量订阅 都必须挂 ctx.effect 清理，实际 ${h.disposers.length}`,
   )
 
   // 三条面板接口都在（第 4 条未知路径必须是 404，证明分发真的在路由表里查）
@@ -287,23 +293,25 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(planned.ok, true, `plan 必须成功：${JSON.stringify(planned)}`)
   const runId = planned.runId as string
   assert.equal(typeof runId, 'string')
-  assert.equal(h.spawned.length, 0, 'plan 阶段不得创建任何成员（反面目标 1）')
 
   const store = new RunsStore(join(home, '.dsh/auto-team/runs'))
+  const statusOf = (taskId: string): string =>
+    store.load(runId)?.plan.tasks.find((task) => task.id === taskId)?.status ?? ''
   const plannedState = store.load(runId) as RunState | null
   assert.ok(plannedState)
-  assert.equal(plannedState.bindings.length, 0)
   assert.equal(typeof plannedState.plannedAt, 'number')
-  assert.deepEqual(
-    plannedState.plan.tasks.map((task) => task.status),
-    ['pending', 'pending'],
-    '计划条目落地时任务都还没开始',
-  )
 
-  // ---- ⑤ dispatch（面板路径）：只派发依赖已满足的 t1，名字由任务决定（确定性，AC-17）
+  // ---- ④½ 自动派发（r13 AC-8 取代 r12 的「plan 阶段零成员」）：计划落盘即派发，用户不再点 dispatch。
+  //      判据是落盘真值（t1 running）而不是只看 spawn 次数：只起人不写状态同样是坏的。
+  const autoDispatched = await waitFor(() => statusOf('t1') === 'running' && h.spawned.length === 1, 4000)
+  assert.ok(autoDispatched, '计划落盘后必须自动派发无依赖的 t1（AC-8：不经过 bridge.act 的 dispatch 动作）')
+  const firstId = h.spawned[0]?.id ?? ''
+
+  // ---- ⑤ 手动 dispatch（面板路径）必须幂等：t1 已在跑，再点一次不得多起成员。
+  //      两条路径共用同一个 dispatch 闭包，行为不可能漂移（AC-8 的单点要求）。
   const dispatched = await act(h.routes, { type: 'dispatch', runId })
   assert.ok(dispatched.snapshot, 'dispatch 必须返回快照')
-  assert.equal(h.spawned.length, 1, '只有无依赖的 t1 可以被派发')
+  assert.equal(h.spawned.length, 1, '同一执行体重复派发不得重复建成员（幂等）')
   // 名字形态是 `<roleId>-<taskId>-<身份哈希>`（R2-1）：不写死具体哈希，改为从本次 spawn 派生，
   // 再与落盘 binding 交叉核对——这样探针/断言不会因为哈希值变化而假红，也不会因为「派生自同一处」而假绿。
   const t1Name = h.spawned[0]?.name ?? ''
@@ -330,16 +338,52 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
   assert.equal(doneT1?.status, 'done', '门禁通过后任务才算完成')
   assert.equal(doneT1?.evidence?.exitCode, 0, '门禁证据必须记录退出码')
 
-  // ---- ⑦ 下游 ready：t1 过门禁后，再 dispatch 才应该起 t2 的成员
+  // ---- ⑦ 下游 ready（r13 AC-8 的「任务终态」触发点）：t1 过门禁 → 自动/手动派发路径都会起 t2。
+  //      这里先等落盘真值，再用一次手动 dispatch 证明幂等（不得因为等待而多起一个）。
+  const t2Spawned = await waitFor(() => statusOf('t2') === 'running' && h.spawned.length === 2, 4000)
+  assert.ok(t2Spawned, 't1 过门禁后，下游 t2 必须被自动派发（receipt 之后自动补位）')
   const redispatched = await act(h.routes, { type: 'dispatch', runId })
   assert.ok(redispatched.snapshot)
-  assert.equal(h.spawned.length, 2, '下游任务在依赖 done 之后必须可以派发')
+  assert.equal(h.spawned.length, 2, '下游任务在依赖 done 之后可以派发，且重复调用幂等')
   const t2Name = h.spawned[1]?.name ?? ''
   assert.match(t2Name, /^dev-t2-[0-9a-z]{6}$/)
   assert.notEqual(t2Name, t1Name, '同角色的两个任务必须拿到不同名字（R2-1 的缺陷不得回归）')
   const afterSecond = store.load(runId) as RunState
   assert.equal(afterSecond.bindings.find((item) => item.taskId === 't2')?.name, t2Name)
   assert.equal(afterSecond.plan.tasks.find((task) => task.id === 't2')?.status, 'running')
+
+  // ---- ⑦½ 真实用量（r13 AC-3）：根作用域 session/event → run.usage → 快照 taskUsage/runUsage
+  assert.equal(h.sessionEvents.length, 1, '必须订阅 session/event 才能记录真实 token（AC-3）')
+  const usageEvent = {
+    type: 'assistant/message',
+    sessionId: h.spawned[0]?.id ?? '',
+    id: 'evt-wire-1',
+    usage: { input: 10, output: 5 },
+  }
+  h.sessionEvents[0]?.(usageEvent)
+  // 同一条事件重复投递（宿主重放/重连）不得记两次：去重表由装配层持有。
+  h.sessionEvents[0]?.(usageEvent)
+  const usageReply = await panel(h.routes, 'GET', `/api/auto-team/snapshot?sessionId=${SESSION}`)
+  assert.equal(usageReply.status, 200)
+  const usageSnap = usageReply.body.data as Record<string, unknown>
+  const taskUsage = usageSnap.taskUsage as Record<string, { source: string; tokens?: { total: number } }>
+  assert.equal(taskUsage.t1?.source, 'provider', '拿得到真实用量时必须标 provider，而不是「不可得」')
+  assert.equal(taskUsage.t1?.tokens?.total, 15, '重复投递必须去重（10+5 只记一次）')
+  const runUsage = usageSnap.runUsage as { source: string; tokens?: { total: number } }
+  assert.equal(runUsage.source, 'provider')
+
+  // ---- ⑦¾ 左栏项目库（r13 AC-15/AC-22）：历史详情走同一条 /library，不新增第 5 条路由
+  const libraryReply = await panel(h.routes, 'GET', `/api/auto-team/library?sessionId=${SESSION}`)
+  assert.equal(libraryReply.status, 200, 'GET /library 必须存在（左栏项目列表 + 历史详情）')
+  const library = libraryReply.body.data as Record<string, unknown>
+  assert.ok(Array.isArray(library.projects), '项目列表必须投影（左栏渲染的唯一数据源）')
+  const detailReply = await panel(h.routes, 'GET', `/api/auto-team/library?sessionId=${SESSION}&runId=${runId}`)
+  assert.equal(detailReply.status, 200)
+  assert.notEqual(
+    (detailReply.body.data as Record<string, unknown>).detail,
+    undefined,
+    '带 runId 时必须返回 RunDetailView（历史详情，AC-22）',
+  )
 
   // ---- ⑧ watcher 真的在对账：成员全死掉后，运行中的任务必须被标记为 interrupted
   // （AC-18 的反面目标「面板显示运行中而成员已死」只能由 host 侧轮询发现）。
@@ -348,8 +392,6 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
   // T9 修掉了 `src/host/store.ts` 里 `TASK_STATUSES` 漏 `'interrupted'` 的缺陷（它会把 watcher
   // 刚写下的 interrupted 归回 'pending'，导致面板显示「待办」、resume 静默跳过，AC-17/AC-18 双双失效）。
   // 这里改成按读回值断言：把该白名单改回旧版，本条必红 —— 判据是可分辨的。
-  const statusOf = (taskId: string): string =>
-    store.load(runId)?.plan.tasks.find((task) => task.id === taskId)?.status ?? ''
   h.members.splice(0)
   const listCallsBefore = h.memberListCalls()
   const reconciled = await waitFor(() => statusOf('t2') === 'interrupted', 4000)
@@ -358,7 +400,6 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
 
   // ---- ⑨ agent/created 的实际模型与声明不一致 → drift 审计（AC-22，绝不静默回退）
   assert.equal(h.listeners.length, 1, '必须订阅 agent/created 才能审计实际下发模型')
-  const firstId = h.spawned[0]?.id ?? ''
   h.listeners[0]?.({ member: { id: firstId, name: t1Name }, model: { provider: 'other', model: 'other-model' } })
   const afterAudit = store.load(runId) as RunState
   const audit = afterAudit.routeAudits.find((item) => item.taskId === 't1')

@@ -731,3 +731,211 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
   // 暂停前后完成数一致 —— 「已完成的不要重跑」在描述层可见
   assert.equal(paused.input.done, resumed.input.done)
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * r13 的 8 个纯展示组件（`src/client/views/`）与样式单串
+ *
+ * 为什么是源码断言而不是渲染断言：本仓没有 react-dom，`node --test` 也不转 JSX，
+ * 组件物理上跑不起来。能在这里守住的是三条**契约级事实**：
+ *  1) 钩子清单（`data-tab` / `data-cell` / `data-flow-node` / `data-confirm-dialog` …）逐字存在，
+ *     因为左栏、右栏、QA 探针都靠这些钩子认元素；
+ *  2) 组件只做展示 —— token/用时的文本必须来自 viewmodel，组件内不许出现第二套格式化；
+ *  3) 安全默认值 —— 确认弹窗的初始焦点在「取消」，Esc 取消，不用原生 <dialog>（无法降级）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+import { readFileSync } from 'node:fs'
+import { AUTO_TEAM_CSS } from '../src/client/styles.ts'
+
+const VIEWS_DIR = new URL('../src/client/views/', import.meta.url)
+
+function viewSource(name: string): string {
+  return readFileSync(new URL(`${name}.tsx`, VIEWS_DIR), 'utf8')
+}
+
+/** 去掉注释的源码：断言「实现了某钩子」时不能被注释里的同名文字骗过。 */
+function viewCode(name: string): string {
+  return viewSource(name)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+}
+
+test('8 个视图组件全部存在，命名导出与设计契约一致，且只依赖 react 与本地模块', () => {
+  const expected: Record<string, string> = {
+    RunHeader: 'RunHeader',
+    RoleStrip: 'RoleStrip',
+    TaskTable: 'TaskTable',
+    FlowGraph: 'FlowGraph',
+    MemoryList: 'MemoryList',
+    ConfirmDialog: 'ConfirmDialog',
+    DetailPane: 'DetailPane',
+    EmptyState: 'EmptyState',
+  }
+  for (const [file, exportName] of Object.entries(expected)) {
+    const code = viewCode(file)
+    assert.match(code, new RegExp(`export function ${exportName}\\(`), `${file} 必须导出 ${exportName}`)
+    assert.match(code, /import \* as React from 'react'/, `${file} 必须用 classic JSX（宿主只解析 react）`)
+    assert.equal(/jsx-runtime|react-dom/.test(code), false, `${file} 不许依赖 jsx-runtime / react-dom`)
+    // 展示组件不取数：没有 fetch，也没有宿主 import（host/client 零直接 import 铁律）
+    assert.equal(/\bfetch\(/.test(code), false, `${file} 不许自己取数`)
+    assert.equal(/from '\.\.\/\.\.\/host\//.test(code), false, `${file} 不许 import 宿主模块`)
+  }
+})
+
+test('RunHeader：run 头钩子、暂停按钮、在途派发三态、降级行', () => {
+  const code = viewCode('RunHeader')
+  assert.match(code, /data-region="run-head"/)
+  assert.match(code, /data-run-id/)
+  assert.match(code, /data-plan-status/)
+  assert.match(code, /data-auto-team-pause/)
+  assert.match(code, /aria-pressed=/)
+  assert.match(code, /data-inflight-dispatch=\{/)
+  assert.match(code, /data-inflight-dot/)
+  assert.match(code, /data-run-usage/)
+  assert.match(code, /data-usage-source=\{/)
+  assert.match(code, /data-run-window/)
+  assert.match(code, /data-run-duration/)
+  assert.match(code, /data-duration-state=\{/)
+  assert.match(code, /data-run-downgrade/)
+  // 文本全部来自 viewmodel（runHeadOf），组件内不拼 token/用时
+  assert.match(code, /runHeadOf\(/)
+  assert.equal(/toLocaleString|\\B\(\?=\(\\d\{3\}\)/.test(code), false, '组件内不许出现第二套千分位实现')
+})
+
+test('RoleStrip：角色 chip 带任务数与 token 来源标记', () => {
+  const code = viewCode('RoleStrip')
+  assert.match(code, /data-region="task-roles"/)
+  assert.match(code, /data-role-chip/)
+  assert.match(code, /data-role-id=/)
+  assert.match(code, /data-role-name/)
+  assert.match(code, /data-role-tasks/)
+  assert.match(code, /data-role-token/)
+  assert.match(code, /data-usage-source=/)
+  assert.match(code, /roleChipsOf\(/)
+})
+
+test('TaskTable：两行式任务行、token/用时 data-cell、展开详情与门禁证据', () => {
+  const code = viewCode('TaskTable')
+  assert.match(code, /data-region="task-list"/)
+  assert.match(code, /data-task-head/)
+  assert.match(code, /data-head-cell="token"/)
+  assert.match(code, /data-head-cell="duration"/)
+  assert.match(code, /data-task-rows/)
+  assert.match(code, /data-task-row/)
+  assert.match(code, /data-task-line="title"/)
+  assert.match(code, /data-task-line="meta"/)
+  assert.match(code, /data-cell="token"/)
+  assert.match(code, /data-cell="duration"/)
+  assert.match(code, /data-usage-source=/)
+  assert.match(code, /data-duration-state=/)
+  assert.match(code, /aria-expanded=/)
+  assert.match(code, /data-task-detail/)
+  assert.match(code, /data-gate-evidence/)
+  assert.match(code, /data-gate-tail/)
+  // 排序/筛选/格式化都归 viewmodel：组件只消费 TaskRowView（AC-7 的单点）
+  assert.match(code, /taskRowOf\(/)
+  assert.equal(code.includes('toLocaleString'), false, 'token 千分位只能在 viewmodel.tokenTextOf')
+})
+
+test('FlowGraph：自绘 SVG 边 + 绝对定位节点，节点钩子带任务 id', () => {
+  const code = viewCode('FlowGraph')
+  assert.match(code, /data-region="task-flow"/)
+  assert.match(code, /data-flow-canvas/)
+  assert.match(code, /data-flow-inner/)
+  assert.match(code, /data-flow-edges/)
+  assert.match(code, /data-flow-edge/)
+  assert.match(code, /data-upstream-done=/)
+  assert.match(code, /data-flow-node=/)
+  assert.match(code, /data-flow-column=/)
+  assert.match(code, /data-flow-row=/)
+  assert.match(code, /data-flow-line="title"/)
+  assert.match(code, /data-flow-line="meta"/)
+  assert.match(code, /data-flow-legend/)
+  assert.match(code, /flowLayoutOf\(/)
+  // 不引图形库（零运行时依赖）
+  assert.equal(/from '(d3|mermaid|reactflow|cytoscape)/.test(code), false)
+})
+
+test('MemoryList：条目钩子 = track/name，正文逐字，错误态不吞', () => {
+  const code = viewCode('MemoryList')
+  assert.match(code, /data-memory-list/)
+  assert.match(code, /data-memory-row/)
+  assert.match(code, /data-auto-team-memory-item=/)
+  assert.match(code, /data-memory-title/)
+  assert.match(code, /data-memory-token/)
+  assert.match(code, /data-memory-body/)
+  assert.match(code, /data-error/)
+  assert.match(code, /data-memory-loading/)
+  assert.match(code, /memoryRowOf\(/)
+  // token 单元格刻意不用 data-cell（那是任务行/流转图的计数口径）
+  assert.equal(code.includes('data-cell='), false)
+})
+
+test('ConfirmDialog：默认焦点在取消、Esc 取消、非原生 dialog、确认按钮是动词短语', () => {
+  const code = viewCode('ConfirmDialog')
+  assert.match(code, /data-confirm-overlay/)
+  assert.match(code, /data-confirm-dialog/)
+  assert.match(code, /role="dialog"/)
+  assert.match(code, /aria-modal="true"/)
+  assert.match(code, /aria-labelledby=/)
+  assert.match(code, /aria-describedby=/)
+  assert.match(code, /data-dialog-mode=/)
+  assert.match(code, /data-dialog-title/)
+  assert.match(code, /data-dialog-action="reject"/)
+  assert.match(code, /data-dialog-action="confirm"/)
+  assert.match(code, /data-dialog-waited/)
+  // 安全默认值：初始焦点必须在 reject（按钮也先于 confirm 声明，Tab 顺序与视觉顺序一致）
+  assert.match(code, /rejectRef\.current\?\.focus\(\)/)
+  assert.equal(
+    code.indexOf('data-dialog-action="reject"') < code.indexOf('data-dialog-action="confirm"'),
+    true,
+    '「取消」必须声明在确认按钮之前',
+  )
+  assert.match(code, /'Escape'/)
+  // 原生 <dialog> 在宿主面板里无法降级（transform 祖先会让 fixed 失效），必须自绘
+  assert.equal(/<dialog/.test(code), false, '不用原生 <dialog>')
+  assert.match(code, /confirmDialogOf\(/)
+})
+
+test('DetailPane / EmptyState：详情面包屑与三段式空态', () => {
+  const detail = viewCode('DetailPane')
+  assert.match(detail, /data-region="detail-pane"/)
+  assert.match(detail, /data-detail-bar/)
+  assert.match(detail, /data-detail-back/)
+  assert.match(detail, /data-detail-crumbs/)
+  assert.match(detail, /data-crumb=/)
+
+  const empty = viewCode('EmptyState')
+  assert.match(empty, /data-empty-title/)
+  assert.match(empty, /data-empty-hint/)
+  assert.match(empty, /role="status"/)
+})
+
+test('样式：r13 新块只用宿主 token，关键尺寸来自设计稿', () => {
+  const marker = AUTO_TEAM_CSS.indexOf('r13：三页面板')
+  assert.ok(marker > 0, 'r13 样式块必须存在于 AUTO_TEAM_CSS 单串内')
+  const block = AUTO_TEAM_CSS.slice(marker)
+  // 1) 字号必须是 font 简写（`font-size: var(--dsw-font-*)` 是无效声明，AGENTS §4 铁律）
+  assert.equal(/font-size:\s*var\(--dsw-font/.test(block), false, '不许写 font-size: var(--dsw-font-*)')
+  // 2) 新块不写 16 进制色值（旧块的历史兜底不复制过来）
+  assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(block), false, 'r13 新块不许出现 #hex 色值')
+  // 3) 关键尺寸：任务行 56、表头 24、run 头 64、节点 148×56、列距 188、行距 72、画布 300、弹窗 402、左列 220
+  for (const snippet of [
+    'min-height: 56px',
+    'height: 24px',
+    'min-height: 64px',
+    'width: 148px',
+    'height: 56px',
+    'height: 300px',
+    'width: 402px',
+    'flex: 0 0 220px',
+    'grid-template-columns: minmax(0, 1fr) 76px 84px',
+  ]) {
+    assert.equal(block.includes(snippet), true, `r13 样式必须包含 \`${snippet}\``)
+  }
+  // 4) 折叠与动效兜底都在（主区宽度 ≠ 视口宽度，容器查询优先）
+  assert.equal(block.includes('@container (max-width: 719px)'), true)
+  assert.equal(block.includes('@media (prefers-reduced-motion: reduce)'), true)
+  // 5) 右栏与左栏共用同一批规则（否则同一任务行两处会长得不一样）
+  const shared = block.split('[data-auto-team-panel]').length - 1
+  assert.equal(shared > 3, true, '样式必须同时覆盖左栏与右栏作用域')
+})
