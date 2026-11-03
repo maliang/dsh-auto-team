@@ -2961,6 +2961,53 @@ export const AUTO_TEAM_CSS = `
   padding: 12px 14px;
 }
 
+/* ── 左栏栏目入口：只占一行，不得参与任何两栏布局（2026-11-03 布局修正） ──────
+ * 事故：栏目里曾直接渲染整块项目库（项目列 + 详情列），把宿主侧栏撑变形。
+ * 现在它只是一个 28px 高的行内按钮，宽度受 min-width:0 约束、文本只许省略。 */
+[data-auto-team-panellist] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--dsw-radius-xs, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px);
+  text-align: start;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+}
+[data-auto-team-panellist]:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary, inherit);
+}
+[data-auto-team-panellist]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+[data-auto-team-panellist] [data-panellist-label] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-auto-team-panellist] [data-panellist-dot] {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  background: var(--dsw-alias-state-business-primary);
+}
+
 /* ── 左栏项目库：220px 项目列 + 详情列（容器查询折叠，@media 兜底） ───────── */
 :is([data-auto-team-library], [data-auto-team-panellist]),
 [data-auto-team-library] [data-library-shell],

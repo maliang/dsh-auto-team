@@ -367,12 +367,29 @@ function ProjectPane(props: {
   )
 }
 
-/** `sidebar.panellist` 槽位的组件（左栏栏目）。 */
+/**
+ * `sidebar.panellist` 槽位的组件（左栏栏目）。
+ *
+ * **只渲染一行入口**（2026-11-03 修正）：早先这里直接挂了整个 `LibraryContent`（项目列表 +
+ * 右列两栏布局），塞进窄窄的侧栏列会把整条侧栏撑变形。栏目只负责「有个入口、点开去主区看」，
+ * 真正的两栏项目库在 `main` 槽位（`LibraryPage`）里渲染。
+ * 这里也**不**装配项目库（不调 `loadLibrary`）：入口不需要数据，装配成本留给打开后的整页。
+ */
 export function PanellistEntry(props: LibraryPageProps): React.ReactElement {
+  const openLibrary = typeof props.openLibrary === 'function' ? (props.openLibrary as () => boolean) : undefined
   return (
-    <div data-auto-team-panellist>
-      <LibraryContent {...props} root="panellist" />
-    </div>
+    <button
+      type="button"
+      data-auto-team-panellist
+      data-panellist-entry
+      title="打开自动团队项目库（项目 / 任务 / 记忆）"
+      onClick={() => {
+        if (openLibrary !== undefined) openLibrary()
+      }}
+    >
+      <span data-panellist-dot aria-hidden="true" />
+      <span data-panellist-label>自动团队</span>
+    </button>
   )
 }
 
