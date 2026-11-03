@@ -301,9 +301,9 @@ test('D1：角色声明的 model/effort 进 spawn 请求，且 agent/created 内
   const result = await spawnMember(ctx as never, { plan, task, role, name: 'dev-t1', prompt: '去做 t1' } as never)
   assert.equal(result.ok, true)
 
-  // ① 请求里带上了声明模型（宿主 rc.2 会忽略，但这是「队长要求什么」的可核证据）
-  assert.equal(requests[0]?.provider, 'deepseek')
-  assert.equal(requests[0]?.model, 'deepseek-reasoner')
+  // ① 请求里带上了声明模型（`provider` 是 subagent 名，LLM 路由在 agentOptions 里）
+  assert.equal(requests[0]?.provider, 'spawn')
+  assert.deepEqual(requests[0]?.agentOptions, { provider: 'deepseek', model: 'deepseek-reasoner' })
 
   // ② 真正的生效点：agent/created 里装了路由，事件回报 installed=声明值（不是宿主自报值）
   assert.equal(seen.length, 1)
@@ -354,7 +354,12 @@ test('spawnMember：返回 memberId + 我们声明的名字（恢复靠名字重
 
   assert.deepEqual(result, { ok: true, memberId: 'm-1', name: 'dev-t1' })
   assert.equal(requests[0]?.name, 'dev-t1')
-  assert.equal(requests[0]?.provider, 'session-default', '未声明模型时 provider 回落会话默认')
+  assert.equal(
+    requests[0]?.provider,
+    'spawn',
+    'provider 是 subagent provider 名（不是 LLM provider）——填会话默认模型名会让宿主报 no subagent provider registered',
+  )
+  assert.deepEqual(requests[0]?.agentOptions, { provider: 'session-default' }, '未声明角色模型时会话默认模型经 agentOptions 下发')
   assert.deepEqual(requests[0]?.prompt, [{ type: 'text', text: '去做 t1' }])
 })
 
@@ -812,11 +817,11 @@ test('registerHttpRoutes：ctx.get 拿不到 webServer 时不注册路由并如�
   assert.equal(registered, 1, '有 webServer 时必须注册一条 prefix 路由')
 })
 
-test('createSpawnPorts：缺 agentDefaultModel 时不带模型覆盖，并给出明确报错（不静默兜底）', async () => {
+test('createSpawnPorts：provider 必须是 subagent provider 名，LLM 模型走 agentOptions（r12 真机事故）', async () => {
   const requests: Array<Record<string, unknown>> = []
   const ctx = {
     agents: { currentInitiator: () => ({ id: 'captain' }) },
-    get: () => undefined, // 宿主没有默认模型选择
+    get: () => undefined, // 宿主没有默认模型选择，也没注册 subagents 表
     logger: { warn: () => {} },
     agentTeams: {
       spawnTeammate: async (_caller: unknown, request: unknown) => {
@@ -829,18 +834,19 @@ test('createSpawnPorts：缺 agentDefaultModel 时不带模型覆盖，并给出
   const ports = createSpawnPorts(ctx)
   const result = await ports.spawn({ prompt: '去做 t1', name: 'dev-t1', sessionId: 's1', taskId: 't1' })
 
-  assert.equal(result.ok, false, '既没声明模型也没有宿主默认模型时必须失败，不能凭空猜一个 provider')
-  assert.match(
-    (result as { error?: string }).error ?? '',
-    /无法确定成员的 provider/,
-    '报错必须说清缺的是什么（角色未声明模型 + 宿主无默认模型）',
+  assert.equal(result.ok, true, '定不出 LLM 模型也必须照常派发：模型交给宿主默认，不该因此整个失败')
+  assert.equal(requests.length, 1)
+  assert.equal(
+    requests[0]?.provider,
+    'spawn',
+    'provider 是 subagent provider 名（宿主注册表里的 spawn），把 LLM provider 塞进来会让宿主报 no subagent provider registered',
   )
-  assert.equal(requests.length, 0, '既然定不出 provider，就不该发出 spawn 请求')
+  assert.equal(requests[0]?.agentOptions, undefined, '既无角色模型也无会话默认时不该凭空造 agentOptions')
 
-  // 反证：补上默认模型后同一条路径必须成功，且请求里带上该 provider（证明降级不是永久坏）。
-  const withDefault = {
+  // 角色声明了模型：provider 仍必须是 spawn，LLM 路由走 agentOptions（宿主官方通道）。
+  const withRoute = {
     agents: { currentInitiator: () => ({ id: 'captain' }) },
-    get: (name: string) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'host-default' }) } : undefined),
+    get: () => undefined,
     logger: { warn: () => {} },
     agentTeams: {
       spawnTeammate: async (_caller: unknown, request: unknown) => {
@@ -849,10 +855,66 @@ test('createSpawnPorts：缺 agentDefaultModel 时不带模型覆盖，并给出
       },
     },
   } as unknown as HostContext
+  await createSpawnPorts(withRoute).spawn({
+    prompt: '去做 t2',
+    name: 'dev-t2',
+    sessionId: 's1',
+    taskId: 't2',
+    route: { provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' },
+  })
+  assert.equal(requests[1]?.provider, 'spawn', '角色声明的 LLM provider 绝不能填进 provider 字段')
+  assert.deepEqual(
+    requests[1]?.agentOptions,
+    { provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' },
+    '逐角色模型经 agentOptions 下发（SubagentStartRequest 的官方字段）',
+  )
 
-  const ok = await createSpawnPorts(withDefault).spawn({ prompt: '去做 t2', name: 'dev-t2', sessionId: 's1', taskId: 't2' })
+  // 只有会话默认模型：provider 仍是 spawn，agentOptions 只带 provider。
+  const withDefault = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'host-default' }) } : undefined),
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async (_caller: unknown, request: unknown) => {
+        requests.push(request as Record<string, unknown>)
+        return { member: { id: 'm-3', name: 'dev-t3' } }
+      },
+    },
+  } as unknown as HostContext
+  const ok = await createSpawnPorts(withDefault).spawn({ prompt: '去做 t3', name: 'dev-t3', sessionId: 's1', taskId: 't3' })
   assert.equal(ok.ok, true)
-  assert.equal(requests[0]?.provider, 'host-default', '有宿主默认模型时 provider 落成它')
+  assert.equal(requests[2]?.provider, 'spawn')
+  assert.deepEqual(requests[2]?.agentOptions, { provider: 'host-default' }, '会话默认模型只补 provider')
+
+  // 注册表给了多个名字：优先 spawn；没有 spawn 时取第一个已注册的名字。
+  const multi = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) =>
+      name === 'subagents' ? { list: () => ['custom-provider', 'spawn'] } : undefined,
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async (_caller: unknown, request: unknown) => {
+        requests.push(request as Record<string, unknown>)
+        return { member: { id: 'm-4', name: 'dev-t4' } }
+      },
+    },
+  } as unknown as HostContext
+  await createSpawnPorts(multi).spawn({ prompt: '去做 t4', name: 'dev-t4', sessionId: 's1', taskId: 't4' })
+  assert.equal(requests[3]?.provider, 'spawn', '注册表里有 spawn 就优先用它')
+
+  const onlyCustom = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) => (name === 'subagents' ? { list: () => ['custom-provider'] } : undefined),
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async (_caller: unknown, request: unknown) => {
+        requests.push(request as Record<string, unknown>)
+        return { member: { id: 'm-5', name: 'dev-t5' } }
+      },
+    },
+  } as unknown as HostContext
+  await createSpawnPorts(onlyCustom).spawn({ prompt: '去做 t5', name: 'dev-t5', sessionId: 's1', taskId: 't5' })
+  assert.equal(requests[4]?.provider, 'custom-provider', '没有 spawn 时取注册表第一个名字')
 })
 
 test('losslessJson：undefined 键必须被丢掉（宿主拒收 lossy 返回，r12 真机事故）', () => {

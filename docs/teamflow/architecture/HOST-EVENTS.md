@@ -119,6 +119,26 @@ AssembleContext = { scope?: ScopeKey; signal?: AbortSignal }   // 没有 session
 把判定权交给工具（工具按 `exec.agent.id` 查开关，未开时回可读的「未启用」）。
 
 
+### 3.3 `spawnTeammate` 的 `provider` 是 subagent provider 名，不是 LLM provider（r12 真机事故）
+
+用户新开会话里第一次派发就失败，原文：
+`{"ok":false,"code":"BAD_REQUEST","error":"创建成员失败：no subagent provider registered for \"opencode-go\""}`
+
+事实（`cordis_inspect_query(host, Service, listService, {"service":"subagents"})` 取到）：
+
+- `SubagentActivationSpec.provider: string` / spawn 请求的 `provider` =
+  **`subagents.list()` 里的已注册名**（本机只有 `spawn`），由 `registerProvider(provider)` 注册。
+  填 LLM provider（`opencode-go`、`deepseek`…）→ 宿主查不到实现 → 整个 spawn 失败。
+- 逐角色模型走 **`SubagentStartRequest.agentOptions?: AgentOptions`**
+  （`{ provider?, model?, reasoningEffort?, maxTokens? }`），由 spawn 请求的 `agentOptions` 字段带下去。
+  之前 `src/host/adapters.ts` 的注释写「请求里没有 model/effort 的下发通道」是**错的**。
+
+修法：`provider` 取 `subagents.list()`（优先 `spawn`，否则第一个，取不到退 `spawn`）；
+LLM 路由放进 `agentOptions`；`installMemberRoute` 保留为第二道保险（宿主版本忽略 `agentOptions` 时仍能改写）。
+
+**为什么之前所有验证都没抓到**：subagent 会话里 `dispatch` 必先撞「only the Team Lead can create
+teammates」，探针停在那一步；而单测里的假宿主从不校验 provider 是否已注册。
+
 ## 4. 已知作用域事实
 
 - `agent.ctx` 上注册的 `agent/*` 监听器**只收到该 agent 的**事件（宿主 `dsh-scope` 的作用域派发）。

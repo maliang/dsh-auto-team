@@ -91,6 +91,14 @@ export interface HostContext {
   /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'agentDefaultModel') 读取，不要裸读本字段。 */
   agentDefaultModel?: { currentSelection?(): unknown }
   /**
+   * [已核] subagents 服务：`list(): string[]` 是**已注册的 subagent provider 名**（本机 `spawn`）。
+   *
+   * r12 真机事故：把 LLM provider 当 subagent provider 传进 spawn 请求 → 宿主
+   * `no subagent provider registered for "opencode-go"`，派发全盘失败。两者是两套命名。
+   */
+  /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'subagents') 读取，不要裸读本字段。 */
+  subagents?: { list?(): unknown; getProvider?(name: string): unknown }
+  /**
    * [已核] Cordis 的可选服务读取口。可选服务**只能**经本文件的 optionalService() 走这里读；
    * 缺 `get`（旧宿主 / 手搓 fake ctx）时一律按服务缺失降级，不回退裸读。
    */
@@ -116,7 +124,7 @@ export interface HostContext {
  * （同时出现会让 cordis 把整条 entry 判为 required，可选语义立刻消失）。
  * 测试 `test/host-contract.test.ts` 会断言 inject ∩ OPTIONAL_SERVICES === ∅。
  */
-export const OPTIONAL_SERVICES = ['webServer', 'llm', 'agentDefaultModel'] as const
+export const OPTIONAL_SERVICES = ['webServer', 'llm', 'agentDefaultModel', 'subagents'] as const
 
 /** 可选服务名（从白名单派生，不许另写一份字面量）。 */
 export type OptionalServiceName = (typeof OPTIONAL_SERVICES)[number]
@@ -130,6 +138,18 @@ export interface OptionalServiceMap {
     listModels?(providerId: string): Promise<unknown>
   }
   agentDefaultModel: { currentSelection?(): unknown }
+  /**
+   * [已核] subagents 服务（r12 真机事故后补）。
+   *
+   * `list()` 返回的是**已注册的 subagent provider 名**（本机为 `spawn`），
+   * 与 LLM provider（`opencode-go` / `deepseek` 之类）是**两套完全不同的命名**：
+   * 把 LLM provider 填进 spawn 请求的 `provider` 字段，宿主会报
+   * `no subagent provider registered for "<llm-provider>"` 并直接创建失败。
+   */
+  subagents: {
+    list?(): unknown
+    getProvider?(name: string): unknown
+  }
 }
 
 /**
@@ -528,6 +548,15 @@ export function resolveCaller(ctx: HostContext): HostAgent | undefined {
 const NO_CALLER = '当前没有活跃的队长会话：agentTeams 需要以 Agent 身份调用，请在会话内使用本工具。'
 
 /**
+ * spawn 请求里 `provider` 的默认值：**subagent provider 名**（不是 LLM provider）。
+ *
+ * 本机 `subagents.list()` 实测只有 `spawn`（宿主内置的 fresh-context 子会话实现），
+ * `spawn_teammate` 工具自己统计到的成员 `provider` 也是它。读不到注册表时退回它，
+ * 由宿主给出明确报错（r12 事故：这里曾填 LLM provider，派发 100% 失败）。
+ */
+const DEFAULT_SUBAGENT_PROVIDER = 'spawn'
+
+/**
  * `interrupt(caller, name)` 的返回形状**未核实**（只核实了宿主有这个方法），所以宽松归一
  * 只能放在宿主边界这一处 —— bridge/dispatch 只消费 `{ ok, error? }`，端口不漂移。
  *
@@ -552,15 +581,18 @@ export function normalizeInterruptResult(value: unknown): { ok: boolean; error?:
   return { ok: true }
 }
 
+/** `spawn` 端口的入参（与 dispatch 的 `SpawnInput` 分开：这层只关心宿主调用所需字段）。 */
+export interface SpawnPortInput {
+  prompt: string
+  name: string
+  description?: string
+  route?: RoleModelRoute
+  sessionId: string
+  taskId: string
+}
+
 export interface SpawnPorts {
-  spawn: (input: {
-    prompt: string
-    name: string
-    description?: string
-    route?: RoleModelRoute
-    sessionId: string
-    taskId: string
-  }) => Promise<
+  spawn: (input: SpawnPortInput) => Promise<
     | {
         ok: true
         memberId: string
@@ -586,27 +618,30 @@ export interface SpawnPorts {
  * [已核] SpawnTeammateRequest = { name, description, prompt: ContentBlock[], context: 'fresh'|'fork', provider, signal }
  *   SpawnTeammateResult  = { member: TeamMemberView }，member.id + member.name 是我们要的两件事。
  *
- * 逐角色模型（AC-22）怎么才真的生效：宿主 rc.2 的 `spawnAdmitted()` 只把 `request.provider`
- * 交给 `subagents.startActivation({ provider })`，**请求里没有 model/effort 的下发通道**
- * （实测宿主源码 spawnAdmitted → startActivation 只读 provider）。官方扩展点是「创建事务内
- * serial、awaited 的 `agent/created`」：在该事件里往 `agent.ctx` 装一套 member-scoped 路由
- * （同机生产实现 dsh-agent-team-presets 的 installModelSelection 就是这么做的）。
- * 因此这里请求里仍附带 model/reasoningEffort（宿主忽略、仅作观测与前向兼容），
- * 真正生效靠 {@link installMemberRoute}。
+ * **`provider` 是 subagent provider 名，不是 LLM provider 名**（r12 真机事故定案）：
+ * 宿主拿它去 `subagents.getProvider(name)` 查已注册实现（本机只有 `spawn`，见
+ * `subagents.list(): string[]`），查不到就报
+ * `no subagent provider registered for "<name>"` 并让整个 spawn 失败。
+ * 过去这里塞的是角色的 LLM provider（`opencode-go`），于是**任何一次派发都必然失败**；
+ * 单元测试与探针都没发现，因为探针会话先被「只有 Lead 能建成员」拦住了。
+ *
+ * 逐角色模型的正确通道是 `SubagentStartRequest.agentOptions?: AgentOptions =
+ * { provider?, model?, reasoningEffort?, maxTokens? }`（宿主 `subagents` 服务契约原文），
+ * 由 spawn 请求的 `agentOptions` 字段带下去。`installMemberRoute`（`agent/created` 里装
+ * member-scoped 路由）保留为第二道保险：宿主版本忽略 `agentOptions` 时它仍能改写模型。
  */
-export interface SpawnRouteFields {
-  model?: string
-  reasoningEffort?: RoleModelRoute['reasoningEffort']
-}
-
-/** 把角色声明的路由摊成请求字段（宿主忽略未知字段，探针/日志可核）。 */
-export function spawnRouteFields(route: RoleModelRoute | undefined): SpawnRouteFields {
-  if (!route) return {}
-  return {
-    model: route.model,
-    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-  }
-}
+/*
+ * 关于 `provider` 与 `agentOptions`（r12 真机事故定案，改这里之前先读）：
+ *
+ *  - spawn 请求的 `provider` 是**已注册的 subagent provider 名**（宿主 `subagents.list()`，
+ *    本机只有 `spawn`），不是 LLM provider。填 LLM provider 会让宿主报
+ *    `no subagent provider registered for "<name>"`，**每一次派发都失败**；
+ *    单测与探针都发现不了，因为探针会话先被「只有 Lead 能建成员」拦住了。
+ *  - 逐角色模型的官方通道是 `SubagentStartRequest.agentOptions?: AgentOptions =
+ *    { provider?, model?, reasoningEffort?, maxTokens? }`，由 spawn 请求的 `agentOptions` 带下去。
+ *  - `installMemberRoute`（`agent/created` 里装 member-scoped 路由）保留为第二道保险：
+ *    宿主版本忽略 `agentOptions` 时它仍能改写模型。
+ */
 
 /**
  * 待装路由表：**成员名 → 角色声明路由**。
@@ -712,6 +747,37 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
     }
   }
 
+  /**
+   * 组 spawn 请求时要填的 **subagent provider 名**（≠ LLM provider）。
+   *
+   * 宿主 `subagents.list()` 给出已注册名字（本机只有 `spawn`）。优先选 `spawn`
+   * （宿主内置的 fresh-context 子会话实现），否则取第一个已注册的；读不到就退回
+   * `DEFAULT_SUBAGENT_PROVIDER`（与 `spawn_teammate` 工具自身用的默认一致）。
+   */
+  function subagentProviderName(): string {
+    try {
+      const rows = readServiceQuietly(ctx, 'subagents')?.list?.()
+      const registered = Array.isArray(rows) ? rows.filter((row): row is string => typeof row === 'string' && row !== '') : []
+      if (registered.includes(DEFAULT_SUBAGENT_PROVIDER)) return DEFAULT_SUBAGENT_PROVIDER
+      if (registered.length > 0) return registered[0] as string
+    } catch {
+      /* 读不到就退回默认名，由宿主给出明确报错 */
+    }
+    return DEFAULT_SUBAGENT_PROVIDER
+  }
+
+  /** 角色声明 / 会话默认的 **LLM** 路由；`agentOptions` 与成员路由都用它。 */
+  function modelRouteOf(input: SpawnPortInput): RoleModelRoute | undefined {
+    const route = input.route
+    const provider = route?.provider ?? fallbackProvider()
+    if (provider === '' && route?.model === undefined) return undefined
+    return {
+      provider,
+      model: route?.model ?? '',
+      ...(route?.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    } as RoleModelRoute
+  }
+
   return {
     async spawn(input) {
       if (!teams?.spawnTeammate) {
@@ -719,10 +785,17 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
       }
       const caller = resolveCaller(ctx)
       if (!caller) return { ok: false, error: NO_CALLER }
-      const provider = input.route?.provider ?? fallbackProvider()
-      if (provider === '') {
-        return { ok: false, error: '无法确定成员的 provider：角色未声明模型且宿主未提供默认模型选择' }
-      }
+      // provider 必须是**已注册的 subagent provider 名**；LLM 模型走 agentOptions 带下去。
+      const provider = subagentProviderName()
+      const modelRoute = modelRouteOf(input)
+      const agentOptions =
+        modelRoute === undefined
+          ? undefined
+          : {
+              ...(modelRoute.provider === '' ? {} : { provider: modelRoute.provider }),
+              ...(modelRoute.model === '' ? {} : { model: modelRoute.model }),
+              ...(modelRoute.reasoningEffort === undefined ? {} : { reasoningEffort: modelRoute.reasoningEffort }),
+            }
       // 必须先登记再 spawn：agent/created 在 spawnTeammate 内部同步触发（见 pendingRoutes 说明）。
       trackPendingRoute(input.name, input.route)
       // 同上：清掉可能残留的旧观测，保证 take 到的只可能是**本次**创建观测到的路由。
@@ -734,9 +807,8 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
           prompt: [{ type: 'text', text: input.prompt }] satisfies HostTextBlock[],
           context: 'fresh',
           provider,
-          // 角色声明的模型：宿主当前忽略这两项（实际下发靠 agent/created 装路由），
-          // 但探针/日志与未来宿主版本要能看见「队长要求的是哪个模型」。
-          ...spawnRouteFields(input.route),
+          // 角色声明的 LLM 模型：宿主 `SubagentStartRequest.agentOptions` 是官方下发通道。
+          ...(agentOptions === undefined ? {} : { agentOptions }),
           signal: signal ?? new AbortController().signal,
         })) as { member?: { id?: unknown; name?: unknown } } | undefined
         const member = created?.member
