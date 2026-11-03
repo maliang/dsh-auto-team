@@ -49,8 +49,8 @@ export function MembersTab(props: TabProps): React.ReactElement {
       <div data-auto-team-members data-empty>
         <p>还没有成员。</p>
         <p data-empty-next>
-          下一步：去「计划」页确认任务图与角色，点「开始派发」后成员会出现在这里 ——
-          可继续（中断后续聊）、可发直达消息、可通过回执把结果交给门禁。
+          下一步：去「计划」页确认任务图与角色，然后让队长派发（在对话里说「开始派发」）——
+          成员会出现在这里：可继续（中断后续聊）、可发直达消息、可通过回执把结果交给门禁。
         </p>
       </div>
     )

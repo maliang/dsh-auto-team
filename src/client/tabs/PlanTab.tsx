@@ -221,15 +221,18 @@ export function PlanTab(props: TabProps): React.ReactElement {
       )}
 
       <div data-plan-actions>
-        <button
-          type="button"
-          data-plan-dispatch
-          disabled={busy || paused || dispatching}
-          title={paused ? '已暂停：先点页头的「继续任务」' : '把就绪任务派发给成员'}
-          onClick={() => void send({ type: 'dispatch' }, '已请求派发')}
+        {/*
+          派发必须由队长（Agent 身份）执行：宿主只允许顶层会话创建成员，而面板走 HTTP，
+          没有 `ctx.agents.currentInitiator()`，点这里只会得到「当前没有活跃的队长会话」。
+          所以这里不做成可点按钮，只说明该怎么派发（r12 真机实测）。
+        */}
+        <span
+          data-plan-dispatch-hint
+          role="note"
+          title="派发需要以队长 Agent 身份调用 auto_team_dispatch（HTTP 面板路径拿不到该身份）"
         >
-          {dispatching ? '派发中…' : '开始派发'}
-        </button>
+          {paused ? '已暂停：先点页头的「继续任务」' : dispatching ? '派发中…' : '派发需由队长执行：在对话里说「开始派发」'}
+        </span>
         <button
           type="button"
           data-plan-cancel
