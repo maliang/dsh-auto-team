@@ -490,7 +490,7 @@ test('渲染描述层必须真的被组件调用（防「逻辑写完、模板�
     ['src/client/views/RunHeader.tsx', 'runHeadOf'],
     ['src/client/views/RoleStrip.tsx', 'roleChipsOf'],
     ['src/client/views/TaskTable.tsx', 'taskRowOf'],
-    ['src/client/views/FlowGraph.tsx', 'flowLayoutOf'],
+    ['src/client/views/FlowCanvas.tsx', 'flowLayoutOf'],
     ['src/client/views/MemoryList.tsx', 'memoryRowOf'],
     ['src/client/views/ConfirmDialog.tsx', 'confirmDialogOf'],
   ]
@@ -513,14 +513,14 @@ test('r13 三页：页签单源恰三项，三页模板各自绑定视图组件�
 
   // ② 三页各自把视图组件真绑进模板（不是「逻辑写完、模板没绑」）
   const tasksTab = codeOnlyOf('src/client/tabs/TasksTab.tsx')
-  for (const view of ['RunHeader', 'RoleStrip', 'TaskTable', 'FlowGraph']) {
+  for (const view of ['RunHeader', 'RoleGrid', 'TaskOverview', 'FlowCanvas']) {
     assert.equal(tasksTab.includes(`<${view}`), true, `任务页必须渲染 ${view}`)
   }
   assert.equal(/buildRunDetail\(\{/.test(tasksTab), true,
     '任务页的详情必须由 buildRunDetail 装配（AC-18 单点）')
 
   const historyTab = codeOnlyOf('src/client/tabs/HistoryTab.tsx')
-  for (const view of ['DetailPane', 'RunHeader', 'TaskTable', 'FlowGraph']) {
+  for (const view of ['DetailPane', 'RunHeader', 'TaskTable', 'FlowCanvas']) {
     assert.equal(historyTab.includes(`<${view}`), true, `历史详情必须复用 ${view}（AC-18：左右两处同一套）`)
   }
   assert.match(historyTab, /HISTORY_PAGE_SIZE/, '历史列表必须按常量分页（50/页）')
@@ -561,7 +561,7 @@ test('r13 客户端零格式化：时长/千分位/token 文本只来自宿主�
   const files = [
     'src/client/views/RunHeader.tsx',
     'src/client/views/TaskTable.tsx',
-    'src/client/views/FlowGraph.tsx',
+    'src/client/views/FlowCanvas.tsx',
     'src/client/tabs/TasksTab.tsx',
     'src/client/tabs/HistoryTab.tsx',
     'src/client/tabs/rows.ts',
@@ -839,11 +839,56 @@ test('client 与 host 零直接 import（只许 import type 共享契约）', ()
     'src/client/tabs/rows.ts',
     'src/client/views/RunHeader.tsx',
     'src/client/views/TaskTable.tsx',
-    'src/client/views/FlowGraph.tsx',
+    'src/client/views/FlowCanvas.tsx',
   ]
   for (const relPath of files) {
     const code = codeOnlyOf(relPath)
     assert.equal(/from ['"]\.\.?\/host\//.test(code), false, `${relPath} 出现了对 host 半的直接 import`)
     assert.equal(/from ['"]\.\.\/\.\.\/host\//.test(code), false, `${relPath} 出现了对 host 半的直接 import`)
   }
+})
+
+test('r14 AC-13：分栏容器必须真的渲染 [data-project-split]（styles 死选择器不算）', () => {
+  // QA D1：交互实测通过，但 PRD 指定的钩子只写在 styles.ts 里，DOM 里根本没有 ——
+  // 「纯文本 grep 绿」这类判据可以被注释满足，所以这里用 AST 断言**同一个 JSX 标签**
+  // 同时带 data-library-body 与 data-project-split，且手柄是它的后代。
+  const path = 'src/client/LibraryPage.tsx'
+  const file = ts.createSourceFile(path, sourceOf(path), ts.ScriptTarget.ESNext, true, ts.ScriptKind.TSX)
+  const attrsOf = (node: ts.JsxOpeningElement | ts.JsxSelfClosingElement): Set<string> => {
+    const names = new Set<string>()
+    for (const attr of node.attributes.properties) {
+      if (ts.isJsxAttribute(attr) && ts.isIdentifier(attr.name)) names.add(attr.name.text)
+    }
+    return names
+  }
+  const tags: Array<{ node: ts.JsxOpeningElement | ts.JsxSelfClosingElement; attrs: Set<string> }> = []
+  const collect = (node: ts.Node): void => {
+    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+      tags.push({ node, attrs: attrsOf(node) })
+    }
+    ts.forEachChild(node, collect)
+  }
+  collect(file)
+
+  const containers = tags.filter((tag) => tag.attrs.has('data-library-body'))
+  assert.equal(containers.length, 1, '项目库页必须恰好一处 [data-library-body]')
+  const container = containers[0] as { node: ts.JsxOpeningElement | ts.JsxSelfClosingElement; attrs: Set<string> }
+  assert.equal(
+    container.attrs.has('data-project-split'),
+    true,
+    '[data-library-body] 必须同时带 [data-project-split]：PRD AC-13 的分栏钩子必须渲染在 DOM 里',
+  )
+  assert.equal(container.attrs.has('style'), true, '--lib-list-w 必须挂在这个分栏容器上（宽度变量唯一来源）')
+
+  // 手柄必须是这个容器的后代（PRD：分栏容器内有可拖拽手柄）
+  let handleInside = 0
+  const walk = (node: ts.Node): void => {
+    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+      if (attrsOf(node).has('data-split-handle')) handleInside += 1
+    }
+    ts.forEachChild(node, walk)
+  }
+  const parent = container.node.parent
+  walk(ts.isJsxOpeningElement(container.node) ? parent : container.node)
+  assert.equal(handleInside, 1, '[data-project-split] 内必须恰有一个 [data-split-handle]')
 })

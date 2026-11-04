@@ -61,17 +61,21 @@ export function buildPlan(draft: PlanDraft, runId: string, now: number): { ok: t
   const requested = draft.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
   const maxConcurrent = Math.min(Math.max(1, requested), MAX_CONCURRENT_LIMIT)
 
-  return {
-    ok: true,
-    plan: {
-      runId,
-      sessionId: draft.sessionId,
-      createdAt: now,
-      status: 'draft',
-      tasks,
-      maxConcurrent,
-    },
+  // r14 AC-15：目标原文必须落盘 —— r13 的 PlanDraft 有 goal，但装配时被丢掉了，
+  // 于是项目页只能拿 runId 当标题。空串等同于没写（不写可选字段，旧夹具形状不变）。
+  const goal = (draft.goal ?? '').trim()
+
+  const plan: Plan = {
+    runId,
+    sessionId: draft.sessionId,
+    createdAt: now,
+    status: 'draft',
+    tasks,
+    maxConcurrent,
   }
+  if (goal !== '') plan.goal = goal
+
+  return { ok: true, plan }
 }
 
 /** 计划指纹：用于判断「同一条需求的重复拆解」是否等于上一份（面板提示「计划就绪」用）。 */

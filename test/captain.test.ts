@@ -76,6 +76,17 @@ test('AC-1：约束段落在「工作方式」之前', () => {
   assert.ok(constraintsAt < workflowAt, '硬约束必须在工作方式之前')
 })
 
+test('r14 AC-2：受理制特征句在常驻段里（派发后立即结束本轮，不要等待成员）', () => {
+  const text = sectionOf(makeSnapshot())
+  const phrase = '派发后立即结束本轮，不要等待成员'
+  assert.ok(text.includes(phrase), `缺少受理制特征句：${phrase}`)
+  assert.ok(CAPTAIN_CONSTRAINTS.some((line) => line.includes(phrase)), '特征句必须来自同一个导出常量')
+  assert.match(text, /返回「已接受派发」即表示后台已接手/, '要解释「为什么不用等」，否则模型仍会轮询')
+  // 与三条老约束同段、同位置纪律：必须排在「工作方式」之前（先立规矩再讲流程）。
+  assert.ok(text.indexOf(phrase) < text.indexOf('工作方式（顺序不可颠倒）'))
+  assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
+})
+
 test('AC-1：段落总长 ≤ 2600 字符', () => {
   const text = sectionOf(makeSnapshot())
   assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)

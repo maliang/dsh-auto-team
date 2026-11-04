@@ -35,12 +35,19 @@ interface Harness {
   tools: Map<string, ToolSpec>
 }
 
-function setup(options: { enabled?: boolean } = {}): Harness {
+function setup(options: { enabled?: boolean; workspace?: string } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'auto-team-t3-'))
   const store = new RunsStore(join(dir, 'runs'))
   // 这些用例只走 plan/add_tasks，不需要完整 Bridge；能答 enabled 即可。
   const bridge = { enabled: () => options.enabled ?? true } as unknown as Bridge
-  const specs = buildToolSpecs({ store, roles: {} as RoleRepo, bridge, now: () => NOW })
+  const specs = buildToolSpecs({
+    store,
+    roles: {} as RoleRepo,
+    bridge,
+    now: () => NOW,
+    // 缺省不传 workspace：旧装配/旧夹具必须保持「不写 project」的行为（r14 AC-18 的可选字段）。
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+  })
   return { dir, store, specs, tools: new Map(specs.map((spec) => [spec.name, spec])) }
 }
 
@@ -220,6 +227,26 @@ test('plan 正常路径：写域归一后落盘、run 可读', async () => {
   assert.deepEqual(state.plan.tasks[0]?.writeScopes, ['src/host/tools.ts'], '写域去重、去空白、字典序')
   assert.equal(state.plan.sessionId, SESSION, '会话只能来自 sessionOf（exec.agent.id）')
   assert.equal(h.store.list().length, 1)
+})
+
+test('r14 AC-14：装配层注入 workspace 时 plan 落盘写 project；未注入时不猜（旧 run 可读）', async () => {
+  const workspace = '/tmp/proj-r14'
+  const withWs = setup({ workspace })
+  const first = await call(withWs, 'auto_team_plan', {
+    goal: '写 project',
+    tasks: [{ title: '一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
+  })
+  assert.equal(first.ok, true)
+  const state = withWs.store.load(String(first.runId))
+  assert.equal(state?.project, workspace, '必须原样落同一个字符串：library 用它分桶，拼尾斜杠即裂桶')
+
+  // 未注入时**不写**（不是写空串）：旧 run 与旧夹具都靠「没有 project」被判进历史桶。
+  const without = setup()
+  const second = await call(without, 'auto_team_plan', {
+    goal: '不写 project',
+    tasks: [{ title: '另一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
+  })
+  assert.equal(without.store.load(String(second.runId))?.project, undefined)
 })
 
 test('AC-9/AC-11：add_tasks 幂等 —— 连调两次 added=0、tasks 与 runId 不变', async () => {

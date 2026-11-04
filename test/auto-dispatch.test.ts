@@ -532,3 +532,76 @@ test('幂等（AC-10）：同一次自动派发重复触发 → 新增成员 0�
     cleanup()
   }
 })
+
+/* ───────────── 4. r14：受理制的后台侧（manual 触发 / 失败播报 / 报告环） ───────────── */
+
+test('r14 AC-3：manual 受理后由 kick 派发；全失败 onError、成功 onClear，报告带可读 errors', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    store.save(makeState([makeTask('t1')]))
+    const failures: string[] = []
+    const cleared: string[] = []
+    let mode: 'fail' | 'ok' = 'fail'
+    const dispatcher = createAutoDispatcher({
+      store,
+      dispatch: async () => {
+        if (mode === 'fail') return { started: [], skipped: [], errors: [{ taskId: 't1', error: 'spawn 失败' }] }
+        return { started: ['t1'], skipped: [], errors: [] }
+      },
+      now: () => now,
+      onError: (runId, text) => failures.push(`${runId}:${text}`),
+      onClear: (runId) => cleared.push(runId),
+    })
+
+    // 工具受理后正是这个形状：fire-and-forget 的 kick('manual')，调用方不 await。
+    dispatcher.kick('session-1', 'run-1', 'manual')
+    await flush()
+
+    const reports = dispatcher.reportsOf('session-1')
+    assert.equal(reports.length, 1)
+    assert.equal(reports[0].cause, 'manual', '受理制必须有自己的 cause，便于解释「这次是谁触发的」')
+    assert.equal(reports[0].attempted, true)
+    assert.equal(reports[0].failed, 1)
+    assert.deepEqual(reports[0].errors, ['t1：spawn 失败'], 'errors 给原文，failed 只给条数')
+    assert.equal(failures.length, 1)
+    assert.match(failures[0], /派发失败：后台未能创建成员（t1：spawn 失败）/)
+
+    // 有成员真的起来：清掉上一次失败文案（面板不该一直挂着过期红字），且退避计数被清。
+    mode = 'ok'
+    dispatcher.kick('session-1', 'run-1', 'manual')
+    await flush()
+    assert.deepEqual(cleared, ['run-1'])
+    const after = dispatcher.reportsOf('session-1')
+    assert.equal(after.length, 2)
+    assert.deepEqual(after[1].started, ['t1'])
+    assert.deepEqual(after[1].errors, [])
+    dispatcher.dispose()
+  } finally {
+    cleanup()
+  }
+})
+
+test('r14：报告环 cap 5 且 reportsOf 返回副本（内存态，不是账本）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    store.save(makeState([makeTask('t1')]))
+    const dispatcher = createAutoDispatcher({
+      store,
+      dispatch: async () => ({ started: [], skipped: [{ taskId: 't1', reason: '并发已满' }], errors: [] }),
+      now: () => now,
+    })
+    for (let index = 0; index < 7; index += 1) {
+      dispatcher.kick('session-1', 'run-1', 'manual')
+      await flush()
+    }
+    const reports = dispatcher.reportsOf('session-1')
+    assert.equal(reports.length, 5, '只留最近 5 条（进程重启即空，不当事实账本）')
+    assert.equal(dispatcher.reportsOf('other-session').length, 0, '按会话隔离')
+
+    reports.length = 0
+    assert.equal(dispatcher.reportsOf('session-1').length, 5, 'reportsOf 必须回副本')
+    dispatcher.dispose()
+  } finally {
+    cleanup()
+  }
+})

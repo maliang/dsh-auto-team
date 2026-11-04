@@ -128,6 +128,18 @@ export interface DispatchOutcome {
 
 export type DispatchPort = (state: RunState) => Promise<DispatchOutcome>
 
+/**
+ * 派发预检结果（r14 AC-1）。
+ *
+ * 受理制之后 `auto_team_dispatch` 不再 `await` 整条派发链：它先同步问这里「能不能派」，
+ * 得到 `ok` 才把执行交给后台调度器并立刻返回。**判据只有 `admissionOf` 一处**，
+ * 面板 `act('dispatch')` 走的是同一个函数，因此工具与面板永远不会给出不同答案
+ * （两套判据轮换改漏一个，就是 AC-1 前后两次同源事故的根因）。
+ */
+export type DispatchAdmission =
+  | { ok: true; runId: string; ready: string[]; unbound: string[] }
+  | { ok: false; code: RejectionCode; message: string }
+
 /** 编排层（team/dispatch.ts resumeRun）的结果投影。 */
 export interface ResumeOutcome {
   resumed: number
@@ -274,7 +286,14 @@ export interface BridgeDeps {
    * bridge 只在**自己改完状态**后调它，真正的派发语义在装配层的 auto dispatcher 里；
    * 桥不直接派发，否则就出现第二条派发路径（绕过四道闸）。
    */
-  onRunChanged?: (sessionId: string, runId: string, cause: 'plan-saved' | 'task-terminal' | 'member-exit' | 'tasks-added' | 'tick') => void
+  onRunChanged?: (sessionId: string, runId: string, cause: AutoDispatchCause) => void
+  /**
+   * r14 AC-3：后台派发失败通知（内存环，`team/dispatch-notices.ts`）。
+   *
+   * 可选注入：缺省时活动流里没有这一类条目（不假装有），单测也不必造装配层。
+   * 之所以只收 `recent` 而不收整个 store，是因为桥只需要「读」——写入点只有装配层的 onError/onClear。
+   */
+  dispatchNotices?: { recent(runId: string): ActivityEvent[] }
 }
 
 export interface Bridge {
@@ -282,6 +301,13 @@ export interface Bridge {
   setEnabled(sessionId: string, enabled: boolean): void
   snapshot(sessionId: string): PanelSnapshot
   act(sessionId: string, action: PanelAction): Promise<ActResult>
+  /**
+   * r14 AC-1：**同步**派发预检（不碰 spawn、不读门禁、不落盘）。
+   *
+   * 与 `act('dispatch')` 共用 `admissionOf` 一处判据：未启用 → 无计划 → runId 不匹配 →
+   * 暂停 → 计划状态 → 已派发无新人。`ok:false` 的 `code` 就是面板同一动作会拿到的拒绝码。
+   */
+  precheckDispatch(sessionId: string, runId?: string): DispatchAdmission
   /**
    * r13 AC-21/AC-22：左栏项目库（含 `?runId=` 时的历史详情）。
    *
@@ -621,6 +647,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
         source: 'trigger',
       })
     }
+    // r14 AC-3：受理制之后「后台 spawn 全失败」发生在工具返回之后，只进宿主日志就没人看得见。
+    // 通知环由装配层注入（内存态、cap 5），事件形状复用既有 kind:'status' —— 快照零扩张。
+    for (const note of deps.dispatchNotices?.recent(state.plan.runId) ?? []) events.push(note)
     return events.sort((a, b) => b.at - a.at).slice(0, ACTIVITY_LIMIT)
   }
 
@@ -1114,6 +1143,61 @@ export function createBridge(deps: BridgeDeps): Bridge {
     }
   }
 
+  /**
+   * 派发准入判定（r14 AC-1）：`precheckDispatch` 与 `case 'dispatch'` 的唯一判据。
+   *
+   * 顺序刻意与 `act` 对齐 —— `act` 的 `preflightGate` 在进 case **之前**就先拦「未启用/暂停」，
+   * 所以这里也必须先拦这两道，否则同一状态下工具与面板会得到不同拒绝码
+   *（TECHNICAL §3.2 的判定次序把 PAUSED 写在 status 之后，与既有 act 行为矛盾，按行为为准）。
+   */
+  function admissionOf(sessionId: string, runId?: string): DispatchAdmission {
+    if (flags[sessionId]?.enabled !== true) {
+      return { ok: false, code: 'NOT_ENABLED', message: NOT_ENABLED_TEXT }
+    }
+    const state = loadState(sessionId)
+    if (!state) {
+      return {
+        ok: false,
+        code: 'NO_PLAN',
+        message: '当前会话还没有执行计划：先让队长拆解目标（auto_team_plan）',
+      }
+    }
+    // PAUSED（r7 AC-16）：dispatch 属于 PAUSED_BLOCKED，暂停时一律不放行。
+    if (state.plan.status === 'paused') {
+      return { ok: false, code: 'PAUSED', message: PAUSED_TEXT }
+    }
+    if (runId !== undefined && runId !== state.plan.runId) {
+      return {
+        ok: false,
+        code: 'NOT_FOUND',
+        message: `找不到运行 ${runId}（当前会话最新运行是 ${state.plan.runId}）`,
+      }
+    }
+    const status = state.plan.status
+    // r7：`paused` 已由上一道闸门拦掉，这里只留两个可派发状态 ——
+    // 两处都收窄是刻意的（bridge 一处、dispatchReady 一处）：任何一条推进路径绕开都不会起人。
+    if (status !== 'draft' && status !== 'dispatching') {
+      return {
+        ok: false,
+        code: 'NO_PLAN',
+        message: `计划状态为 ${status}，不能派发（需要 draft/dispatching）`,
+      }
+    }
+    const boundIds = new Set(
+      state.bindings.filter((binding) => binding.retired !== true).map((binding) => binding.taskId),
+    )
+    const ready = readyTasks(state.plan.tasks)
+    const unbound = ready.filter((taskId) => !boundIds.has(taskId))
+    if (status === 'dispatching' && unbound.length === 0) {
+      return {
+        ok: false,
+        code: 'PLAN_ALREADY_DISPATCHED',
+        message: '计划已派发：成员已在运行，不会重复起人（中断的成员请用「继续」恢复）',
+      }
+    }
+    return { ok: true, runId: state.plan.runId, ready, unbound }
+  }
+
   /** 执行体：所有 Action 的唯一实现（确认闸确认后也回到这里）。 */
   async function executeAction(sessionId: string, action: PanelAction): Promise<ActResult> {
     try {
@@ -1215,30 +1299,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         case 'dispatch': {
+          // 判据在 `admissionOf`（与 precheckDispatch 同一处），这里只做「过闸→执行→组 notices」。
+          const admission = admissionOf(sessionId, action.runId)
+          if (!admission.ok) return reject(admission.code, admission.message, sessionId)
           const state = loadState(sessionId)
-          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：先让队长拆解目标（auto_team_plan）', sessionId)
-          if (action.runId !== undefined && action.runId !== state.plan.runId) {
-            return reject('NOT_FOUND', `找不到运行 ${action.runId}（当前会话最新运行是 ${state.plan.runId}）`, sessionId)
-          }
-          const status = state.plan.status
-          // r7：`paused` 已由入口的 PAUSED 闸门拦掉，这里只留两个可派发状态 ——
-          // 两处都收窄是刻意的（bridge 一处、dispatchReady 一处）：任何一条推进路径绕开都不会起人。
-          if (status !== 'draft' && status !== 'dispatching') {
-            return reject('NO_PLAN', `计划状态为 ${status}，不能派发（需要 draft/dispatching）`, sessionId)
-          }
-
-          const boundIds = new Set(
-            state.bindings.filter((binding) => binding.retired !== true).map((binding) => binding.taskId),
-          )
-          const ready = readyTasks(state.plan.tasks)
-          const unbound = ready.filter((taskId) => !boundIds.has(taskId))
-          if (status === 'dispatching' && unbound.length === 0) {
-            return reject(
-              'PLAN_ALREADY_DISPATCHED',
-              '计划已派发：成员已在运行，不会重复起人（中断的成员请用「继续」恢复）',
-              sessionId,
-            )
-          }
+          // admissionOf 刚刚读过同一份状态且中间没有 await：这个分支只为让类型收敛，不可达。
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
 
           const outcome = await deps.dispatch(state)
           const notices: string[] = []
@@ -1819,6 +1885,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
     snapshot,
 
     act,
+
+    /**
+     * r14 AC-1：同步预检（工具受理制的「先问能不能派」）。
+     *
+     * 纯函数式读一次状态，不产生任何副作用：既可以把回答原样写进工具返回值，
+     * 也可以被面板在点按钮前拿来禁用 —— 两处结论必须一致，因为判据同源。
+     */
+    precheckDispatch(sessionId: string, runId?: string): DispatchAdmission {
+      return admissionOf(sessionId, runId)
+    },
 
     /**
      * r13 AC-21/AC-22：左栏项目库。装配在 `host/library.ts`（带缓存），这里只转派；

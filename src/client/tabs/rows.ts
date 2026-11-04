@@ -17,6 +17,7 @@ import {
   durationTextOf,
   durationTitleOf,
   formatStamp,
+  goalTitleOf,
   statusBadge,
   tokenTextOf,
   tokenTitleOf,
@@ -27,8 +28,15 @@ import type { BadgeTone } from '../viewmodel.ts'
 
 export interface RunRowView {
   runId: string
-  /** 主标题：项目名优先，没有项目就退回 runId（历史里 runId 才是唯一可认的标识）。 */
+  /** 主标题：项目库 run 行 = run 级 goal（截断 24 字），历史行 = 项目名/runId。 */
   title: string
+  /**
+   * r14 AC-15：标题来源。`goal` = 真的记录了目标；`fallback` = 旧 run / 无目标，
+   * 界面据此打 `data-title-source="fallback"`（诚实标注，不是假装有目标）。
+   */
+  titleSource: 'goal' | 'fallback'
+  /** `title` 属性用的完整文本（标题被截断时仍能悬停看全）。 */
+  titleTitle?: string
   /** 次行：开始 / 结束时间戳与任务数。 */
   metaText: string
   statusText: string
@@ -46,6 +54,8 @@ export interface RunRowView {
 function rowOf(input: {
   runId: string
   title: string
+  titleSource?: 'goal' | 'fallback'
+  titleTitle?: string
   metaText: string
   status: string
   usage: UsageCell
@@ -53,9 +63,10 @@ function rowOf(input: {
   active: boolean
 }): RunRowView {
   const badge = statusBadge(input.status)
-  return {
+  const view: RunRowView = {
     runId: input.runId,
     title: input.title,
+    titleSource: input.titleSource ?? 'fallback',
     metaText: input.metaText,
     statusText: badge.text,
     statusTone: badge.tone,
@@ -68,6 +79,8 @@ function rowOf(input: {
     durationState: input.duration.state,
     active: input.active,
   }
+  if (input.titleTitle !== undefined) view.titleTitle = input.titleTitle
+  return view
 }
 
 /** 无 DurationCell 时的降级：只给时间戳，**不给时长**（客户端没有第二套时长格式化）。 */
@@ -101,9 +114,13 @@ export function runSummaryRowOf(run: RunSummary, now: number = Date.now()): RunR
 export function projectRunRowOf(run: ProjectRunSummaryView): RunRowView {
   const start = formatStamp(run.plannedAt)
   const end = formatStamp(run.finishedAt)
+  // r14 AC-15：标题 = run 级 goal（24 字截断在 goalTitleOf 单点做，组件不再截）。
+  const goal = goalTitleOf(run.goal, run.runId)
   return rowOf({
     runId: run.runId,
-    title: run.runId,
+    title: goal.text,
+    titleSource: goal.source,
+    titleTitle: goal.title,
     metaText: `开始 ${start} · 结束 ${end} · 任务 ${run.done}/${run.tasks}`,
     status: run.planStatus,
     usage: run.usage,

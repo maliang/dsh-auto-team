@@ -69,6 +69,7 @@ import { createExpander } from './memory/expand.ts'
 import { listMemoryItems } from './memory/repo.ts'
 // r13 五个新模块里的三个装配点：自动派发 / 项目库缓存 / 用量记录（判定都在纯模块，这里只接线）。
 import { createAutoDispatcher } from './team/auto-dispatch.ts'
+import { createDispatchNotes } from './team/dispatch-notices.ts'
 import { createLibraryCache, isKnownWorkspace, type LibraryDeps } from './library.ts'
 import {
   applyUsage,
@@ -246,11 +247,23 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    * 单飞状态放在 dispatcher 自己的 Map 里（不落 RunState）：跨进程重启后不能残留「正在派发」。
    * 失败在 `onStatus` 里只记 warn：`stallAlerts` 的归一化只接受 kind='tool'，写进去会被丢弃。
    */
+  /**
+   * 派发失败通知环（r14 AC-3）：受理制之后工具不再 await spawn，「后台没起来」必须自己长腿回来。
+   * 内存态（cap 5、不落盘）：进程重启后旧失败不该再算「刚发生的事实」，与单飞状态同一取舍。
+   * createBridge 把它并入既有 activityOf（kind='status'），所以快照形状零扩张。
+   */
+  const dispatchNotes = createDispatchNotes(now)
+
   const autoDispatcher = createAutoDispatcher({
     store,
     dispatch,
     now,
     onStatus: (_runId, text) => warn(ctx, text),
+    onError: (runId, text) => {
+      warn(ctx, text)
+      dispatchNotes.add(runId, text)
+    },
+    onClear: (runId) => dispatchNotes.clear(runId),
   })
 
   /** 恢复端口：只处理 running/gate/interrupted，重复调用必须幂等（AC-17）。 */
@@ -400,6 +413,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     resume,
     applyReceipt: applyReceiptPort,
     sendMessage,
+    // r14 AC-3：后台派发失败 → 并入既有 activity（kind='status'），受理制不再是「静默失败」。
+    dispatchNotices: dispatchNotes,
     // 门禁超时（AC-13 生效点②）**不在这里传**：缺省时 bridge 取 `settings.gateTimeoutMs`
     // （其缺省正是 GATE_TIMEOUT_MS），设置才能立刻生效；这里硬塞常量会把可配点做废。
     gate: { cwd: workspace, artifactsDir },
@@ -453,9 +468,14 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       roles,
       bridge,
       now,
+      // r14 AC-14：与 libraryDeps.workspace 同一个变量（装配层是唯一能保证同源的地方）——
+      // 换成两次 process.cwd() 或任一处拼尾斜杠，同一个工作区就会裂成两个项目桶。
+      workspace,
       // r13 AC-8 的前两个触发点（plan 落盘 / add_tasks 追加）直接由工具层通知；
       // 工具只知道「计划变了」，派发语义留在 dispatcher 里（不在工具里长出第二套调度）。
       autoDispatch: (sessionId, runId, cause) => autoDispatcher.kick(sessionId, runId, cause),
+      // r14 AC-3：auto_team_status 的 dispatch 段（最近 ≤5 条报告，内存态）。
+      dispatchReports: (sessionId) => autoDispatcher.reportsOf(sessionId),
     }
     registerTools(ctx, toolsDeps)
   } catch (error) {

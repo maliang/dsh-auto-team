@@ -24,7 +24,7 @@ import { buildPlan, extendPlan, progressOf, type PlanDraftTask } from './plan/pl
 import { normalizeWriteScopes } from './plan/scope.ts'
 import { RUN_STATE_VERSION, uniqueRunId, type RunState, type RunsStore } from './store.ts'
 import type { Bridge } from './bridge.ts'
-import type { AutoDispatchCause } from './team/auto-dispatch.ts'
+import type { AutoDispatchCause, AutoDispatchReport } from './team/auto-dispatch.ts'
 import type { RoleRepo } from './roles/repo.ts'
 import { registerTool, type HostContext, type ToolSpec } from './adapters.ts'
 
@@ -49,9 +49,50 @@ export interface ToolsDeps {
    * 缺省（单测桩）= 不自动派发，行为退回 r12 的手动派发。
    */
   autoDispatch?: (sessionId: string, runId: string | undefined, cause: AutoDispatchCause) => void
+  /**
+   * 本 run 的工作区名（r14 AC-14/AC-15）：`auto_team_plan` 落盘时写进 `RunState.project`。
+   *
+   * **必须与 `LibraryDeps.workspace` 是同一个字符串**（装配层注入，`host/index.ts` 一处取值）：
+   * 两个字符串只要差一个字符，同一个工作区就会在左栏裂成两个项目桶。
+   * 缺省（单测桩）= 不写 project，旧 run 归入「历史运行（未记录工作区）」——不猜、不迁移。
+   */
+  workspace?: string
+  /**
+   * 派发报告（r14 AC-3）：`auto_team_status` 的 `dispatch` 段，来源 `autoDispatcher.reportsOf`。
+   *
+   * 可选注入：缺省时该段为空数组（不是「没失败」，而是「本进程没有记录」）。
+   */
+  dispatchReports?: (sessionId: string) => AutoDispatchReport[]
 }
 
 const NOT_ENABLED = '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。'
+
+/**
+ * 受理成功文案（r14 AC-1）：**逐字**，被 PRD/TECHNICAL 与测试同时 grep。
+ * 它必须同时回答三件事：已经接下、成员还在后台、失败去哪儿看 —— 少一句用户就会去轮询。
+ */
+const DISPATCH_ACCEPTED_TEXT = '已接受派发：成员在后台创建，失败会显示在活动流'
+
+/**
+ * 未装配自动派发时的降级说明（只可能出现在单测桩里：生产装配层 `host/index.ts` 必定接线）。
+ *
+ * 为什么不是「直接失败」：`test/bridge.test.ts` 的 dispatch 用例构造 `buildToolSpecs` 时
+ * 没有 autoDispatch 却要求同步派发成功，那是 r13 的既有契约。这里的处理是**如实降级**：
+ * 走回同步 `bridge.act`，返回真实结果并显式 `accepted:false` —— 既不假装受理，也不让旧行为失效。
+ */
+const DISPATCH_SYNC_NOTE = '派发端口未装配（宿主未接自动派发），本次退回同步派发：返回时成员已创建。'
+
+/** 成员投影（dispatch 与 status 工具共用的那一份，避免两处字段慢慢分叉）。 */
+function memberBrief(member: PanelSnapshot['members'][number]): Record<string, unknown> {
+  return {
+    memberId: member.memberId,
+    name: member.name,
+    roleId: member.roleId,
+    taskId: member.taskId,
+    status: member.status,
+    modelRoute: member.modelRoute,
+  }
+}
 
 /**
  * 当前会话 id：面板按会话隔离，工具必须**认到同一个会话**——否则就是「面板里开关打开了，
@@ -256,6 +297,9 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           messages: [],
           bindings: [],
           routeAudits: [],
+          // r14 AC-14：r13 早就有这个字段与投影，只是从没被写过 —— 左栏因此把每次新 run
+          // 都归进历史桶（「历史运行（未记录工作区）」）。写入点只在这里（读的是装配层那个与 library 完全同源的字符串）。
+          ...(deps.workspace === undefined ? {} : { project: deps.workspace }),
         }
         deps.store.save(state)
         // r13 AC-8：计划落盘后**零点击**自动派发（notice 文案同步改成「已自动派发」，不再要求用户手动确认）。
@@ -277,7 +321,9 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
     {
       name: `${TOOL_PREFIX}dispatch`,
       description:
-        '按依赖顺序派发就绪任务并创建成员（并发受 maxConcurrent 与宿主上限限制）。必须带 plan 返回的 runId。',
+        '按依赖顺序派发就绪任务并创建成员（并发受 maxConcurrent 与宿主上限限制）。必须带 plan 返回的 runId。'
+        + '**本工具受理后立即返回**（accepted/dispatching）：成员在后台创建，你不需要、也不应该在同一轮等待成员；'
+        + '进度用 auto_team_status 查，失败了会在下一次返回里看到。',
       parameters: {
         type: 'object',
         properties: { runId: { type: 'string', description: 'auto_team_plan 返回的 runId（必填）' } },
@@ -295,31 +341,48 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
               'auto_team_dispatch 必须带 runId：先调用 auto_team_plan 生成计划，再用它返回的 runId 派发（计划必须早于成员创建）。',
           }
         }
-        const state = deps.store.load(runId)
-        if (!state || state.plan.sessionId !== sessionId) {
-          return { ok: false, error: `找不到运行 ${runId}：当前会话没有这个 runId（重新调用 auto_team_plan）` }
+
+        // ① 同步预检：判据与面板 act('dispatch') 同源，不通过就原样回码并**不** kick。
+        const admission = deps.bridge.precheckDispatch(sessionId, runId)
+        if (!admission.ok) {
+          return { ok: false, code: admission.code, error: admission.message }
         }
 
-        const result = await deps.bridge.act(sessionId, { type: 'dispatch', runId })
-        const rejected = rejectedOf(result)
-        if (rejected) return rejected
+        // ② 受理：真正的 spawn 交给后台调度器（单飞/退避/四道闸都在它里面）。
+        //    ⚠️ 受理分支里**不许 await 任何与 spawn 相关的东西**：一 await，队长轮就被拖住（AC-1）。
+        if (deps.autoDispatch === undefined) {
+          // 只有未装配的桩环境会走到这里（生产装配层必定接 autoDispatch）：退回 r13 同步语义，
+          // 返回真实结果，但显式标 accepted:false —— 绝不把「没被后台受理」说成「已受理」。
+          const result = await deps.bridge.act(sessionId, { type: 'dispatch', runId })
+          const rejected = rejectedOf(result)
+          if (rejected) return rejected
+          const snapshot = result.snapshot
+          return {
+            ok: true,
+            accepted: false,
+            dispatching: false,
+            runId: snapshot.runId,
+            planStatus: snapshot.planStatus,
+            ready: admission.ready,
+            tasks: snapshot.tasks.map(taskBrief),
+            members: snapshot.members.map(memberBrief),
+            notices: [...(result.notices ?? []), DISPATCH_SYNC_NOTE],
+          }
+        }
+        deps.autoDispatch(sessionId, runId, 'manual')
 
-        const snapshot = result.snapshot
+        // ③ 立即返回「已受理」：成员此刻还没创建，如实回快照里的既有成员，不预支结果。
+        const snapshot = deps.bridge.snapshot(sessionId)
         return {
           ok: true,
-          runId: snapshot.runId,
+          accepted: true,
+          dispatching: true,
+          runId: admission.runId,
           planStatus: snapshot.planStatus,
-          concurrency: snapshot.concurrency,
+          ready: admission.ready,
           tasks: snapshot.tasks.map(taskBrief),
-          members: snapshot.members.map((member) => ({
-            memberId: member.memberId,
-            name: member.name,
-            roleId: member.roleId,
-            taskId: member.taskId,
-            status: member.status,
-            modelRoute: member.modelRoute,
-          })),
-          notices: result.notices,
+          members: snapshot.members.map(memberBrief),
+          notices: [DISPATCH_ACCEPTED_TEXT],
         }
       },
     },
@@ -348,6 +411,17 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           members: snapshot.members,
           messages: snapshot.messages.slice(-20),
           routeAudits: snapshot.routeAudits,
+          // r14 AC-3：「后台派发到底发生了什么」——受理制之后这是唯一能解释「已接受派发但没人起来」的窗口。
+          // 只报最近 ≤5 条（内存态，进程重启即空）：它不是账本，而是「刚才那几次」。
+          dispatch: (deps.dispatchReports?.(sessionId) ?? []).map((report) => ({
+            cause: report.cause,
+            attempted: report.attempted,
+            started: report.started,
+            failed: report.failed,
+            skipped: report.skipped,
+            errors: report.errors,
+            ...(report.reason === undefined ? {} : { reason: report.reason }),
+          })),
           memory: {
             injectedChars: snapshot.memory.injectedChars,
             budget: snapshot.memory.budget,

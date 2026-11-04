@@ -759,12 +759,15 @@ function viewCode(name: string): string {
     .replace(/^\s*\/\/.*$/gm, '')
 }
 
-test('8 个视图组件全部存在，命名导出与设计契约一致，且只依赖 react 与本地模块', () => {
+test('视图组件全部存在，命名导出与设计契约一致，且只依赖 react 与本地模块', () => {
   const expected: Record<string, string> = {
     RunHeader: 'RunHeader',
     RoleStrip: 'RoleStrip',
     TaskTable: 'TaskTable',
-    FlowGraph: 'FlowGraph',
+    ProgressRing: 'ProgressRing',
+    RoleCard: 'RoleCard',
+    TaskOverview: 'TaskOverview',
+    FlowCanvas: 'FlowCanvas',
     MemoryList: 'MemoryList',
     ConfirmDialog: 'ConfirmDialog',
     DetailPane: 'DetailPane',
@@ -836,23 +839,75 @@ test('TaskTable：两行式任务行、token/用时 data-cell、展开详情与�
   assert.equal(code.includes('toLocaleString'), false, 'token 千分位只能在 viewmodel.tokenTextOf')
 })
 
-test('FlowGraph：自绘 SVG 边 + 绝对定位节点，节点钩子带任务 id', () => {
-  const code = viewCode('FlowGraph')
+test('FlowCanvas：可平移视口 + rAF 直写 transform，节点第一行是角色名', () => {
+  const code = viewCode('FlowCanvas')
   assert.match(code, /data-region="task-flow"/)
   assert.match(code, /data-flow-canvas/)
-  assert.match(code, /data-flow-inner/)
+  assert.match(code, /data-flow-viewport/)
   assert.match(code, /data-flow-edges/)
   assert.match(code, /data-flow-edge/)
   assert.match(code, /data-upstream-done=/)
   assert.match(code, /data-flow-node=/)
   assert.match(code, /data-flow-column=/)
   assert.match(code, /data-flow-row=/)
-  assert.match(code, /data-flow-line="title"/)
+  assert.match(code, /data-flow-node-role/)
+  assert.match(code, /data-flow-node-title/)
   assert.match(code, /data-flow-line="meta"/)
   assert.match(code, /data-flow-legend/)
+  assert.match(code, /data-canvas-reset/)
   assert.match(code, /flowLayoutOf\(/)
+  // 拖动只写 transform + rAF 合帧 + 4px 累计阈值（AC-22：60 帧不来 60 次重排）
+  assert.match(code, /requestAnimationFrame\(/)
+  assert.match(code, /style\.transform = /)
+  assert.match(code, /FLOW_DRAG_THRESHOLD/)
   // 不引图形库（零运行时依赖）
   assert.equal(/from '(d3|mermaid|reactflow|cytoscape)/.test(code), false)
+})
+
+test('ProgressRing：64×64、r=28、两档字号，环内文字严格是 done/total', () => {
+  const code = viewCode('ProgressRing')
+  assert.match(code, /data-progress-ring/)
+  assert.match(code, /data-done=\{String/)
+  assert.match(code, /data-total=\{String/)
+  assert.match(code, /data-ring-track/)
+  assert.match(code, /data-ring-arc/)
+  assert.match(code, /data-complete=/)
+  assert.match(code, /data-progress-text/)
+  assert.match(code, /data-text-tier=/)
+  assert.match(code, /rotate\(-90 32 32\)/)
+  assert.match(code, /PROGRESS_RING_RADIUS/)
+  assert.match(code, /PROGRESS_RING_CIRCUMFERENCE/)
+  assert.match(code, /strokeDashoffset=/)
+  assert.match(code, /role="img"/)
+  // 组件不做除法：dashOffset 由 taskOverviewOf 预计算（避免两处舍入不一致）
+  assert.match(code, /props\.dashOffset/)
+})
+
+test('RoleCard / RoleGrid：2 列网格只渲染、六个派生量全来自 shared 的单点', () => {
+  const code = viewCode('RoleCard')
+  assert.match(code, /data-role-grid/)
+  assert.match(code, /data-role-card/)
+  assert.match(code, /data-role-id=/)
+  assert.match(code, /data-role-name/)
+  assert.match(code, /data-role-status/)
+  assert.match(code, /data-tone=/)
+  assert.match(code, /data-role-active-task/)
+  assert.match(code, /data-role-usage/)
+  assert.match(code, /data-usage-source=/)
+  assert.match(code, /data-role-duration/)
+  assert.match(code, /data-duration-state=/)
+  // 状态文本只能来自 shared 的 ROLE_STATE_TEXT（宿主/客户端同源），不许在组件里另写一张表
+  assert.match(code, /ROLE_STATE_TEXT/)
+})
+
+test('TaskOverview：环与两组由同一次 taskOverviewOf 派生（AC-11 同帧）', () => {
+  const code = viewCode('TaskOverview')
+  assert.match(code, /data-task-overview/)
+  assert.match(code, /data-overview-ring/)
+  assert.match(code, /data-overview-list/)
+  assert.match(code, /taskOverviewOf\(/)
+  assert.match(code, /ProgressRing/)
+  assert.match(code, /grouped/)
 })
 
 test('MemoryList：条目钩子 = track/name，正文逐字，错误态不吞', () => {
@@ -918,19 +973,21 @@ test('样式：r13 新块只用宿主 token，关键尺寸来自设计稿', () =
   assert.equal(/font-size:\s*var\(--dsw-font/.test(block), false, '不许写 font-size: var(--dsw-font-*)')
   // 2) 新块不写 16 进制色值（旧块的历史兜底不复制过来）
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(block), false, 'r13 新块不许出现 #hex 色值')
-  // 3) 关键尺寸：任务行 56、表头 24、run 头 64、节点 148×56、列距 188、行距 72、画布 300、弹窗 402、左列 220
+  // 3) 关键尺寸：任务行 56、表头 24、run 头 64、节点 180×76、画布 300、弹窗 402、
+  //    项目列表列宽走 --lib-list-w 变量（AC-13 要能拖动，所以不能再写死 220px）
   for (const snippet of [
     'min-height: 56px',
     'height: 24px',
     'min-height: 64px',
-    'width: 148px',
-    'height: 56px',
+    'width: 180px',
+    'height: 76px',
     'height: 300px',
     'width: 402px',
-    'flex: 0 0 220px',
+    '--lib-list-w',
+    'flex: 0 0 var(--lib-list-w',
     'grid-template-columns: minmax(0, 1fr) 76px 84px',
   ]) {
-    assert.equal(block.includes(snippet), true, `r13 样式必须包含 \`${snippet}\``)
+    assert.equal(block.includes(snippet), true, `r14 样式必须包含 \`${snippet}\``)
   }
   // 4) 折叠与动效兜底都在（主区宽度 ≠ 视口宽度，容器查询优先）
   assert.equal(block.includes('@container (max-width: 719px)'), true)

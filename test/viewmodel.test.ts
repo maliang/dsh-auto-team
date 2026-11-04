@@ -757,12 +757,17 @@ import {
   FLOW_NODE_WIDTH,
   FLOW_PADDING,
   FLOW_ROW_STEP,
+  GOAL_TITLE_MAX,
+  LIB_LIST_DEFAULT,
+  LIB_LIST_MAX,
+  LIB_LIST_MIN,
   NOT_STARTED_TEXT,
   TASK_TABLE_HEADER,
   UNAVAILABLE_TEXT,
   buildFlow,
   buildRunDetail,
   buildTaskDetail,
+  clampListWidth,
   compactTokenTextOf,
   confirmDialogOf,
   confirmVerbOf,
@@ -770,8 +775,10 @@ import {
   durationTitleOf,
   flowLayoutOf,
   flowNodeViewOf,
+  goalTitleOf,
   inflightOf,
   memoryRowOf,
+  nextListWidth,
   roleChipsOf,
   roleUsageOf,
   runHeadOf,
@@ -791,6 +798,7 @@ import type {
   TaskDetailView,
   UsageCell,
 } from '../src/shared/types.ts'
+import { ROLE_STATE_TEXT } from '../src/shared/role-view.ts'
 
 const providerCell = (total: number, input?: number, output?: number): UsageCell => ({
   source: 'provider',
@@ -974,16 +982,16 @@ test('buildFlow：环形依赖不死循环，仍能产出完整节点', () => {
   for (const node of flow.nodes) assert.equal(Number.isFinite(node.column), true)
 })
 
-test('flowLayoutOf：节点 148×56、列距 188、行距 72，边是三次贝塞尔', () => {
+test('flowLayoutOf：节点 180×76、列距 220、行距 92，边是三次贝塞尔', () => {
   const flow: FlowView = buildFlow([
     taskOf('t1', 'done'),
     taskOf('t2', 'running', { dependsOn: ['t1'] }),
   ])
   const layout = flowLayoutOf(flow)
-  assert.equal(FLOW_NODE_WIDTH, 148)
-  assert.equal(FLOW_NODE_HEIGHT, 56)
-  assert.equal(FLOW_COLUMN_STEP, 188)
-  assert.equal(FLOW_ROW_STEP, 72)
+  assert.equal(FLOW_NODE_WIDTH, 180, 'r14：节点加宽到 180（三行：角色名 / 任务简述 / 用量）')
+  assert.equal(FLOW_NODE_HEIGHT, 76)
+  assert.equal(FLOW_COLUMN_STEP, 220)
+  assert.equal(FLOW_ROW_STEP, 92)
   const t1 = layout.nodes.find((entry) => entry.node.id === 't1')!
   const t2 = layout.nodes.find((entry) => entry.node.id === 't2')!
   assert.equal(t1.x, FLOW_PADDING)
@@ -1010,17 +1018,21 @@ test('flowLayoutOf：缺端的边被跳过，不产生 NaN 坐标', () => {
   assert.equal(layout.height, FLOW_PADDING * 2 + FLOW_NODE_HEIGHT)
 })
 
-test('flowNodeViewOf：长 token 数字降级到紧凑写法，title 保留全文', () => {
+test('flowNodeViewOf：token 用宿主原串不压缩（节点 158 内宽容得下），title 保留全文', () => {
   const flow = buildFlow([taskOf('t1', 'done')], {
     usage: { t1: providerCell(1_234_567) },
     durations: { t1: durationCell('1 小时 02 分') },
   })
   const view = flowNodeViewOf(flow.nodes[0])
-  assert.equal(view.tokenText, '1.2M', '节点内超 7 字符必须降级，否则撑破 128px')
+  // r14 AC-6：不截断数字 —— 1,234,567 共 9 字符，仍在 158px 内宽内（第 3 行最坏 133px）
+  assert.equal(view.tokenText, '1,234,567')
   assert.equal(view.durationText, '1 小时 02 分')
-  assert.equal(view.text, '1.2M · 1 小时 02 分')
-  assert.equal(view.title.includes('1,234,567'), true, '全文只放在 title 里')
-  assert.equal(view.label.includes('任务 t1'), true)
+  assert.equal(view.text, '1,234,567 · 1 小时 02 分')
+  assert.equal(view.title.includes('1,234,567'), true, '全文同样放 title')
+  // 角色名与任务简述分开给两行（第一行不许再是任务 id；缺角色名时如实说「角色未记录」）
+  assert.equal(view.roleText, '角色未记录')
+  assert.equal(view.taskTitle, '任务t1')
+  assert.equal(view.label.startsWith('角色未记录：任务t1'), true)
 })
 
 /* ──────────────────── 角色条：部分缺来源不合计 ──────────────────── */
@@ -1058,6 +1070,15 @@ test('roleUsageOf：只列有任务的角色，全有来源才合计', () => {
   assert.equal(usage[0].tasks, 2)
   assert.equal(usage[0].usage.source, 'provider')
   assert.equal(usage[0].usage.tokens?.total, 3_500)
+  // r14 AC-7：卡片四要素的派生量也来自同一份 roleStateOf（不是组件自己再算一遍）
+  assert.equal(usage[0].done, 1, '已完成分子只认 done（t2 还是 running）')
+  assert.equal(usage[0].state, 'running')
+  assert.equal(usage[0].stateText, ROLE_STATE_TEXT.running)
+  assert.equal(usage[0].activeTaskId, 't2')
+  assert.equal(usage[0].activeTaskTitle, '任务t2')
+  assert.equal(usage[0].duration?.text, '20 秒')
+  assert.equal(usage[1].state, 'running')
+  assert.equal(usage[1].done, 0)
   assert.equal(usage[1].roleId, 'qa')
   assert.equal(usage[1].tasks, 1)
   // ops 在任务里没有出现 → 不占位置
@@ -1257,6 +1278,56 @@ test('memoryRowOf：token 一律带 ≈ 且说明是估算，不是 provider 上
   // 没有建立时间时只显示修改时间
   const noCreated = memoryRowOf({ ...item, createdAt: undefined })
   assert.equal(noCreated.timeText.startsWith('修改 '), true)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * r14：run 级标题 / 项目列表分栏宽度（AC-15 / AC-13）
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+test('goalTitleOf：24 字单点截断（按 code point，中文与 emoji 安全），title 给全文', () => {
+  assert.equal(GOAL_TITLE_MAX, 24)
+  const short = goalTitleOf('把任务页改成可拖动的无限画布', 'run-abcdef123456')
+  assert.deepEqual(short, { text: '把任务页改成可拖动的无限画布', title: '把任务页改成可拖动的无限画布', source: 'goal' })
+
+  const exact = 'a'.repeat(24)
+  assert.equal(goalTitleOf(exact, 'r1').text, exact, '正好 24 字不补省略号')
+  const over = 'b'.repeat(25)
+  const truncated = goalTitleOf(over, 'r1')
+  assert.equal(truncated.text, `${'b'.repeat(24)}…`)
+  assert.equal(truncated.title, over, '行标题截断，悬停仍看全文')
+
+  // emoji 是代理对：按 UTF-16 截会切坏字符，必须 Array.from
+  const emoji = '🚀'.repeat(30)
+  const emojiTitle = goalTitleOf(emoji, 'r1')
+  assert.equal(emojiTitle.text, `${'🚀'.repeat(24)}…`)
+  assert.equal(emojiTitle.title, emoji)
+  // 首尾空白不占用 24 字预算
+  assert.equal(goalTitleOf('  目标  ', 'r1').text, '目标')
+})
+
+test('goalTitleOf：旧 run 没有 goal → fallback「未命名任务 · 后 6 位」，不拿 runId 冒充目标', () => {
+  for (const empty of [undefined, '', '   ']) {
+    const view = goalTitleOf(empty, 'run-abcdef123456')
+    assert.equal(view.source, 'fallback')
+    assert.equal(view.text, '未命名任务 · 123456')
+    assert.equal(view.text.includes('run-abcdef'), false)
+    assert.notEqual(view.title, view.text, 'title 里说明为什么没有目标')
+  }
+})
+
+test('clampListWidth / nextListWidth：夹在 160–360，非数字回 220（AC-13 分栏）', () => {
+  assert.equal(LIB_LIST_DEFAULT, 220)
+  assert.equal(LIB_LIST_MIN, 160)
+  assert.equal(LIB_LIST_MAX, 360)
+  assert.equal(clampListWidth(Number.NaN), LIB_LIST_DEFAULT, 'NaN 不许传染到 flex-basis')
+  assert.equal(clampListWidth(Number.POSITIVE_INFINITY), LIB_LIST_DEFAULT)
+  assert.equal(clampListWidth(100), LIB_LIST_MIN)
+  assert.equal(clampListWidth(999), LIB_LIST_MAX)
+  assert.equal(clampListWidth(220.6), 221, '像素取整，避免亚像素抖动')
+  assert.equal(nextListWidth(220, 80), 300)
+  assert.equal(nextListWidth(220, -200), LIB_LIST_MIN)
+  assert.equal(nextListWidth(Number.NaN, 40), 260, '从坏起点出发先归一再夹')
+  assert.equal(nextListWidth(220, Number.NaN), 220)
 })
 
 

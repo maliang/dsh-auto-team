@@ -8,6 +8,10 @@
  *   3. 状态枚举只在这里定义一次（宿主 4 态 → 面板 7 态的映射在 host 侧唯一一处）。
  */
 
+// r14 AC-7：角色态枚举的唯一实现是 shared/role-view.ts（host 与 client 共用同一套派生算法）。
+// 这里只做**类型**引用 —— `import type` 编译期擦除，不构成运行时循环依赖。
+import type { RoleStateKind } from './role-view.ts'
+
 /** 任务状态（AC-30 的计划条目 / AC-18 的存活对账 / AC-19 的返工都会读它）。 */
 export type TaskStatus =
   | 'pending'
@@ -148,6 +152,11 @@ export interface Plan {
   sessionId: string
   createdAt: number
   status: PlanStatus
+  /**
+   * r14 AC-15：本轮目标原文（`PlanDraft.goal` 落盘时写回）。
+   * 缺省 = 旧 run 没有记录目标（界面显示「未命名任务 · 后 6 位」），**不补猜**。
+   */
+  goal?: string
   tasks: PlanTask[]
   maxConcurrent: number
 }
@@ -466,12 +475,23 @@ export interface DurationCell {
   state: DurationState
 }
 
-/** run 头的角色条：该角色在本 run 里承担几个任务、合计多少 token。 */
+/** run 头的角色条 / 角色卡片：该角色在本 run 里承担几个任务、合计多少 token。 */
 export interface RoleUsageView {
   roleId: string
   name: string
   tasks: number
   usage: UsageCell
+  /**
+   * r14 AC-7：以下 6 个派生量全部来自 `shared/role-view.ts#roleStateOf` ——
+   * 宿主 `library.rolesOf` 与客户端 `roleUsageOf` 只做映射，禁止各写一份聚合。
+   * 全部可选：旧快照/旧夹具可读（缺省 = 界面按待命 + 「不可得」渲染）。
+   */
+  done?: number
+  state?: RoleStateKind
+  stateText?: string
+  activeTaskId?: string
+  activeTaskTitle?: string
+  duration?: DurationCell
 }
 
 /** 任务表一行（右栏任务页与左栏项目页**共用**这一份形状，AC-18 的 deep equal 靠它）。 */
@@ -500,6 +520,8 @@ export interface FlowNodeView {
   id: string
   title: string
   status: TaskStatus
+  /** r14 AC-4/AC-5：节点首行显示的角色名（缺省 = 旧 run 没记录，组件回退到「角色未记录」）。 */
+  roleName?: string
   /** 列 = 依赖深度（0 起）；行 = 同列内序号。 */
   column: number
   row: number
@@ -566,6 +588,8 @@ export interface MemoryItemView {
 /** 项目里最近一个 run 的一行（左栏项目页「最近运行」用，不展开任务）。 */
 export interface ProjectRunSummaryView {
   runId: string
+  /** r14 AC-15：run 级目标（项目页行标题的唯一来源；缺省 = 旧 run，界面走 fallback）。 */
+  goal?: string
   planStatus: PlanStatus
   plannedAt?: number
   finishedAt?: number
@@ -580,7 +604,7 @@ export interface ProjectView {
   id: string
   name: string
   path?: string
-  /** true = 没有 `project` 字段的历史 run 聚成的「未知项目」（固定末位）。 */
+  /** true = 没有 `project` 字段的历史 run 聚成的「历史运行（未记录工作区）」（固定末位）。 */
   unknown?: boolean
   runs: number
   usage: UsageCell
@@ -613,7 +637,9 @@ export interface RunSummary {
   status: PlanStatus
   tasks: number
   done: number
-  /** r13：项目（工作区路径的 basename）；旧 run 缺失 = 「未知项目」。 */
+  /** r14 AC-15：run 级目标（缺省 = 旧 run 未记录，界面走 fallback）。 */
+  goal?: string
+  /** r13：项目（工作区路径的 basename）；旧 run 缺失 = 归入「历史运行（未记录工作区）」。 */
   project?: string
   /** r13：计划写入时间（AC-30 证据）。 */
   plannedAt?: number
@@ -706,7 +732,7 @@ export interface PanelSnapshot {
   runUsage?: UsageCell
   /** r13 AC-20：run 用时（`plannedAt → finishedAt`，未结束取 now 且 `state='running'`）。 */
   runDuration?: DurationCell
-  /** r13：本 run 所属项目（工作区 basename）；旧 run 缺失 = 「未知项目」。 */
+  /** r13：本 run 所属项目（工作区 basename）；旧 run 缺失 = 「历史运行（未记录工作区）」。 */
   project?: string
   /** r13 AC-3：任务级用量（key = taskId；文本已在宿主格式化）。 */
   taskUsage?: Record<string, UsageCell>

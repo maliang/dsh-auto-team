@@ -111,7 +111,7 @@ export interface RunState {
    * 与 `plan.status === 'paused'` 的区别：这里是**可还原的原状态**，`plan.status` 只是对外的当前态。
    */
   pause?: PauseRecord
-  /** r13：本 run 所属项目（工作区 basename）；缺省 = 旧 run，左栏归入「未知项目」。 */
+  /** r13：本 run 所属项目（工作区 basename）；缺省 = 旧 run，左栏归入「历史运行（未记录工作区）」。 */
   project?: string
   /** r13 AC-20：进入终态（全部任务终态 / 取消）的时刻；进行中缺省。 */
   finishedAt?: number
@@ -250,6 +250,8 @@ export class RunsStore {
         done: plan.tasks.filter((task) => task.status === 'done').length,
         // r13：左栏项目页/历史页要的四个可选量；拿不到就不写（面板显示「不可得」而不是 0）。
         ...(normalizeLabel(state.project) !== undefined ? { project: normalizeLabel(state.project) } : {}),
+        // r14 AC-15：run 级目标（旧 run 没有就不写，客户端走 fallback —— 不猜、不迁移）。
+        ...(normalizeLabel(plan.goal) !== undefined ? { goal: normalizeLabel(plan.goal) } : {}),
         plannedAt: state.plannedAt,
         ...(state.finishedAt !== undefined ? { finishedAt: state.finishedAt } : {}),
         ...(state.usage?.total !== undefined ? { usageTotals: state.usage.total } : {}),
@@ -655,7 +657,7 @@ function normalizePlan(raw: Record<string, unknown>): Plan | null {
   const { runId, sessionId, tasks } = raw
   if (typeof runId !== 'string' || runId === '') return null
   if (typeof sessionId !== 'string' || !Array.isArray(tasks)) return null
-  return {
+  const plan: Plan = {
     runId,
     sessionId,
     createdAt: finiteNumber(raw.createdAt, 0),
@@ -663,6 +665,10 @@ function normalizePlan(raw: Record<string, unknown>): Plan | null {
     tasks: tasks.map(normalizeTask).filter((task): task is PlanTask => task !== null),
     maxConcurrent: clampConcurrency(raw.maxConcurrent),
   }
+  // r14 AC-15：`wrapLegacy` / 旧文件透传 goal；写成可选字段，旧夹具形状保持不变。
+  const goal = normalizeLabel(raw.goal)
+  if (goal !== undefined) plan.goal = goal
+  return plan
 }
 
 /** 单个任务的最小结构校验：旧文件里缺字段时补默认值，坏条目直接丢弃。 */

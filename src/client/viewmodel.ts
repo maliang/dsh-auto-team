@@ -13,6 +13,7 @@
  */
 import { TASK_STATUS_LABELS, taskActionAllowed, taskActionDisabledReason } from '../shared/task-actions.ts'
 import type { TaskActionName } from '../shared/task-actions.ts'
+import { roleStateOf, roleUsageCellOf } from '../shared/role-view.ts'
 import type {
   CaptainModelView,
   DeviationView,
@@ -1115,34 +1116,155 @@ export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
   return panel
 }
 
+/* ───────────── 任务总览（环 + 两组） ───────────── */
+
+/** 进度环几何（r14 DESIGN §2.2：64×64、r=28、stroke=6）。 */
+export const PROGRESS_RING_RADIUS = 28
+export const PROGRESS_RING_STROKE = 6
+export const PROGRESS_RING_CIRCUMFERENCE = 2 * Math.PI * PROGRESS_RING_RADIUS
+
+export interface TaskOverviewView {
+  done: number
+  total: number
+  /** 圆心文本，严格 `done/total`（0 任务 = `0/0`，不写 NaN、不写百分比）。 */
+  text: string
+  /** 环的无障碍名（`role="img"` 用，读屏不读两个数字拼起来的文本）。 */
+  ariaLabel: string
+  /** 0..1；`total === 0` 时为 0（弧长退化为整圈轨迹）。 */
+  ratio: number
+  /** 传给 `stroke-dashoffset` 的像素值；由本函数算好，组件不做除法（避免两处舍入）。 */
+  dashOffset: number
+  groups: { open: TaskRowView[]; done: TaskRowView[] }
+}
+
+/**
+ * 任务总览的**唯一**派生点（r14 AC-10 / AC-11）。
+ *
+ * 一次调用同时产出环的比例、圆心文本与两个分组 —— 组件不再自己做除法或二次过滤，
+ * 所以「改一个任务 running→done」时环与两组必然同一帧一致（AC-11）。
+ * 分子只认 `status === 'done'`：`cancelled`/`skipped` 是终态但不是完成（AC-10）。
+ */
+export function taskOverviewOf(
+  tasks: readonly TaskDetailView[],
+  expandedTaskId?: string,
+): TaskOverviewView {
+  const open: TaskRowView[] = []
+  const done: TaskRowView[] = []
+  for (const task of tasks) {
+    const row = taskRowOf(task, task.id === expandedTaskId)
+    if (task.status === 'done') done.push(row)
+    else open.push(row)
+  }
+  const total = tasks.length
+  const ratio = total === 0 ? 0 : done.length / total
+  return {
+    done: done.length,
+    total,
+    text: `${done.length}/${total}`,
+    ariaLabel: `已完成 ${done.length} / 共 ${total}`,
+    ratio,
+    dashOffset: PROGRESS_RING_CIRCUMFERENCE * (1 - ratio),
+    groups: { open, done },
+  }
+}
+
+/* ───────────── 目标标题（项目页 run 行） ───────────── */
+
+/** 行标题最多显示多少个字符（r14 AC-15 / DESIGN §3；按 code point 计，中文与 emoji 都算 1）。 */
+export const GOAL_TITLE_MAX = 24
+
+export interface GoalTitleView {
+  /** 行里显示的文本（超出 24 字截断并补 `…`）。 */
+  text: string
+  /** `title` 属性用的完整原文（截断与否都给全文，鼠标悬停能看全）。 */
+  title: string
+  source: 'goal' | 'fallback'
+}
+
+/**
+ * run 级标题的**唯一截断点**（r14 AC-15）：组件只渲染，不再二次截断/补 `…`。
+ *
+ * 没有 goal 的旧 run 用「未命名任务 · runId 后 6 位」——**不拿任务标题或 runId 冒充目标**，
+ * 也不猜（AC-15 明确禁止标题等于 `t1`/裸 runId）。
+ */
+export function goalTitleOf(goal: string | undefined, runId: string): GoalTitleView {
+  const full = (goal ?? '').trim()
+  if (full === '') {
+    return {
+      text: `未命名任务 · ${runId.slice(-6)}`,
+      title: `本轮没有记录目标（run ${runId}）`,
+      source: 'fallback',
+    }
+  }
+  const chars = Array.from(full)
+  if (chars.length <= GOAL_TITLE_MAX) return { text: full, title: full, source: 'goal' }
+  return { text: `${chars.slice(0, GOAL_TITLE_MAX).join('')}…`, title: full, source: 'goal' }
+}
+
+/* ───────────── 项目库分栏宽度 ───────────── */
+
+/** 项目列表列宽（r14 DESIGN §3）：默认 220，夹在 160–360（再窄放不下项目名，再宽挤掉详情）。 */
+export const LIB_LIST_DEFAULT = 220
+export const LIB_LIST_MIN = 160
+export const LIB_LIST_MAX = 360
+
+/** 任意输入 → 合法列宽；非数字（NaN/Infinity）回默认值，不做 `Math.min(undefined)` 这种 NaN 传染。 */
+export function clampListWidth(width: number): number {
+  if (!Number.isFinite(width)) return LIB_LIST_DEFAULT
+  return Math.min(LIB_LIST_MAX, Math.max(LIB_LIST_MIN, Math.round(width)))
+}
+
+/** 拖动增量 → 新列宽（先归一再夹取，避免从 NaN 起点一路 NaN）。 */
+export function nextListWidth(current: number, deltaPx: number): number {
+  const base = clampListWidth(current)
+  const delta = Number.isFinite(deltaPx) ? deltaPx : 0
+  return clampListWidth(base + delta)
+}
+
 /* ───────────── 流转图 ───────────── */
 
-/** 节点几何（DESIGN §2.4：行高 = 8+20+4+16+8 = 56，宽 148 按最长 ID + 状态文案核算）。 */
-export const FLOW_NODE_WIDTH = 148
-export const FLOW_NODE_HEIGHT = 56
-export const FLOW_COLUMN_STEP = 188
-export const FLOW_ROW_STEP = 72
+/**
+ * 节点几何（r14 DESIGN §2.4）：180×76，列/行步进 220/92。
+ *
+ * 180 宽 = 296 画布内一列放得下（含两侧 padding 12）；76 高 = 三行（角色名 20 + 任务简述 16 +
+ * meta 16 + 三个 12 的间距）。放不下靠 CSS ellipsis，**不压缩数字**。
+ */
+export const FLOW_NODE_WIDTH = 180
+export const FLOW_NODE_HEIGHT = 76
+export const FLOW_COLUMN_STEP = 220
+export const FLOW_ROW_STEP = 92
 export const FLOW_PADDING = 12
+
+/** 缺角色名时的兜底文案（旧 run 的 `TaskDetailView.roleName` 恒有，这里只防脏数据）。 */
+export const FLOW_ROLE_FALLBACK = '角色未记录'
 
 export interface FlowNodeCellView {
   tokenText: string
   durationText: string
-  /** 节点第二行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
+  /** 节点首行的角色名（r14 AC-5：t1 → 角色名称）。 */
+  roleText: string
+  /** 节点第二行的任务简述（给人看的名字，不是任务 id）。 */
+  taskTitle: string
+  /** 节点第三行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
   text: string
   title: string
   label: string
 }
 
 export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
+  // r14：token 一律给**原串**（宿主已格式化千分位）。r13 在这里超过 7 位就换紧凑写法，
+  // 那是设计师明确否掉的口径 —— 截断/压缩数字等于造假，宁可让 CSS 省略号省略文字。
   const full = tokenTextOf(node.usage)
-  const tokenText = full.length > 7 ? compactTokenTextOf(node.usage) : full
   const durationText = durationTextOf(node.duration)
+  const roleText = (node.roleName ?? '').trim() || FLOW_ROLE_FALLBACK
   return {
-    tokenText,
+    tokenText: full,
     durationText,
-    text: `${tokenText} · ${durationText}`,
-    title: `${node.id} ${node.title}\ntoken ${full} · 用时 ${durationText}`,
-    label: `任务 ${node.id} ${node.title}，${statusBadge(node.status).text}，token ${full}，用时 ${durationText}`,
+    roleText,
+    taskTitle: node.title,
+    text: `${full} · ${durationText}`,
+    title: `${roleText}：${node.title}\ntoken ${full} · 用时 ${durationText}`,
+    label: `${roleText}：${node.title}，${statusBadge(node.status).text}，token ${full}，用时 ${durationText}`,
   }
 }
 
@@ -1336,7 +1458,11 @@ export interface FlowCells {
  *
  * 环（坏计划 / 历史脏数据）不能让渲染死循环：遇到回边按深度 0 处理，图仍然画得出来。
  */
-export function buildFlow(tasks: PlanTask[], cells: FlowCells = {}): FlowView {
+export function buildFlow(
+  tasks: PlanTask[],
+  cells: FlowCells = {},
+  roleNameOf?: (roleId: string) => string,
+): FlowView {
   const byId = new Map(tasks.map((task) => [task.id, task]))
   const depth = new Map<string, number>()
   const visiting = new Set<string>()
@@ -1371,6 +1497,8 @@ export function buildFlow(tasks: PlanTask[], cells: FlowCells = {}): FlowView {
       usage: usageCellOr(cells.usage?.[task.id], '该任务没有可用用量事件'),
       duration: cells.durations?.[task.id] ?? fallbackDurationOf(progressOf(task).status),
     }
+    // r14 AC-5：节点首行显示角色名。PlanTask 只有 roleId，名字由调用方给（快照路径取 roles 表）。
+    if (roleNameOf !== undefined) node.roleName = roleNameOf(task.roleId)
     nodes.push(node)
   }
   const edges: FlowEdgeView[] = []
@@ -1405,7 +1533,14 @@ function sumUsage(cells: readonly UsageCell[], missingReason: string): UsageCell
   return { source: 'provider', tokens: { total } }
 }
 
-/** 逐角色聚合：只列真正有任务的角色（没任务的角色不占位置）。 */
+/**
+ * 逐角色聚合：只列真正有任务的角色（没任务的角色不占位置）。
+ *
+ * r14 AC-7/AC-8/AC-9：状态 / 当前任务 / 用时走 `shared/role-view.ts#roleStateOf`，
+ * 用量走同文件的 `roleUsageCellOf` —— 与宿主 `library.rolesOf` **同一份实现**，
+ * 所以右栏与抽屉里的文案逐字相等（AC-17）。r13 里这里另写了一份「部分缺失即不可得」
+ * 的合计，宿主却把已知项加起来（QA D2），两边因此对同一张角色卡说两种话。
+ */
 export function roleUsageOf(tasks: readonly TaskDetailView[], roles: readonly Role[]): RoleUsageView[] {
   const order: string[] = []
   const groups = new Map<string, TaskDetailView[]>()
@@ -1420,15 +1555,20 @@ export function roleUsageOf(tasks: readonly TaskDetailView[], roles: readonly Ro
   return order.map((roleId) => {
     const list = groups.get(roleId) ?? []
     const known = roles.find((role) => role.id === roleId)
-    return {
+    const state = roleStateOf(list)
+    const view: RoleUsageView = {
       roleId,
       name: known?.name ?? list[0]?.roleName ?? roleId,
       tasks: list.length,
-      usage: sumUsage(
-        list.map((task) => task.usage),
-        '该角色没有可用用量事件',
-      ),
+      usage: roleUsageCellOf(list.map((task) => task.usage)),
+      done: state.done,
+      state: state.state,
+      stateText: state.stateText,
+      duration: state.duration,
     }
+    if (state.activeTaskId !== undefined) view.activeTaskId = state.activeTaskId
+    if (state.activeTaskTitle !== undefined) view.activeTaskTitle = state.activeTaskTitle
+    return view
   })
 }
 
@@ -1476,7 +1616,7 @@ export function buildRunDetail(source: RunDetailSource, runId?: string): RunDeta
     duration,
     roles: roleUsageOf(taskViews, roles),
     tasks: taskViews,
-    flow: buildFlow(tasks, { usage: snapshot.taskUsage, durations: snapshot.taskDurations }),
+    flow: buildFlow(tasks, { usage: snapshot.taskUsage, durations: snapshot.taskDurations }, roleNameOf),
   }
   if (snapshot.project) detail.project = snapshot.project
   if (snapshot.plannedAt) detail.plannedAt = snapshot.plannedAt

@@ -17,7 +17,7 @@ import type { TabProps } from '../Panel.tsx'
 import { buildRunDetail } from '../viewmodel.ts'
 import { DetailPane } from '../views/DetailPane.tsx'
 import { EmptyState } from '../views/EmptyState.tsx'
-import { FlowGraph } from '../views/FlowGraph.tsx'
+import { FlowCanvas } from '../views/FlowCanvas.tsx'
 import { RoleStrip } from '../views/RoleStrip.tsx'
 import { RunHeader } from '../views/RunHeader.tsx'
 import { TaskTable } from '../views/TaskTable.tsx'
@@ -57,7 +57,7 @@ export function HistoryTab(props: TabProps): React.ReactElement {
                 expandedTaskId={expanded}
                 onToggleTask={(taskId) => toggleTask(taskId)}
               />
-              <FlowGraph
+              <FlowCanvas
                 flow={detailView.flow}
                 onSelectTask={(taskId) => {
                   expandTask(taskId)

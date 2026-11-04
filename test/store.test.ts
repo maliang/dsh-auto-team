@@ -514,3 +514,30 @@ test('r7：暂停记账随运行落盘 —— 另一个 store 实例也能读到
     assert.equal(second.list()[0].status, loaded.plan.status, '列表口径不受 pause 影响')
   })
 })
+
+test('r14 AC-15：plan.goal 随 run 落盘，并由 list() 投影到 RunSummary（客户端不必再读盘）', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const state = wrapLegacy(legacyPlan({ goal: '  把任务页改成可拖动的无限画布  ' }))
+    assert.ok(state)
+    // 归一口径：首尾空白丢掉（否则项目列表标题会带上不可见缩进）
+    assert.equal(state.plan.goal, '把任务页改成可拖动的无限画布')
+    store.save(state)
+
+    const summary = store.list()[0]
+    assert.equal(summary.goal, '把任务页改成可拖动的无限画布', 'list() 必须投影 goal，避免 library 二次读盘')
+    assert.equal(store.load('run-legacy')?.plan.goal, '把任务页改成可拖动的无限画布', '落盘后重新读出来也得在')
+  })
+})
+
+test('r14 AC-18：没有 goal 的旧 run 形状不变 —— 可选字段不出现，而不是空串', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const state = wrapLegacy(legacyPlan())
+    assert.ok(state)
+    assert.equal(state.plan.goal, undefined)
+    store.save(state)
+    assert.equal('goal' in store.list()[0], false, '旧夹具投影后不得多出 goal: undefined/空串')
+    assert.equal(store.load('run-legacy')?.plan.goal, undefined)
+  })
+})

@@ -9,7 +9,7 @@
  *
  * 三条纪律：
  *  1. 文本（token 千分位 / 时长）一律由 `format.ts` / `team/usage.ts` 生成，本模块不拼字符串；
- *  2. 旧 run 缺 `project` 归「未知项目」并固定末位，缺 `usage` 显示「不可得」而不是 0；
+ *  2. 旧 run 缺 `project` 归「历史运行（未记录工作区）」并固定末位，缺 `usage` 显示「不可得」而不是 0；
  *  3. 缓存键只读**目录 mtime + 文件数**，不逐文件 parse；没有目录句柄时退化为 5s TTL 缓存。
  */
 import { readdirSync, statSync } from 'node:fs'
@@ -34,16 +34,17 @@ import type {
   TokenTotals,
   UsageCell,
 } from '../shared/types.ts'
+import { roleStateOf, roleUsageCellOf } from '../shared/role-view.ts'
 import { durationCellOf, usageCellOf } from './format.ts'
 import type { RunState } from './store.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
 import { pendingViewOf } from './team/confirm.ts'
 import { runUsageOf, taskUsageOf } from './team/usage.ts'
 
-/** 「未知项目」的固定 id：不是真实路径，客户端据此给末位与灰态。 */
+/** 历史桶的固定 id：不是真实路径，客户端据此给末位与灰态。 */
 export const UNKNOWN_PROJECT_ID = '__unknown__'
-/** 未知项目的展示名（AC-15：旧 run 没有 `project` 字段）。 */
-export const UNKNOWN_PROJECT_NAME = '未知项目'
+/** 历史桶的展示名（r14 AC-14：旧 run 没有 `project` 字段，不猜工作区、不迁移）。 */
+export const UNKNOWN_PROJECT_NAME = '历史运行（未记录工作区）'
 /** 每个项目最多带多少条记忆索引（AC-17；与项目最近 run 的 20 条同量级）。 */
 const MEMORY_INDEX_LIMIT = 50
 /** 没有数字时的统一人话（`UsageCell.reason`，会进 tooltip）。 */
@@ -87,7 +88,7 @@ export interface RunsStorePort {
   load(runId: string): RunState | null
 }
 
-/** 项目路径 → 展示名（basename）；空/缺省 = 「未知项目」。纯函数，可单测。 */
+/** 项目路径 → 展示名（basename）；空/缺省 = 「历史运行（未记录工作区）」。纯函数，可单测。 */
 export function projectNameOf(path: string | undefined): string {
   const text = (path ?? '').trim().replace(/[/\\]+$/, '')
   if (text === '') return UNKNOWN_PROJECT_NAME
@@ -127,7 +128,7 @@ function knownWorkspaces(deps: LibraryDeps): string[] {
 /**
  * 装配整页（AC-15/AC-16/AC-21）。
  *
- * 顺序约定：已知项目按 `lastActiveAt` 倒序，`未知项目` 固定末位；
+ * 顺序约定：已知项目按 `lastActiveAt` 倒序，「历史运行（未记录工作区）」固定末位；
  * 「全局」不在 `projects` 里，它固定占据列表首行（`global.memories`），否则切换会串轨。
  */
 export function buildLibrary(deps: LibraryDeps, query: LibraryQuery = {}): LibraryView {
@@ -277,10 +278,13 @@ function taskDetailOf(
 }
 
 /**
- * 角色条：按任务里**首次出现顺序**分组，`usage` = 该角色名下任务的合计。
+ * 角色条 / 角色卡片：按任务里**首次出现顺序**分组，`usage` = 该角色名下任务的合计。
  *
- * 至少有一条 `provider` 数字才给合计（含 0）；一条都没有时 `unavailable` +
- * 「该角色名下任务都没有用量」—— 拿 0 顶替会让人以为角色真的没耗 token。
+ * r14 AC-7/AC-8/AC-9：角色态 / 当前任务 / 用时 / 用量口径**都不在这里算**——统一走
+ * `shared/role-view.ts` 的 `roleStateOf` + `roleUsageCellOf`，与客户端
+ * `viewModel.roleUsageOf` 是同一份实现，两侧文本因此逐字相等（AC-17 的抽屉 vs 右栏
+ * 比对靠这条构造保证；r13 的「宿主累加已知项、客户端判不可得」两套口径已由 QA D2 证实
+ * 会给出两种结论，故把聚合也一并收进 shared）。
  */
 export function rolesOf(tasks: TaskDetailView[]): RoleUsageView[] {
   const order: string[] = []
@@ -297,25 +301,29 @@ export function rolesOf(tasks: TaskDetailView[]): RoleUsageView[] {
   return order.map((roleId) => {
     const list = buckets.get(roleId) ?? []
     const name = list[0]?.roleName ?? roleId
-    let total: TokenTotals | undefined
-    for (const task of list) {
-      const tokens = task.usage.source === 'provider' ? task.usage.tokens : undefined
-      if (tokens === undefined) continue
-      total = addTotals(total, tokens)
-    }
-    return {
+    const state = roleStateOf(list)
+    const view: RoleUsageView = {
       roleId,
       name,
       tasks: list.length,
-      usage: usageCellOf(total, '该角色名下任务都没有用量'),
+      usage: roleUsageCellOf(list.map((task) => task.usage)),
+      done: state.done,
+      state: state.state,
+      stateText: state.stateText,
+      duration: state.duration,
     }
+    if (state.activeTaskId !== undefined) view.activeTaskId = state.activeTaskId
+    if (state.activeTaskTitle !== undefined) view.activeTaskTitle = state.activeTaskTitle
+    return view
   })
 }
 
 /**
  * 流转图装配（AC-5）：列 = 依赖深度（0 起），行 = 同列内计划顺序。
  *
- * 只画图不排版：列距/行距/画布尺寸在客户端 CSS 里（`views/FlowGraph`）。
+ * 只画图不排版：列距/行距/画布尺寸在客户端 CSS 里（`views/FlowCanvas`）。
+ * r14 AC-5：节点首行要角色名，`roleName` 由宿主给出（任务详情里是 `name || roleId`，
+ * 所以旧 run 也一定会落到角色 id 而不是任务 id 或空白）。
  * 环依赖（坏数据）用过访问集兜住，深度按 0 兜底 —— 画错也比抛错让整页空白好。
  */
 export function flowOf(tasks: TaskDetailView[]): FlowView {
@@ -347,6 +355,7 @@ export function flowOf(tasks: TaskDetailView[]): FlowView {
       id: task.id,
       title: task.title,
       status: task.status,
+      roleName: task.roleName,
       column,
       row,
       usage: task.usage,
@@ -443,6 +452,8 @@ function projectRunViewOf(summary: RunSummary, at: number): ProjectRunSummaryVie
   }
   if (summary.plannedAt !== undefined) view.plannedAt = summary.plannedAt
   if (summary.finishedAt !== undefined) view.finishedAt = summary.finishedAt
+  // r14 AC-15：项目页行标题的唯一来源（缺省 = 旧 run，客户端走「未命名任务 · 后 6 位」）。
+  if (summary.goal !== undefined) view.goal = summary.goal
   return view
 }
 

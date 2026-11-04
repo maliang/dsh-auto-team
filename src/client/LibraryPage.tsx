@@ -1,33 +1,47 @@
 /**
- * 左栏「自动团队」栏目 + 项目库（r13 AC-23 / AC-24 / AC-25）。
+ * 左栏「自动团队」栏目 + 项目库（r13 AC-23/24/25，r14 AC-13/15/16/17 改造）。
  *
- * 结构（DESIGN §5）：`[data-library-shell]` → `[data-library-head]`（44px）+ `[data-library-body]`：
- *  - `[data-region="project-list"]`（220px）：**首行「全局」**、中间各项目（最近活跃倒序）、**末位「未知项目」**；
- *  - `[data-region="project-detail"]`：项目头（名称/路径/运行数/用量）+ 最近 run 任务区 + 项目记忆；
- *    点开某条 run 就在这块里内联展开详情（保留左列与选中态，DESIGN §5.4）。
+ * 结构（DESIGN §3）：`[data-library-shell]` → `[data-library-head]`（44px）+
+ * `[data-library-body]`（分栏容器，持 `--lib-list-w` 变量）：
+ *  - `[data-region="project-list"]`：首行「全局」、已知项目桶、固定末位的
+ *    `[data-bucket="history"]` 历史桶（未记录工作区的旧 run），列宽 160–360 可拖；
+ *  - `[data-split-handle]`：6px 分隔条，双击复位、键盘 ±8px（仅容器 ≥560px 可见）；
+ *  - `[data-region="project-detail"]`：项目头 + run 列表（`[data-run-row]`）+ 项目记忆；
+ *    点 run 行在页面右侧打开 `RunDrawer`（**不卸载背景列表**，否则 scrollTop/焦点必丢）。
  *
- * 两条硬约束：
- *  1. **AC-23**：`loadLibrary()` 只在本组件挂载时调用一次（页面打开才装配），与右栏的快照轮询完全分离；
- *  2. **AC-18**：run 详情的任务表/角色条/流转图复用右栏同一套组件与同一个 `buildRunDetail`，
- *     绝不在这里内联第二份任务表（否则两处 token 文本会漂移）。
+ * 三条硬约束：
+ *  1. **AC-23**：`loadLibrary()` 只在本组件挂载时调用一次（页面打开才装配），不参与快照轮询；
+ *  2. **AC-17**：抽屉内容与右栏同一套组件、同一个 `buildRunDetail`，绝不内联第二份任务表；
+ *  3. **AC-16**：打开抽屉前记住 `project-detail` 的 scrollTop 与 `document.activeElement`，
+ *     关闭动画结束、状态归零后用 rAF 复原——所以抽屉的 `openRunId` 是单值，DOM 内最多一个。
  *
- * `main` 槽位对第三方插件是否开放**尚未真机验证**（TECHNICAL §0 U2），所以：
- *  - `PanellistEntry` 是被 `registerPanellist` 整段 try/catch 注册的，失败不影响其它槽位；
- *  - 拿不到主区入口时派发 `AUTO_TEAM_OPEN_LIBRARY_EVENT`，由 `Panel` 在面板内联渲染本页（降级路径）。
+ * 数字/时长文案一律来自宿主下发的 cell（`tokenTextOf` / `durationTextOf`），本页不二次格式化。
  */
 import * as React from 'react'
 import type { LibraryView, MemoryItemView, MemoryTrack, ProjectView } from '../shared/types.ts'
-import { sessionIdOf, usePanelState } from './state.ts'
 import { panelApi } from './api.ts'
 import { OPEN_LIBRARY_EVENT } from './slots.ts'
-import { buildRunDetail, formatStamp, tokenTextOf, tokenTitleOf } from './viewmodel.ts'
-import { DetailPane } from './views/DetailPane.tsx'
+import { sessionIdOf, usePanelState } from './state.ts'
+import {
+  LIB_LIST_DEFAULT,
+  LIB_LIST_MAX,
+  LIB_LIST_MIN,
+  buildRunDetail,
+  clampListWidth,
+  formatStamp,
+  goalTitleOf,
+  nextListWidth,
+  tokenTextOf,
+  tokenTitleOf,
+} from './viewmodel.ts'
 import { EmptyState } from './views/EmptyState.tsx'
-import { FlowGraph } from './views/FlowGraph.tsx'
+import { FlowCanvas } from './views/FlowCanvas.tsx'
 import { MemoryList } from './views/MemoryList.tsx'
-import { RoleStrip } from './views/RoleStrip.tsx'
+import { RoleGrid } from './views/RoleCard.tsx'
+import { RunDrawer } from './views/RunDrawer.tsx'
 import { RunHeader } from './views/RunHeader.tsx'
-import { TaskTable } from './views/TaskTable.tsx'
+import { RunRow } from './views/RunRow.tsx'
+import { TaskOverview } from './views/TaskOverview.tsx'
 import { projectNavOf, projectRunRowOf, scrollToTaskRow, useExpandedTask } from './tabs/rows.ts'
 
 /**
@@ -51,6 +65,16 @@ interface OpenMemory {
   workspace?: string
 }
 
+/** 分栏容器内联变量：只写 CSS 变量，不写 flex-basis（内联 basis 会盖掉容器查询的降级规则）。 */
+type SplitStyle = React.CSSProperties & { '--lib-list-w'?: string }
+
+/** 指针拖动的最小状态（放 ref：pointermove 不触发 React 渲染）。 */
+interface SplitDrag {
+  pointerId: number
+  startX: number
+  startWidth: number
+}
+
 /** 左栏与面板内联两处共用的内容体（只差外面那层 root 钩子）。 */
 function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist' }): React.ReactElement {
   const sessionId = sessionIdOf(props)
@@ -71,26 +95,66 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
   const [memoryLoading, setMemoryLoading] = React.useState(false)
   const [expanded, toggleTask, expandTask] = useExpandedTask('library')
 
+  // r14 AC-13：分栏宽度；handle 拖动只改这个 state 与 CSS 变量。
+  const [listWidth, setListWidth] = React.useState<number>(LIB_LIST_DEFAULT)
+  const [dragging, setDragging] = React.useState(false)
+  const dragRef = React.useRef<SplitDrag | null>(null)
+
+  // r14 AC-16：抽屉的单值状态 + 打开前捕获的滚动位置/焦点。
+  const [openRunId, setOpenRunId] = React.useState<string | null>(null)
+  const detailRef = React.useRef<HTMLDivElement | null>(null)
+  const pendingFocusRef = React.useRef<HTMLElement | null>(null)
+  const pendingScrollRef = React.useRef<number>(0)
+
   const readMemory = React.useCallback(
     (track: MemoryTrack, name: string, workspace?: string) => panelApi.readMemory(sessionId, track, name, workspace),
     [sessionId],
   )
 
-  /** 「全局」固定在最上；其余按最近活跃倒序；`unknown` 项目固定末位（PRD §11 默认值）。 */
+  /** 「全局」固定在最上；已知项目按宿主给的最近活跃顺序；历史桶固定末位（PRD §11 默认值）。 */
   const projects = React.useMemo<ProjectView[]>(() => {
     const list = library?.projects ?? []
     const known = list.filter((project) => project.unknown !== true)
     const unknown = list.filter((project) => project.unknown === true)
     return [...known, ...unknown]
   }, [library])
+  const knownProjects = React.useMemo(() => projects.filter((project) => project.unknown !== true), [projects])
+  const historyProjects = React.useMemo(() => projects.filter((project) => project.unknown === true), [projects])
 
   const selectedId = picked !== '' ? picked : (library?.currentProject ?? 'global')
   const selectedProject = projects.find((project) => project.id === selectedId)
+  const globalItems = library?.global.memories ?? []
+  const projectItems = selectedProject?.memories ?? []
 
-  const detail = view.detail !== null && view.detailRunId !== null && view.detail.runId === view.detailRunId ? view.detail : null
+  const openSummary =
+    openRunId !== null && selectedProject !== undefined
+      ? selectedProject.recentRuns.find((run) => run.runId === openRunId)
+      : undefined
+  const openGoal = openSummary !== undefined ? goalTitleOf(openSummary.goal, openSummary.runId) : undefined
+  const drawerSubtitle =
+    openSummary !== undefined
+      ? [
+          openSummary.runId.slice(-6),
+          openSummary.planStatus,
+          tokenTextOf(openSummary.usage),
+          openSummary.duration.text,
+        ].join(' · ')
+      : (openRunId ?? '')
+
+  // AC-17：抽屉详情与右栏同一个装配函数（三源优先级由 viewmodel 保证，runId 不匹配就返回 null）。
   const detailView = React.useMemo(
-    () => (detail === null ? null : buildRunDetail({ snapshot: null, runDetail: detail })),
-    [detail],
+    () =>
+      openRunId === null
+        ? null
+        : buildRunDetail(
+            {
+              snapshot: view.snapshot,
+              library,
+              runDetail: view.detail ?? undefined,
+            },
+            openRunId,
+          ),
+    [openRunId, view.snapshot, view.detail, library],
   )
   const detailTaskIds = React.useMemo(
     () => (detailView === null ? [] : detailView.tasks.map((task) => task.id)),
@@ -117,8 +181,116 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
     }
   }
 
-  const globalItems = library?.global.memories ?? []
-  const projectItems = selectedProject?.memories ?? []
+  /** 切项目：关掉抽屉、清掉记忆展开态（记忆正文属于上一个项目，不能串台）。 */
+  function pickProject(id: string): void {
+    if (openRunId !== null) closeDrawer()
+    setPicked(id)
+    setOpenMemory(undefined)
+    setMemoryBody(undefined)
+    setMemoryError(undefined)
+  }
+
+  /* ───────────── 分栏拖拽：pointer capture + 键盘 + 双击复位（AC-13） ───────────── */
+
+  // 拖拽期间锁 body 光标与选择（否则快速横拖会选中列表文字）；卸载/结束后还原。
+  React.useEffect(() => {
+    if (!dragging) return undefined
+    const body = document.body
+    const previousCursor = body.style.cursor
+    const previousSelect = body.style.userSelect
+    body.style.cursor = 'col-resize'
+    body.style.userSelect = 'none'
+    return () => {
+      body.style.cursor = previousCursor
+      body.style.userSelect = previousSelect
+    }
+  }, [dragging])
+
+  function onHandlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    event.preventDefault()
+    const handle = event.currentTarget
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: listWidth }
+    try {
+      handle.setPointerCapture(event.pointerId)
+    } catch {
+      // 某些合成事件没有活跃指针；退回普通 pointermove（不阻断拖动）。
+    }
+    handle.focus()
+    setDragging(true)
+  }
+
+  function onHandlePointerMove(event: React.PointerEvent<HTMLDivElement>): void {
+    const drag = dragRef.current
+    if (drag === null || drag.pointerId !== event.pointerId) return
+    setListWidth(nextListWidth(drag.startWidth, event.clientX - drag.startX))
+  }
+
+  function endHandleDrag(event: React.PointerEvent<HTMLDivElement>): void {
+    if (dragRef.current === null) return
+    dragRef.current = null
+    setDragging(false)
+    const handle = event.currentTarget
+    try {
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId)
+    } catch {
+      // capture 已随指针结束释放；这里只是收尾。
+    }
+  }
+
+  function onHandleKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
+    let next: number | undefined
+    if (event.key === 'ArrowLeft') next = nextListWidth(listWidth, -8)
+    else if (event.key === 'ArrowRight') next = nextListWidth(listWidth, 8)
+    else if (event.key === 'Home') next = LIB_LIST_MIN
+    else if (event.key === 'End') next = LIB_LIST_MAX
+    if (next === undefined) return
+    event.preventDefault()
+    setListWidth(next)
+  }
+
+  function resetListWidth(): void {
+    setListWidth(clampListWidth(LIB_LIST_DEFAULT))
+  }
+
+  /* ───────────── 抽屉：打开/关闭与 scrollTop、焦点复原（AC-16） ───────────── */
+
+  function openDrawer(runId: string): void {
+    const pane = detailRef.current
+    pendingScrollRef.current = pane === null ? 0 : pane.scrollTop
+    const active = typeof document === 'undefined' ? null : document.activeElement
+    pendingFocusRef.current = active instanceof HTMLElement ? active : null
+    setOpenRunId(runId)
+    void view.openRun(runId)
+  }
+
+  function closeDrawer(): void {
+    setOpenRunId(null)
+    view.closeRun()
+    const focus = pendingFocusRef.current
+    pendingFocusRef.current = null
+    const scrollTop = pendingScrollRef.current
+    const restore = (): void => {
+      const pane = detailRef.current
+      // 背景列表在整个过程中没有卸载（只有抽屉是条件渲染），所以这两个复原是可靠的。
+      if (pane !== null) pane.scrollTop = scrollTop
+      if (focus !== null && focus.isConnected) focus.focus()
+    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore)
+    else restore()
+  }
+
+  function selectDrawerTask(taskId: string): void {
+    expandTask(taskId)
+    const ids = detailTaskIds
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => scrollToTaskRow(taskId, ids))
+    } else {
+      scrollToTaskRow(taskId, ids)
+    }
+  }
+
+  const splitStyle: SplitStyle = { '--lib-list-w': `${listWidth}px` }
 
   return (
     <div data-library-shell data-library-page={props.root}>
@@ -137,51 +309,106 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
         </button>
       </div>
 
-      <div data-library-body>
-        <div data-region="project-list" role="list" aria-label="项目">
+      {/* r14 AC-13：PRD 指定的分栏锚点必须真的渲染出来（QA D1：此前只写在 styles.ts 的死选择器里） */}
+      <div data-library-body data-project-split style={splitStyle}>
+        <div data-region="project-list" aria-label="项目">
           <button
             type="button"
-            role="listitem"
             data-auto-team-nav
             data-nav-kind="global"
             data-active={selectedId === 'global' ? 'true' : 'false'}
-            onClick={() => {
-              setPicked('global')
-              setOpenMemory(undefined)
-            }}
+            onClick={() => pickProject('global')}
           >
             <span data-nav-name>全局</span>
             <span data-nav-meta>{globalItems.length} 条公共记忆</span>
           </button>
 
-          {projects.map((project) => {
-            const nav = projectNavOf(project, project.id === selectedId)
-            return (
-              <button
-                key={project.id}
-                type="button"
-                role="listitem"
-                data-auto-team-nav
-                data-nav-kind={nav.unknown ? 'unknown' : 'project'}
-                data-project-id={nav.id}
-                data-active={nav.active ? 'true' : 'false'}
-                title={nav.path ?? nav.name}
-                onClick={() => {
-                  setPicked(nav.id)
-                  setOpenMemory(undefined)
-                }}
-              >
-                <span data-nav-name>{nav.name}</span>
-                <span data-nav-meta>{nav.metaText}</span>
-                <span data-nav-token data-usage-source={project.usage.source} title={nav.tokenTitle}>
-                  {nav.tokenText}
-                </span>
-              </button>
-            )
-          })}
+          {knownProjects.length > 0 ? (
+            <div data-bucket="projects">
+              <div data-bucket-head>
+                <span>项目</span>
+                <span data-bucket-count>{knownProjects.length}</span>
+              </div>
+              <ul data-bucket-list>
+                {knownProjects.map((project) => {
+                  const nav = projectNavOf(project, project.id === selectedId)
+                  return (
+                    <li key={project.id}>
+                      <button
+                        type="button"
+                        data-auto-team-nav
+                        data-nav-kind="project"
+                        data-project-id={nav.id}
+                        data-active={nav.active ? 'true' : 'false'}
+                        title={nav.path ?? nav.name}
+                        onClick={() => pickProject(nav.id)}
+                      >
+                        <span data-nav-name>{nav.name}</span>
+                        <span data-nav-meta>{nav.metaText}</span>
+                        <span data-nav-token data-usage-source={project.usage.source} title={nav.tokenTitle}>
+                          {nav.tokenText}
+                        </span>
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          ) : null}
+
+          {historyProjects.length > 0 ? (
+            <div data-bucket="history">
+              <div data-bucket-head title="旧版本 run 未记录工作区，无法自动归类">
+                <span>历史运行</span>
+                <span data-bucket-count>{historyProjects.length}</span>
+              </div>
+              <ul data-bucket-list>
+                {historyProjects.map((project) => {
+                  const nav = projectNavOf(project, project.id === selectedId)
+                  return (
+                    <li key={project.id}>
+                      <button
+                        type="button"
+                        data-auto-team-nav
+                        data-nav-kind="history"
+                        data-project-id={nav.id}
+                        data-active={nav.active ? 'true' : 'false'}
+                        title={nav.path ?? nav.name}
+                        onClick={() => pickProject(nav.id)}
+                      >
+                        <span data-nav-name>{nav.name}</span>
+                        <span data-nav-meta>{nav.metaText}</span>
+                        <span data-nav-token data-usage-source={project.usage.source} title={nav.tokenTitle}>
+                          {nav.tokenText}
+                        </span>
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          ) : null}
         </div>
 
-        <div data-region="project-detail">
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整项目列表宽度"
+          aria-valuemin={LIB_LIST_MIN}
+          aria-valuemax={LIB_LIST_MAX}
+          aria-valuenow={listWidth}
+          tabIndex={0}
+          data-split-handle
+          data-dragging={dragging ? 'true' : 'false'}
+          onPointerDown={onHandlePointerDown}
+          onPointerMove={onHandlePointerMove}
+          onPointerUp={endHandleDrag}
+          onPointerCancel={endHandleDrag}
+          onDoubleClick={resetListWidth}
+          onKeyDown={onHandleKeyDown}
+        />
+
+        <div data-region="project-detail" ref={detailRef}>
           {library === null && libraryError === null ? (
             <EmptyState title="正在读取项目库…" hint="宿主会扫描运行目录与两轨记忆" />
           ) : library === null ? (
@@ -197,14 +424,8 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
           ) : (
             <ProjectPane
               project={selectedProject}
-              detailView={detailView}
-              detailRunId={view.detailRunId}
-              detailTaskIds={detailTaskIds}
-              expandedTaskId={expanded}
-              onToggleTask={toggleTask}
-              onExpandTask={expandTask}
-              onOpenRun={(runId) => void view.openRun(runId)}
-              onCloseRun={view.closeRun}
+              openRunId={openRunId}
+              onOpenRun={openDrawer}
               memories={projectItems}
               expandedMemory={openMemory?.track === 'project' ? openMemory.name : undefined}
               memoryBody={memoryLoading ? undefined : memoryBody}
@@ -218,8 +439,39 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
               {libraryError}
             </p>
           ) : null}
+
+          <p
+            data-library-foot
+            data-library-project-meta
+            style={{ margin: '12px 0 0', color: 'var(--dsw-alias-label-tertiary, inherit)' }}
+          >
+            宿主未暴露左栏宽度接口，外框宽度固定
+          </p>
         </div>
       </div>
+
+      <RunDrawer
+        open={openRunId !== null}
+        runId={openRunId ?? undefined}
+        title={openGoal !== undefined ? openGoal.text : '运行详情'}
+        subtitle={drawerSubtitle}
+        onClose={closeDrawer}
+      >
+        {detailView === null ? (
+          <EmptyState
+            title="正在读取运行详情…"
+            hint="宿主会从运行记录里装配任务、角色与流转"
+            next={openRunId !== null ? `runId：${openRunId}` : undefined}
+          />
+        ) : (
+          <>
+            <RunHeader detail={detailView} inflight="idle" />
+            <RoleGrid roles={detailView.roles} />
+            <TaskOverview tasks={detailView.tasks} expandedTaskId={expanded} onToggleTask={toggleTask} />
+            <FlowCanvas flow={detailView.flow} onSelectTask={selectDrawerTask} />
+          </>
+        )}
+      </RunDrawer>
     </div>
   )
 }
@@ -254,17 +506,11 @@ function GlobalPane(props: {
   )
 }
 
-/** 单项目面板：项目头 + 最近 run（可展开详情）+ 项目记忆。 */
+/** 单项目面板：项目头（含历史桶说明）+ run 行列表 + 项目记忆。 */
 function ProjectPane(props: {
   project: ProjectView
-  detailView: ReturnType<typeof buildRunDetail>
-  detailRunId: string | null
-  detailTaskIds: string[]
-  expandedTaskId?: string
-  onToggleTask: (taskId: string) => void
-  onExpandTask: (taskId: string) => void
+  openRunId: string | null
   onOpenRun: (runId: string) => void
-  onCloseRun: () => void
   memories: MemoryItemView[]
   expandedMemory?: string
   memoryBody?: string
@@ -272,6 +518,7 @@ function ProjectPane(props: {
   onOpenMemory: (item: MemoryItemView) => void
 }): React.ReactElement {
   const { project } = props
+  const history = project.unknown === true
   return (
     <>
       <div data-library-project-head>
@@ -288,60 +535,28 @@ function ProjectPane(props: {
             {project.path}
           </code>
         ) : null}
+        {history ? (
+          <span data-bucket-note data-library-project-meta>
+            旧版本 run 未记录工作区，无法自动归类
+          </span>
+        ) : null}
       </div>
 
       <section data-library-section="runs">
         <h4 data-library-section-title>最近运行</h4>
-        {props.detailView !== null && props.detailRunId !== null ? (
-          <DetailPane breadcrumb={['历史', props.detailRunId]} onBack={props.onCloseRun}>
-            <RunHeader detail={props.detailView} inflight="idle" />
-            <RoleStrip roles={props.detailView.roles} />
-            <TaskTable
-              tasks={props.detailView.tasks}
-              expandedTaskId={props.expandedTaskId}
-              onToggleTask={props.onToggleTask}
-            />
-            <FlowGraph
-              flow={props.detailView.flow}
-              onSelectTask={(taskId) => {
-                props.onExpandTask(taskId)
-                if (typeof requestAnimationFrame === 'function') {
-                  requestAnimationFrame(() => scrollToTaskRow(taskId, props.detailTaskIds))
-                } else {
-                  scrollToTaskRow(taskId, props.detailTaskIds)
-                }
-              }}
-            />
-          </DetailPane>
-        ) : project.recentRuns.length === 0 ? (
+        {project.recentRuns.length === 0 ? (
           <EmptyState title="这个项目还没有运行记录" hint="计划落盘后自动派发，运行记录会出现在这里" />
         ) : (
-          <ul data-region="history-list" data-scope="project">
+          <ul data-region="history-list" data-scope="project" data-count={project.recentRuns.length}>
             {project.recentRuns.map((run) => {
               const row = projectRunRowOf(run)
-              const active = props.detailRunId === row.runId
               return (
-                <li key={row.runId} data-history-row data-active={active ? 'true' : 'false'}>
-                  <button type="button" data-history-open={row.runId} onClick={() => props.onOpenRun(row.runId)}>
-                    <span data-history-line="title">
-                      <span data-history-title title={row.title}>
-                        {row.title}
-                      </span>
-                      <span data-badge data-tone={row.statusTone} title={`状态：${row.statusText}`}>
-                        <span aria-hidden="true">{row.statusIcon}</span> {row.statusText}
-                      </span>
-                    </span>
-                    <span data-history-line="meta">
-                      <span data-history-time>{row.metaText}</span>
-                      <span data-history-token data-usage-source={row.tokenSource} title={row.tokenTitle}>
-                        {row.tokenText}
-                      </span>
-                      <span data-history-duration data-duration-state={row.durationState} title={row.durationTitle}>
-                        {row.durationText}
-                      </span>
-                    </span>
-                  </button>
-                </li>
+                <RunRow
+                  key={row.runId}
+                  row={row}
+                  active={props.openRunId === row.runId}
+                  onOpen={props.onOpenRun}
+                />
               )
             })}
           </ul>

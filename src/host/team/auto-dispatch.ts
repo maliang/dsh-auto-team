@@ -22,8 +22,19 @@ import { AUTO_DISPATCH_RETRY_LIMIT } from '../../shared/const.ts'
 import { readyTasks } from '../plan/graph.ts'
 import type { RunState, RunsStore } from '../store.ts'
 
-/** 5 个触发点（缺一个 AC-8 的变异用例就会红）。 */
-export type AutoDispatchCause = 'plan-saved' | 'task-terminal' | 'member-exit' | 'tasks-added' | 'tick'
+/**
+ * 6 个触发点（缺一个 AC-8 的变异用例就会红）。
+ *
+ * `'manual'`（r14）来自 `auto_team_dispatch` 工具：受理制之后工具不再 await 整条派发链，
+ * 只把「现在派」交给这里执行，因此报告里必须能与自动触发区分（`auto_team_status.dispatch`）。
+ */
+export type AutoDispatchCause =
+  | 'plan-saved'
+  | 'task-terminal'
+  | 'member-exit'
+  | 'tasks-added'
+  | 'tick'
+  | 'manual'
 
 /**
  * 派发端口的最小投影。
@@ -45,6 +56,15 @@ export interface AutoDispatchDeps {
   now?: () => number
   /** 需要人看见的结论（由装配层写成 `kind:'status'` 活动，本模块不落盘）。 */
   onStatus?: (runId: string, text: string) => void
+  /**
+   * 本批 spawn 全失败（`started===0 && errors>0`）或 dispatch 抛错时**立刻**播报（r14 AC-3）。
+   *
+   * 受理制之后失败发生在工具返回之后，`onStatus` 只进宿主日志、用户看不见；
+   * 装配层把它接到 `dispatch-notices` 内存环 → 既有 `snapshot.activity`（形状零扩张）。
+   */
+  onError?: (runId: string, text: string) => void
+  /** 有成员真的起来后清掉上一次失败文案（避免面板一直挂着旧红字）。 */
+  onClear?: (runId: string) => void
 }
 
 export interface AutoDispatchReport {
@@ -57,6 +77,8 @@ export interface AutoDispatchReport {
   failed: number
   /** 被 dispatchReady 跳过的数量（并发满/角色缺失/已在跑等）。 */
   skipped: number
+  /** 本批错误的可读文案（无错为空数组）；`failed` 给条数，这里给原文（r14 AC-3）。 */
+  errors: string[]
   reason?: string
 }
 
@@ -69,6 +91,8 @@ export interface AutoDispatcher {
   /** 用户显式动作后解除退避（停止计数清零）。 */
   reset(runId: string): void
   dispose(): void
+  /** 本进程内最近 ≤5 条派发报告（`auto_team_status` 的 `dispatch` 段，r14 AC-3）。 */
+  reportsOf(sessionId: string): AutoDispatchReport[]
 }
 
 /** 连续失败到达上限时的可见文案（逐字，供面板/探针断言复用）。 */
@@ -113,14 +137,37 @@ interface Inflight {
   promise: Promise<AutoDispatchReport>
 }
 
+/** 每个会话最多保留几条派发报告（`auto_team_status.dispatch` 只用来解释「刚才发生了什么」）。 */
+const REPORT_LIMIT = 5
+
+/** 一条错误的可读文案（`auto_team_status.dispatch.errors` 与活动流共用同一种句法）。 */
+function errorLineOf(item: { taskId: string; error: string }): string {
+  return `${item.taskId}：${item.error}`
+}
+
+/** 本批全失败时的播报文案（AC-3 的「可读错误」，必须包含具体错误而不是只有计数）。 */
+function failureTextOf(errors: string[]): string {
+  const head = errors.slice(0, 3).join('；')
+  const more = errors.length > 3 ? `；等共 ${errors.length} 条` : ''
+  return `派发失败：后台未能创建成员（${head}${more}）`
+}
+
 export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
   const now = deps.now ?? Date.now
   /** key = runId：单飞粒度按 run，不按 session（一个会话可能留有多份历史 run）。 */
   const inflightRuns = new Map<string, Inflight>()
   /** 连续失败计数；有进展（started 非空）即清零。 */
   const failures = new Map<string, number>()
+  /** key = sessionId：最近几条报告（只读给 `auto_team_status`，不参与任何判定）。 */
+  const reports = new Map<string, AutoDispatchReport[]>()
   const timers = new Set<ReturnType<typeof setTimeout>>()
   let disposed = false
+
+  function record(sessionId: string, report: AutoDispatchReport): void {
+    const list = reports.get(sessionId) ?? []
+    list.push(report)
+    reports.set(sessionId, list.slice(-REPORT_LIMIT))
+  }
 
   function stalled(runId: string): boolean {
     return (failures.get(runId) ?? 0) >= AUTO_DISPATCH_RETRY_LIMIT
@@ -140,7 +187,7 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
     cause: AutoDispatchCause,
     patch: Partial<AutoDispatchReport> = {},
   ): AutoDispatchReport {
-    return { runId, cause, attempted: false, started: [], failed: 0, skipped: 0, ...patch }
+    return { runId, cause, attempted: false, started: [], failed: 0, skipped: 0, errors: [], ...patch }
   }
 
   async function dispatchOnce(
@@ -160,23 +207,35 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
     try {
       const result = await deps.dispatch(state)
       const started = result.started ?? []
+      const errors = (result.errors ?? []).map(errorLineOf)
       const failed = result.errors?.length ?? 0
       // 「一个都没起来且有错误」才算一次失败：部分成功说明路径是通的，不该累计退避。
-      if (started.length === 0 && failed > 0) bumpFailure(runId)
-      else failures.delete(runId)
+      if (started.length === 0 && failed > 0) {
+        bumpFailure(runId)
+        // AC-3：后台失败必须 5s 内可见 —— 工具早已返回「已接受派发」，这里才是唯一能喊出来的地方。
+        deps.onError?.(runId, failureTextOf(errors))
+      } else {
+        failures.delete(runId)
+        // 有成员真的起来了：清掉上一次失败文案，否则面板会一直挂着一条已经过期的红字。
+        if (started.length > 0) deps.onClear?.(runId)
+      }
       return reportOf(runId, cause, {
         attempted: true,
         started,
         failed,
         skipped: result.skipped?.length ?? 0,
+        errors,
         ...(started.length === 0 && failed > 0 ? { reason: `本批 spawn 全部失败（${failed} 条错误）` } : {}),
       })
     } catch (error) {
       bumpFailure(runId)
+      const message = error instanceof Error ? error.message : String(error)
+      deps.onError?.(runId, `派发失败：${message}`)
       return reportOf(runId, cause, {
         attempted: true,
         failed: 1,
-        reason: error instanceof Error ? error.message : String(error),
+        errors: [message],
+        reason: message,
       })
     }
   }
@@ -196,7 +255,9 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
     const promise = dispatchOnce(sessionId, runId, cause)
     inflightRuns.set(runId, { sessionId, promise })
     try {
-      return await promise
+      const report = await promise
+      record(sessionId, report)
+      return report
     } finally {
       inflightRuns.delete(runId)
     }
@@ -246,14 +307,20 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
     failures.delete(runId)
   }
 
+  function reportsOf(sessionId: string): AutoDispatchReport[] {
+    // 返回副本：调用方（auto_team_status）只读快照，绝不能把内部数组改坏。
+    return [...(reports.get(sessionId) ?? [])]
+  }
+
   function dispose(): void {
     disposed = true
     for (const handle of timers) clearTimeout(handle)
     timers.clear()
     inflightRuns.clear()
     failures.clear()
+    reports.clear()
     void now
   }
 
-  return { kick, tick, inflight, reset, dispose }
+  return { kick, tick, inflight, reset, dispose, reportsOf }
 }
