@@ -36,7 +36,8 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url))
  * `inject` 是 cordis 的「依赖就绪才回调」API（`ctx.inject(['<service>'], cb)`），
  * client 半用它取可选服务 `sidebarRightTabs`/`sidebarRight`（QA-02 修复），因此它不算裸访问面。
  */
-const CORE_MEMBERS: ReadonlySet<string> = new Set(['logger', 'effect', 'on', 'get', 'inject'])
+// `root` 是 cordis 的 Context 核心成员（根上下文，子 ctx 原型链继承），不是可选服务。
+const CORE_MEMBERS: ReadonlySet<string> = new Set(['logger', 'effect', 'on', 'get', 'inject', 'root'])
 
 /** 可选服务白名单的字符串形态（从实现的唯一登记处派生，测试里不再抄一份字面量）。 */
 const OPTIONAL: readonly string[] = [...OPTIONAL_SERVICES]

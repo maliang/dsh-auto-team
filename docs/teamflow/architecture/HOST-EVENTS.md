@@ -151,3 +151,29 @@ teammates」，探针停在那一步；而单测里的假宿主从不校验 prov
 - `subagent/end` 的 `SubagentRunEndInfo` 具体字段（是否含 parent/child agent id）。
 - `agent/error` 的 `error: unknown` 在本宿主上的实际形态（是否总是 Error 实例）。
 - 工具调用在**成员 session**里是否同样触发 `tools/result`（真机未接线验证，需要把插件装进 profile 才能测）。
+
+### 3.4 插件 ctx 订阅服务事件收不到：必须 `root` + `{ global: true }`（r13 真机事故 2026-11-04）
+
+**症状**：成员在真机上正常跑、会话日志里 `assistant/message` 明确带 `usage`，但 run JSON 里
+`usage`/`routeAudits`/`progress`/`triggers` 全空 —— token 用量恒「不可得」、路由审计空、
+停滞检测与 Trigger 总线一次都没喂到。所有依赖「宿主事件」的子系统**同时**静默。
+
+**根因**：cordis 派发时按作用域过滤监听器：
+
+```js
+// @deepseek-ai/cordis/lib/index.js  EventsService.dispatch()
+const filter = thisArg?.[Context.filter]
+return (this._hooks[name] || []).filter((hook) => hook.global || !filter || filter.call(thisArg, hook.ctx))
+```
+
+插件自己的 ctx 是 root 的**兄弟分支**；会话/工具事件在各自作用域里派发，过滤后我们这条监听器
+被排除。单测里的 fake ctx 从不实现 `Context.filter`，所以 5 轮单测与探针**全绿**，真机全空。
+
+**修法**（本仓库唯一入口：`src/host/adapters.ts` 的 `subscribeHostEvent`）：
+
+1. 在 `ctx.root` 上注册（root 是所有作用域的公共祖先，过滤必通过）；
+2. 同时传第三参 `{ global: true }`（cordis 见到 `hook.global` 直接跳过过滤）；
+3. 拿不到 root 时退回 `ctx.on`（至少与旧行为等价，不会更差）。
+
+**注意**：`installMemberRoute` 用 **成员自己的 `agent.ctx.on`** 是有意为之（它只该改写该成员的
+请求），不要一起改成 root —— 那样会把队长的模型路由也改掉。

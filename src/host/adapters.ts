@@ -112,8 +112,26 @@ export interface HostContext {
    */
   inject?(deps: readonly string[], fn: (scope: HostContext) => void): unknown
   logger?: { warn?: (message: string) => void; info?: (message: string) => void }
-  /** Cordis 事件订阅形态（ctx.on(event, listener)）；事件名/payload 尚未实测，仅用于兜底。 */
-  on?: (event: string, listener: (...args: unknown[]) => void) => (() => void) | void
+  /**
+   * Cordis 事件订阅形态 `ctx.on(event, listener, options?)`。
+   *
+   * `options.global === true` 会跳过宿主的作用域过滤（cordis `dispatch()` 里
+   * `hook.global || !filter || filter.call(thisArg, hook.ctx)`）。我们观测的是跨作用域的
+   * 宿主事实（谁在调工具、哪个会话产出了用量），必须带这个开关 —— 见 subscribeHostEvent。
+   */
+  on?: (
+    event: string,
+    listener: (...args: unknown[]) => void,
+    options?: { global?: boolean },
+  ) => (() => void) | void
+  /**
+   * Cordis 的根上下文（子 ctx 靠原型链继承同一个 root）。
+   *
+   * r13 真机事故（2026-11-04）：插件 `apply` 时在自己的 ctx 上订阅服务事件，宿主按作用域
+   * 过滤后一条都送不到（真机上 `usage`/`routeAudits`/`progress`/`triggers` 全空；单测的
+   * fake ctx 从不带过滤，所以一直是绿的）。订阅宿主事件请统一走 `subscribeHostEvent()`。
+   */
+  root?: HostContext
 }
 
 /**
@@ -200,6 +218,47 @@ function readServiceQuietly<K extends OptionalServiceName>(
     return service ?? undefined
   } catch {
     return undefined
+  }
+}
+
+/**
+ * 订阅宿主事件 —— **唯一入口**（r13 真机事故后收口）。
+ *
+ * 为什么不能直接 `ctx.on(...)`：cordis 派发时按作用域过滤监听器
+ * （`hook.global || !filter || filter.call(thisArg, hook.ctx)`），插件自己的 ctx 是 root 的
+ * 兄弟分支，会话/工具作用域的事件过滤后**一条都送不到**。2026-11-04 真机实测：成员确实在跑、
+ * 会话日志里 assistant/message 带着 usage，而 run JSON 里 `usage`/`routeAudits`/`progress`/
+ * `triggers` 全空 —— 单测的 fake ctx 不实现过滤，所以一直绿。
+ *
+ * 两条路一起走，任一可用即可：
+ *  1. 在 `ctx.root` 上注册（root 是所有作用域的公共祖先，过滤必通过）；
+ *  2. 注册时置 `{ global: true }`，按 cordis 的语义直接跳过过滤。
+ * 拿不到 root 又没有 global 选项时退回普通订阅（至少与旧行为等价，不会更差）。
+ */
+export function subscribeHostEvent(
+  ctx: HostContext,
+  event: string,
+  listener: (...args: unknown[]) => void,
+): (() => void) | void {
+  const root = ctx.root
+  const target =
+    root && typeof root.on === 'function' && root !== ctx ? root : ctx
+  const on = target.on
+  if (typeof on !== 'function') {
+    // 拿不到 on 是宿主不支持事件（不是我们传错），交给调用方降级。
+    return undefined
+  }
+  try {
+    return on.call(target, event, listener, { global: true })
+  } catch (error) {
+    // 有些宿主/老版本不接受第三参：退回两参订阅（至少与旧行为等价）。
+    // 两次都失败说明订阅本身有问题，交给调用方 degrade —— 这里不吞异常，否则调用方
+    // 分不清「宿主没有事件能力」和「订阅被拒绝」（r5 的三档降级就靠这个区分）。
+    try {
+      return on.call(target, event, listener)
+    } catch {
+      throw error
+    }
   }
 }
 
@@ -915,11 +974,10 @@ export function createRoutePorts(ctx: HostContext): RoutePorts {
  * 面板的实际路由按「角色声明值」展示，并在 UI 标注来源，见 ARCHITECTURE §7 已知限制。
  */
 export function onAgentCreated(ctx: HostContext, handler: (payload: unknown) => void): void {
-  if (!ctx.on) {
+  const dispose = subscribeHostEvent(ctx, 'agent/created', handler)
+  if (dispose === undefined) {
     ctx.logger?.warn?.('[auto-team] 宿主未提供事件订阅，成员实际模型路由将退回声明值')
-    return
   }
-  ctx.on('agent/created', handler)
 }
 
 /** 角色路由 → 展示用 route（避免上层直接摸 Role.model）。 */
@@ -1072,14 +1130,9 @@ export function onCaptainToolResult(
   ctx: HostContext,
   handler: (call: { toolName: string; args: unknown }) => void,
 ): { stop: () => void } {
-  if (typeof ctx.on !== 'function') {
-    ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：队长留痕不生效（面板不会显示执行痕迹）')
-    return { stop() {} }
-  }
   let dispose: (() => void) | void = undefined
   try {
-    const on = ctx.on.bind(ctx)
-    dispose = on('tools/result', (...args: unknown[]) => {
+    dispose = subscribeHostEvent(ctx, 'tools/result', (...args: unknown[]) => {
       try {
         const exec = args[0]
         if (!exec || typeof exec !== 'object') return
@@ -1124,16 +1177,15 @@ export function onMemberProgress(
   ctx: HostContext,
   handler: (info: { agent: unknown; at: number }) => void,
 ): { stop: () => void } {
-  if (typeof ctx.on !== 'function') {
+  if (typeof ctx.on !== 'function' && typeof ctx.root?.on !== 'function') {
     ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：停滞判定降级为「以派发时间为基线」')
     return { stop() {} }
   }
-  const on = ctx.on.bind(ctx)
   const disposers: Array<() => void> = []
 
   const subscribe = (event: string, agentOf: (args: unknown[]) => unknown): void => {
     try {
-      const dispose = on(event, (...args: unknown[]) => {
+      const dispose = subscribeHostEvent(ctx, event, (...args: unknown[]) => {
         try {
           const agent = agentOf(args)
           if (agent === undefined) return
@@ -1267,12 +1319,14 @@ export function registerAgentCreated(
   ctx: HostContext,
   handler: (payload: AgentCreatedEvent) => void,
 ): boolean {
-  if (!ctx.on) {
+  if (!ctx.on && !ctx.root?.on) {
     ctx.logger?.warn?.('[auto-team] 宿主未提供事件订阅，成员将按 provider 默认模型运行')
     return false
   }
   try {
-    ctx.on('agent/created', (payload: unknown) => {
+    // 事件订阅统一走 subscribeHostEvent（root + global），详见该函数注释里的 r13 真机事故。
+    // 这里不再保存 disposer：宿主随 entry 卸载一起回收，单测里用 fake ctx 也不做清理断言。
+    subscribeHostEvent(ctx, 'agent/created', (payload: unknown) => {
       const parsed = parseAgentCreated(payload)
       if (!parsed) return
       try {
@@ -1411,8 +1465,8 @@ export function registerToolGuard(
   ctx: HostContext,
   decide: (request: ToolGuardRequest) => GuardVerdict,
 ): () => void {
-  const on = ctx.on
-  if (typeof on !== 'function') {
+  const hasEvents = typeof ctx.on === 'function' || typeof ctx.root?.on === 'function'
+  if (!hasEvents) {
     // L3：宿主没有事件订阅能力 → 守卫装不上，只剩提示词里的硬约束。
     ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：noWait 守卫未装配，队长仍可能前台同步长等待')
     return () => {}
@@ -1449,7 +1503,10 @@ export function registerToolGuard(
   }
 
   try {
-    const dispose = on.call(ctx, 'tools/execute', listener)
+    // 统一走 subscribeHostEvent（root + global）：作用域过滤会让我们收不到队长的工具执行
+    // （r13 真机事故：守卫在真机上一次都没触发）。global 后成员调用也会进来，
+    // 但 listener 里的 agentId 非空即放行，不会影响成员。
+    const dispose = subscribeHostEvent(ctx, 'tools/execute', listener)
     return typeof dispose === 'function'
       ? () => {
           try {
@@ -1519,17 +1576,17 @@ export function onHostTriggerEvents(
   ctx: HostContext,
   handler: (name: TriggerEventName, payload: unknown) => void,
 ): TriggerEventSubscription {
-  if (typeof ctx.on !== 'function') {
+  if (typeof ctx.on !== 'function' && typeof ctx.root?.on !== 'function') {
     ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：Trigger 事件源不可用，四类推进退回轮询兜底')
     return { stop() {}, degraded: true }
   }
-  const subscribe = ctx.on.bind(ctx)
   const disposers: Array<() => void> = []
   let failed = 0
 
   for (const name of TRIGGER_EVENT_NAMES) {
     try {
-      const dispose = subscribe(name, (...args: unknown[]) => {
+      // 统一走 subscribeHostEvent（root + global）：见 r13 真机事故注释。
+      const dispose = subscribeHostEvent(ctx, name, (...args: unknown[]) => {
         try {
           handler(name, payloadOfEvent(name, args))
         } catch (error) {
@@ -1580,13 +1637,14 @@ export function onSessionEvents(
   ctx: HostContext,
   handler: (payload: unknown) => void,
 ): SessionEventSubscription {
-  if (typeof ctx.on !== 'function') {
+  if (typeof ctx.on !== 'function' && typeof ctx.root?.on !== 'function') {
     ctx.logger?.warn?.('[auto-team] 宿主未提供 ctx.on：session/event 不可用，token 用量显示「不可得」')
     return { stop() {}, degraded: true }
   }
   let dispose: (() => void) | void
   try {
-    dispose = ctx.on('session/event', (...args: unknown[]) => {
+    // 统一走 subscribeHostEvent（root + global）：r13 真机事故的正面修复。
+    dispose = subscribeHostEvent(ctx, 'session/event', (...args: unknown[]) => {
       try {
         handler(args.length <= 1 ? args[0] : args)
       } catch (error) {
