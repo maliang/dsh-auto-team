@@ -22,8 +22,9 @@
 | `settings.section` | list | root | none | One settings page per list entry. | 见宿主 `SettingsSection` 契约 |
 | `settings.general.item` | list | root | none | One preference row inside the General section — the additive seat for a single preference. | 见宿主契约 |
 | `settings.action` | list | root | none | Optional actions rendered in the content-column header before Close. | `id*` / `order?` / `label?` |
-| `sidebar.panellist` | list | root | none | Global panel icons. | `id*` / `order?` / `label?` |
-| `main` ⚠️**未验证** | keyed（按注册样本推断） | root（推断） | 未知（推断为整页替换） | 主内容区座位：r13 左栏「项目库」整页（`{ name: 'main', key: PANELLIST_ID }`）。**未验证**：宿主是否对第三方插件开放、是否需要额外 `inject`、`replaceRisk` 取值均未实测（U2）；实现按 keyed 注册整段 `try/catch`，失败降级为 `auto-team:open-library` 事件 → 面板内联 library，只是左栏入口消失，弹窗与右栏不受影响。 | `key*`（推断） |
+| `sidebar.panellist` | list | root | none | Global panel icons. **插槽里放的是图标，不是一行 UI**：宿主 (`dsh-client-ui-sidebar` 的 `SidebarRoot`) 自己按本槽位的 `{ id, order, label }` 渲染面板行，行内用 `renderSlot('sidebar.panellist', { size: 16|18, active }, { only: id })` 画 glyph，点击由宿主调 `ctx.layout.selectPanel(id)`。因此：① 组件只画 svg 图标（颜色 `currentColor`、尺寸吃 `props.size`）；② **绝不能在里面包 `<button>`**——外层已是按钮，嵌套按钮会被浏览器改写 DOM，点击不再落到宿主行上（症状：点了主界面没变化，2026-11-04 实测）；③ 不要渲染标题文本，`label` 由宿主绘制。 | `id*` / `order?` / `label?` |
+| `main`（已真机验证 2026-11-03） | keyed（按注册样本推断） | root（推断） | 未知（推断为整页替换） | 主内容区座位：r13 左栏「项目库」整页（`{ name: 'main', key: PANELLIST_ID }`）。**未验证**：宿主是否对第三方插件开放、是否需要额外 `inject`、`replaceRisk` 取值均未实测（U2）；实现按 keyed 注册整段 `try/catch`，失败降级为 `auto-team:open-library` 事件 → 面板内联 library，只是左栏入口消失，弹窗与右栏不受影响。 | `key*`（推断） |
+| `sidebar.panellist.actions` | list | root | none | 「More」菜单里的面板操作行（本插件未使用）。 | — |
 | `sidebar.footer.action` | list | root | none | Optional actions beside Settings at the sidebar foot. | `id*` / `order?` / `label?` |
 | `shell.leading` | single | root | **shadows-shipped-ui** | Window-chrome seat at the frame's top-left, over every main panel. | — |
 

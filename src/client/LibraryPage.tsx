@@ -370,26 +370,36 @@ function ProjectPane(props: {
 /**
  * `sidebar.panellist` 槽位的组件（左栏栏目）。
  *
- * **只渲染一行入口**（2026-11-03 修正）：早先这里直接挂了整个 `LibraryContent`（项目列表 +
- * 右列两栏布局），塞进窄窄的侧栏列会把整条侧栏撑变形。栏目只负责「有个入口、点开去主区看」，
- * 真正的两栏项目库在 `main` 槽位（`LibraryPage`）里渲染。
- * 这里也**不**装配项目库（不调 `loadLibrary`）：入口不需要数据，装配成本留给打开后的整页。
+ * 宿主对这个槽位的用法是**面板行的图标**（2026-11-04 修正两次）：
+ * `dsh-client-ui-sidebar` 把本槽位每个 entry 的 `{ id, order, label }` 渲染成自己的面板行，
+ * 行内用 `renderSlot('sidebar.panellist', { size, active }, { only: id })` 画图标，
+ * 点击由宿主调 `ctx.layout.selectPanel(id)` 完成 —— 所以这里
+ *   ① 只能画图标（16/18px，`currentColor`），不能画标题/按钮；
+ *   ② 绝不能包 `<button>`：外层已经是按钮，嵌套按钮会让浏览器改写 DOM，
+ *      点击就不再落到宿主那一行上（症状：点了主界面没反应）。
+ * 真正的两栏项目库在 `main` 槽位（`LibraryPage`，key 同为 `PANELLIST_ID`）里渲染。
  */
 export function PanellistEntry(props: LibraryPageProps): React.ReactElement {
-  const openLibrary = typeof props.openLibrary === 'function' ? (props.openLibrary as () => boolean) : undefined
+  const size = typeof props.size === 'number' ? props.size : 16
   return (
-    <button
-      type="button"
+    <svg
       data-auto-team-panellist
-      data-panellist-entry
-      title="打开自动团队项目库（项目 / 任务 / 记忆）"
-      onClick={() => {
-        if (openLibrary !== undefined) openLibrary()
-      }}
+      data-panellist-glyph
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      role="presentation"
+      focusable="false"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
     >
-      <span data-panellist-dot aria-hidden="true" />
-      <span data-panellist-label>自动团队</span>
-    </button>
+      <circle cx="8" cy="3.6" r="1.75" />
+      <circle cx="3.6" cy="12.2" r="1.75" />
+      <circle cx="12.4" cy="12.2" r="1.75" />
+      <path d="M7.2 5.1 4.2 10.7M8.8 5.1l3 5.6" />
+    </svg>
   )
 }
 
