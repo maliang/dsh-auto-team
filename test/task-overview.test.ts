@@ -12,7 +12,9 @@ import assert from 'node:assert/strict'
 import {
   PROGRESS_RING_CIRCUMFERENCE,
   PROGRESS_RING_RADIUS,
+  PROGRESS_RING_SIZE,
   PROGRESS_RING_STROKE,
+  PROGRESS_RING_VIEWBOX,
   buildTaskDetail,
   taskOverviewOf,
 } from '../src/client/viewmodel.ts'
@@ -56,10 +58,12 @@ test('taskOverviewOf：2 done + 1 running → 2/3、弧长 2/3，分组顺序「
   )
   assert.deepEqual(overview.groups.open.map((row) => row.id), ['t3'], '未完成组在前，保持计划顺序')
   assert.deepEqual(overview.groups.done.map((row) => row.id), ['t1', 't2'], '已完成组在后')
-  // 公差：环几何常量本身也得对（64 环 / r28 / 6 描边）
-  assert.equal(PROGRESS_RING_RADIUS, 28)
-  assert.equal(PROGRESS_RING_STROKE, 6)
-  assert.equal(Math.abs(PROGRESS_RING_CIRCUMFERENCE - 2 * Math.PI * 28) < 1e-9, true)
+  // 公差：环几何常量本身也得对（r16 设计 §0：80 环 / viewBox 80 / r34 / 8 描边）
+  assert.equal(PROGRESS_RING_SIZE, 80)
+  assert.equal(PROGRESS_RING_VIEWBOX, 80)
+  assert.equal(PROGRESS_RING_RADIUS, 34)
+  assert.equal(PROGRESS_RING_STROKE, 8)
+  assert.equal(Math.abs(PROGRESS_RING_CIRCUMFERENCE - 2 * Math.PI * 34) < 1e-9, true)
 })
 
 test('taskOverviewOf：同一渲染帧内改状态 → 环与分组一起变（AC-11 不许一个变一个不变）', () => {

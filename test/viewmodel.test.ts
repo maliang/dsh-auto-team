@@ -754,9 +754,13 @@ test('计划状态：5 态全映射为中文，无计划走「未启用」', () 
 import {
   FLOW_COLUMN_STEP,
   FLOW_NODE_HEIGHT,
+  FLOW_NODE_TOP,
   FLOW_NODE_WIDTH,
   FLOW_PADDING,
+  FLOW_ROLE_FALLBACK,
   FLOW_ROW_STEP,
+  FLOW_STAGE_LINK_Y,
+  FLOW_STAGE_TOP,
   GOAL_TITLE_MAX,
   LIB_LIST_DEFAULT,
   LIB_LIST_MAX,
@@ -780,6 +784,7 @@ import {
   memoryRowOf,
   nextListWidth,
   roleChipsOf,
+  roleTaskRefViewOf,
   roleUsageOf,
   runHeadOf,
   taskDetailOf,
@@ -982,23 +987,49 @@ test('buildFlow：环形依赖不死循环，仍能产出完整节点', () => {
   for (const node of flow.nodes) assert.equal(Number.isFinite(node.column), true)
 })
 
-test('flowLayoutOf：节点 180×76、列距 220、行距 92，边是三次贝塞尔', () => {
+test('flowLayoutOf：按角色分列（180×64、列距 208、行距 80），同角色按计划顺序排行', () => {
   const flow: FlowView = buildFlow([
-    taskOf('t1', 'done'),
-    taskOf('t2', 'running', { dependsOn: ['t1'] }),
+    taskOf('t1', 'done', { roleId: 'dev' }),
+    taskOf('t2', 'running', { roleId: 'qa', dependsOn: ['t1'] }),
+    taskOf('t3', 'pending', { roleId: 'dev' }),
   ])
   const layout = flowLayoutOf(flow)
-  assert.equal(FLOW_NODE_WIDTH, 180, 'r14：节点加宽到 180（三行：角色名 / 任务简述 / 用量）')
-  assert.equal(FLOW_NODE_HEIGHT, 76)
-  assert.equal(FLOW_COLUMN_STEP, 220)
-  assert.equal(FLOW_ROW_STEP, 92)
-  const t1 = layout.nodes.find((entry) => entry.node.id === 't1')!
-  const t2 = layout.nodes.find((entry) => entry.node.id === 't2')!
+  // r16 DESIGN §0：环从 76 收到 64，列/行步进同步收紧
+  assert.equal(FLOW_NODE_WIDTH, 180, 'r16：列内宽度 180（24 tN + 78 标题 + 48 状态 = 158）')
+  assert.equal(FLOW_NODE_HEIGHT, 64)
+  assert.equal(FLOW_COLUMN_STEP, 208)
+  assert.equal(FLOW_ROW_STEP, 80)
+  const byId = new Map(layout.nodes.map((entry) => [entry.node.id, entry]))
+  const t1 = byId.get('t1')!
+  const t2 = byId.get('t2')!
+  const t3 = byId.get('t3')!
+  // dev 两次出现只有一列：t1 第 0 行、t3 第 1 行；qa 是新角色 → 第 2 列（不是依赖深度 2）
+  assert.deepEqual([t1.column, t1.row], [0, 0])
+  assert.deepEqual([t3.column, t3.row], [0, 1])
+  assert.deepEqual([t2.column, t2.row], [1, 0])
   assert.equal(t1.x, FLOW_PADDING)
-  assert.equal(t1.y, FLOW_PADDING)
+  assert.equal(t1.y, FLOW_NODE_TOP)
+  assert.equal(t3.y, FLOW_NODE_TOP + FLOW_ROW_STEP)
   assert.equal(t2.x, FLOW_PADDING + FLOW_COLUMN_STEP)
   assert.equal(layout.width, FLOW_PADDING * 2 + FLOW_NODE_WIDTH + FLOW_COLUMN_STEP)
-  assert.equal(layout.height, FLOW_PADDING * 2 + FLOW_NODE_HEIGHT)
+  assert.equal(layout.height, FLOW_NODE_TOP + FLOW_NODE_HEIGHT + FLOW_ROW_STEP + FLOW_PADDING)
+  // 列头：按首次出现保序，count 是该角色的任务数
+  assert.deepEqual(layout.stages.map((stage) => [stage.key, stage.index, stage.name, stage.count]), [
+    ['dev', 0, 'dev', 2],
+    ['qa', 1, 'qa', 1],
+  ])
+  assert.equal(layout.stages[0]?.x, FLOW_PADDING)
+  assert.equal(layout.stages[0]?.y, FLOW_STAGE_TOP)
+  // 列间箭头：上游列头右缘 + 4 → 下游列头左缘 − 4，高度 = 列头中线
+  assert.deepEqual(layout.stageLinks, [
+    {
+      key: 'dev->qa',
+      from: FLOW_PADDING + FLOW_NODE_WIDTH + 4,
+      to: FLOW_PADDING + FLOW_COLUMN_STEP - 4,
+      d: `M ${FLOW_PADDING + FLOW_NODE_WIDTH + 4} ${FLOW_STAGE_LINK_Y} L ${FLOW_PADDING + FLOW_COLUMN_STEP - 4} ${FLOW_STAGE_LINK_Y}`,
+      upstreamDone: false,
+    },
+  ])
   assert.equal(layout.edges.length, 1)
   assert.match(layout.edges[0].d, /^M [\d.]+ [\d.]+ C /)
   // 边的终点在目标节点左侧内缩 2px，起点在上游节点右边缘
@@ -1006,19 +1037,43 @@ test('flowLayoutOf：节点 180×76、列距 220、行距 92，边是三次贝�
   assert.equal(layout.edges[0].d.endsWith(` ${t2.x - 2} ${t2.y + FLOW_NODE_HEIGHT / 2}`), true)
 })
 
-test('flowLayoutOf：缺端的边被跳过，不产生 NaN 坐标', () => {
+test('flowLayoutOf：旧快照按 roleName 回退分列，同名不同 roleId 不合并、缺名落「角色未记录」', () => {
+  const flow: FlowView = {
+    nodes: [
+      { id: 'a', title: 'A', status: 'done', roleName: '同名', column: 0, row: 0 } as FlowView['nodes'][number],
+      { id: 'b', title: 'B', status: 'running', roleName: '同名', roleId: 'qa', column: 0, row: 0 } as FlowView['nodes'][number],
+      { id: 'c', title: 'C', status: 'pending', column: 9, row: 9 } as FlowView['nodes'][number],
+    ],
+    edges: [],
+    columns: 2,
+    rows: 2,
+  }
+  const layout = flowLayoutOf(flow)
+  assert.deepEqual(layout.stages.map((stage) => stage.name), ['同名', '同名', FLOW_ROLE_FALLBACK])
+  assert.deepEqual(layout.nodes.map((entry) => [entry.node.id, entry.column, entry.row]), [
+    ['a', 0, 0],
+    ['b', 1, 0],
+    ['c', 2, 0],
+  ])
+})
+
+test('flowLayoutOf：空计划 24×24（两侧 padding），没有阶段/箭头/节点也不得 NaN', () => {
   const layout = flowLayoutOf({
     nodes: [],
     edges: [{ from: 'ghost', to: 'ghost2', upstreamDone: false }],
     columns: 0,
     rows: 0,
   })
+  assert.deepEqual(layout.nodes, [])
+  assert.deepEqual(layout.stages, [])
+  assert.deepEqual(layout.stageLinks, [])
   assert.equal(layout.edges.length, 0)
-  assert.equal(layout.width, FLOW_PADDING * 2 + FLOW_NODE_WIDTH)
-  assert.equal(layout.height, FLOW_PADDING * 2 + FLOW_NODE_HEIGHT)
+  assert.equal(layout.width, FLOW_PADDING * 2)
+  assert.equal(layout.height, FLOW_PADDING * 2)
+  assert.equal(Number.isFinite(layout.width) && Number.isFinite(layout.height), true)
 })
 
-test('flowNodeViewOf：token 用宿主原串不压缩（节点 158 内宽容得下），title 保留全文', () => {
+test('flowNodeViewOf：token 用宿主原串不压缩（节点 158 内宽容得下），title 带 tN 与角色名', () => {
   const flow = buildFlow([taskOf('t1', 'done')], {
     usage: { t1: providerCell(1_234_567) },
     durations: { t1: durationCell('1 小时 02 分') },
@@ -1032,7 +1087,11 @@ test('flowNodeViewOf：token 用宿主原串不压缩（节点 158 内宽容得�
   // 角色名与任务简述分开给两行（第一行不许再是任务 id；缺角色名时如实说「角色未记录」）
   assert.equal(view.roleText, '角色未记录')
   assert.equal(view.taskTitle, '任务t1')
-  assert.equal(view.label.startsWith('角色未记录：任务t1'), true)
+  // r16：title/aria 都以 tN 开头并带状态中文，角色名只出现在 title 里（不进节点第一行）
+  assert.equal(view.title, 't1 任务t1 · 角色 角色未记录 · token 1,234,567 · 用时 1 小时 02 分')
+  assert.equal(view.label, 't1：任务t1，已通过，token 1,234,567，用时 1 小时 02 分')
+  assert.equal(view.statusText, '已通过')
+  assert.equal(view.tone, 'success')
 })
 
 /* ──────────────────── 角色条：部分缺来源不合计 ──────────────────── */
@@ -1077,10 +1136,16 @@ test('roleUsageOf：只列有任务的角色，全有来源才合计', () => {
   assert.equal(usage[0].activeTaskId, 't2')
   assert.equal(usage[0].activeTaskTitle, '任务t2')
   assert.equal(usage[0].duration?.text, '20 秒')
+  // r16 AC-16：角色卡 refs 按计划顺序列出该角色的任务编号（状态随任务走）
+  assert.deepEqual(usage[0].taskRefs, [
+    { id: 't1', status: 'done' },
+    { id: 't2', status: 'running' },
+  ])
   assert.equal(usage[1].state, 'running')
   assert.equal(usage[1].done, 0)
   assert.equal(usage[1].roleId, 'qa')
   assert.equal(usage[1].tasks, 1)
+  assert.deepEqual(usage[1].taskRefs, [{ id: 't3', status: 'running' }])
   // ops 在任务里没有出现 → 不占位置
   assert.equal(usage.some((row) => row.roleId === 'ops'), false)
   const chips = roleChipsOf(usage)
@@ -1098,6 +1163,26 @@ test('roleUsageOf：部分任务缺用量时给「不可得」，不给出偏小
   assert.equal(tokenTextOf(row.usage), UNAVAILABLE_TEXT)
   assert.equal(row.usage.tokens, undefined, '不能只把已知的一半加起来冒充合计')
   assert.equal(row.name, 'dev', '角色表查不到时回落到任务上的 roleId')
+})
+
+/* ──────────────────── 角色卡 refs：tN + 状态彩点 ──────────────────── */
+
+test('roleTaskRefViewOf：chip 只写 tN，状态词与 tone 全部来自 statusBadge', () => {
+  const done = roleTaskRefViewOf({ id: 't1', status: 'done' })
+  assert.equal(done.text, 't1')
+  assert.equal(done.title, 't1 · 已通过', 'done 的文案是「已通过」，不另造「已完成」')
+  assert.equal(done.label, done.title, 'aria-label 与 title 同源')
+  assert.equal(done.tone, 'success')
+  const running = roleTaskRefViewOf({ id: 't2', status: 'running' })
+  assert.equal(running.text, 't2')
+  assert.equal(running.tone, 'business')
+  assert.equal(running.title, 't2 · 运行中')
+  // 5 种 tone 必须覆盖到 5 个不同值（彩点不能同色，AC-16）
+  const tones = (['done', 'running', 'pending', 'failed', 'blocked'] as const).map(
+    (status) => roleTaskRefViewOf({ id: 't', status }).tone,
+  )
+  assert.deepEqual([...new Set(tones)].sort(), ['business', 'danger', 'neutral', 'success', 'warn'])
+  assert.equal(roleTaskRefViewOf({ id: 't1', status: 'done' }).status, 'done')
 })
 
 /* ──────────────────── run 详情：三源优先级 ──────────────────── */

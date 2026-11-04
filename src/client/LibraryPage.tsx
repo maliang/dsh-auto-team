@@ -20,7 +20,8 @@
 import * as React from 'react'
 import type { LibraryView, MemoryItemView, MemoryTrack, ProjectView } from '../shared/types.ts'
 import { panelApi } from './api.ts'
-import { OPEN_LIBRARY_EVENT } from './slots.ts'
+import { OPEN_LIBRARY_EVENT, visibleLibrarySurface } from './slots.ts'
+import type { LibraryOpenResult } from './slots.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
 import {
   LIB_LIST_DEFAULT,
@@ -594,22 +595,91 @@ function ProjectPane(props: {
  *      点击就不再落到宿主那一行上（症状：点了主界面没反应）。
  * 真正的两栏项目库在 `main` 槽位（`LibraryPage`，key 同为 `PANELLIST_ID`）里渲染。
  */
-export function PanellistEntry(props: LibraryPageProps): React.ReactElement {
+export interface PanellistEntryProps {
+  size?: number
+  /** 由 slots 注入（`registerPanellist` 已绑定 sessionId）；node 环境或旧宿主可能没有。 */
+  openLibrary?: () => LibraryOpenResult
+}
+
+/** glyph 的点击结果：`none` 只出现在「还没点过」，点过之后必须是 main / event / error。 */
+type GlyphOpenState = 'none' | LibraryOpenResult
+
+export function PanellistEntry(props: PanellistEntryProps): React.ReactElement {
   const size = typeof props.size === 'number' ? props.size : 16
+  const openLibrary = props.openLibrary
+  const [result, setResult] = React.useState<GlyphOpenState>('none')
+  const [openError, setOpenError] = React.useState(false)
+  const timers = React.useRef<Array<ReturnType<typeof setTimeout>>>([])
+
+  // 卸载时清掉 700ms 校准与 2s 红字定时器：宿主切走侧栏后不再 setState。
+  React.useEffect(
+    () => () => {
+      for (const timer of timers.current) clearTimeout(timer)
+      timers.current = []
+    },
+    [],
+  )
+
+  /** 以 DOM 里真实可见的 surface 为准：`open()` 说成功但主区没挂载时必须落到降级结果。 */
+  function settle(immediate: LibraryOpenResult): void {
+    const surface = visibleLibrarySurface()
+    setResult(
+      surface === 'main' ? 'main' : surface === 'panel' ? 'event' : immediate === 'event' ? 'event' : 'error',
+    )
+  }
+
+  function onClick(): void {
+    if (typeof openLibrary !== 'function') return
+    let immediate: LibraryOpenResult = 'error'
+    try {
+      immediate = openLibrary()
+    } catch {
+      // 打开链自己抛错也要有可见结果：红 glyph + <title>，绝不静默。
+      immediate = 'error'
+    }
+    const failed = immediate === 'error'
+    setResult(immediate)
+    setOpenError(failed)
+    if (failed) {
+      timers.current.push(
+        setTimeout(() => {
+          setOpenError(false)
+        }, 2000),
+      )
+    }
+    // 700ms 校准：晚于 500ms watchdog，1s 预算内把最终结果写回 data-last-open-result（AC-8）。
+    timers.current.push(
+      setTimeout(() => {
+        settle(immediate)
+      }, 700),
+    )
+  }
+
+  // additive：只有真的注入了动作才挂 onClick —— 不包 <button>、不 stopPropagation，
+  // 宿主行的 layout.selectPanel 照常执行（AC-8 的「还能切到主区」靠它）。
+  const interactive = typeof openLibrary === 'function'
   return (
     <svg
       data-auto-team-panellist
       data-panellist-glyph
+      data-last-open-result={result}
+      data-open-error={openError ? 'true' : undefined}
+      // 兜底：r13 的样式把 glyph 设成 pointer-events:none（当时点击全交给宿主行）。
+      // r16 的点击链必须由这里自己发起，否则 onClick 永远收不到事件 = 点了没反应（AC-8）。
+      // 内联样式优先于样式表，且不 stopPropagation：宿主行仍能收到冒泡后的 selectPanel。
+      style={interactive ? { pointerEvents: 'auto' } : undefined}
       width={size}
       height={size}
       viewBox="0 0 16 16"
       role="presentation"
       focusable="false"
       fill="none"
-      stroke="currentColor"
+      stroke={openError ? 'var(--dsw-alias-state-error-primary)' : 'currentColor'}
       strokeWidth="1.2"
       strokeLinecap="round"
+      onClick={interactive ? onClick : undefined}
     >
+      <title>{openError ? '项目库暂时打不开，请稍后再试' : '打开项目库'}</title>
       <circle cx="8" cy="3.6" r="1.75" />
       <circle cx="3.6" cy="12.2" r="1.75" />
       <circle cx="12.4" cy="12.2" r="1.75" />
@@ -621,7 +691,7 @@ export function PanellistEntry(props: LibraryPageProps): React.ReactElement {
 /** 面板内联降级 / `main` 槽位的整页版本。 */
 export function LibraryPage(props: LibraryPageProps): React.ReactElement {
   return (
-    <div data-auto-team-library>
+    <div data-auto-team-library data-library-surface={props.inline === true ? 'panel' : 'main'}>
       <LibraryContent {...props} root="library" />
     </div>
   )

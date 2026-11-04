@@ -87,6 +87,36 @@ test('r14 AC-2：受理制特征句在常驻段里（派发后立即结束本轮
   assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
 })
 
+test('r16 AC-1：条件式规则 —— 只有改代码才组队，先查 enabled，文档/验证/查证不组队', () => {
+  const text = sectionOf(makeSnapshot())
+
+  // AC-1 的三工具 + 开关条件必须同时出现：队长据此判断「开没开」，而不是猜。
+  for (const token of ['auto_team_status', 'auto_team_plan', 'auto_team_dispatch', 'enabled']) {
+    assert.ok(text.includes(token), `缺少条件式规则要素：${token}`)
+  }
+  // 可判定清单：算改代码 / 不算改代码都必须在常驻段里逐字可查（删掉任一侧即红）。
+  for (const token of [
+    '只有「需要修改代码」的任务才组队',
+    'src/**',
+    'docs/**',
+    '不得修改任何文件',
+    '立即结束本轮',
+    '纯问答',
+    '明确叫停',
+    '跑验证',
+    '查证',
+  ]) {
+    assert.ok(text.includes(token), `缺少条件式规则要素：${token}`)
+  }
+  // 「文档任务也算组队」是最危险的退化：`*.md` 与 `docs/**` 必须明确落在「不算」一侧。
+  assert.match(text, /不算：`\*\.md`、`docs\/\*\*`/, '文档任务必须明确不算改代码')
+  // 无条件断言必须不存在：开关状态只能由工具读取。
+  assert.equal(/本会话已(开启|启用)/.test(text), false, '不得出现会话级无条件断言')
+  // 旧的无条件派发规则（用户确认后才 dispatch）必须被条件式规则取代。
+  assert.equal(text.includes('用户确认（或明确说「开干」）后才用'), false)
+  assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
+})
+
 test('AC-1：段落总长 ≤ 2600 字符', () => {
   const text = sectionOf(makeSnapshot())
   assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)

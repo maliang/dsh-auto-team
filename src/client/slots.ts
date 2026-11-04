@@ -464,6 +464,84 @@ export const PANELLIST_LABEL = '自动团队'
  */
 export const OPEN_LIBRARY_EVENT = 'auto-team:open-library'
 
+/* ─────────────── r16 项目库 surface 协议（AC-8 / AC-9） ─────────────── */
+
+/**
+ * 项目库的两个可见 surface：主区整页 `main` / 右栏内联 `panel`。
+ *
+ * `data-library-surface` 是**唯一**判据 —— 组件把根节点标上它，watchdog 与 Panel 只读它，
+ * 不各自 querySelector 别的选择器（两处各猜一套选择器 = 主区/面板双开的温床）。
+ */
+export const LIBRARY_SURFACE_ATTR = 'data-library-surface'
+
+/** watchdog 等待主区真正挂载的预算（AC-8：点击后 1s 内必须出现可见结果）。 */
+export const LIBRARY_OPEN_WATCHDOG_MS = 500
+
+/** pending 标记的有效期：同一次点击的「主区正在打开」不要在 1.5s 内被当成新的请求。 */
+export const LIBRARY_OPEN_PENDING_MS = 1500
+
+export type LibrarySurface = 'main' | 'panel'
+
+/** `createOpenLibrary` 的三种结局（`data-last-open-result` 的取值集合）。 */
+export type LibraryOpenResult = 'main' | 'event' | 'error'
+
+/**
+ * 当前可见的项目库 surface；`null` = 一个都没有（或不在浏览器里）。
+ *
+ * **main 优先**：同一时刻只允许一个可见 surface，主区一旦可见就不再往右栏塞镜像。
+ * `getClientRects().length > 0` 用来排除「节点在 DOM 里但被宿主收起/隐藏」的假可见。
+ */
+export function visibleLibrarySurface(): LibrarySurface | null {
+  if (typeof document === 'undefined' || document === null) return null
+  if (typeof document.querySelector !== 'function') return null
+  const visible = (surface: LibrarySurface): boolean => {
+    try {
+      const node = document.querySelector(`[${LIBRARY_SURFACE_ATTR}="${surface}"]`)
+      if (node === null || node === undefined) return false
+      if (typeof node.getClientRects !== 'function') return true
+      return node.getClientRects().length > 0
+    } catch {
+      // 宿主 DOM 桩不完整（node 测试 / 旧宿主）时按「不可见」处理，不许把异常抛给点击链。
+      return false
+    }
+  }
+  if (visible('main')) return 'main'
+  if (visible('panel')) return 'panel'
+  return null
+}
+
+/** 最近一次「请求打开项目库」的时间戳；Panel 挂载时消费它，避免刷新/重挂后丢内联。 */
+let libraryOpenRequestAt: number | null = null
+
+/** 标记一次打开请求（glyph 点击 / 主区打开前调用）。 */
+export function markLibraryOpenRequest(now: number = Date.now()): void {
+  libraryOpenRequestAt = now
+}
+
+/**
+ * 消费一次打开请求：只有 1.5s 内的请求算数（过期请求不能把用户拖进一个他早就放弃的内联库）。
+ * 消费即清空 —— 同一次点击最多触发一次降级。
+ */
+export function consumeLibraryOpenRequest(now: number = Date.now()): boolean {
+  const at = libraryOpenRequestAt
+  libraryOpenRequestAt = null
+  if (at === null) return false
+  return now - at <= LIBRARY_OPEN_PENDING_MS && now - at >= 0
+}
+
+/** 测试隔离用：清掉 pending 标记（不在生产过程调用）。 */
+export function resetLibraryOpenRequest(): void {
+  libraryOpenRequestAt = null
+}
+
+/** 派发降级事件；没有 window（node 测试 / 非浏览器宿主）时安全返回 false。 */
+function dispatchOpenLibraryEvent(): boolean {
+  if (typeof window === 'undefined' || window === null) return false
+  if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') return false
+  window.dispatchEvent(new CustomEvent(OPEN_LIBRARY_EVENT, { detail: { id: PANELLIST_ID } }))
+  return true
+}
+
 /** 主区服务的只声明用到的成员（形状未验证，故整段 try/catch）。 */
 export interface MainAreaFace {
   open?(id: string): unknown
@@ -484,12 +562,14 @@ function warnSlot(name: string, error: unknown): void {
 }
 
 /**
- * 生成「打开左栏项目库」动作。
+ * 生成「打开左栏项目库」动作（AC-8 / AC-9 的唯一入口）。
  *
- * 两级：先 `mainArea.open(PANELLIST_ID)`；没有该服务（或它抛错）时派发 `OPEN_LIBRARY_EVENT`。
- * 返回 `false` 表示走了事件降级 —— 调用方可据此提示「在右栏打开」而不是假装成功。
+ * additive 语义：先试主区 `mainArea.open(PANELLIST_ID)`；主区缺失 / 显式拒绝 / 500ms 内
+ * 没有出现可见的 `[data-library-surface="main"]` 时，降级到右栏内联（打开面板页签 + 派发
+ * `OPEN_LIBRARY_EVENT`）。返回 `'main' | 'event' | 'error'` —— 调用方（glyph）据此显示
+ * `data-last-open-result`，**任何分支都不静默**。
  */
-export function createOpenLibrary(ctx: SlotsContext): () => boolean {
+export function createOpenLibrary(ctx: SlotsContext): (sessionId?: string) => LibraryOpenResult {
   let face: MainAreaFace | undefined
   if (typeof ctx.inject === 'function') {
     try {
@@ -502,23 +582,50 @@ export function createOpenLibrary(ctx: SlotsContext): () => boolean {
       face = undefined
     }
   }
-  return () => {
+  const panel = createPanelCommands(ctx)
+
+  /** 降级到右栏：打开面板页签 + 派发事件；两步缺一都会被用户当成「点了没反应」。 */
+  function fallback(sessionId?: string, deferred = false): LibraryOpenResult {
+    markLibraryOpenRequest()
+    let opened = false
+    try {
+      const id = sessionId === undefined || sessionId === '' ? 'current' : sessionId
+      opened = panel.open(id)
+    } catch {
+      opened = false
+    }
+    if (deferred) {
+      // 让 openTab 先把 Panel 挂起来（mount 时消费 pending 标记），再派发事件。
+      setTimeout(() => {
+        dispatchOpenLibraryEvent()
+      }, 0)
+    } else {
+      dispatchOpenLibraryEvent()
+    }
+    return opened ? 'event' : 'error'
+  }
+
+  return (sessionId?: string): LibraryOpenResult => {
     if (face !== undefined && typeof face.open === 'function') {
+      let accepted = true
       try {
-        face.open(PANELLIST_ID)
-        return true
+        // 只有**显式 false** 才算主区拒绝：真实宿主多半返回 void，
+        // 那种情况交给 watchdog 用 DOM 事实判定，否则会误判成失败并双开。
+        accepted = face.open(PANELLIST_ID) !== false
       } catch {
-        // 宿主拒绝打开主区 → 落到事件降级（面板内联），不要静默什么都不做。
+        accepted = false
+      }
+      if (accepted) {
+        markLibraryOpenRequest()
+        // 一次性 watchdog（不是 setInterval）：主区说打开了、实际没挂载时 500ms 内降级。
+        setTimeout(() => {
+          if (visibleLibrarySurface() === 'main') return
+          fallback(sessionId, true)
+        }, LIBRARY_OPEN_WATCHDOG_MS)
+        return 'main'
       }
     }
-    if (
-      typeof window !== 'undefined' &&
-      typeof window.dispatchEvent === 'function' &&
-      typeof CustomEvent === 'function'
-    ) {
-      window.dispatchEvent(new CustomEvent(OPEN_LIBRARY_EVENT, { detail: { id: PANELLIST_ID } }))
-    }
-    return false
+    return fallback(sessionId)
   }
 }
 
@@ -536,7 +643,10 @@ export function registerPanellist(
   if (ctx === undefined || ctx === null || ctx.slots === undefined) return result
 
   const openLibrary = createOpenLibrary(ctx)
-  const injectOf = (sessionId: string): Record<string, unknown> => sessionIdBag(sessionId, { openLibrary })
+  // 组件侧零参（`PanellistEntryProps.openLibrary`）；sessionId 在这一层绑定，
+  // 免得每个组件各自记住「点左栏时要带会话 id」。
+  const injectOf = (sessionId: string): Record<string, unknown> =>
+    sessionIdBag(sessionId, { openLibrary: () => openLibrary(sessionId) })
 
   // 左栏栏目：非 keyed → name/id/order/label/inject（不带 key）。
   try {

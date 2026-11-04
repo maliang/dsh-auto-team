@@ -307,6 +307,8 @@ export function rolesOf(tasks: TaskDetailView[]): RoleUsageView[] {
       name,
       tasks: list.length,
       usage: roleUsageCellOf(list.map((task) => task.usage)),
+      // r16 AC-16：任务编号与状态按计划顺序投影；标题仍来自任务详情，不复制第二份真相。
+      taskRefs: list.map((task) => ({ id: task.id, status: task.status })),
       done: state.done,
       state: state.state,
       stateText: state.stateText,
@@ -355,6 +357,8 @@ export function flowOf(tasks: TaskDetailView[]): FlowView {
       id: task.id,
       title: task.title,
       status: task.status,
+      // r16 AC-12：节点归属角色 id 由宿主投影，客户端 flowLayoutOf 据此分列。
+      roleId: task.roleId,
       roleName: task.roleName,
       column,
       row,

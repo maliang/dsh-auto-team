@@ -217,11 +217,25 @@ test('runId → detail：任务/角色/流转图/用时/token 全部由宿主算
   assert.deepEqual(roles.map((role) => [role.roleId, role.tasks]), [['dev', 1], ['qa', 2]])
   assert.equal(roles[0]?.usage.tokens?.total, 1_000)
   assert.equal(roles[1]?.usage.source, 'unavailable')
+  // r16 AC-16：历史详情同样投影 taskRefs（按计划顺序、真实状态）
+  assert.deepEqual(roles.map((role) => role.taskRefs), [
+    [{ id: 't1', status: 'done' }],
+    [
+      { id: 't2', status: 'running' },
+      { id: 't3', status: 'ready' },
+    ],
+  ])
 
   assert.deepEqual(
     detail?.flow.nodes.map((node) => [node.id, node.column, node.row]),
     [['t1', 0, 0], ['t2', 1, 0], ['t3', 1, 1]],
   )
+  // r16 AC-12：节点带 roleId（客户端据此分列，不再信任 column）
+  assert.deepEqual(detail?.flow.nodes.map((node) => [node.id, node.roleId]), [
+    ['t1', 'dev'],
+    ['t2', 'qa'],
+    ['t3', 'qa'],
+  ])
   assert.equal(detail?.flow.columns, 2)
   assert.equal(detail?.flow.rows, 2)
   assert.deepEqual(

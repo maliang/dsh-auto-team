@@ -43,13 +43,18 @@ export function captainSection(deps: PromptDeps, sessionId: string): string {
     ...CAPTAIN_CONSTRAINTS,
     '',
     '工作方式（顺序不可颠倒）：',
-    '1. **先 plan，再 dispatch**：把目标拆成有依赖的任务图用 `auto_team_plan`（每个任务必须指定 roleId 与可执行的 acceptance），**计划条目先落地**，用户确认（或明确说「开干」）后才用 `auto_team_dispatch` 派发。',
-    '2. `auto_team_dispatch` **必须带 plan 返回的 runId**：它同时用于确认「你派的是刚给用户看的那份计划」。缺少 runId 会被直接拒绝——这是「计划早于第一个成员」的机械保证（AC-30），不要试图绕过。',
-    '3. 派发前提醒用户：计划可在面板「计划」页改角色、取消；取消后成员数为 0。派发后同一时刻在跑的任务数受 maxConcurrent 限制（默认 3），超出的会排队等前置任务过门禁。',
-    '4. 成员是**可续聊**的独立 Agent：用 `auto_team_message` 直达消息，中断后用同一 memberId 继续（面板「继续」或 `resume`），不要重新创建同名成员。',
-    '5. **完成必须过门禁**：任务从 running 到 done 唯一入口是 `auto_team_receipt`（host 会执行该任务的 acceptance 并记录命令、退出码、输出尾部）。成员口头说「做完了」、你读代码觉得「应该没问题」都不算完成；门禁失败的任务转 rework，其下游保持 blocked，你必须把失败证据发回原成员再改。',
-    '6. 团队记忆分公共与项目两轨，都是 md：相关约定优先 `auto_team_memory` 读取，沉淀时才写入。',
-    '7. 面板（输入框内「自动团队」选项 + 右栏面板）是用户的可视入口与唯一状态来源；你的结论要与面板显示一致。',
+    // r16 AC-1：把「一律先 plan 再 dispatch」改成**条件式**——只有改代码才组队。
+    // 无条件规则的反面代价是：开关开着时用户只是问一句，队长也开始落计划、起成员（PRD 反目标 1）。
+    // 判性质必须给可判定的路径清单，否则模型会自己发明边界（把改文档也算进去，或把改配置算作不算）。
+    '1. **先判性质**：只有「需要修改代码」的任务才组队。算：`src/**`、`test/**`、`lib/**`、`package.json`、`tsconfig*.json`、`*.config.*`、`pnpm-lock.yaml`、`scripts/**`、`.github/workflows/**`、`cordis.patch.yml`；不算：`*.md`、`docs/**`、`README*`、`logs/**`、只跑 test/typecheck 验证、只做查证并产出说明。',
+    '2. **开关打开 + 改代码**：先 `auto_team_status` 确认 `enabled`，再 `auto_team_plan`（计划落盘后自动派发），再 `auto_team_dispatch`（只做幂等确认）；开关打开时队长不得自己改代码（不得修改任何文件）；受理后本轮立即结束，不等成员。',
+    '3. **不组队**：纯问答、用户明确叫停、改文档、跑验证、单纯查证；开关关闭时零 `auto_team_*` 写操作。本段不判断当前会话是否启用，以 `auto_team_status` 的 `enabled` 为准。',
+    '4. `auto_team_dispatch` **必须带 plan 返回的 runId**：它同时用于确认「你派的是刚给用户看的那份计划」。缺少 runId 会被直接拒绝——这是「计划早于第一个成员」的机械保证（AC-30），不要试图绕过。',
+    '5. 派发前提醒用户：计划可在面板「计划」页改角色、取消；取消后成员数为 0。派发后同一时刻在跑的任务数受 maxConcurrent 限制（默认 3），超出的会排队等前置任务过门禁。',
+    '6. 成员是**可续聊**的独立 Agent：用 `auto_team_message` 直达消息，中断后用同一 memberId 继续（面板「继续」或 `resume`），不要重新创建同名成员。',
+    '7. **完成必须过门禁**：任务从 running 到 done 唯一入口是 `auto_team_receipt`（host 会执行该任务的 acceptance 并记录命令、退出码、输出尾部）。成员口头说「做完了」、你读代码觉得「应该没问题」都不算完成；门禁失败的任务转 rework，其下游保持 blocked，你必须把失败证据发回原成员再改。',
+    '8. 团队记忆分公共与项目两轨，都是 md：相关约定优先 `auto_team_memory` 读取，沉淀时才写入。',
+    '9. 面板（输入框内「自动团队」选项 + 右栏面板）是用户的可视入口与唯一状态来源；你的结论要与面板显示一致。',
   ]
   // 两行都「有内容才出现」，避免常驻段随风膨胀（预算 ≤2600 字符，见 test/captain.test.ts）。
   const notes = [captainModelLineOf(snapshot.captainModel), memoryLineOf(snapshot.memory)].filter(

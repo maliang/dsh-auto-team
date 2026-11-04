@@ -42,6 +42,7 @@ import {
   registerPanelTab,
   registerPanellist,
   registerSlots,
+  resetLibraryOpenRequest,
 } from '../src/client/slots.ts'
 import { PLUGIN_ID } from '../src/shared/const.ts'
 
@@ -891,4 +892,60 @@ test('r14 AC-13：分栏容器必须真的渲染 [data-project-split]（styles �
   const parent = container.node.parent
   walk(ts.isJsxOpeningElement(container.node) ? parent : container.node)
   assert.equal(handleInside, 1, '[data-project-split] 内必须恰有一个 [data-split-handle]')
+})
+
+test('r16 左栏 glyph：注入的 openLibrary 零参且只返回三值，座位/注册计数不变（AC-8/AC-9）', () => {
+  // 这个测试守的是「r16 不许改挂载点契约」：座位数、inject 集合、register 次数都必须与 r13 一致。
+  const injected: string[] = []
+  const metas: Array<Record<string, unknown>> = []
+  const components: unknown[] = []
+  // 只有右栏服务（模拟旧宿主 / main 未注册）：点击必须降级到内联，而不是静默。
+  const services: Record<string, unknown> = { sidebarRight: { openTab() {} } }
+  const ctx = {
+    slots: {
+      inject(name: string, run: () => void) {
+        injected.push(name)
+        run()
+      },
+      register(meta: Record<string, unknown>, component: unknown) {
+        metas.push(meta)
+        components.push(component)
+      },
+    },
+    inject(_deps: readonly string[], fn: (scope: Record<string, unknown>) => void) {
+      fn(services)
+    },
+  }
+  const deps = { PanellistEntry: 'panellist-stub', LibraryPage: 'library-stub' }
+  const store = globalThis as unknown as Record<string, unknown>
+  const savedWindow = store.window
+  const events: string[] = []
+  store.window = {
+    dispatchEvent(event: { type?: unknown }) {
+      events.push(String(event?.type))
+      return true
+    },
+  }
+  try {
+    assert.deepEqual(registerPanellist(ctx as never, deps as never), { panellist: true, main: true })
+
+    // 计数不变：一个侧栏 inject + 两次 register（栏目 + 主区），r16 不新增座位
+    assert.deepEqual(injected, [PANELLIST_SLOT], 'r16 不许新增 slots.inject 座位')
+    assert.equal(metas.length, 2, 'r16 不许新增 slots.register 次数')
+
+    const bag = bagOf({ injected, metas, components }, PANELLIST_SLOT)
+    const openLibrary = bag.openLibrary as (() => unknown) & { length: number }
+    assert.equal(typeof openLibrary, 'function', '栏目要能主动打开主区项目库')
+    assert.equal(openLibrary.length, 0, '注入给组件的动作必须零参（sessionId 在 slots 层绑定）')
+
+    // 返回值是 glyph 的 data-last-open-result 取值域：main | event | error（不含 none）
+    const outcome = openLibrary()
+    assert.equal(['main', 'event', 'error'].includes(String(outcome)), true, `openLibrary 返回了 ${String(outcome)}`)
+    assert.equal(outcome, 'event', '主区不可用时必须走右栏降级')
+    assert.deepEqual(events, [OPEN_LIBRARY_EVENT], '降级必须派发一次打开事件（不静默）')
+  } finally {
+    if (savedWindow === undefined) delete store.window
+    else store.window = savedWindow
+    resetLibraryOpenRequest()
+  }
 })

@@ -2719,14 +2719,72 @@ export const AUTO_TEAM_CSS = `
 [data-region="task-flow"] [data-flow-arrow] {
   fill: var(--dsw-alias-border-l3, currentColor);
 }
+/* r16 角色列头（180×32）：编号徽标 + 角色名 + ×N；平面表头，不是卡片也不是按钮 */
+[data-region="task-flow"] [data-flow-stage] {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  width: 180px;
+  height: 32px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: inherit;
+  cursor: inherit;
+  user-select: none;
+}
+[data-region="task-flow"] [data-flow-stage-badge] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+[data-region="task-flow"] [data-flow-stage-name] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+  font-weight: 600;
+}
+[data-region="task-flow"] [data-flow-stage-count] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-variant-numeric: tabular-nums;
+}
+/* 列间箭头：颜色/虚实由组件按「左列是否全 done」写在 SVG 属性上，CSS 只管不吃指针 */
+[data-region="task-flow"] [data-flow-stage-link] {
+  pointer-events: none;
+}
+/* r16 节点：180×64 两行（tN + 标题 + 状态胶囊 / token · 用时）；角色名只在列头 */
 [data-region="task-flow"] [data-flow-node] {
   position: absolute;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  justify-content: space-between;
+  gap: 4px;
   box-sizing: border-box;
   width: 180px;
-  height: 76px;
+  height: 64px;
   margin: 0;
   padding: 8px 10px;
   overflow: hidden;
@@ -2736,6 +2794,7 @@ export const AUTO_TEAM_CSS = `
   color: inherit;
   text-align: left;
   cursor: pointer;
+  user-select: none;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
 [data-region="task-flow"] [data-flow-node]:hover {
@@ -2756,24 +2815,27 @@ export const AUTO_TEAM_CSS = `
   height: 20px;
   min-width: 0;
 }
-/* r14 节点首行：状态点 + 角色名（r13 这里是任务 id） */
-[data-region="task-flow"] [data-flow-node-role] {
-  flex: 1 1 auto;
-  min-width: 0;
+/* r16 节点首行：tN 徽标 + 标题 + 状态胶囊（角色名只在列头，节点内不再渲染角色名） */
+[data-region="task-flow"] [data-flow-node-id] {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-width: 24px;
+  height: 18px;
+  padding: 0 4px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
   color: var(--dsw-alias-label-primary, inherit);
-  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
-  font-weight: 600;
-}
-[data-region="task-flow"] [data-flow-line="task"] {
-  display: block;
-  min-width: 0;
-  height: 16px;
+  text-align: center;
+  white-space: nowrap;
+  font: 600 11px/18px var(--ds-font-family-code, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
 }
 [data-region="task-flow"] [data-flow-node-title] {
   display: block;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2800,14 +2862,50 @@ export const AUTO_TEAM_CSS = `
 [data-region="task-flow"] [data-flow-dot][data-tone="danger"] {
   background: var(--dsw-alias-state-error-primary, currentColor);
 }
+/* 状态胶囊：18 高、999、11/500；5 个 tone 统一 10% 底 + 40% 边（文字永远在，颜色只是冗余通道） */
 [data-region="task-flow"] [data-flow-status] {
+  display: inline-flex;
   flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 18px;
+  max-width: 48px;
+  padding: 0 5px;
   overflow: hidden;
-  max-width: 56px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--dsw-alias-label-tertiary, inherit);
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-weight: 500;
+}
+[data-region="task-flow"] [data-flow-status][data-tone="business"] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 10%, transparent);
+}
+[data-region="task-flow"] [data-flow-status][data-tone="success"] {
+  color: var(--dsw-alias-state-success-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, currentColor) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary, currentColor) 10%, transparent);
+}
+[data-region="task-flow"] [data-flow-status][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 10%, transparent);
+}
+[data-region="task-flow"] [data-flow-status][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 10%, transparent);
+}
+[data-region="task-flow"] [data-flow-status][data-tone="neutral"] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  border-color: var(--dsw-alias-border-l1, currentColor);
+  background: var(--dsw-alias-bg-layer-2, transparent);
 }
 [data-region="task-flow"] [data-flow-line="meta"] {
   display: flex;
@@ -2824,10 +2922,13 @@ export const AUTO_TEAM_CSS = `
 }
 [data-region="task-flow"] [data-flow-line="meta"] [data-cell="token"],
 [data-region="task-flow"] [data-flow-line="meta"] [data-cell="duration"] {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
   white-space: nowrap;
   text-align: left;
+}
+[data-region="task-flow"] [data-flow-sep] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
 }
 [data-region="task-flow"] [data-flow-line="meta"] [data-cell="token"][data-usage-source="unavailable"],
 [data-region="task-flow"] [data-flow-line="meta"] [data-cell="duration"][data-duration-state="unavailable"],
@@ -3464,11 +3565,11 @@ export const AUTO_TEAM_CSS = `
  * ③ 颜色只用宿主 token，混合色一律 color-mix 且带 currentColor 兜底。
  * ════════════════════════════════════════════════════════════════════════════ */
 
-/* ── ① 任务总览：64px 环列 + 12px gap + 220px 列表列（DESIGN §2.3） ───────── */
+/* ── ① 任务总览：80px 环列 + 8px gap + 208px 列表列（DESIGN §2.1：80+8+208=296） ───────── */
 [data-task-overview] {
   display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 8px;
   align-items: start;
   box-sizing: border-box;
   padding: 8px 12px 10px;
@@ -3481,18 +3582,18 @@ export const AUTO_TEAM_CSS = `
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 64px;
-  height: 64px;
+  width: 80px;
+  height: 80px;
 }
 [data-task-overview] [data-overview-list] {
   min-width: 0;
 }
-/* 220px 塞不下 r13 的「1fr 76px 84px」表头（DESIGN §2.3 的取舍）：分组模式没有表头，
-   两行式行的 meta 行改成 flex 单行，token/用时靠右、角色名先让位。 */
+/* 184px 列表内容放不下 r13 的「1fr 76px 84px」表头（DESIGN §2.1 的取舍）：分组模式没有表头，
+   两行式行的 meta 行改成 flex 单行，角色名先 ellipsis、token/用时保持不省略。 */
 [data-task-overview] [data-task-line="meta"] {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   min-height: 16px;
   margin-top: 2px;
   overflow: hidden;
@@ -3501,6 +3602,9 @@ export const AUTO_TEAM_CSS = `
 [data-task-overview] [data-task-role] {
   flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--dsw-alias-label-secondary, inherit);
 }
 [data-task-overview] [data-task-line="meta"] [data-cell="token"],
@@ -3509,37 +3613,43 @@ export const AUTO_TEAM_CSS = `
   text-align: left;
 }
 
-/* 进度环：64×64、r=28、stroke=6、rotate(-90) 由组件属性给出，这里只管视觉 */
+/* 进度环（r16）：80×80、r=34、stroke=8、C=213.628；rotate(-90) 由组件属性给出，这里只管视觉 */
 [data-progress-ring] {
   display: block;
-  width: 64px;
-  height: 64px;
+  width: 80px;
+  height: 80px;
   overflow: visible;
 }
 [data-progress-ring] [data-ring-track] {
   fill: none;
   stroke: var(--dsw-alias-border-l2, currentColor);
-  stroke-width: 6;
+  stroke-width: 8;
 }
 [data-progress-ring] [data-ring-arc] {
   fill: none;
   stroke: var(--dsw-alias-state-business-primary, currentColor);
-  stroke-width: 6;
+  stroke-width: 8;
   transition: stroke-dashoffset 240ms ease;
 }
 [data-progress-ring] [data-ring-arc][data-complete="true"] {
   stroke: var(--dsw-alias-state-success-primary, currentColor);
 }
-/* 圆内文字两档：≤5 字 13px、≥6 字 11px（999/999 必须还有 6px 余量，绝不截断数字） */
+/* 圆内文字两档：≤5 字（99/99、3/9）16px、≥6 字（999/999）13px，tabular 保证数字等宽不抖 */
 [data-progress-ring] [data-progress-text] {
   fill: var(--dsw-alias-label-primary, currentColor);
   font: var(--dsw-font-xs-13, 13px/16px sans-serif);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-[data-progress-ring] [data-progress-text][data-text-tier="long"] {
-  font: var(--dsw-font-xxxs-11, 11px/14px sans-serif);
+[data-progress-ring] [data-progress-text][data-text-tier="short"] {
+  font: var(--dsw-font-h3-16, 16px/20px sans-serif);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+[data-progress-ring] [data-progress-text][data-text-tier="long"] {
+  font: var(--dsw-font-xs-13, 13px/16px sans-serif);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 分组：未完成在前、已完成在后，组头 sticky 24px（计数由 taskOverviewOf 给） */
@@ -3664,6 +3774,71 @@ export const AUTO_TEAM_CSS = `
 [data-role-grid] [data-role-active-task][data-empty="true"] {
   color: var(--dsw-alias-label-tertiary, inherit);
 }
+/* r16 refs 行：该角色的任务编号 chip（tN + 状态彩点）；无 taskRefs 的旧快照整行不渲染 */
+[data-role-grid] [data-role-line="refs"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  min-height: 18px;
+}
+[data-role-grid] [data-role-task-refs] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  min-height: 18px;
+}
+[data-role-grid] [data-role-task-ref] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: 100%;
+  height: 18px;
+  padding: 0 4px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 彩点用 background:currentColor：color 由 tone 决定，computed color 与 dot 颜色天然一致 */
+[data-role-grid] [data-task-ref-dot] {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  color: var(--dsw-alias-label-tertiary, currentColor);
+}
+[data-role-grid] [data-task-ref-dot][data-tone="business"] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+}
+[data-role-grid] [data-task-ref-dot][data-tone="success"] {
+  color: var(--dsw-alias-state-success-primary, currentColor);
+}
+[data-role-grid] [data-task-ref-dot][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+}
+[data-role-grid] [data-task-ref-dot][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+}
+[data-role-grid] [data-task-ref-dot][data-tone="neutral"] {
+  color: var(--dsw-alias-label-tertiary, currentColor);
+}
+[data-role-grid] [data-task-ref-id] {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 600 11px/16px var(--ds-font-family-code, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+}
 [data-role-grid] [data-role-line="meta"] {
   display: flex;
   align-items: center;
@@ -3700,6 +3875,110 @@ export const AUTO_TEAM_CSS = `
 [data-role-grid] [data-role-empty] {
   color: var(--dsw-alias-label-tertiary, inherit);
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+
+/* ── ④ r16：左栏 glyph 反馈 + 右栏内联项目库（AC-8/9 的唯一可见 surface） ───── */
+/* 左栏 glyph：只在宿主按钮内部做 press/失败反馈，不改宿主行结构、不抢 selectPanel */
+[data-auto-team-panellist][data-panellist-glyph] {
+  display: block;
+  color: inherit;
+  opacity: 0.9;
+  transition: opacity 120ms var(--ds-ease-in-out, ease), transform 80ms var(--ds-ease-in-out, ease),
+    color 200ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-panellist][data-panellist-glyph]:hover {
+  opacity: 1;
+}
+[data-auto-team-panellist][data-panellist-glyph]:active {
+  transform: scale(0.92);
+}
+[data-auto-team-panellist][data-panellist-glyph][data-open-error="true"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+}
+[data-auto-team-panel] [data-panel-library-inline] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  animation: auto-team-detail-in 120ms ease-out;
+}
+[data-auto-team-panel] [data-panel-library-bar] {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+[data-auto-team-panel] [data-library-inline-back] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 28px;
+  margin: 0;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  cursor: pointer;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  transition: background-color 120ms var(--ds-ease-in-out, ease),
+    border-color 120ms var(--ds-ease-in-out, ease), color 120ms var(--ds-ease-in-out, ease);
+}
+[data-auto-team-panel] [data-library-inline-back]:hover {
+  background: var(--dsw-alias-bg-layer-3, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+}
+[data-auto-team-panel] [data-library-inline-back]:active {
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+[data-auto-team-panel] [data-library-inline-back]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+[data-auto-team-panel] [data-panel-library-hint] {
+  display: inline-flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-weight: 500;
+}
+[data-auto-team-panel] [data-panel-library-warn] {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-warn-primary, currentColor);
+}
+/* DESIGN §9 的另一路命名：只在「空元素」时当圆点（TECH §6.3 定稿用 data-panel-library-warn，
+   若后续把它当文案容器用，这条不会误伤排版） */
+[data-auto-team-panel] [data-library-notice]:empty {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-warn-primary, currentColor);
+}
+[data-auto-team-panel] [data-panel-library-inline] [data-auto-team-library] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* ── ③ 项目库：分栏（CSS 变量）、run 行、历史桶、右侧抽屉（T5 复用这些钩子） ── */
@@ -3960,6 +4239,9 @@ export const AUTO_TEAM_CSS = `
   [data-region="project-detail"] [data-run-row],
   [data-run-drawer],
   [data-run-drawer-mask],
+  [data-auto-team-panellist][data-panellist-glyph],
+  [data-auto-team-panel] [data-panel-library-inline],
+  [data-auto-team-panel] [data-library-inline-back],
   [data-role-grid] [data-role-card] {
     transition: none;
     animation: none;

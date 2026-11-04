@@ -5,17 +5,19 @@
  * 全部来自 `shared/role-view.ts#roleStateOf`（宿主 rolesOf 与客户端 roleUsageOf 同一份实现），
  * 组件**只渲染、不聚合** —— 这是 AC-9/AC-17「右栏与抽屉文本逐字相等」的构造保证。
  *
- * 几何（DESIGN §2.1）：296 内容宽 / 2 列 = 144，min-height 76；三行 ——
+ * 几何（DESIGN §2.2）：296 内容宽 / 2 列 = 144，min-height 76；四行 ——
  *   1. 角色名（13/600，弹性，ellipsis）+ 状态徽标（18px 高）；
  *   2. 当前任务标题（11px，一行 ellipsis）；没有当前任务时写「无进行中任务」；
- *   3. token · 用时 · 已完成 N/总数（11px tabular-nums）。
+ *   3. refs 行（r16 AC-16）：该角色的任务编号 chip（`tN` + 状态彩点），
+ *      `taskRefs` 缺省/空则整行不渲染 —— 旧快照不显示「0 个任务」；
+ *   4. token · 用时 · 已完成 N/总数（11px tabular-nums）。
  * 卡片数 = 不同 roleId 数（分组已在宿主/客户端聚合层完成）。
  */
 import * as React from 'react'
 import type { RoleUsageView } from '../../shared/types.ts'
 import { ROLE_STATE_TEXT, ROLE_STATE_TONE } from '../../shared/role-view.ts'
 import type { RoleStateKind } from '../../shared/role-view.ts'
-import { durationTitleOf, tokenTextOf, tokenTitleOf } from '../viewmodel.ts'
+import { durationTitleOf, roleTaskRefViewOf, tokenTextOf, tokenTitleOf } from '../viewmodel.ts'
 
 export interface RoleCardProps {
   role: RoleUsageView
@@ -36,6 +38,8 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   const done = role.done ?? 0
   const activeTitle = role.activeTaskId !== undefined ? (role.activeTaskTitle ?? role.activeTaskId) : undefined
   const duration = role.duration
+  // r16 AC-16：只渲染、不排序 —— 顺序 = 计划顺序，数量 = role.tasks（空/缺省整行不渲染）。
+  const refs = (role.taskRefs ?? []).map((ref) => roleTaskRefViewOf(ref))
   return (
     <article
       data-role-card
@@ -60,6 +64,24 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
           无进行中任务
         </span>
       )}
+      {refs.length > 0 ? (
+        <div data-role-line="refs" data-role-task-refs>
+          {refs.map((chip) => (
+            <span
+              key={chip.id}
+              data-role-task-ref
+              data-task-id={chip.id}
+              data-status={chip.status}
+              data-tone={chip.tone}
+              title={chip.title}
+              aria-label={chip.label}
+            >
+              <span data-task-ref-dot data-tone={chip.tone} aria-hidden="true" />
+              <span data-task-ref-id>{chip.text}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div data-role-line="meta">
         <span data-role-usage data-usage-source={role.usage.source} title={tokenTitleOf(role.usage)}>
           {tokenTextOf(role.usage)}

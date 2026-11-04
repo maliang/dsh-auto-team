@@ -133,6 +133,17 @@ test('AC-8/AC-2：工具面 8 个，plan description 明示单任务合法', () 
   assert.match(plan.description, /简单任务/, 'plan description 必须出现「简单任务」')
   assert.match(plan.description, /不自己动手/, 'plan description 必须说明队长不自己动手')
   assert.match(plan.description, /合法/, 'plan description 必须说明单任务计划合法')
+  // r16 AC-1：三个工具的描述要各自回答「为什么现在就该用它 / 什么时候先别用」，否则队长会绕开它们自己动手。
+  assert.match(plan.description, /改代码任务的默认路径/, 'plan description 必须点明改代码默认路径')
+  const dispatch = tools.get('auto_team_dispatch')
+  assert.ok(dispatch)
+  assert.match(dispatch.description, /幂等确认/, 'dispatch description 必须点明幂等确认')
+  assert.match(dispatch.description, /立即返回/, 'dispatch description 必须点明受理后立即返回')
+  assert.match(dispatch.description, /alreadyDispatched/, 'dispatch description 必须说明 alreadyDispatched 的返回')
+  const status = tools.get('auto_team_status')
+  assert.ok(status)
+  assert.match(status.description, /只读/, 'status description 必须点明只读')
+  assert.match(status.description, /enabled/, 'status description 必须让队长先查 enabled')
 
   // 写域必须是**模型看得见**的字段：看不见的字段等于不存在（模型会照旧不声明）。
   const properties = (plan.parameters.properties ?? {}) as Record<string, Record<string, unknown>>

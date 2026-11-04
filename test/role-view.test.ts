@@ -232,6 +232,21 @@ test('宿主 rolesOf 与客户端 roleUsageOf 逐字段相等（AC-9/AC-17 的�
   assert.deepEqual(client.map((row) => row.roleId), host.map((row) => row.roleId))
   assert.equal(host.length, 3)
   assert.deepEqual(client, host)
+  // r16 AC-16/AC-17：taskRefs 双端同序同源（计划顺序 + 各自真实状态），deepEqual 已覆盖，这里再显式钉一次
+  assert.deepEqual(host.map((row) => row.taskRefs), [
+    [
+      { id: 't1', status: 'done' },
+      { id: 't2', status: 'running' },
+    ],
+    [
+      { id: 't3', status: 'gate' },
+      { id: 't4', status: 'rework' },
+    ],
+    [
+      { id: 't5', status: 'failed' },
+      { id: 't6', status: 'cancelled' },
+    ],
+  ])
 
   // 可见文本（RoleCard 的 data-role-usage）也必须逐字相等，且部分缺失说的是「不可得」
   const textOf = (row: { usage: UsageCell }): string =>

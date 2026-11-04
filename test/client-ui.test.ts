@@ -839,7 +839,7 @@ test('TaskTable：两行式任务行、token/用时 data-cell、展开详情与�
   assert.equal(code.includes('toLocaleString'), false, 'token 千分位只能在 viewmodel.tokenTextOf')
 })
 
-test('FlowCanvas：可平移视口 + rAF 直写 transform，节点第一行是角色名', () => {
+test('FlowCanvas：可平移视口 + rAF 直写 transform，角色列头 + tN 节点（r16）', () => {
   const code = viewCode('FlowCanvas')
   assert.match(code, /data-region="task-flow"/)
   assert.match(code, /data-flow-canvas/)
@@ -850,10 +850,22 @@ test('FlowCanvas：可平移视口 + rAF 直写 transform，节点第一行是�
   assert.match(code, /data-flow-node=/)
   assert.match(code, /data-flow-column=/)
   assert.match(code, /data-flow-row=/)
-  assert.match(code, /data-flow-node-role/)
+  // r16 AC-12：列头 = 01/02 徽标 + 角色名 + ×N，列间箭头单独一条 path
+  assert.match(code, /data-flow-stage\b/)
+  assert.match(code, /data-flow-stage-badge/)
+  assert.match(code, /data-flow-stage-name/)
+  assert.match(code, /data-flow-stage-count/)
+  assert.match(code, /data-flow-stage-link/)
+  assert.match(code, /layout\.stageLinks\.map/)
+  // r16 AC-13：节点第一行 tN + 标题 + 状态胶囊；角色名只由列头承载
+  assert.match(code, /data-flow-node-id/)
   assert.match(code, /data-flow-node-title/)
+  assert.match(code, /data-flow-status data-tone=\{cell\.tone\}/)
+  assert.equal(code.includes('data-flow-node-role'), false, '节点内不再渲染角色名（角色名只在列头）')
   assert.match(code, /data-flow-line="meta"/)
   assert.match(code, /data-flow-legend/)
+  assert.match(code, /实线 = 已完成/)
+  assert.match(code, /虚线 = 未完成/)
   assert.match(code, /data-canvas-reset/)
   assert.match(code, /flowLayoutOf\(/)
   // 拖动只写 transform + rAF 合帧 + 4px 累计阈值（AC-22：60 帧不来 60 次重排）
@@ -864,7 +876,7 @@ test('FlowCanvas：可平移视口 + rAF 直写 transform，节点第一行是�
   assert.equal(/from '(d3|mermaid|reactflow|cytoscape)/.test(code), false)
 })
 
-test('ProgressRing：64×64、r=28、两档字号，环内文字严格是 done/total', () => {
+test('ProgressRing：80×80、viewBox 80、r=34、stroke=8、两档字号，环内文字严格是 done/total', () => {
   const code = viewCode('ProgressRing')
   assert.match(code, /data-progress-ring/)
   assert.match(code, /data-done=\{String/)
@@ -874,8 +886,13 @@ test('ProgressRing：64×64、r=28、两档字号，环内文字严格是 done/t
   assert.match(code, /data-complete=/)
   assert.match(code, /data-progress-text/)
   assert.match(code, /data-text-tier=/)
-  assert.match(code, /rotate\(-90 32 32\)/)
+  // r16 AC-11：80 视口 → 圆心 40；圆心必须跟 viewBox 同源，不能写死 32
+  assert.match(code, /const CENTER = PROGRESS_RING_VIEWBOX \/ 2/)
+  assert.match(code, /rotate\(-90 \$\{CENTER\} \$\{CENTER\}\)/)
+  assert.equal(code.includes('rotate(-90 32 32)'), false, 'r16 圆心随 80 视口改到 40')
+  assert.match(code, /PROGRESS_RING_SIZE/)
   assert.match(code, /PROGRESS_RING_RADIUS/)
+  assert.match(code, /PROGRESS_RING_STROKE/)
   assert.match(code, /PROGRESS_RING_CIRCUMFERENCE/)
   assert.match(code, /strokeDashoffset=/)
   assert.match(code, /role="img"/)
@@ -892,6 +909,11 @@ test('RoleCard / RoleGrid：2 列网格只渲染、六个派生量全来自 shar
   assert.match(code, /data-role-status/)
   assert.match(code, /data-tone=/)
   assert.match(code, /data-role-active-task/)
+  // r16 AC-16：refs 行（tN + 状态彩点）四段结构之一；空 refs 整行不渲染，旧快照安全
+  assert.match(code, /data-role-task-refs/)
+  assert.match(code, /data-role-task-ref\b/)
+  assert.match(code, /data-task-ref-dot/)
+  assert.match(code, /roleTaskRefViewOf\(/)
   assert.match(code, /data-role-usage/)
   assert.match(code, /data-usage-source=/)
   assert.match(code, /data-role-duration/)

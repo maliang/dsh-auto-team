@@ -82,6 +82,14 @@ const DISPATCH_ACCEPTED_TEXT = '已接受派发：成员在后台创建，失败
  */
 const DISPATCH_SYNC_NOTE = '派发端口未装配（宿主未接自动派发），本次退回同步派发：返回时成员已创建。'
 
+/**
+ * 幂等确认文案（r16 AC-6）：计划已由 `auto_team_plan` 落盘后自动派发时，队长仍可能按旧习惯
+ * 显式调一次 dispatch。它不是一个错误（`PLAN_ALREADY_DISPATCHED` 是面板 `act('dispatch')` 的拒绝码，
+ * 不属于工具语义）—— 工具层把同一个准入结果翻译成「已受理、本次没重复起人」，零 kick、零 spawn。
+ * **逐字**被 PRD/TECHNICAL 与测试 grep，改文案等于改给用户看的契约。
+ */
+export const DISPATCH_ALREADY_TEXT = '此前已自动派发：成员已在运行，本次未重复起人'
+
 /** 成员投影（dispatch 与 status 工具共用的那一份，避免两处字段慢慢分叉）。 */
 function memberBrief(member: PanelSnapshot['members'][number]): Record<string, unknown> {
   return {
@@ -249,7 +257,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         + '**单任务计划合法**：哪怕只有一件小事、只改一处，也必须走这里拆成 1 个任务并派 1 个成员去做——'
         + '简单任务同样属于团队，队长不自己动手。'
         + `验收命令必须真能执行（exit 0 才算过），可直接用：${ACCEPTANCE_TEMPLATES.join(' / ')}（尖括号换成实际值）。`
-        + '返回 runId，派发时必须带上它；后续要加任务用 auto_team_add_tasks，不要新开计划。',
+        + '返回 runId，派发时必须带上它；后续要加任务用 auto_team_add_tasks，不要新开计划。'
+        + '**改代码任务的默认路径**：判断为需要修改代码后，先 plan 再 dispatch；计划落盘即自动派发，不必等用户确认。',
       parameters: {
         type: 'object',
         properties: {
@@ -323,7 +332,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       description:
         '按依赖顺序派发就绪任务并创建成员（并发受 maxConcurrent 与宿主上限限制）。必须带 plan 返回的 runId。'
         + '**本工具受理后立即返回**（accepted/dispatching）：成员在后台创建，你不需要、也不应该在同一轮等待成员；'
-        + '进度用 auto_team_status 查，失败了会在下一次返回里看到。',
+        + '进度用 auto_team_status 查，失败了会在下一次返回里看到。'
+        + '**幂等确认**：若计划已自动派发，本工具返回 `alreadyDispatched:true`，不会重复起人。',
       parameters: {
         type: 'object',
         properties: { runId: { type: 'string', description: 'auto_team_plan 返回的 runId（必填）' } },
@@ -345,6 +355,24 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         // ① 同步预检：判据与面板 act('dispatch') 同源，不通过就原样回码并**不** kick。
         const admission = deps.bridge.precheckDispatch(sessionId, runId)
         if (!admission.ok) {
+          // r16 AC-6：已自动派发 → **幂等确认**，不是错误。
+          // 面板 act('dispatch') 继续用 `admissionOf` 的 PLAN_ALREADY_DISPATCHED（语义不变）；
+          // 工具层只做翻译：不 kick、不调 bridge.act、不 spawn，成员数取真实快照（不预支新成员）。
+          if (admission.code === 'PLAN_ALREADY_DISPATCHED') {
+            const snapshot = deps.bridge.snapshot(sessionId)
+            return {
+              ok: true,
+              accepted: true,
+              dispatching: true,
+              alreadyDispatched: true,
+              runId: snapshot.runId ?? runId,
+              planStatus: snapshot.planStatus,
+              ready: [],
+              tasks: snapshot.tasks.map(taskBrief),
+              members: snapshot.members.map(memberBrief),
+              notices: [DISPATCH_ALREADY_TEXT],
+            }
+          }
           return { ok: false, code: admission.code, error: admission.message }
         }
 
@@ -388,7 +416,9 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
     },
     {
       name: `${TOOL_PREFIX}status`,
-      description: '读取当前会话的执行计划、成员状态、门禁证据、消息账本、记忆注入预算与角色列表。',
+      description:
+        '读取当前会话的执行计划、成员状态、门禁证据、消息账本、记忆注入预算与角色列表。'
+        + '**只读**：先查 `enabled`，确认开关打开后才决定是否 plan/dispatch；未启用时不要创建成员或计划。',
       parameters: { type: 'object', properties: {}, required: [] },
       async handler(_args, meta) {
         const sessionId = sessionOf(meta)

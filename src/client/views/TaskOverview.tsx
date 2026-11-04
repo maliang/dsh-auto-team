@@ -11,7 +11,7 @@
  */
 import * as React from 'react'
 import type { TaskDetailView } from '../../shared/types.ts'
-import { taskOverviewOf } from '../viewmodel.ts'
+import { PROGRESS_RING_SIZE, taskOverviewOf } from '../viewmodel.ts'
 import { ProgressRing } from './ProgressRing.tsx'
 import { TaskTable } from './TaskTable.tsx'
 
@@ -30,6 +30,7 @@ export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
         <ProgressRing
           done={overview.done}
           total={overview.total}
+          size={PROGRESS_RING_SIZE}
           dashOffset={overview.dashOffset}
         />
       </div>

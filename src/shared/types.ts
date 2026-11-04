@@ -475,12 +475,20 @@ export interface DurationCell {
   state: DurationState
 }
 
+/** r16：角色卡上的任务编号与状态（只读投影，顺序 = 计划顺序）。 */
+export interface RoleTaskRef {
+  id: string
+  status: TaskStatus
+}
+
 /** run 头的角色条 / 角色卡片：该角色在本 run 里承担几个任务、合计多少 token。 */
 export interface RoleUsageView {
   roleId: string
   name: string
   tasks: number
   usage: UsageCell
+  /** r16 AC-16：本角色任务编号与状态，按计划顺序；旧快照无此字段。 */
+  taskRefs?: RoleTaskRef[]
   /**
    * r14 AC-7：以下 6 个派生量全部来自 `shared/role-view.ts#roleStateOf` ——
    * 宿主 `library.rolesOf` 与客户端 `roleUsageOf` 只做映射，禁止各写一份聚合。
@@ -520,6 +528,8 @@ export interface FlowNodeView {
   id: string
   title: string
   status: TaskStatus
+  /** r16 AC-12：节点归属角色 id；旧快照可能没有，按 roleName 回退。 */
+  roleId?: string
   /** r14 AC-4/AC-5：节点首行显示的角色名（缺省 = 旧 run 没记录，组件回退到「角色未记录」）。 */
   roleName?: string
   /** 列 = 依赖深度（0 起）；行 = 同列内序号。 */

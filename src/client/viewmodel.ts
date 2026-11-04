@@ -33,6 +33,7 @@ import type {
   PlanTask,
   Role,
   RoleModelRoute,
+  RoleTaskRef,
   RoleUsageView,
   RunDetailView,
   ScopeLockView,
@@ -1118,9 +1119,11 @@ export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
 
 /* ───────────── 任务总览（环 + 两组） ───────────── */
 
-/** 进度环几何（r14 DESIGN §2.2：64×64、r=28、stroke=6）。 */
-export const PROGRESS_RING_RADIUS = 28
-export const PROGRESS_RING_STROKE = 6
+/** 进度环几何（r16 DESIGN §0：80×80、圆心 40、r=34、stroke=8）。 */
+export const PROGRESS_RING_SIZE = 80
+export const PROGRESS_RING_VIEWBOX = 80
+export const PROGRESS_RING_RADIUS = 34
+export const PROGRESS_RING_STROKE = 8
 export const PROGRESS_RING_CIRCUMFERENCE = 2 * Math.PI * PROGRESS_RING_RADIUS
 
 export interface TaskOverviewView {
@@ -1224,16 +1227,19 @@ export function nextListWidth(current: number, deltaPx: number): number {
 /* ───────────── 流转图 ───────────── */
 
 /**
- * 节点几何（r14 DESIGN §2.4）：180×76，列/行步进 220/92。
- *
- * 180 宽 = 296 画布内一列放得下（含两侧 padding 12）；76 高 = 三行（角色名 20 + 任务简述 16 +
- * meta 16 + 三个 12 的间距）。放不下靠 CSS ellipsis，**不压缩数字**。
+ * 角色列画布几何（r16 DESIGN §0）：节点 180×64，列步进 208、行步进 80；
+ * 列头 32px 高贴顶 12，节点从 54 起。两列总宽 412 > 296 靠拖动平移，不缩放。
  */
 export const FLOW_NODE_WIDTH = 180
-export const FLOW_NODE_HEIGHT = 76
-export const FLOW_COLUMN_STEP = 220
-export const FLOW_ROW_STEP = 92
+export const FLOW_NODE_HEIGHT = 64
+export const FLOW_COLUMN_STEP = 208
+export const FLOW_ROW_STEP = 80
 export const FLOW_PADDING = 12
+export const FLOW_STAGE_TOP = 12
+export const FLOW_STAGE_HEIGHT = 32
+export const FLOW_NODE_TOP = 54
+export const FLOW_STAGE_LINK_Y = 28
+export const FLOW_STAGE_LINK_INSET = 4
 
 /** 缺角色名时的兜底文案（旧 run 的 `TaskDetailView.roleName` 恒有，这里只防脏数据）。 */
 export const FLOW_ROLE_FALLBACK = '角色未记录'
@@ -1241,14 +1247,18 @@ export const FLOW_ROLE_FALLBACK = '角色未记录'
 export interface FlowNodeCellView {
   tokenText: string
   durationText: string
-  /** 节点首行的角色名（r14 AC-5：t1 → 角色名称）。 */
+  /** 角色名：r16 只用于 title/aria，不再渲染进节点第一行（第一行是 tN + 标题 + 状态）。 */
   roleText: string
-  /** 节点第二行的任务简述（给人看的名字，不是任务 id）。 */
+  /** 节点第一行的任务简述（给人看的名字，不是任务 id）。 */
   taskTitle: string
-  /** 节点第三行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
+  /** 第二行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
   text: string
   title: string
   label: string
+  /** 状态中文（唯一词表 `statusBadge().text`，不另造第二套）。 */
+  statusText: string
+  /** 状态胶囊的 tone（`data-tone` 上色）。 */
+  tone: BadgeTone
 }
 
 export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
@@ -1257,14 +1267,47 @@ export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
   const full = tokenTextOf(node.usage)
   const durationText = durationTextOf(node.duration)
   const roleText = (node.roleName ?? '').trim() || FLOW_ROLE_FALLBACK
+  // r16：状态词与 tone 只从 statusBadge 取（13 态一张表），组件不再自己映射。
+  const status = statusBadge(node.status)
   return {
     tokenText: full,
     durationText,
     roleText,
     taskTitle: node.title,
     text: `${full} · ${durationText}`,
-    title: `${roleText}：${node.title}\ntoken ${full} · 用时 ${durationText}`,
-    label: `${roleText}：${node.title}，${statusBadge(node.status).text}，token ${full}，用时 ${durationText}`,
+    statusText: status.text,
+    tone: status.tone,
+    title: `${node.id} ${node.title} · 角色 ${roleText} · token ${full} · 用时 ${durationText}`,
+    label: `${node.id}：${node.title}，${status.text}，token ${full}，用时 ${durationText}`,
+  }
+}
+
+/** r16 AC-16：角色卡 refs 行的单枚 chip（`tN` + 状态彩点）。 */
+export interface RoleTaskRefView {
+  id: string
+  status: TaskStatus
+  tone: BadgeTone
+  text: string
+  title: string
+  label: string
+}
+
+/**
+ * 角色任务引用 → chip 视图（唯一派生点，RoleCard 只渲染）。
+ *
+ * 文案只写 `tN`，状态中文只取 `statusBadge().text`（`done` = 「已通过」），
+ * 不另造「已完成/未开始」第二套词；彩点颜色由 `tone` 决定，与角色卡状态点同族。
+ */
+export function roleTaskRefViewOf(ref: RoleTaskRef): RoleTaskRefView {
+  const badge = statusBadge(ref.status)
+  const text = `${ref.id} · ${badge.text}`
+  return {
+    id: ref.id,
+    status: ref.status,
+    tone: badge.tone,
+    text: ref.id,
+    title: text,
+    label: text,
   }
 }
 
@@ -1273,10 +1316,37 @@ export interface FlowLayoutNode {
   cell: FlowNodeCellView
   x: number
   y: number
+  /** 角色列索引（r16 派生值；不读 `FlowNodeView.column`，那个是旧的依赖深度）。 */
+  column: number
+  /** 角色列内序号（派生）。 */
+  row: number
 }
 
 export interface FlowLayoutEdge {
   key: string
+  d: string
+  upstreamDone: boolean
+}
+
+/** r16：一个角色列（列 = 有任务的角色，按计划里首次出现顺序）。 */
+export interface FlowStageView {
+  /** 分组键：`roleId` → `roleName` → `角色未记录`（同名不同 id 不会合并）。 */
+  key: string
+  index: number
+  roleId?: string
+  /** 列头显示的角色名。 */
+  name: string
+  count: number
+  x: number
+  y: number
+  allDone: boolean
+}
+
+/** r16：相邻列之间的箭头（列头 y 高度上的水平线）。 */
+export interface FlowStageLinkView {
+  key: string
+  from: number
+  to: number
   d: string
   upstreamDone: boolean
 }
@@ -1286,18 +1356,72 @@ export interface FlowLayout {
   height: number
   nodes: FlowLayoutNode[]
   edges: FlowLayoutEdge[]
+  stages: FlowStageView[]
+  stageLinks: FlowStageLinkView[]
 }
 
-/** 节点左上角坐标 → 三次贝塞尔（水平出入，避免折线穿过节点）。 */
+/**
+ * 流转图布局（r16 AC-12/AC-13 的唯一派生点）。
+ *
+ * 列不再等于依赖深度，而是**角色**：按 `roleId → roleName → 「角色未记录」` 建组，
+ * 首次出现决定列序；组内按计划顺序排行。旧快照没有 `roleId` 时回退 `roleName`，
+ * 两者都没有才落单列。`node.column/node.row` 与 `flow.columns/flow.rows` 一律不读 ——
+ * 同一个任务图在两个客户端版本里不能有两种列序。
+ *
+ * 节点边（依赖）仍是三次贝塞尔，端点缺失或环依赖直接跳过，绝不产生 NaN。
+ */
 export function flowLayoutOf(flow: FlowView): FlowLayout {
-  const columns = Math.max(1, flow.columns)
-  const rows = Math.max(1, flow.rows)
-  const nodes: FlowLayoutNode[] = flow.nodes.map((node) => ({
-    node,
-    cell: flowNodeViewOf(node),
-    x: FLOW_PADDING + node.column * FLOW_COLUMN_STEP,
-    y: FLOW_PADDING + node.row * FLOW_ROW_STEP,
-  }))
+  // 1. 分组：key 与展示名分离（同 roleName 不同 roleId 恰好同名时不能合并）。
+  const keys: string[] = []
+  const groups = new Map<string, FlowNodeView[]>()
+  for (const node of flow.nodes) {
+    const key = node.roleId ?? node.roleName ?? FLOW_ROLE_FALLBACK
+    const list = groups.get(key)
+    if (list === undefined) {
+      keys.push(key)
+      groups.set(key, [node])
+    } else {
+      list.push(node)
+    }
+  }
+  // 2. 列：index = 组下标；列头固定在顶部，节点从 FLOW_NODE_TOP 起。
+  const stages: FlowStageView[] = keys.map((key, index) => {
+    const list = groups.get(key) ?? []
+    const first = list[0]
+    const name = (first?.roleName ?? '').trim() || first?.roleId || FLOW_ROLE_FALLBACK
+    const stage: FlowStageView = {
+      key,
+      index,
+      name,
+      count: list.length,
+      x: FLOW_PADDING + index * FLOW_COLUMN_STEP,
+      y: FLOW_STAGE_TOP,
+      allDone: list.every((node) => node.status === 'done'),
+    }
+    if (first?.roleId !== undefined) stage.roleId = first.roleId
+    return stage
+  })
+  let maxCount = 0
+  for (const stage of stages) maxCount = Math.max(maxCount, stage.count)
+
+  // 3. 行：组内保持原数组顺序（一次遍历 + 游标，O(n)）。
+  const stageIndex = new Map(stages.map((stage) => [stage.key, stage]))
+  const cursors = new Map<string, number>()
+  const nodes: FlowLayoutNode[] = flow.nodes.map((node) => {
+    const key = node.roleId ?? node.roleName ?? FLOW_ROLE_FALLBACK
+    const column = stageIndex.get(key)?.index ?? 0
+    const row = cursors.get(key) ?? 0
+    cursors.set(key, row + 1)
+    return {
+      node,
+      cell: flowNodeViewOf(node),
+      column,
+      row,
+      x: FLOW_PADDING + column * FLOW_COLUMN_STEP,
+      y: FLOW_NODE_TOP + row * FLOW_ROW_STEP,
+    }
+  })
+
   const byId = new Map(nodes.map((entry) => [entry.node.id, entry]))
   const edges: FlowLayoutEdge[] = []
   for (const edge of flow.edges as readonly FlowEdgeView[]) {
@@ -1315,12 +1439,34 @@ export function flowLayoutOf(flow: FlowView): FlowLayout {
       upstreamDone: edge.upstreamDone,
     })
   }
-  return {
-    width: FLOW_PADDING * 2 + FLOW_NODE_WIDTH + (columns - 1) * FLOW_COLUMN_STEP,
-    height: FLOW_PADDING * 2 + FLOW_NODE_HEIGHT + (rows - 1) * FLOW_ROW_STEP,
-    nodes,
-    edges,
+
+  // 4. 列间箭头：从上游列头右缘到下游列头左缘。
+  const stageLinks: FlowStageLinkView[] = []
+  for (let i = 1; i < stages.length; i += 1) {
+    const prev = stages[i - 1]
+    const cur = stages[i]
+    if (prev === undefined || cur === undefined) continue
+    const from = prev.x + FLOW_NODE_WIDTH + FLOW_STAGE_LINK_INSET
+    const to = cur.x - FLOW_STAGE_LINK_INSET
+    stageLinks.push({
+      key: `${prev.key}->${cur.key}`,
+      from,
+      to,
+      d: `M ${from} ${FLOW_STAGE_LINK_Y} L ${to} ${FLOW_STAGE_LINK_Y}`,
+      upstreamDone: prev.allDone,
+    })
   }
+
+  // 5. 画布尺寸：空计划给最小 24×24（= 两侧 padding），不得 NaN。
+  const width =
+    stages.length === 0
+      ? FLOW_PADDING * 2
+      : FLOW_PADDING * 2 + FLOW_NODE_WIDTH + (stages.length - 1) * FLOW_COLUMN_STEP
+  const height =
+    stages.length === 0
+      ? FLOW_PADDING * 2
+      : FLOW_NODE_TOP + FLOW_NODE_HEIGHT + (maxCount - 1) * FLOW_ROW_STEP + FLOW_PADDING
+  return { width, height, nodes, edges, stages, stageLinks }
 }
 
 /* ───────────── 记忆行 ───────────── */
@@ -1492,6 +1638,9 @@ export function buildFlow(
       id: task.id,
       title: task.title,
       status: progressOf(task).status,
+      // r16 AC-12：角色归属必须随节点下发（宿主 flowOf 同样填），客户端据此分列；
+      // column/row 仍是旧的依赖深度，只为兼容旧消费方，不再参与角色列布局。
+      roleId: task.roleId,
       column,
       row,
       usage: usageCellOr(cells.usage?.[task.id], '该任务没有可用用量事件'),
@@ -1565,6 +1714,8 @@ export function roleUsageOf(tasks: readonly TaskDetailView[], roles: readonly Ro
       state: state.state,
       stateText: state.stateText,
       duration: state.duration,
+      // r16 AC-16：角色卡 refs 行按计划顺序列出该角色的任务编号（只加可选字段，旧快照安全）。
+      taskRefs: list.map((task) => ({ id: task.id, status: task.status })),
     }
     if (state.activeTaskId !== undefined) view.activeTaskId = state.activeTaskId
     if (state.activeTaskTitle !== undefined) view.activeTaskTitle = state.activeTaskTitle

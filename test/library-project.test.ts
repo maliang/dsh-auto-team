@@ -195,12 +195,18 @@ test('AC-7：rolesOf = 不同 roleId 数（2 个角色 3 个任务 → 2 张卡�
   assert.equal(dev.activeTaskTitle, '任务 t1')
   assert.deepEqual(dev.duration, RUNNING_DURATION, '当前任务的用时原样透传')
   assert.deepEqual(dev.usage, { source: 'provider', tokens: { total: 2_400, input: 2_000, output: 400 } })
+  // r16 AC-16：宿主侧也投影 taskRefs（顺序 = 计划顺序，状态 = 任务真实状态）
+  assert.deepEqual(dev.taskRefs, [
+    { id: 't1', status: 'running' },
+    { id: 't2', status: 'done' },
+  ])
 
   const qa = roles[1]
   assert.equal(qa.done, 0)
   assert.equal(qa.state, 'waiting_gate')
   assert.equal(qa.stateText, ROLE_STATE_TEXT.waiting_gate)
   assert.equal(qa.activeTaskId, 't3')
+  assert.deepEqual(qa.taskRefs, [{ id: 't3', status: 'gate' }])
   assert.equal(qa.usage.source, 'unavailable', '没有用量时是「不可得」，不是 0')
 })
 
@@ -217,12 +223,13 @@ test('AC-7：全部完成的角色判「已完成」，没有当前任务时用�
   assert.deepEqual(dev.duration, { state: 'unavailable', text: '不可得' })
 })
 
-test('AC-5：flowOf 节点带上角色名（客户端节点首行不再显示任务 id）', () => {
+test('AC-5：flowOf 节点带上角色名与 roleId（客户端按角色分列的唯一依据）', () => {
   const flow = flowOf([
-    detailOf('t1', { roleName: '开发', status: 'done' }),
-    detailOf('t2', { roleName: '测试', dependsOn: ['t1'] }),
+    detailOf('t1', { roleId: 'dev', roleName: '开发', status: 'done' }),
+    detailOf('t2', { roleId: 'qa', roleName: '测试', dependsOn: ['t1'] }),
   ])
   assert.deepEqual(flow.nodes.map((node) => node.roleName), ['开发', '测试'])
+  assert.deepEqual(flow.nodes.map((node) => node.roleId), ['dev', 'qa'])
   assert.equal(flow.nodes[0]?.column, 0)
   assert.equal(flow.nodes[1]?.column, 1)
 })

@@ -1,9 +1,14 @@
 /**
- * 可平移的无限流转画布（r14 AC-4 / AC-5 / AC-22）。
+ * 可平移的无限流转画布（r14 AC-4 / AC-5 / AC-22 · r16 AC-12 / AC-13 / AC-14）。
  *
  * 结构：`[data-flow-canvas]`（固定视口，overflow:hidden、touch-action:none）
  *      → `[data-flow-viewport]`（可平移层，`transform: translate3d(x, y, 0)`）
- *        → edge SVG + 绝对定位节点（180×76）。
+ *        → edge SVG（任务边 + 列间箭头）+ 角色列头 + 绝对定位节点（180×64）。
+ *
+ * r16 起列 = **角色**（`01/02` 徽标 + 角色名 + `×N`），列序/行序一律来自
+ * `flowLayoutOf()`；组件不读 `node.column/node.row`，也不自己分组 —— 同一任务图
+ * 在任何客户端版本里只能有一种列序。节点第一行是 `tN` + 标题 + 状态胶囊，
+ * 角色名只由列头承载（节点内不再渲染 `data-flow-node-role`）。
  *
  * 为什么拖动**不走 React state**：60 帧拖动如果每帧 setState，就是 60 次 re-render +
  * 重排，AC-22 的「平均帧间隔 ≤20ms」直接崩。这里 pointermove 只写
@@ -18,7 +23,7 @@
  */
 import * as React from 'react'
 import type { FlowView } from '../../shared/types.ts'
-import { flowLayoutOf, statusBadge } from '../viewmodel.ts'
+import { flowLayoutOf } from '../viewmodel.ts'
 
 export interface FlowCanvasProps {
   flow: FlowView
@@ -38,10 +43,18 @@ function clampPan(value: number): number {
   return Math.max(-FLOW_PAN_LIMIT, Math.min(FLOW_PAN_LIMIT, value))
 }
 
+/** 列头编号 `01/02…`（两位零填充；纯展示格式，只要一处实现）。 */
+function stageNumberText(index: number): string {
+  return String(index + 1).padStart(2, '0')
+}
+
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const { flow, onSelectTask } = props
   const layout = React.useMemo(() => flowLayoutOf(flow), [flow])
-  const markerId = `auto-team-flow-arrow-${React.useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
+  const instanceId = React.useId().replace(/[^a-zA-Z0-9_-]/g, '')
+  const markerId = `auto-team-flow-arrow-${instanceId}`
+  const solidMarkerId = `auto-team-flow-stage-solid-${instanceId}`
+  const dashedMarkerId = `auto-team-flow-stage-dashed-${instanceId}`
 
   const viewportRef = React.useRef<HTMLDivElement | null>(null)
   const panRef = React.useRef({ x: 0, y: 0 })
@@ -243,7 +256,48 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               >
                 <path d="M 0 0 L 8 4 L 0 8 z" />
               </marker>
+              <marker
+                id={solidMarkerId}
+                data-flow-stage-arrow="solid"
+                viewBox="0 0 8 8"
+                refX="7"
+                refY="4"
+                markerWidth="7"
+                markerHeight="7"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 8 4 L 0 8 z" />
+              </marker>
+              <marker
+                id={dashedMarkerId}
+                data-flow-stage-arrow="dashed"
+                viewBox="0 0 8 8"
+                refX="7"
+                refY="4"
+                markerWidth="7"
+                markerHeight="7"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 8 4 L 0 8 z" />
+              </marker>
             </defs>
+            {layout.stageLinks.map((link) => (
+              <path
+                key={link.key}
+                data-flow-stage-link
+                data-upstream-done={link.upstreamDone ? 'true' : 'false'}
+                d={link.d}
+                fill="none"
+                stroke={
+                  link.upstreamDone
+                    ? 'var(--dsw-alias-state-business-primary)'
+                    : 'var(--dsw-alias-label-tertiary)'
+                }
+                strokeWidth={1.5}
+                strokeDasharray={link.upstreamDone ? undefined : '4 3'}
+                markerEnd={`url(#${link.upstreamDone ? solidMarkerId : dashedMarkerId})`}
+              />
+            ))}
             {layout.edges.map((edge) => (
               <path
                 key={edge.key}
@@ -255,47 +309,58 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               />
             ))}
           </svg>
-          {layout.nodes.map(({ node, cell, x, y }) => {
-            const badge = statusBadge(node.status)
-            return (
-              <button
-                key={node.id}
-                type="button"
-                data-flow-node={node.id}
-                data-status={node.status}
-                data-flow-column={String(node.column)}
-                data-flow-row={String(node.row)}
-                style={{ left: `${x}px`, top: `${y}px` }}
-                title={cell.title}
-                aria-label={cell.label}
-                onClick={() => onSelectTask(node.id)}
-              >
-                <span data-flow-line="title">
-                  <span data-flow-dot data-tone={badge.tone} aria-hidden="true" />
-                  <span data-flow-node-role title={cell.roleText}>
-                    {cell.roleText}
-                  </span>
-                  <span data-flow-status>{badge.text}</span>
+          {layout.stages.map((stage) => (
+            <div
+              key={stage.key}
+              data-flow-stage
+              data-flow-column={String(stage.index)}
+              data-role-id={stage.roleId}
+              aria-label={`角色列 ${stageNumberText(stage.index)} ${stage.name}，${stage.count} 个任务`}
+              title={`角色列 ${stageNumberText(stage.index)} ${stage.name}，${stage.count} 个任务`}
+              style={{ left: `${stage.x}px`, top: `${stage.y}px` }}
+            >
+              <span data-flow-stage-badge>{stageNumberText(stage.index)}</span>
+              <span data-flow-stage-name title={stage.name}>
+                {stage.name}
+              </span>
+              <span data-flow-stage-count>×{stage.count}</span>
+            </div>
+          ))}
+          {layout.nodes.map(({ node, cell, x, y, column, row }) => (
+            <button
+              key={node.id}
+              type="button"
+              data-flow-node={node.id}
+              data-status={node.status}
+              data-flow-column={String(column)}
+              data-flow-row={String(row)}
+              style={{ left: `${x}px`, top: `${y}px` }}
+              title={cell.title}
+              aria-label={cell.label}
+              onClick={() => onSelectTask(node.id)}
+            >
+              <span data-flow-line="title">
+                <span data-flow-node-id>{node.id}</span>
+                <span data-flow-node-title title={node.title}>
+                  {cell.taskTitle}
                 </span>
-                <span data-flow-line="task">
-                  <span data-flow-node-title title={node.title}>
-                    {cell.taskTitle}
-                  </span>
+                <span data-flow-status data-tone={cell.tone}>
+                  {cell.statusText}
                 </span>
-                <span data-flow-line="meta">
-                  <span data-cell="token" data-usage-source={node.usage.source}>
-                    {cell.tokenText}
-                  </span>
-                  <span data-flow-sep aria-hidden="true">
-                    ·
-                  </span>
-                  <span data-cell="duration" data-duration-state={node.duration.state}>
-                    {cell.durationText}
-                  </span>
+              </span>
+              <span data-flow-line="meta">
+                <span data-cell="token" data-usage-source={node.usage.source}>
+                  {cell.tokenText}
                 </span>
-              </button>
-            )
-          })}
+                <span data-flow-sep aria-hidden="true">
+                  ·
+                </span>
+                <span data-cell="duration" data-duration-state={node.duration.state}>
+                  {cell.durationText}
+                </span>
+              </span>
+            </button>
+          ))}
         </div>
         <button
           type="button"
@@ -305,11 +370,11 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >
           重置视图
         </button>
-        <p data-flow-legend>
+        <p data-flow-legend title="任务边看上游任务；列间箭头看左侧角色列">
           <span data-legend-line="solid" aria-hidden="true" />
-          实线 = 上游已完成
+          实线 = 已完成
           <span data-legend-line="dashed" aria-hidden="true" />
-          虚线 = 上游未完成
+          虚线 = 未完成
         </p>
       </div>
     </section>

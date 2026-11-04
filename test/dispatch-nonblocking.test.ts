@@ -204,7 +204,7 @@ test('未装配 autoDispatch：如实降级为同步派发（accepted:false + �
   assert.ok((result.notices as string[]).some((text) => text.includes('退回同步派发')))
 })
 
-test('拒绝码与面板同源：无计划 / runId 不存在 / 暂停 / 已派发 / 空 runId —— 一次都不 kick', async () => {
+test('准入与面板同源：无计划 / runId 不存在 / 暂停 / 空 runId 拒绝；已派发转幂等确认 —— 一次都不 kick', async () => {
   const h = setup()
   await enable(h.bridge)
   const { dispatch } = specsOf(h, {
@@ -232,13 +232,59 @@ test('拒绝码与面板同源：无计划 / runId 不存在 / 暂停 / 已派�
     }),
   )
   const already = (await dispatch.handler({ runId: RUN_ID }, META)) as Record<string, unknown>
-  assert.equal(already.code, 'PLAN_ALREADY_DISPATCHED')
+  // r16 AC-6：已自动派发不是错误 —— 工具层把它翻译成幂等确认（面板 act 仍拿 PLAN_ALREADY_DISPATCHED）。
+  assert.equal(already.ok, true, '已派发必须是幂等确认，不是错误码')
+  assert.equal(already.accepted, true)
+  assert.equal(already.dispatching, true)
+  assert.equal(already.alreadyDispatched, true)
+  assert.equal(already.planStatus, 'dispatching')
+  assert.deepEqual(already.ready, [], '幂等确认不预支新的就绪任务')
+  assert.deepEqual(already.notices, ['此前已自动派发：成员已在运行，本次未重复起人'])
+  assert.equal((already.members as unknown[]).length, 1, '成员数取真实快照，不重复起人')
 
   const empty = (await dispatch.handler({}, META)) as Record<string, unknown>
   assert.equal(empty.ok, false)
   assert.match(String(empty.error), /必须带 runId/)
 
   assert.deepEqual(h.calls.kicks, [], '任何拒绝都不得先把后台派发 kick 出去')
+})
+
+test('r16 AC-6：已自动派发时连续两次 dispatch 都是幂等确认 —— 成员/binding/状态都不增', async () => {
+  const h = setup()
+  h.store.save(
+    stateOf({
+      plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'running', memberId: 'member-1' })] }),
+      bindings: [{ taskId: 't1', roleId: 'dev', memberId: 'member-1', name: '开发-1', spawnedAt: NOW + 2 }],
+      plannedAt: NOW + 2,
+    }),
+  )
+  await enable(h.bridge)
+  const { dispatch } = specsOf(h, {
+    autoDispatch: (sessionId, runId, cause) => h.calls.kicks.push({ sessionId, runId, cause }),
+  })
+
+  const before = h.store.load(RUN_ID)
+  assert.ok(before)
+  const first = (await dispatch.handler({ runId: RUN_ID }, META)) as Record<string, unknown>
+  // 连续第二次：幂等确认必须可重复（模型可能在同一轮按旧习惯再确认一次）。
+  const second = (await dispatch.handler({ runId: RUN_ID }, META)) as Record<string, unknown>
+  for (const result of [first, second]) {
+    assert.equal(result.ok, true)
+    assert.equal(result.alreadyDispatched, true)
+    assert.equal((result.members as unknown[]).length, 1, '成员数不得因重复调用而增加')
+    assert.deepEqual(result.ready, [])
+  }
+
+  const after = h.store.load(RUN_ID)
+  assert.ok(after)
+  assert.equal(after.bindings.length, before.bindings.length, 'binding 数不得增加')
+  assert.deepEqual(
+    after.plan.tasks.map((task) => task.status),
+    before.plan.tasks.map((task) => task.status),
+    '任务状态不得被幂等确认推进',
+  )
+  assert.deepEqual(h.calls.kicks, [], '幂等确认零 kick（否则后台会重复派发）')
+  assert.equal(h.calls.dispatch, 0, '幂等确认不走同步 spawn 端口')
 })
 
 test('面板路径不变：bridge.act(dispatch) 仍同步 await 派发端口并回「已创建 N 个成员」', async () => {

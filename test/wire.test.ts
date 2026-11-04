@@ -233,7 +233,14 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
   )
   assert.equal(h.sections.length, 1, '队长提示词只注册一段')
   const sectionText = h.sections[0]?.text() ?? ''
-  assert.match(sectionText, /先 plan，再 dispatch/, '提示词必须写死「先 plan 再 dispatch」（AC-30 的软保证）')
+  // r16 AC-1：条件式规则把「先 plan 再 dispatch」收进「开关打开 + 改代码」分支（文档/问答不组队）；
+  // 顺序不变 —— plan 先落盘、dispatch 只做幂等确认，AC-30 的机械保证仍由 runId 承担。
+  // 这里把两件事锁在一起：性质判定必须出现在 plan 之前，plan 必须出现在 dispatch 之前。
+  assert.match(
+    sectionText,
+    /只有「需要修改代码」的任务才组队[\s\S]*?auto_team_plan[\s\S]*?auto_team_dispatch/,
+    '条件式组队规则须先判性质，再保持 plan 先于 dispatch 的顺序（AC-1 + AC-30 的软保证）',
+  )
   assert.match(sectionText, /完成必须过门禁/, '提示词必须写死「完成必须过门禁」（AC-19 的软保证）')
   assert.match(sectionText, /runId/, '提示词必须说明 dispatch 要带 runId')
   assert.equal(h.routes.length, 1, '宿主 WebRoute 没有 method 字段，四条能力合并成一条 prefix 路由')

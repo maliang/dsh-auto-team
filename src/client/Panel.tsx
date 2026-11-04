@@ -23,6 +23,7 @@ import { TasksTab } from './tabs/TasksTab.tsx'
 import { HistoryTab } from './tabs/HistoryTab.tsx'
 import { MemoryTab } from './tabs/MemoryTab.tsx'
 import { AUTO_TEAM_OPEN_LIBRARY_EVENT, LibraryPage } from './LibraryPage.tsx'
+import { consumeLibraryOpenRequest, visibleLibrarySurface } from './slots.ts'
 import { ConfirmDialog } from './views/ConfirmDialog.tsx'
 import { EmptyState } from './views/EmptyState.tsx'
 import type {
@@ -138,12 +139,30 @@ export function Panel(props: PanelProps): React.ReactElement {
     return () => window.removeEventListener(OPEN_PANEL_EVENT, onOpen)
   }, [])
 
-  // 左栏「打开」按钮在拿不到主区服务时派发该事件：面板内联渲染项目库（AC-24 的降级路径）。
+  // 左栏 glyph 拿不到主区（或主区 500ms 内没挂载）时派发该事件：面板内联渲染项目库。
+  // 单一 surface：主区已经可见就**不**再开镜像（AC-9）。
   React.useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
-    const onOpenLibrary = (): void => setInlineLibrary(true)
+    const onOpenLibrary = (): void => {
+      if (visibleLibrarySurface() === 'main') {
+        setInlineLibrary(false)
+        return
+      }
+      setInlineLibrary(true)
+    }
     window.addEventListener(AUTO_TEAM_OPEN_LIBRARY_EVENT, onOpenLibrary)
     return () => window.removeEventListener(AUTO_TEAM_OPEN_LIBRARY_EVENT, onOpenLibrary)
+  }, [])
+
+  // 刷新 / 重挂后补回内联：glyph 的请求落在 1.5s 内就直接沿用（否则打开面板页签后内联会丢）。
+  React.useEffect(() => {
+    const pending = consumeLibraryOpenRequest()
+    const surface = visibleLibrarySurface()
+    if (surface === 'main') {
+      setInlineLibrary(false)
+      return
+    }
+    if (pending || surface === 'panel') setInlineLibrary(true)
   }, [])
 
   // 头部按钮三级回退都关不掉时派发 PANEL_CLOSE_EVENT：这里给一句人能看懂的原因，
@@ -274,7 +293,10 @@ export function Panel(props: PanelProps): React.ReactElement {
             <button type="button" data-library-inline-back onClick={() => setInlineLibrary(false)}>
               ← 返回面板
             </button>
-            <span data-panel-library-hint>主区未开放，项目库在面板内展开</span>
+            <span data-panel-library-hint role="status" aria-live="polite">
+              <span data-panel-library-warn aria-hidden="true" />
+              主区不可用，已在右栏打开
+            </span>
           </div>
           <LibraryPage sessionId={sessionId} inline />
         </div>
