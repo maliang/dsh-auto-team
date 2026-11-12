@@ -28,6 +28,8 @@ import { ConfirmDialog } from './views/ConfirmDialog.tsx'
 import { EmptyState } from './views/EmptyState.tsx'
 import type {
   LibraryView,
+  MemoryEntryView,
+  MemoryFileView,
   MemoryTrack,
   PanelAction,
   PanelSnapshot,
@@ -48,6 +50,9 @@ export interface MemoryBody {
   name: string
   body: string
   chars: number
+  /** r23：宿主解析后的文件视图与条目视图（旧宿主缺省 → 面板退回整文件正文）。 */
+  file?: MemoryFileView
+  entries?: MemoryEntryView[]
 }
 
 export type ReadMemoryFn = (track: MemoryTrack, name: string, workspace?: string) => Promise<Result<MemoryBody>>
@@ -245,7 +250,7 @@ export function Panel(props: PanelProps): React.ReactElement {
           标题被压成省略号、胶囊换行，这是 r7 面板头部被直接吐槽的根因。 */}
       <div data-panel-head>
         <strong data-panel-title>自动团队</strong>
-        <span data-head-capsule data-tone={TONE_DATA[capsule.tone] ?? 'neutral'} title={capsule.text}>
+        <span data-head-capsule data-tone={TONE_DATA[capsule.tone] ?? 'neutral'} title={capsule.title ?? capsule.text}>
           {capsule.text}
         </span>
         <button type="button" onClick={() => void view.refresh()} data-panel-refresh title="重新拉取快照">

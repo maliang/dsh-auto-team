@@ -66,22 +66,59 @@ export function tokenTotalsOf(raw: unknown): TokenTotals | null {
   const input = firstNumber(raw.inputTokens, raw.input, raw.promptTokens, raw.prompt)
   const output = firstNumber(raw.outputTokens, raw.output, raw.completionTokens, raw.completion)
   const declared = firstNumber(raw.totalTokens, raw.total)
-  if (declared === undefined && input === undefined && output === undefined) return null
-  const total = declared ?? (input ?? 0) + (output ?? 0)
+  // 真实宿主（2026-11-05 会话日志实测）：`inputTokens` 是未命中缓存的新输入，
+  // `cacheReadTokens` 是命中缓存的部分，`totalTokens = inputTokens + cacheReadTokens + outputTokens`。
+  const cacheRead = firstNumber(raw.cacheReadTokens, raw.cacheRead, raw.cacheReadInputTokens, raw.promptCacheReadTokens)
+  const cacheWrite = firstNumber(raw.cacheWriteTokens, raw.cacheWrite, raw.cacheCreationTokens)
+  const calls = firstNumber(raw.calls, raw.callCount, raw.requestCount)
+  if (
+    declared === undefined &&
+    input === undefined &&
+    output === undefined &&
+    cacheRead === undefined &&
+    cacheWrite === undefined &&
+    calls === undefined
+  ) {
+    return null
+  }
+  const total = declared ?? (input ?? 0) + (cacheRead ?? 0) + (output ?? 0)
   const totals: TokenTotals = { total }
   if (input !== undefined) totals.input = input
   if (output !== undefined) totals.output = output
+  if (cacheRead !== undefined) totals.cacheRead = cacheRead
+  if (cacheWrite !== undefined) totals.cacheWrite = cacheWrite
+  if (calls !== undefined) totals.calls = calls
   return totals
 }
 
 /** 两条合计相加：缺失分项按 0 参与，结果只带**真的有过**的分项，避免凭空补 0。 */
 function addTotals(current: TokenTotals | undefined, add: TokenTotals): TokenTotals {
   const next: TokenTotals = { total: (current?.total ?? 0) + add.total }
-  const input = (current?.input ?? 0) + (add.input ?? 0)
-  const output = (current?.output ?? 0) + (add.output ?? 0)
-  if (current?.input !== undefined || add.input !== undefined) next.input = input
-  if (current?.output !== undefined || add.output !== undefined) next.output = output
+  const sumOf = (key: 'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'calls'): number | undefined => {
+    if (current?.[key] === undefined && add[key] === undefined) return undefined
+    return (current?.[key] ?? 0) + (add[key] ?? 0)
+  }
+  const input = sumOf('input')
+  const output = sumOf('output')
+  const cacheRead = sumOf('cacheRead')
+  const cacheWrite = sumOf('cacheWrite')
+  const calls = sumOf('calls')
+  if (input !== undefined) next.input = input
+  if (output !== undefined) next.output = output
+  if (cacheRead !== undefined) next.cacheRead = cacheRead
+  if (cacheWrite !== undefined) next.cacheWrite = cacheWrite
+  if (calls !== undefined) next.calls = calls
   return next
+}
+
+/**
+ * 一条 assistant 消息 = 一次模型调用（r17 口径）。
+ *
+ * 宿主 usage 里没有调用次数计数器，只能由事件条数推出；显式给了 `calls` 的宿主字段优先。
+ */
+function countCall(totals: TokenTotals): TokenTotals {
+  if (totals.calls === undefined) totals.calls = 1
+  return totals
 }
 
 function sumByMember(record: UsageRecord): TokenTotals | undefined {
@@ -112,8 +149,9 @@ export function usageOfSessionEvent(payload: unknown): UsageEventInput | null {
   const type =
     typeof payload.type === 'string' ? payload.type : typeof body.type === 'string' ? body.type : undefined
   if (type !== undefined && !MESSAGE_EVENT_TYPES.has(type)) return null
-  const usage = tokenTotalsOf(body.usage ?? payload.usage)
-  if (!usage) return null
+  const parsed = tokenTotalsOf(body.usage ?? payload.usage)
+  if (!parsed) return null
+  const usage = countCall(parsed)
 
   const agent = isRecord(body.agent) ? body.agent : isRecord(payload.agent) ? payload.agent : undefined
   const sessionId =
@@ -146,8 +184,9 @@ function usageOfHostArgs(payload: unknown): UsageEventInput | null | undefined {
   const type = typeof pair.event.type === 'string' ? pair.event.type : undefined
   if (type === undefined || !MESSAGE_EVENT_TYPES.has(type)) return null
   const data = isRecord(pair.event.data) ? pair.event.data : undefined
-  const usage = tokenTotalsOf(data?.usage ?? pair.event.usage)
-  if (!usage) return null
+  const parsed = tokenTotalsOf(data?.usage ?? pair.event.usage)
+  if (!parsed) return null
+  const usage = countCall(parsed)
 
   const sessionId = firstString(
     isRecord(pair.session) ? firstString(pair.session.id) : undefined,
@@ -228,6 +267,83 @@ export function applyUsage(record: UsageRecord | undefined, event: UsageEventInp
   if (event.taskId) next.byTask[event.taskId] = addTotals(next.byTask[event.taskId], totals)
   next.total = addTotals(next.total, totals)
   return next
+}
+
+/**
+ * 一次投影刷新里「某个成员此刻的累计用量」（r17）。
+ *
+ * `totals` 是宿主会话投影的**全量累计值**（不是增量）：同一成员重复读到同一个数，
+ * 合成结果必须完全不变 —— 投影刷新是「以全量为准覆盖」，不是「再累加一次」。
+ */
+export interface ProjectionUsageEntry {
+  memberId: string
+  /** 该成员当前绑定到的任务；缺省 = 只进 byMember（不猜任务归属）。 */
+  taskId?: string
+  totals: TokenTotals
+}
+
+function sameTotals(left: TokenTotals | undefined, right: TokenTotals | undefined): boolean {
+  if (left === right) return true
+  if (left === undefined || right === undefined) return false
+  return (
+    left.total === right.total &&
+    left.input === right.input &&
+    left.output === right.output &&
+    left.cacheRead === right.cacheRead &&
+    left.cacheWrite === right.cacheWrite &&
+    left.calls === right.calls
+  )
+}
+
+function sameTotalsMap(left: Record<string, TokenTotals>, right: Record<string, TokenTotals>): boolean {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every((key) => sameTotals(left[key], right[key]))
+}
+
+/**
+ * 用「宿主会话投影读到的成员累计用量」合成 UsageRecord（r17，**覆盖**语义）。
+ *
+ * 与 {@link applyUsage} 的区别（为什么必须另写一个）：
+ *   - 事件是增量，重复投递要相加；投影是**累计值**，第二次读到同一个数必须覆盖而不是相加，
+ *     否则快照 2 秒一刷会把用量刷成两倍、四倍……
+ *   - 只有真的读到数的成员才写：本次读不到的成员（会话被卸载 / 宿主重启）保留已落盘的旧值，
+ *     历史不能因为「这一帧没读到」就消失。
+ *   - `byTask` 对本次读到的任务按成员重新求和（同任务的多个绑定累加），未触及的任务保留旧值；
+ *     `total` = 各 `byMember` 之和，保证合计与分项永远对得上。
+ *
+ * 返回值**同一引用 = 数值没变**（调用方据此跳过落盘）；`entries` 为空时原样返回（不写、不补 0）。
+ */
+export function applyProjectionUsage(
+  record: UsageRecord | undefined,
+  entries: ReadonlyArray<ProjectionUsageEntry>,
+  now: number,
+): UsageRecord | undefined {
+  if (entries.length === 0) return record
+  const byMember: Record<string, TokenTotals> = { ...(record?.byMember ?? {}) }
+  const byTask: Record<string, TokenTotals> = { ...(record?.byTask ?? {}) }
+  const taskTotals: Record<string, TokenTotals> = {}
+  for (const entry of entries) {
+    // 投影本身是累计值 ⇒ 覆盖，不能与上一次相加（相加会把数翻倍）。
+    byMember[entry.memberId] = entry.totals
+    if (entry.taskId === undefined || entry.taskId === '') continue
+    taskTotals[entry.taskId] = addTotals(taskTotals[entry.taskId], entry.totals)
+  }
+  for (const [taskId, totals] of Object.entries(taskTotals)) byTask[taskId] = totals
+  const merged: UsageRecord = { attribution: 'per-member', byMember, byTask, updatedAt: now }
+  const total = sumByMember(merged)
+  if (total !== undefined) merged.total = total
+  if (
+    record !== undefined &&
+    record.attribution === 'per-member' &&
+    sameTotalsMap(record.byMember ?? {}, byMember) &&
+    sameTotalsMap(record.byTask ?? {}, byTask) &&
+    sameTotals(record.total, total)
+  ) {
+    return record
+  }
+  return merged
 }
 
 const NO_EVENT_REASON = '尚无用量事件'

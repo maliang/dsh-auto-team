@@ -19,6 +19,7 @@ import { DetailPane } from '../views/DetailPane.tsx'
 import { EmptyState } from '../views/EmptyState.tsx'
 import { FlowCanvas } from '../views/FlowCanvas.tsx'
 import { RoleStrip } from '../views/RoleStrip.tsx'
+import { RunCloseAction } from '../views/RunCloseAction.tsx'
 import { RunHeader } from '../views/RunHeader.tsx'
 import { TaskTable } from '../views/TaskTable.tsx'
 import { runSummaryRowOf, scrollToTaskRow, tabMemoryOf, useExpandedTask, useTabScroll } from './rows.ts'
@@ -100,19 +101,71 @@ export function HistoryTab(props: TabProps): React.ReactElement {
               <li key={row.runId} data-history-row data-active={row.active ? 'true' : 'false'}>
                 <button type="button" data-history-open={row.runId} onClick={() => void props.openRun(row.runId)}>
                   <span data-history-line="title">
-                    <span data-history-title title={row.title}>
+                    <span data-history-title data-title-source={row.titleSource} title={row.titleTitle ?? row.title}>
                       {row.title}
                     </span>
-                    <span data-badge data-tone={row.statusTone} title={`状态：${row.statusText}`}>
+                    <span
+                      data-badge
+                      data-tone={row.statusTone}
+                      title={
+                        row.statusTitle === undefined
+                          ? `状态：${row.statusText}`
+                          : `状态：${row.statusText} · ${row.statusTitle}`
+                      }
+                    >
                       <span aria-hidden="true">{row.statusIcon}</span> {row.statusText}
                     </span>
                   </span>
                   <span data-history-line="meta">
                     <span data-history-time>{row.metaText}</span>
+                    <span
+                      data-history-duration
+                      data-duration-state={row.durationState}
+                      title={row.durationTitle}
+                    >
+                      <span>用时 </span>{row.durationText}
+                    </span>
                     <span data-history-token data-usage-source={row.tokenSource} title={row.tokenTitle}>
                       {row.tokenText}
                     </span>
                   </span>
+                  {row.residualBadge !== undefined ? (
+                    // r24：未收口的 run（draft/dispatching/paused 且无结束时刻）在这一行就地可见，
+                    // 并给出「终止计划」入口；按钮先走 ConfirmDialog 二次确认，失败原因也落在这一行。
+                    // 放在打开按钮**外面**：一行不能嵌套两个 button（HTML 内容模型 + 键盘焦点都会坏）。
+                    <span data-history-line="residual">
+                      <RunCloseAction
+                        runId={row.runId}
+                        badge={row.residualBadge}
+                        act={props.act}
+                        variant="history"
+                      />
+                    </span>
+                  ) : null}
+                  {row.terminationText !== undefined ? (
+                    // r21：旧 run 的收口原因（宿主落盘字段，原样透传）；没有就不渲染，不占位。
+                    <span data-history-line="termination" data-history-termination title={row.terminationText}>
+                      终止原因：{row.terminationText}
+                    </span>
+                  ) : null}
+                  {row.usageMetrics.length > 0 ? (
+                    // r17：底部 token 六项。文本全部来自宿主 `UsageCell.details`，这里只逐项渲染；
+                    // `data-available="false"` 让我们能区分「宿主没上报」与真 0（样式据此用三级色）。
+                    <span data-history-line="usage" data-history-usage>
+                      {row.usageMetrics.map((metric) => (
+                        <span
+                          key={metric.key}
+                          data-history-metric={metric.key}
+                          data-usage-metric={metric.key}
+                          data-available={metric.available ? 'true' : 'false'}
+                          title={`${metric.label}：${metric.text}`}
+                        >
+                          <span data-usage-metric-label>{metric.label}</span>{' '}
+                          <b data-usage-metric-value>{metric.text}</b>
+                        </span>
+                      ))}
+                    </span>
+                  ) : null}
                 </button>
               </li>
             )

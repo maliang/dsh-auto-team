@@ -11,6 +11,9 @@
  *  - `grouped`（右栏任务总览 220px 列表）：**去掉 sticky 表头**（220px 塞不下 r13 的
  *    `1fr 76px 84px` 网格，硬留会把 token 截断），改成两个分组 `未完成 · N` / `已完成 · N`，
  *    组头 sticky 24px。分组与进度环**同源**：都调 `taskOverviewOf`（AC-11 的同帧一致）。
+ *    r18b：分组内容是**全量**任务（用户要求；r18 的「只列进行中/只留最近完成一个」已回滚），
+ *    本组件不再二次过滤内容 —— 否则列表与环会分叉。但**空组整组不渲染**（含组头，
+ *    两组都空时整块列表不渲染）：全部完成时只有「已完成 · N」，不会出现「未完成 · 0」。
  *
  * 交互：整行是一个按钮（点击展开/收起），`aria-expanded` + `aria-controls` 指向详情块；
  * 展开是内联的（DESIGN §3.2），不做抽屉 —— 抽屉会把面板里的其它任务全遮住。
@@ -19,8 +22,9 @@
  * 也不做确认判断（确认闸在宿主，客户端不得自行乐观放行）。
  */
 import * as React from 'react'
-import type { TaskDetailView } from '../../shared/types.ts'
+import type { MemberView, TaskDetailView } from '../../shared/types.ts'
 import type { TaskRowView } from '../viewmodel.ts'
+import { memberForRole } from '../nav.ts'
 import { TASK_TABLE_HEADER, taskDetailOf, taskOverviewOf, taskRowOf } from '../viewmodel.ts'
 import { EmptyState } from './EmptyState.tsx'
 
@@ -30,8 +34,15 @@ export interface TaskTableProps {
   onToggleTask: (taskId: string) => void
   /** r14：右栏任务总览用的分组形态（两组 + 组头，无表头）。 */
   grouped?: boolean
+  /** r17：当前 run 的成员，用于「任务行 → 子智能体」；历史 run 不传。 */
+  members?: MemberView[]
+  onOpenMember?: (member: MemberView, taskId: string) => void
 }
 
+/**
+ * 组头文案（r18b 恢复）：两组都是全量任务，`open` 含所有非 done 状态。
+ * 文案只允许出现在这里（TaskTable 是 props 驱动，历史详情页也用同一个组件）。
+ */
 const GROUP_LABEL: Record<'open' | 'done', string> = {
   open: '未完成',
   done: '已完成',
@@ -42,8 +53,10 @@ function TaskRow(props: {
   task: TaskDetailView
   done: boolean
   onToggleTask: (taskId: string) => void
+  member?: MemberView
+  onOpenMember?: (member: MemberView, taskId: string) => void
 }): React.ReactElement {
-  const { row, task, done, onToggleTask } = props
+  const { row, task, done, onToggleTask, member, onOpenMember } = props
   const panel = row.expanded ? taskDetailOf(task) : null
   const detailId = `auto-team-task-detail-${task.id}`
   return (
@@ -71,9 +84,21 @@ function TaskRow(props: {
           <span data-task-title title={row.title} data-done={done ? 'true' : 'false'}>
             {row.title}
           </span>
+          {row.revisedText ? (
+            // r21：宿主写了 `revisedAt` 才有这个徽标；悬停给完整修订说明。
+            <span data-task-revised title={row.revisionNote ?? row.revisedText}>
+              {row.revisedText}
+            </span>
+          ) : null}
           <span data-badge data-tone={row.badge.tone} title={`状态：${row.badge.text}`}>
             <span aria-hidden="true">{row.badge.icon}</span> {row.badge.text}
           </span>
+          {row.waitScopeText ? (
+            // r21：等写域是「为什么还没跑」的具体原因，悬停给宿主生成的等待说明。
+            <span data-task-wait-scope title={task.waitReason ?? row.waitScopeText}>
+              {row.waitScopeText}
+            </span>
+          ) : null}
         </span>
         <span data-task-line="meta">
           <span data-task-role title={`角色：${row.roleName}`}>
@@ -86,7 +111,40 @@ function TaskRow(props: {
             {row.durationText}
           </span>
         </span>
+        {row.revisionNote ? (
+          // r21：修订说明（宿主的 revisionNote，原样展示）。单行截断，title 兜底全文。
+          <span data-task-line="note" data-task-note="revision" title={row.revisionNote}>
+            修订：{row.revisionNote}
+          </span>
+        ) : null}
+        {row.cancelReason ? (
+          <span data-task-line="note" data-task-note="cancelled" title={row.cancelReason}>
+            取消原因：{row.cancelReason}
+          </span>
+        ) : null}
       </button>
+      {member !== undefined && onOpenMember !== undefined ? (
+        <button
+          type="button"
+          data-task-open-member
+          data-task-id={task.id}
+          data-member-id={member.memberId}
+          title={`在主界面打开子智能体：${member.name}`}
+          style={{
+            margin: '0 12px 8px',
+            padding: 0,
+            border: 0,
+            background: 'transparent',
+            color: 'inherit',
+            cursor: 'pointer',
+            font: 'inherit',
+            textAlign: 'left',
+          }}
+          onClick={() => onOpenMember(member, task.id)}
+        >
+          子智能体 · {member.name} →
+        </button>
+      ) : null}
       {panel ? (
         <div id={detailId} data-task-detail>
           <dl data-task-detail-grid>
@@ -116,6 +174,25 @@ function TaskRow(props: {
               <>
                 <dt>用量</dt>
                 <dd data-detail-reason>{panel.usageReason}</dd>
+              </>
+            ) : null}
+            {panel.usageMetrics ? (
+              <>
+                <dt>用量</dt>
+                <dd data-detail-usage>
+                  <ul data-usage-metrics>
+                    {panel.usageMetrics.map((metric) => (
+                      <li
+                        key={metric.key}
+                        data-usage-metric={metric.key}
+                        data-available={metric.available ? 'true' : 'false'}
+                      >
+                        <span data-usage-metric-label>{metric.label}</span>
+                        <b data-usage-metric-value>{metric.text}</b>
+                      </li>
+                    ))}
+                  </ul>
+                </dd>
               </>
             ) : null}
             {panel.durationReason ? (
@@ -150,7 +227,7 @@ function TaskRow(props: {
 }
 
 export function TaskTable(props: TaskTableProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, grouped } = props
+  const { tasks, expandedTaskId, onToggleTask, grouped, members, onOpenMember } = props
   if (tasks.length === 0) {
     return (
       <EmptyState
@@ -165,25 +242,43 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
     // 与进度环同一派生函数（AC-11）：环的比例与两个分组的计数不可能分叉。
     const overview = taskOverviewOf(tasks, expandedTaskId)
     const byId = new Map(tasks.map((task) => [task.id, task]))
+    // r18b：分组数据已是全量；空组（含组头）依旧整组不渲染 —— 全部完成时只出
+    // 「已完成 · N」，不会出现「未完成 · 0」。过滤只发生在**渲染层**，环仍由
+    // taskOverviewOf 按全量任务算，不受影响。
+    const groups = (['open', 'done'] as const)
+      .map((key) => ({ key, rows: overview.groups[key] }))
+      .filter((group) => group.rows.length > 0)
+    if (groups.length === 0) {
+      // 两组都空（任务列表本身为空）：整块分组列表不渲染。
+      // 环在 TaskOverview 里，仍然照常显示 0/0。
+      return <React.Fragment />
+    }
     return (
       <div data-region="task-list" data-grouped="true">
-        {(['open', 'done'] as const).map((key) => {
-          const rows = overview.groups[key]
-          return (
-            <section key={key} data-task-group={key}>
-              <div data-group-head>
-                {`${GROUP_LABEL[key]} · ${rows.length}`}
-              </div>
-              <ul data-task-rows>
-                {rows.map((row) => {
-                  const task = byId.get(row.id)
-                  if (task === undefined) return null
-                  return <TaskRow key={row.id} row={row} task={task} done={key === 'done'} onToggleTask={onToggleTask} />
-                })}
-              </ul>
-            </section>
-          )
-        })}
+        {groups.map(({ key, rows }) => (
+          <section key={key} data-task-group={key}>
+            <div data-group-head>
+              {`${GROUP_LABEL[key]} · ${rows.length}`}
+            </div>
+            <ul data-task-rows>
+              {rows.map((row) => {
+                const task = byId.get(row.id)
+                if (task === undefined) return null
+                return (
+                  <TaskRow
+                    key={row.id}
+                    row={row}
+                    task={task}
+                    done={key === 'done'}
+                    onToggleTask={onToggleTask}
+                    member={memberForRole(members, task.roleId, task.id)}
+                    onOpenMember={onOpenMember}
+                  />
+                )
+              })}
+            </ul>
+          </section>
+        ))}
       </div>
     )
   }
@@ -203,6 +298,8 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
             task={task}
             done={task.status === 'done'}
             onToggleTask={onToggleTask}
+            member={memberForRole(members, task.roleId, task.id)}
+            onOpenMember={onOpenMember}
           />
         ))}
       </ul>

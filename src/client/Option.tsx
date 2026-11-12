@@ -22,7 +22,7 @@
 import * as React from 'react'
 import { useAutoTeamStyle } from './styles.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
-import { feedbackOf, hintOf } from './viewmodel.ts'
+import { currentRunStageInputOf, feedbackOf, hintOf } from './viewmodel.ts'
 import { optionView } from './ui.ts'
 
 export interface OptionProps {
@@ -40,16 +40,15 @@ export function AutoTeamOption(props: OptionProps): React.ReactElement {
   const [error, setError] = React.useState<string | undefined>(undefined)
   const [flash, setFlash] = React.useState(false)
 
-  const tasks = snapshot?.tasks ?? []
-  const done = tasks.filter((task) => task.status === 'done').length
   const enabled = snapshot?.enabled === true
+  // 状态文案的唯一来源是 viewmodel 的阶段判定：计数优先用宿主投影 runCounts，
+  // 旧快照则从 tasks/members 精确派生（缺什么就不传什么，绝不补 0）。
+  const stage = currentRunStageInputOf(snapshot)
 
   const ui = optionView({
     enabled,
     busy,
-    planStatus: snapshot?.planStatus,
-    done,
-    total: tasks.length,
+    ...stage,
     failure: error,
   })
 

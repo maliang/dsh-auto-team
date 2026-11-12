@@ -347,16 +347,23 @@ test('apply() 装配：8 工具 / 3 面板接口 / 队长提示词，且主链�
 
   // ---- ⑦ 下游 ready（r13 AC-8 的「任务终态」触发点）：t1 过门禁 → 自动/手动派发路径都会起 t2。
   //      这里先等落盘真值，再用一次手动 dispatch 证明幂等（不得因为等待而多起一个）。
-  const t2Spawned = await waitFor(() => statusOf('t2') === 'running' && h.spawned.length === 2, 4000)
-  assert.ok(t2Spawned, 't1 过门禁后，下游 t2 必须被自动派发（receipt 之后自动补位）')
+  //
+  //      t5：同角色优先复用空闲成员 —— t2 不再新建成员，而是把新任务卡续聊发给 t1 的成员。
+  //      判据从「spawn 次数 +1」改成「spawn 次数不变 + t2 的 binding 指向同一 memberId +
+  //      账本里有这张新任务卡」：只新建不续聊、或续聊却没落 binding，本条都会红。
+  const t2Spawned = await waitFor(() => statusOf('t2') === 'running' && h.spawned.length === 1, 4000)
+  assert.ok(t2Spawned, 't1 过门禁后，下游 t2 必须被自动派发（t5：同角色复用空闲成员，不再新建）')
   const redispatched = await act(h.routes, { type: 'dispatch', runId })
   assert.ok(redispatched.snapshot)
-  assert.equal(h.spawned.length, 2, '下游任务在依赖 done 之后可以派发，且重复调用幂等')
-  const t2Name = h.spawned[1]?.name ?? ''
-  assert.match(t2Name, /^dev-t2-[0-9a-z]{6}$/)
-  assert.notEqual(t2Name, t1Name, '同角色的两个任务必须拿到不同名字（R2-1 的缺陷不得回归）')
+  assert.equal(h.spawned.length, 1, '下游任务复用成员后，重复调用依旧幂等（不得多建成员）')
   const afterSecond = store.load(runId) as RunState
-  assert.equal(afterSecond.bindings.find((item) => item.taskId === 't2')?.name, t2Name)
+  const t2Binding = afterSecond.bindings.find((item) => item.taskId === 't2')
+  assert.equal(t2Binding?.memberId, firstId, '同角色下游任务必须复用 t1 的成员（t5 名额修复的核心）')
+  assert.equal(t2Binding?.roleId, 'dev')
+  assert.ok(
+    h.sent.some((item) => item.text.includes('## 新任务（t2）')),
+    '复用必须把新任务卡直达发给该成员（续聊派活，而不是静默改 binding）',
+  )
   assert.equal(afterSecond.plan.tasks.find((task) => task.id === 't2')?.status, 'running')
 
   // ---- ⑦½ 真实用量（r13 AC-3）：根作用域 session/event → run.usage → 快照 taskUsage/runUsage

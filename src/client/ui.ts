@@ -17,7 +17,6 @@ import type {
   AutoTeamSettings,
   DeviationView,
   GateEvidence,
-  PlanStatus,
   PlanTask,
   Role,
   RoleModelRoute,
@@ -27,9 +26,10 @@ import type {
 } from '../shared/types.ts'
 import {
   deviationRowOf,
-  planStatusView,
   progressOf,
   routeTextOf,
+  runStageOf,
+  type RunStageInput,
   scopeLockRowOf,
   taskActionsOf,
   waitReasonOf,
@@ -74,20 +74,15 @@ export const OPTION_FAILURE_PREFIX = '操作失败'
  *     `title`/`aria-label`），可见文本逐字不变（AC-5 + AC-6）；
  *  ③ busy 期间**只换 state、不改 label**（乐观切换文案会让「点了没反应」看起来像已生效）。
  */
-export function optionView(input: {
+export function optionView(input: PlanPillInput & {
   enabled: boolean
   busy: boolean
-  planStatus?: PlanStatus
-  done: number
-  total: number
   /** 上一次动作的失败原因（原始原因，不含前缀）；空串/undefined = 无失败。 */
   failure?: string
 }): OptionView {
   const enabled = input.enabled === true
-  const done = countOf(input.done)
-  const total = countOf(input.total)
   // 关闭态只说「未启用」：此时计划状态没有意义（关掉的自动团队谈不上「计划就绪」）
-  const status = enabled ? planPillText(input.planStatus, done, total) : planStatusView(undefined).label
+  const status = enabled ? planPillText(input) : runStageOf({}).label
   const state: OptionView['state'] =
     input.busy === true ? 'busy' : !enabled ? 'off' : input.planStatus === 'paused' ? 'paused' : 'on'
   const failure = failureTextOf(input.failure)
@@ -139,11 +134,8 @@ export interface HeaderView {
  * `opened` 必须由**真实页签状态**驱动，不能是本地乐观态 —— 否则用户从页签 × 关掉面板后，
  * 按钮仍显示「已打开」，下一次点击又去 close 一个不存在的页签（AC-11）。
  */
-export function headerButtonView(input: {
+export function headerButtonView(input: PlanPillInput & {
   enabled: boolean
-  planStatus?: PlanStatus
-  done: number
-  total: number
   /** 页签是否真的存在（`PanelCommands.isOpen`）；`undefined` = 宿主没给这个能力。 */
   opened?: boolean
   /** 宿主是否有可用的开/收入口（`PanelCommands` 是否拿到 `sidebarRight`）。 */
@@ -153,7 +145,7 @@ export function headerButtonView(input: {
 }): HeaderView {
   const done = countOf(input.done)
   const total = countOf(input.total)
-  const status = planPillText(input.planStatus, done, total)
+  const status = planPillText(input)
   const fallback = input.available === false
   const opened = input.opened === true && !fallback
   const canClose = input.canClose !== false
@@ -489,20 +481,33 @@ export function settingsKeysView(settings: AutoTeamSettings): {
 /* ─────────────────────────────── 内部小工具 ─────────────────────────────── */
 
 /**
- * 胶囊/角标的状态段：文案只由计划状态派生（**不写状态中文**，一律取 `planStatusView`）。
- *  - 无计划 → 待开工；
- *  - 暂停/已终止/已取消 → 只显示状态本身（没有进度可言）；
- *  - 全部完成 → `完成 x/N`（优先于「派发中」：任务都绿了还写派发中会让人以为没跑完）；
- *  - 派发中 → `派发中 · x/N`；
- *  - 其余（计划就绪）→ `计划就绪 · N 任务`。
+ * 胶囊/角标可拿到的阶段计数（取自 `currentRunStageInputOf`，与 run 卡/历史行同构）。
+ * 任一缺失即交给 `runStageOf` 的最保守分支（绝不补 0）。
  */
-function planPillText(planStatus: PlanStatus | undefined, done: number, total: number): string {
-  if (!planStatus) return '待开工'
-  const base = planStatusView(planStatus).label
-  if (planStatus === 'paused' || planStatus === 'terminated' || planStatus === 'cancelled') return base
+export type PlanPillInput = Pick<
+  RunStageInput,
+  'planStatus' | 'done' | 'total' | 'running' | 'failed' | 'interrupted' | 'members'
+>
+
+/**
+ * 胶囊/角标的状态段：文案只由 `runStageOf`（阶段判定表）派生，本函数不写状态中文。
+ *  - 无计划 → 待开工（与「未启用」同义的输入框措辞，壳层语义见调用方注释）；
+ *  - 暂停/已终止/已取消 → 阶段文案本身（没有进度可言）；
+ *  - 全部完成 → `完成 x/N`（进度措辞；任务全绿时先说「完成」，阶段细节仍由面板承载）；
+ *  - 其余 → `runStageOf(...).label`（派发中/执行中/待收口/计划就绪/待派发）。
+ *
+ * 「计划就绪」只可能来自规则 10：`draft + 零成员 + 零完成`。计数缺失时不会命中，
+ * 因此不会再把「draft + 部分完成」误写成「计划就绪 · N 任务」（r26 修）。
+ */
+function planPillText(input: PlanPillInput): string {
+  if (!input.planStatus) return '待开工'
+  // 计数原样交给阶段判定（缺失即 undefined，不补 0）；只有「完成 x/N」这一进度措辞需要数字。
+  const stage = runStageOf(input)
+  if (stage.key === 'paused' || stage.key === 'terminated' || stage.key === 'cancelled') return stage.label
+  const done = countOf(input.done)
+  const total = countOf(input.total)
   if (total > 0 && done >= total) return `完成 ${done}/${total}`
-  if (planStatus === 'dispatching') return total > 0 ? `${base} · ${done}/${total}` : base
-  return total > 0 ? `${base} · ${total} 任务` : base
+  return stage.label
 }
 
 function str(value: unknown): string {

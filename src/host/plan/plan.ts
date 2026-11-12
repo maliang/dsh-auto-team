@@ -1,7 +1,7 @@
 /**
  * 计划构造、续派与规范化。依赖 graph.ts 的纯校验，自身也不碰宿主服务（只碰 fs 由 store 负责）。
  */
-import type { Plan, PlanTask, TaskStatus } from '../../shared/types.ts'
+import type { Plan, PlanRevision, PlanTask, TaskStatus } from '../../shared/types.ts'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from '../config.ts'
 import { validateGraph } from './graph.ts'
 
@@ -209,4 +209,264 @@ export function extendPlan(plan: Plan, inputs: readonly PlanDraftTask[], now: nu
   // Plan 的字段集保持不变（不加 updatedAt）：面板的「刚追加」由任务自身的 createdAt/状态表达。
   void now
   return { ok: true, plan: { ...plan, tasks: merged }, added, skipped }
+}
+
+/* ─────────────────────────────── r21：需求修订（同一个 runId 内并入） ─────────────────────────────── */
+
+/** r21：被修订/作废的任务状态限制 —— 已完成/已跳过/已取消的任务不允许被「改一改」复活。 */
+const REVISION_FROZEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['done', 'skipped', 'cancelled'])
+
+/** 修订输入：目标段落 + 要更新/追加的任务 + 要作废的任务。 */
+export interface RevisionInput {
+  /** 新需求原文（追加到 goal 末尾，不覆盖原目标；空串 = 只改任务）。 */
+  goal?: string
+  /** 哪几点变了（写给在跑成员，也落进任务卡的 revisionNote）。 */
+  changeSummary?: string
+  /** 本次要作废的任务 id（被新需求替换掉的旧任务）。 */
+  cancelledTaskIds?: readonly string[]
+  /** 作废原因（缺省由宿主按修订正文生成，绝不写空话）。 */
+  cancelReason?: string
+  /** 要更新的既有任务（带 id 且 id 命中）或要追加的新任务（无 id / id 未占用）。 */
+  tasks?: readonly PlanDraftTask[]
+  /** 修订顺带调整并发上限（缺省 = 保持原值）。 */
+  maxConcurrent?: number
+}
+
+/** r21：一次修订的落盘结果。`mode` 三态里的 created 由调用方（没有可并入 run）决定。 */
+export interface RevisionResult {
+  plan: Plan
+  mode: 'revised' | 'appended'
+  updated: PlanTask[]
+  added: PlanTask[]
+  cancelled: PlanTask[]
+  /** 被指纹判重跳过的新任务（显式 id 优先，其次标题），与 extendPlan 口径一致。 */
+  skipped: string[]
+  revision: PlanRevision
+}
+
+export type ReviseResult = ({ ok: true } & RevisionResult) | { ok: false; reason: string }
+
+/** 修订时刻的展示文本（宿主本地时区，精确到分钟；只用于 goal 与任务卡留痕）。 */
+function revisionStamp(at: number): string {
+  const date = new Date(at)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 一行摘要（正文首行），作废原因/任务卡说明的兜底，避免把整段需求塞进状态标签。 */
+function firstLineOf(text: string): string {
+  const line = text
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => item !== '')
+  return line ?? ''
+}
+
+/**
+ * r21：把「同一条需求的修改」并入既有 run（同一个 runId，不新建、不重派同名成员）。
+ *
+ * 与 extendPlan 的分工：extendPlan 只追加（内容指纹判重、id 递增）；这里额外支持
+ *  - **更新**：带 id 且命中既有任务 → 覆盖 title/roleId/dependsOn/acceptance/writeScopes；
+ *  - **作废**：cancelledTaskIds → status='cancelled' + cancelledAt/cancelReason/cancelledBy='revision'；
+ *  - **目标留痕**：新需求以 `## 需求修订（时刻）` 段落追加到 goal 末尾，原文不覆盖。
+ *
+ * 原子性：整批先在内存里构造完，再用 validateGraph 全量校验；任一条不合法则整批不落。
+ * 终态任务（done/skipped/cancelled）拒绝被更新；要改已完成的东西请显式作废或新开任务。
+ */
+export function revisePlan(plan: Plan, input: RevisionInput, now: number): ReviseResult {
+  if (CLOSED_PLAN_STATUSES.has(plan.status)) {
+    const label = plan.status === 'cancelled' ? '已取消' : '已终止'
+    return { ok: false, reason: `计划${label}，不能并入需求修订（请开新的计划）` }
+  }
+
+  const goalText = (input.goal ?? '').trim()
+  const changeSummary = (input.changeSummary ?? '').trim()
+  const cancelIds = [...new Set((input.cancelledTaskIds ?? []).map((id) => String(id ?? '').trim()).filter((id) => id !== ''))]
+  const taskById = new Map(plan.tasks.map((task) => [task.id, task]))
+
+  for (const id of cancelIds) {
+    if (!taskById.has(id)) return { ok: false, reason: `要作废的任务不存在：${id}` }
+  }
+
+  const cancelled: PlanTask[] = []
+  const cancelledIdSet = new Set(cancelIds)
+  const cancelReason =
+    (input.cancelReason ?? '').trim() !== ''
+      ? (input.cancelReason as string).trim()
+      : `需求修订作废：${firstLineOf(changeSummary) || firstLineOf(goalText) || '被新需求替换'}`
+
+  const inputs = input.tasks ?? []
+  for (const item of inputs) {
+    const id = (item.id ?? '').trim()
+    if (id !== '' && cancelledIdSet.has(id)) {
+      return { ok: false, reason: `任务 ${id} 同一次修订里既更新又作废，请只保留一种处理` }
+    }
+  }
+
+  const taken = new Set(plan.tasks.map((task) => task.id))
+  let nextIndex = 1
+  for (const id of taken) {
+    const matched = /^t(\d+)$/.exec(id)
+    if (matched) nextIndex = Math.max(nextIndex, Number(matched[1]) + 1)
+  }
+  const allocate = (): string => {
+    let id = `t${nextIndex}`
+    nextIndex += 1
+    while (taken.has(id)) {
+      id = `t${nextIndex}`
+      nextIndex += 1
+    }
+    return id
+  }
+
+  const updated: PlanTask[] = []
+  const added: PlanTask[] = []
+  const skipped: string[] = []
+  const nextTasks: PlanTask[] = plan.tasks.map((task) => ({ ...task }))
+  const nextById = new Map(nextTasks.map((task) => [task.id, task]))
+  const known = new Map<string, string>()
+  for (const task of nextTasks) known.set(taskFingerprint(task), task.id)
+  const note = changeSummary || firstLineOf(goalText) || '需求修订'
+
+  for (const [index, item] of inputs.entries()) {
+    const id = (item.id ?? '').trim()
+    const existing = id === '' ? undefined : nextById.get(id)
+    if (existing) {
+      if (cancelledIdSet.has(id)) return { ok: false, reason: `任务 ${id} 同一次修订里既更新又作废，请只保留一种处理` }
+      const title = (item.title ?? '').trim()
+      const roleId = (item.roleId ?? '').trim()
+      if (title === '') return { ok: false, reason: `第 ${index + 1} 条修订任务没有标题` }
+      if (roleId === '') return { ok: false, reason: `第 ${index + 1} 条修订任务（${title}）未指定角色` }
+      const dependsOn = item.dependsOn === undefined ? [...existing.dependsOn] : [...new Set(item.dependsOn)]
+      const acceptance = item.acceptance === undefined ? existing.acceptance : (item.acceptance ?? '').trim()
+      const writeScopes = item.writeScopes === undefined ? existing.writeScopes : scopesOf(item.writeScopes)
+      const unchanged =
+        title === existing.title &&
+        roleId === existing.roleId &&
+        acceptance === existing.acceptance &&
+        JSON.stringify(dependsOn) === JSON.stringify(existing.dependsOn) &&
+        JSON.stringify(writeScopes ?? []) === JSON.stringify(existing.writeScopes ?? [])
+      if (unchanged) {
+        skipped.push(id)
+        continue
+      }
+      // D1：终态任务是历史事实，不能被一次「改一改」悄悄复活成可执行任务 ——
+      // 与下面「已完成后不能再作废」是同一条规则的另一面（未改动的终态任务上面已 skip，不受影响）。
+      if (REVISION_FROZEN_STATUSES.has(existing.status)) {
+        const label = existing.status === 'done' ? '已完成' : existing.status === 'skipped' ? '已跳过' : '已取消'
+        return { ok: false, reason: `任务 ${id} ${label}，不能再修订（要改请新开任务）` }
+      }
+      if (acceptance === '') return { ok: false, reason: `修订后的任务 ${id} 验收命令为空（完成必须过门禁）` }
+      const patched: PlanTask = {
+        ...existing,
+        title,
+        roleId,
+        dependsOn,
+        acceptance,
+        revisedAt: now,
+        revisionNote: note,
+      }
+      if (writeScopes !== undefined && writeScopes.length > 0) patched.writeScopes = writeScopes
+      if (writeScopes !== undefined && writeScopes.length === 0) delete patched.writeScopes
+      nextById.set(id, patched)
+      const at = nextTasks.findIndex((task) => task.id === id)
+      nextTasks[at] = patched
+      updated.push(patched)
+      continue
+    }
+
+    const title = (item.title ?? '').trim()
+    const roleId = (item.roleId ?? '').trim()
+    if (title === '') return { ok: false, reason: `第 ${index + 1} 条追加任务没有标题` }
+    if (roleId === '') return { ok: false, reason: `第 ${index + 1} 条追加任务（${title}）未指定角色` }
+    const acceptance = (item.acceptance ?? '').trim()
+    if (acceptance === '') return { ok: false, reason: `第 ${index + 1} 条追加任务（${title}）验收命令为空（完成必须过门禁）` }
+
+    const fingerprint = taskFingerprint(item)
+    if (known.has(fingerprint)) {
+      skipped.push(id === '' ? title : id)
+      continue
+    }
+
+    const taskId = id === '' ? allocate() : id
+    if (nextById.has(taskId)) return { ok: false, reason: `追加任务的 id 与已有任务重复：${taskId}` }
+
+    const writeScopes = scopesOf(item.writeScopes)
+    const task: PlanTask = {
+      id: taskId,
+      title,
+      roleId,
+      dependsOn: [...new Set(item.dependsOn ?? [])],
+      acceptance,
+      status: 'pending' as TaskStatus,
+    }
+    if (writeScopes.length > 0) task.writeScopes = writeScopes
+    nextById.set(taskId, task)
+    nextTasks.push(task)
+    taken.add(taskId)
+    known.set(fingerprint, taskId)
+    added.push(task)
+  }
+
+  for (const id of cancelIds) {
+    const task = nextById.get(id)
+    if (!task) return { ok: false, reason: `要作废的任务不存在：${id}` }
+    if (task.status === 'done' || task.status === 'skipped' || task.status === 'cancelled') {
+      const label = task.status === 'done' ? '已完成' : task.status === 'skipped' ? '已跳过' : '已取消'
+      return { ok: false, reason: `任务 ${id} ${label}，不能再作废` }
+    }
+    const patched: PlanTask = {
+      ...task,
+      status: 'cancelled' as TaskStatus,
+      cancelledAt: now,
+      cancelReason,
+      cancelledBy: 'revision',
+    }
+    delete patched.waitingOn
+    delete patched.waitReason
+    nextById.set(id, patched)
+    const at = nextTasks.findIndex((item) => item.id === id)
+    nextTasks[at] = patched
+    cancelled.push(patched)
+  }
+
+  if (updated.length === 0 && added.length === 0 && cancelled.length === 0 && goalText === '') {
+    return { ok: false, reason: '需求修订没有任何变化：既没有新任务，也没有要更新/作废的任务或新目标' }
+  }
+
+  const check = validateGraph(nextTasks.map((task) => ({ id: task.id, dependsOn: task.dependsOn })))
+  if (!check.ok) return { ok: false, reason: check.reason }
+
+  const stamp = revisionStamp(now)
+  const revision: PlanRevision = {
+    at: now,
+    text: goalText,
+    updatedTaskIds: updated.map((task) => task.id),
+    addedTaskIds: added.map((task) => task.id),
+    cancelledTaskIds: cancelled.map((task) => task.id),
+  }
+  if (changeSummary !== '') revision.changeSummary = changeSummary
+
+  const section = goalText === '' ? '' : `\n\n## 需求修订（${stamp}）\n${goalText}`
+  const goal = `${(plan.goal ?? '').trim()}${section}`.trim()
+  const nextPlan: Plan = {
+    ...plan,
+    tasks: nextTasks,
+    revisions: [...(plan.revisions ?? []), revision],
+  }
+  if (goal !== '') nextPlan.goal = goal
+  if (input.maxConcurrent !== undefined) {
+    nextPlan.maxConcurrent = Math.min(Math.max(1, input.maxConcurrent), MAX_CONCURRENT_LIMIT)
+  }
+
+  return {
+    ok: true,
+    plan: nextPlan,
+    mode: updated.length > 0 || cancelled.length > 0 || goalText !== '' ? 'revised' : 'appended',
+    updated,
+    added,
+    cancelled,
+    skipped,
+    revision,
+  }
 }

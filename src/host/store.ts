@@ -16,6 +16,7 @@ import type {
   MemberBinding,
   MessageRecord,
   Plan,
+  PlanRevision,
   PlanStatus,
   PlanTask,
   ProgressRecord,
@@ -127,6 +128,28 @@ export interface RunState {
    * 记在 run 上而不是进程内：确认是一次**持久授权**，重启后再撞同一写域不应再弹窗。
    */
   forceParallel?: string[]
+  /**
+   * r21 AC-3：run 收口原因（与 `finishedAt` 同时落盘）。
+   *
+   * 为什么必须落盘：面板要在历史里回答「这个 run 为什么停了」；只在内存里存的话，
+   * 重启后旧 run 就只剩一个「已终止/已取消」标签，用户无法区分「全部做完自然收口」、
+   * 「用户取消」与「被需求修订取代」。时间统一以 `finishedAt` 为准，这里不再存第二份时刻。
+   */
+  termination?: TerminationRecord
+  /**
+   * r23：终态 run 的记忆沉淀幂等键（epoch ms）。
+   *
+   * `saveState` 在 receipt/停滞/暂停恢复等路径会被反复调用；没有这个字段的话同一条失败教训
+   * 会被反复 upsert，`修正 N` 一路涨。**只有终态沉淀成功（包括 0 条草稿）后才写入**，
+   * 非终态与异常路径都不写，下一次保存重试（fail-open）。
+   */
+  memorySunkAt?: number
+}
+
+/** r21：收口原因。`kind` 只描述**用户可理解的来源**，不是新的命运状态。 */
+export interface TerminationRecord {
+  reason: string
+  kind: 'cancelled' | 'terminated' | 'superseded' | 'stale'
 }
 
 /** 用量归属三态（降级只允许单向：`per-member → aggregate-only → unavailable`）。 */
@@ -148,6 +171,209 @@ export interface UsageRecord {
 export interface TaskTimeRecord {
   startedAt?: number
   endedAt?: number
+}
+
+/**
+ * 计划已收口（不会再变）的状态：只有它们才有「结束时刻」。
+ *
+ * r25：显式导出成 `PLAN_TERMINAL_STATUSES` 并只服务 **run 级**语义（结束时刻、列表里的
+ * `ongoing`/`active` 归零）。**不要**拿它跟任务级的 `SUMMARY_TERMINAL_STATUSES` 混用：
+ * 前者判 plan.status，后者判 task.status，两张表回答的是不同问题。
+ */
+export const PLAN_TERMINAL_STATUSES: ReadonlySet<PlanStatus> = new Set<PlanStatus>([
+  'terminated',
+  'cancelled',
+])
+
+/**
+ * run 的结束时刻（r20）。
+ *
+ * 真实落盘值优先（r20 起 `team/dispatch.applyReceipt` 收口、`bridge.cancel` 取消都会写
+ * `finishedAt`）。历史 run（r20 之前只改 `plan.status`、不记时间）用**可核实的事实**回退：
+ *  1. 各任务 `taskTimes[].endedAt` 的最大值 —— 收口只会发生在最后一个任务结束之后；
+ *  2. 最后一条消息的 `at` —— 没有任务时间的旧 run（例如派发前取消）只剩消息时间可核。
+ * 取两者较大值（结束时刻不早于任一可核事实）。都拿不到 → `undefined`，界面继续显示
+ * 「不可得」，绝不拿 `now` 冒充；进行中的 run 没有结束时刻，不看回退。
+ *
+ * 只读派生、不落盘：替代口径是**下限**，写进文件会与真实收口时刻混成同一种证据。
+ */
+export function finishedAtOf(state: RunState): number | undefined {
+  const recorded = finiteOptional(state.finishedAt)
+  if (recorded !== undefined) return recorded
+  if (!PLAN_TERMINAL_STATUSES.has(state.plan.status)) return undefined
+  let latest: number | undefined
+  for (const record of Object.values(state.taskTimes ?? {})) {
+    const endedAt = finiteOptional(record?.endedAt)
+    if (endedAt !== undefined && (latest === undefined || endedAt > latest)) latest = endedAt
+  }
+  const lastMessage = state.messages?.[state.messages.length - 1]
+  const lastAt = finiteOptional(lastMessage?.at)
+  if (lastAt !== undefined && (latest === undefined || lastAt > latest)) latest = lastAt
+  return latest
+}
+
+/**
+ * r26：真实派发成功后的计划态推进 —— `draft → dispatching`。
+ *
+ * 只进不退、幂等：只有 `draft` 会被改写；已是 `dispatching`（重复派发/并发成功）、
+ * `paused`、`terminated`、`cancelled` 一律返回 `null`（调用方不写盘）。派发失败路径
+ * 不得调用本函数，因此失败时计划保持 `draft`，用户仍能再次点派发。
+ */
+export function advancePlanToDispatching(state: RunState): RunState | null {
+  if (state.plan.status !== 'draft') return null
+  return { ...state, plan: { ...state.plan, status: 'dispatching' } }
+}
+
+/** r24：残留计划判定阈值 —— 30 分钟内没有任何可核活动且没有存活成员。 */
+export const STALE_PLAN_MS = 30 * 60 * 1000
+
+/** r24：只有「还在进行」的计划会被自动收口；终态与暂停不算（暂停是用户主动事务）。 */
+const STALE_CANDIDATE_STATUSES: ReadonlySet<PlanStatus> = new Set<PlanStatus>([
+  'draft',
+  'dispatching',
+  'paused',
+])
+
+/** r24：自动收口的固定文案（面板原文渲染，不拼装）。 */
+export const STALE_PLAN_REASON = '计划长时间无活动且没有成员在跑，已自动收口'
+
+/**
+ * r24：一次 run 的「最后活动时刻」—— 取所有可核实事实的最大值。
+ *
+ * 候选事实：`plannedAt`、各任务计时区间两端、消息账本各条 `at`、需求修订时刻、
+ * 任务 `revisedAt`。故意**不**看 `Date.now()`：没有活动就是没有活动，拿当前时刻兜底
+ * 会让残留 run 永远显得「刚刚活跃过」。
+ */
+export function lastActivityAtOf(state: RunState): number {
+  let latest = finiteOptional(state.plannedAt) ?? finiteOptional(state.plan.createdAt) ?? 0
+  const bump = (value: unknown): void => {
+    const at = finiteOptional(value)
+    if (at !== undefined && at > latest) latest = at
+  }
+  for (const record of Object.values(state.taskTimes ?? {})) {
+    bump(record?.startedAt)
+    bump(record?.endedAt)
+  }
+  for (const message of state.messages ?? []) bump(message?.at)
+  for (const revision of state.plan.revisions ?? []) bump(revision?.at)
+  for (const task of state.plan.tasks) bump(task.revisedAt)
+  return latest
+}
+
+/**
+ * r25：计划收口时一并终结的「残留任务」状态词。
+ *
+ * 用**任务级**终态集合的反面：done/failed/cancelled/skipped/interrupted 之外的一切
+ * （running/gate/rework/pending/blocked/ready/paused/waiting）都必须被终结，否则已收口的
+ * run 里会留下「还在跑 / 还能点派发」的假活任务，面板的 ongoing/active 也会自相矛盾。
+ * 集合本身复用 `SUMMARY_TERMINAL_STATUSES`（与 `team/dispatch.ts` 的终态表同源），
+ * 不在这里再抄一份，避免新增终态时漂移。
+ */
+export function cancelResidualTasks(
+  state: RunState,
+  finishedAt: number,
+  reason: string,
+): { tasks: PlanTask[]; changed: number } {
+  const cancelReason = `计划已收口：${reason}`
+  let changed = 0
+  const tasks = state.plan.tasks.map((task) => {
+    if (SUMMARY_TERMINAL_STATUSES.has(task.status)) return task
+    changed += 1
+    return {
+      ...task,
+      status: 'cancelled' as TaskStatus,
+      cancelledAt: finishedAt,
+      cancelReason,
+      cancelledBy: 'stale' as const,
+    }
+  })
+  return { tasks, changed }
+}
+
+/**
+ * r24：残留计划自动对账（进程内只调用一次，见 `bridge.createBridge`）。
+ *
+ * 对「仍在进行、无 `finishedAt`/`termination`、最后活动早于 `staleMs`、且本进程没有该 run
+ * 存活成员」的 run 落盘收口（`status='terminated'` + `finishedAt=最后活动时刻` +
+ * `termination.kind='stale'`）。r25：**同一次落盘**把残留任务一并终结（见
+ * {@link cancelResidualTasks}），不能先写终态再补任务 —— 中间态被面板读到就是脏数据。
+ * 幂等：第二次启动时状态已是终态，直接跳过，不再改写文件。
+ *
+ * 返回被收口的 runId 列表（供日志/测试断言；正常运行时通常为空）。
+ */
+export function reconcileStalePlans(
+  store: Pick<RunsStore, 'list' | 'load' | 'save'>,
+  options: {
+    now: number
+    staleMs?: number
+    /** 该 run 在本进程里是否还有存活成员（缺省 = 没有，因此调用点必须在派发之前）。 */
+    hasLiveMembers?: (runId: string) => boolean
+  },
+): string[] {
+  const staleMs = options.staleMs ?? STALE_PLAN_MS
+  const now = options.now
+  const reconciled: string[] = []
+  for (const summary of store.list()) {
+    const state = store.load(summary.runId)
+    if (state === null) continue
+    if (!STALE_CANDIDATE_STATUSES.has(state.plan.status)) continue
+    if (state.finishedAt !== undefined) continue
+    if (state.termination !== undefined) continue
+    if (options.hasLiveMembers?.(state.plan.runId) === true) continue
+    const lastActivityAt = lastActivityAtOf(state)
+    if (lastActivityAt >= now - staleMs) continue
+    const cancelled = cancelResidualTasks(state, lastActivityAt, STALE_PLAN_REASON)
+    try {
+      store.save({
+        ...state,
+        plan: { ...state.plan, status: 'terminated', tasks: cancelled.tasks },
+        finishedAt: lastActivityAt,
+        termination: { kind: 'stale', reason: STALE_PLAN_REASON },
+      })
+      reconciled.push(state.plan.runId)
+    } catch {
+      // 单个文件写失败不能阻断其余 run 的对账，也不能让启动失败：下一次启动会重试。
+    }
+  }
+  return reconciled
+}
+
+/** r25：历史 run 没有收口原因时的兜底文案（不编造具体来源，只说「已结束」）。 */
+const CLOSED_RUN_FALLBACK_REASON = '该运行已结束'
+
+/**
+ * r25：一次性修正已收口的历史 run —— 终态 run 里仍留着非终态任务时，按
+ * {@link cancelResidualTasks} 把它们一并终结（`cancelledBy='stale'`）。
+ *
+ * 幂等判据是「没有残留任务就**不写盘**」：第二次启动零 `save`，文件字节逐字不变。
+ * 单个 run 修失败只跳过并 `onWarn`，绝不让启动/面板读取失败 —— 历史脏数据不该导致
+ * 整个面板打不开。返回被修正的 runId 列表（正常运行时为空）。
+ */
+export function repairClosedRuns(
+  store: Pick<RunsStore, 'list' | 'load' | 'save'>,
+  options: { onWarn?: (message: string) => void } = {},
+): string[] {
+  const repaired: string[] = []
+  for (const summary of store.list()) {
+    try {
+      const state = store.load(summary.runId)
+      if (state === null) continue
+      if (!PLAN_TERMINAL_STATUSES.has(state.plan.status)) continue
+      const finishedAt = finishedAtOf(state) ?? lastActivityAtOf(state)
+      const reason = state.termination?.reason ?? CLOSED_RUN_FALLBACK_REASON
+      const cancelled = cancelResidualTasks(state, finishedAt, reason)
+      if (cancelled.changed === 0) continue
+      store.save({ ...state, plan: { ...state.plan, tasks: cancelled.tasks } })
+      repaired.push(state.plan.runId)
+    } catch (error) {
+      options.onWarn?.(
+        `自动团队：修正已收口运行的残留任务失败（${summary.runId}）：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
+  }
+  return repaired
 }
 
 /**
@@ -174,12 +400,46 @@ export interface PendingConfirmation {
   taskId?: string
 }
 
+/**
+ * `RunsStore.save` 的写盘选项。
+ *
+ * 历史列表（`bridge.historyOf`）的 5 秒 memo 以 `writeEpoch()` 为失效判据：任何一次
+ * 「会改变历史行」的落盘都必须让旧缓存作废。只有一个例外，见 `historyNeutral`。
+ */
+export interface SaveOptions {
+  /**
+   * 这次写盘**不影响历史列表行**：仅供「只改 usage」的投影刷新使用。
+   *
+   * 历史行确实带 `usageTotals`，但投影写盘在每个轮询帧都可能发生；若它也失效 memo，
+   * 面板 2 秒一刷就会重新全量 `list()`，把 5 秒合并读的意义抹掉（t4 明确禁止的退化）。
+   * 状态 / 终止原因 / 任务状态等真正决定历史行的写一律**不得**走这个豁免。
+   */
+  historyNeutral?: boolean
+}
+
 export class RunsStore {
   /** 显式字段赋值而非构造器参数属性：node --test 的类型剥离（strip-only）不支持参数属性。 */
   private readonly dir: string
+  /**
+   * 成功落盘次数（单调递增）——历史列表 memo 的「写后失效」判据。
+   *
+   * 放在 store 而不是 bridge：写库的不止 `bridge.saveState`（dispatch / watcher / tools /
+   * reconcile 都直接 `store.save`）。把版本号收敛到**唯一写入口** `save()`，这些路径
+   * 才都能让历史缓存失效，而不必在每个调用点手工补一次 `historyMemo = null`。
+   */
+  private writeCount: number
 
   constructor(dir: string) {
     this.dir = dir
+    this.writeCount = 0
+  }
+
+  /**
+   * 当前写盘版本号：`bridge.historyOf` 用它判断 5 秒 memo 是否已过期。
+   * 只读；`historyNeutral` 的写不计入（见 `SaveOptions`）。
+   */
+  writeEpoch(): number {
+    return this.writeCount
   }
 
   /** 读一个 run；v1 裸 Plan 会被 `wrapLegacy` 升成 v2；文件缺失/损坏返回 null。 */
@@ -194,7 +454,7 @@ export class RunsStore {
   }
 
   /** 整体原子写（tmp + rename）；消息账本 / 停滞记录 / 告警都按上限裁剪后再落盘。 */
-  save(state: RunState): void {
+  save(state: RunState, options?: SaveOptions): void {
     const path = this.fileFor(state.plan.runId)
     if (path === null) throw new Error(`非法 runId：${state.plan.runId}`)
     mkdirSync(this.dir, { recursive: true })
@@ -218,10 +478,14 @@ export class RunsStore {
       taskTimes: normalizeTaskTimes(state.taskTimes),
       pendingConfirmation: normalizePending(state.pendingConfirmation),
       forceParallel: normalizeIdList(state.forceParallel),
+      termination: normalizeTermination(state.termination),
     }
     const tmp = `${path}.tmp`
     writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
     renameSync(tmp, path)
+    // 写后失效点：只有 rename 成功才算「盘上真的变了」。写失败不推进版本号，
+    // 历史 memo 继续保持 —— 读到的仍是上一次成功落盘的那份，不存在半截状态。
+    if (options?.historyNeutral !== true) this.writeCount += 1
   }
 
   /** 按会话取最近一次运行（面板「计划」页与「恢复」的默认数据源）。 */
@@ -241,6 +505,17 @@ export class RunsStore {
       const state = this.load(entry.slice(0, -'.json'.length))
       if (state === null) continue
       const { plan } = state
+      // r18b：`ongoing` 与 `active` 用**同一个**谓词算，避免「还有进行中任务」出现两种口径。
+      // 旧文件缺 `tasks` 时 `wrapLegacy`/`normalizePlan` 已判成非法 run（load 返回 null → 跳过），
+      // 因此这里拿到的 `plan.tasks` 恒为数组，统计不会抛。
+      //
+      // r25：已收口（terminated/cancelled）的 run 一律 ongoing=0、active=false —— 收口动作
+      // 会把残留任务一并终结，但历史脏数据/旧版本收口的 run 仍可能带着 running/pending 任务；
+      // 若照任务表数下去，左栏会永远标「活跃」、历史详情还会显示「进行中」，与终态自相矛盾。
+      // 非终态 run 的算法逐字不变（不把两张终态表混用）。
+      const planClosed = PLAN_TERMINAL_STATUSES.has(plan.status)
+      const ongoing = planClosed ? 0 : plan.tasks.filter((task) => !SUMMARY_TERMINAL_STATUSES.has(task.status)).length
+      const resolvedFinishedAt = finishedAtOf(state)
       out.push({
         runId: plan.runId,
         sessionId: plan.sessionId,
@@ -253,9 +528,13 @@ export class RunsStore {
         // r14 AC-15：run 级目标（旧 run 没有就不写，客户端走 fallback —— 不猜、不迁移）。
         ...(normalizeLabel(plan.goal) !== undefined ? { goal: normalizeLabel(plan.goal) } : {}),
         plannedAt: state.plannedAt,
-        ...(state.finishedAt !== undefined ? { finishedAt: state.finishedAt } : {}),
+        // r20：历史 run 没有 finishedAt 时按可核实事实回退（见 `finishedAtOf`）；仍无 → 不写。
+        ...(resolvedFinishedAt !== undefined ? { finishedAt: resolvedFinishedAt } : {}),
         ...(state.usage?.total !== undefined ? { usageTotals: state.usage.total } : {}),
-        active: plan.tasks.some((task) => !SUMMARY_TERMINAL_STATUSES.has(task.status)),
+        // r21：收口原因（旧 run 没有就不写，历史列表显示「未记录原因」而不是编一个）。
+        ...(state.termination !== undefined ? { terminationReason: state.termination.reason } : {}),
+        ongoing,
+        active: planClosed ? false : ongoing > 0,
       })
     }
     return out.sort((a, b) => b.createdAt - a.createdAt)
@@ -305,6 +584,9 @@ export function wrapLegacy(raw: unknown): RunState | null {
     taskTimes: normalizeTaskTimes(raw.taskTimes),
     pendingConfirmation: normalizePending(raw.pendingConfirmation),
     forceParallel: normalizeIdList(raw.forceParallel),
+    termination: normalizeTermination(raw.termination),
+    // r23：自动沉淀幂等键必须随 run 一起读回；丢了它，每次 load→save 都会重写同一条记忆。
+    memorySunkAt: finiteOptional(raw.memorySunkAt),
   }
 }
 
@@ -500,11 +782,24 @@ function normalizePause(raw: unknown): PauseRecord | undefined {
 
 /* ──────────── r13 追加字段的归一（坏数据只能被丢掉，绝不能让 load/save 抛） ──────────── */
 
+/** r21：收口记录归一 —— 空 reason 视为没有记录（面板显示「未记录原因」而不是空白）。 */
+function normalizeTermination(raw: unknown): TerminationRecord | undefined {
+  if (!isRecord(raw)) return undefined
+  const reason = normalizeLabel(raw.reason)
+  if (reason === undefined) return undefined
+  const kind =
+    raw.kind === 'cancelled' || raw.kind === 'terminated' || raw.kind === 'superseded' || raw.kind === 'stale'
+      ? raw.kind
+      : 'terminated'
+  return { reason, kind }
+}
+
 /**
  * 列表摘要用的终态集合：必须与 `team/dispatch.ts` 的 `TERMINAL_TASK_STATUSES` 一致。
  *
  * 不直接 import 那个模块是为了让 `store.ts`（落盘层）保持零运行时依赖 ——
- * 这里只服务「左栏是否标活跃」这一件事，语义偏差的后果只是多一个圆点，不是派发错误。
+ * 这里只服务「左栏是否标活跃 / run 还有几个进行中任务」这两件事（r18b：`active` 与
+ * `ongoing` 共用它），语义偏差的后果只是圆点多一个或少一个，不是派发错误。
  */
 const SUMMARY_TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   'done',
@@ -537,16 +832,36 @@ function normalizeIdList(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined
 }
 
-/** 一组 token 数字：丢非有限/负数；`total` 缺失时按 `input + output` 补（tech §2.5）。 */
+/**
+ * 一组 token 数字：丢非有限/负数；`total` 缺失时按 `input + cacheRead + output` 补（tech §2.5）。
+ *
+ * r17 新增 `cacheRead/cacheWrite/calls`：真实宿主把命中缓存的部分单独放在 `cacheReadTokens`
+ * （`totalTokens` 已含它），这里必须逐项保留 —— 漏一个字段，重新载入 run 后六项指标就没了。
+ */
 export function normalizeTokenTotals(raw: unknown): TokenTotals | undefined {
   if (!isRecord(raw)) return undefined
   const input = finiteOptional(raw.input)
   const output = finiteOptional(raw.output)
+  const cacheRead = finiteOptional(raw.cacheRead)
+  const cacheWrite = finiteOptional(raw.cacheWrite)
+  const calls = finiteOptional(raw.calls)
   const declared = finiteOptional(raw.total)
-  if (declared === undefined && input === undefined && output === undefined) return undefined
-  const totals: TokenTotals = { total: declared ?? (input ?? 0) + (output ?? 0) }
+  if (
+    declared === undefined &&
+    input === undefined &&
+    output === undefined &&
+    cacheRead === undefined &&
+    cacheWrite === undefined &&
+    calls === undefined
+  ) {
+    return undefined
+  }
+  const totals: TokenTotals = { total: declared ?? (input ?? 0) + (cacheRead ?? 0) + (output ?? 0) }
   if (input !== undefined) totals.input = input
   if (output !== undefined) totals.output = output
+  if (cacheRead !== undefined) totals.cacheRead = cacheRead
+  if (cacheWrite !== undefined) totals.cacheWrite = cacheWrite
+  if (calls !== undefined) totals.calls = calls
   return totals
 }
 
@@ -668,7 +983,32 @@ function normalizePlan(raw: Record<string, unknown>): Plan | null {
   // r14 AC-15：`wrapLegacy` / 旧文件透传 goal；写成可选字段，旧夹具形状保持不变。
   const goal = normalizeLabel(raw.goal)
   if (goal !== undefined) plan.goal = goal
+  // r21：需求修订留痕（旧文件没有 = 从未修订；坏条目丢弃而不是让整个 run 读不出来）。
+  const revisions = normalizeRevisions(raw.revisions)
+  if (revisions.length > 0) plan.revisions = revisions
   return plan
+}
+
+/** r21：修订记录归一 —— `at` 必须有效、`text` 允许为空（只改任务时没有新需求正文）。 */
+function normalizeRevisions(raw: unknown): PlanRevision[] {
+  const out: PlanRevision[] = []
+  for (const value of asArray<unknown>(raw)) {
+    if (!isRecord(value)) continue
+    const at = finiteOptional(value.at)
+    if (at === undefined) continue
+    const revision: PlanRevision = {
+      at,
+      text: typeof value.text === 'string' ? value.text : '',
+      updatedTaskIds: stringList(value.updatedTaskIds),
+      addedTaskIds: stringList(value.addedTaskIds),
+      cancelledTaskIds: stringList(value.cancelledTaskIds),
+    }
+    if (typeof value.changeSummary === 'string' && value.changeSummary.trim() !== '') {
+      revision.changeSummary = value.changeSummary.trim()
+    }
+    out.push(revision)
+  }
+  return out
 }
 
 /** 单个任务的最小结构校验：旧文件里缺字段时补默认值，坏条目直接丢弃。 */
@@ -698,6 +1038,26 @@ function normalizeTask(raw: unknown): PlanTask | null {
   const waitReason = typeof raw.waitReason === 'string' ? raw.waitReason.trim() : ''
   if (waitReason !== '') task.waitReason = waitReason
   else delete task.waitReason
+
+  // r21：需求修订留痕 —— 只在真的有值时留在对象上，旧文件的形态保持不变。
+  const revisedAt = finiteOptional(raw.revisedAt)
+  if (revisedAt !== undefined) task.revisedAt = revisedAt
+  else delete task.revisedAt
+  const revisionNote = typeof raw.revisionNote === 'string' ? raw.revisionNote.trim() : ''
+  if (revisionNote !== '') task.revisionNote = revisionNote
+  else delete task.revisionNote
+  const cancelledAt = finiteOptional(raw.cancelledAt)
+  if (cancelledAt !== undefined) task.cancelledAt = cancelledAt
+  else delete task.cancelledAt
+  const cancelReason = typeof raw.cancelReason === 'string' ? raw.cancelReason.trim() : ''
+  if (cancelReason !== '') task.cancelReason = cancelReason
+  else delete task.cancelReason
+  const cancelledBy =
+    raw.cancelledBy === 'revision' || raw.cancelledBy === 'user' || raw.cancelledBy === 'stale'
+      ? raw.cancelledBy
+      : undefined
+  if (cancelledBy !== undefined) task.cancelledBy = cancelledBy
+  else delete task.cancelledBy
 
   return task
 }

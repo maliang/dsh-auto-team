@@ -40,7 +40,7 @@ function overviewTask(id: string, status: TaskStatus): TaskDetailView {
 
 /* ────────────────────────── 用例 ────────────────────────── */
 
-test('taskOverviewOf：2 done + 1 running → 2/3、弧长 2/3，分组顺序「未完成在前」', () => {
+test('taskOverviewOf：2 done + 1 running → 2/3、弧长 2/3，分组顺序「未完成在前、已完成在后」', () => {
   const overview = taskOverviewOf([
     overviewTask('t1', 'done'),
     overviewTask('t2', 'done'),
@@ -57,7 +57,7 @@ test('taskOverviewOf：2 done + 1 running → 2/3、弧长 2/3，分组顺序「
     'dashoffset = C×(1−done/total)，误差 ≤0.01',
   )
   assert.deepEqual(overview.groups.open.map((row) => row.id), ['t3'], '未完成组在前，保持计划顺序')
-  assert.deepEqual(overview.groups.done.map((row) => row.id), ['t1', 't2'], '已完成组在后')
+  assert.deepEqual(overview.groups.done.map((row) => row.id), ['t1', 't2'], '已完成组在后，全量 done')
   // 公差：环几何常量本身也得对（r16 设计 §0：80 环 / viewBox 80 / r34 / 8 描边）
   assert.equal(PROGRESS_RING_SIZE, 80)
   assert.equal(PROGRESS_RING_VIEWBOX, 80)
@@ -93,7 +93,7 @@ test('taskOverviewOf：空计划 0/0，不出现 NaN / Infinity', () => {
   assert.equal(overview.groups.done.length, 0)
 })
 
-test('taskOverviewOf：13 种 TaskStatus 的分子与分组（cancelled/skipped 不算完成）', () => {
+test('taskOverviewOf：13 种 TaskStatus 的分子与分组（只有 done 进已完成组，其余全在未完成组）', () => {
   const statuses = [
     'pending',
     'blocked',
@@ -118,8 +118,9 @@ test('taskOverviewOf：13 种 TaskStatus 的分子与分组（cancelled/skipped 
     assert.equal(overview.groups.open.length, completed ? 0 : 1, `${status} 落错分组`)
     assert.equal(overview.text, completed ? '1/1' : '0/1')
   }
-  // cancelled / skipped 是终态但不是完成：两行都留在未完成组
+  // cancelled / skipped 是终态但不是完成：按 r18b 全量口径留在未完成组
   const both = taskOverviewOf([overviewTask('t1', 'cancelled'), overviewTask('t2', 'skipped')])
   assert.equal(both.done, 0)
-  assert.equal(both.groups.open.length, 2)
+  assert.equal(both.groups.open.length, 2, '全量口径：cancelled/skipped 仍在未完成组可见')
+  assert.equal(both.groups.done.length, 0)
 })

@@ -16,10 +16,15 @@ import { join } from 'node:path'
 
 import { MEMORY_EXPAND_MAX_CHARS, MEMORY_EXPAND_MAX_DEPTH, MEMORY_RELATED_MAX } from '../src/host/config.ts'
 import { EXPAND_MESSAGES, createExpander, parseMemoryId, sha256Hex } from '../src/host/memory/expand.ts'
-import { memoryIdOf } from '../src/host/memory/inject.ts'
 import type { MemoryRoots } from '../src/host/memory/repo.ts'
 
 /* ────────────────────────── 夹具 ────────────────────────── */
+
+// r23：文件级 ID 拼装已迁出 inject.ts（条目 ID 走 entries.entryIdOf）；
+// 展开侧对「无 # 的整文件 ID」行为不变，这里保留同形 helper 作为同源判据。
+function memoryIdOf(track: 'public' | 'project', name: string): string {
+  return `mem://${track}/${name.replace(/\.md$/i, '')}`
+}
 
 function withTemp(fn: (roots: MemoryRoots) => void): void {
   const root = mkdtempSync(join(tmpdir(), 'auto-team-expand-'))
@@ -47,19 +52,27 @@ test('parseMemoryId：合法 ID 归一成「轨道 + 安全文件名」', () => 
     ok: true,
     track: 'project',
     name: 'conventions.md',
+    file: 'conventions.md',
   })
-  assert.deepEqual(parseMemoryId('mem://public/git.md'), { ok: true, track: 'public', name: 'git.md' })
+  assert.deepEqual(parseMemoryId('mem://public/git.md'), {
+    ok: true,
+    track: 'public',
+    name: 'git.md',
+    file: 'git.md',
+  })
   // 大小写保留：ID 由 `inject.memoryIdOf` 生成（它保留原文件名大小写），展开期必须逐字还原，
   // 否则区分大小写的文件系统上会「注入期给出、展开期找不到」。
   assert.deepEqual(parseMemoryId('mem://project/Conventions'), {
     ok: true,
     track: 'project',
     name: 'Conventions.md',
+    file: 'Conventions.md',
   })
   assert.deepEqual(parseMemoryId('  mem://project/testing  '), {
     ok: true,
     track: 'project',
     name: 'testing.md',
+    file: 'testing.md',
   })
 })
 

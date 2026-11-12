@@ -11,7 +11,7 @@ import { mkdtempSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
-import type { DurationCell, PlanTask, TaskDetailView, UsageCell } from '../src/shared/types.ts'
+import type { DurationCell, PlanTask, RunSummary, TaskDetailView, UsageCell } from '../src/shared/types.ts'
 import type { RunState } from '../src/host/store.ts'
 import { RUN_STATE_VERSION, RunsStore } from '../src/host/store.ts'
 import {
@@ -21,8 +21,11 @@ import {
   flowOf,
   projectNameOf,
   rolesOf,
+  runDetailOf,
 } from '../src/host/library.ts'
 import { ROLE_STATE_TEXT } from '../src/shared/role-view.ts'
+import { roleUsageOf } from '../src/client/viewmodel.ts'
+import { runSummaryRowOf } from '../src/client/tabs/rows.ts'
 
 const WORKSPACE = '/work/current'
 
@@ -81,6 +84,7 @@ function depsFor(store: RunsStore): Parameters<typeof buildLibrary>[0] {
 const UNAVAILABLE: UsageCell = { source: 'unavailable', reason: '没有用量来源' }
 const RUNNING_DURATION: DurationCell = { state: 'running', ms: 61_000, text: '1m 1s', startAt: 1_200 }
 const NO_DURATION: DurationCell = { state: 'not-started', text: '未开始' }
+const DONE_DURATION: DurationCell = { state: 'done', ms: 2_000, text: '2 秒', startAt: 1_200, endAt: 3_200 }
 
 function detailOf(id: string, over: Partial<TaskDetailView> = {}): TaskDetailView {
   return {
@@ -181,7 +185,7 @@ test('AC-7：rolesOf = 不同 roleId 数（2 个角色 3 个任务 → 2 张卡�
   const tokens: UsageCell = { source: 'provider', tokens: { total: 1_200, input: 1_000, output: 200 } }
   const roles = rolesOf([
     detailOf('t1', { roleId: 'dev', roleName: '开发', status: 'running', usage: tokens, duration: RUNNING_DURATION }),
-    detailOf('t2', { roleId: 'dev', roleName: '开发', status: 'done', usage: tokens, duration: NO_DURATION }),
+    detailOf('t2', { roleId: 'dev', roleName: '开发', status: 'done', usage: tokens, duration: DONE_DURATION }),
     detailOf('t3', { roleId: 'qa', roleName: '测试', status: 'gate' }),
   ])
 
@@ -193,7 +197,7 @@ test('AC-7：rolesOf = 不同 roleId 数（2 个角色 3 个任务 → 2 张卡�
   assert.equal(dev.stateText, ROLE_STATE_TEXT.running)
   assert.equal(dev.activeTaskId, 't1')
   assert.equal(dev.activeTaskTitle, '任务 t1')
-  assert.deepEqual(dev.duration, RUNNING_DURATION, '当前任务的用时原样透传')
+  assert.deepEqual(dev.duration, { state: 'running', ms: 63_000, text: '1 分 03 秒' }, '角色累计 = 名下任务用时之和（61s + 2s），不是当前任务原样透传')
   assert.deepEqual(dev.usage, { source: 'provider', tokens: { total: 2_400, input: 2_000, output: 400 } })
   // r16 AC-16：宿主侧也投影 taskRefs（顺序 = 计划顺序，状态 = 任务真实状态）
   assert.deepEqual(dev.taskRefs, [
@@ -210,7 +214,7 @@ test('AC-7：rolesOf = 不同 roleId 数（2 个角色 3 个任务 → 2 张卡�
   assert.equal(qa.usage.source, 'unavailable', '没有用量时是「不可得」，不是 0')
 })
 
-test('AC-7：全部完成的角色判「已完成」，没有当前任务时用时是「不可得」而不是 0', () => {
+test('AC-7：全部完成的角色判「已完成」；用时缺口给出可核对原因（不是裸「不可得」）', () => {
   const roles = rolesOf([
     detailOf('t1', { roleId: 'dev', status: 'done' }),
     detailOf('t2', { roleId: 'dev', status: 'done' }),
@@ -220,7 +224,118 @@ test('AC-7：全部完成的角色判「已完成」，没有当前任务时用�
   assert.equal(dev.stateText, ROLE_STATE_TEXT.done)
   assert.equal(dev.done, 2)
   assert.equal(dev.activeTaskId, undefined)
-  assert.deepEqual(dev.duration, { state: 'unavailable', text: '不可得' })
+  assert.deepEqual(dev.duration, {
+    state: 'unavailable',
+    text: '不可得：任务 t1 缺少开始时刻（另有 1 个任务同样不可得）',
+  })
+})
+
+/* ─────────────── r20：角色累计用时 / run 用时（宿主与客户端逐字相等） ─────────────── */
+
+test('r20：run 详情用时 —— 进行中任务按 at 计入，角色累计 = 名下任务之和（两侧逐字相等）', () => {
+  const at = 10_000
+  const state = stateOf({
+    plannedAt: 1_000,
+    taskTimes: {
+      t1: { startedAt: at - 5_000, endedAt: at - 2_000 },
+      t2: { startedAt: at - 3_000 },
+    },
+    plan: {
+      tasks: [taskOf('t1', { status: 'done' }), taskOf('t2', { status: 'running' })],
+    },
+  })
+  const detail = runDetailOf(state, at)
+  assert.deepEqual(detail.tasks.map((task) => task.duration), [
+    { startAt: at - 5_000, endAt: at - 2_000, ms: 3_000, text: '3 秒', state: 'done' },
+    { startAt: at - 3_000, endAt: at, ms: 3_000, text: '3 秒', state: 'running' },
+  ], '进行中的任务必须用 at 推当前耗时，而不是停在开始时刻')
+
+  // 两个任务同属 dev：角色累计 = 3s + 3s；聚合格不带 startAt/endAt。
+  assert.deepEqual(detail.roles.map((role) => role.duration), [
+    { state: 'running', ms: 6_000, text: '6 秒' },
+  ])
+
+  // run 自己的用时：plannedAt → at（进行中按 at 计入）。
+  assert.deepEqual(detail.duration, { startAt: 1_000, endAt: at, ms: 9_000, text: '9 秒', state: 'running' })
+
+  // 客户端同一批任务走同一份 shared 算法：整个角色行（含 duration）逐字段相等。
+  const client = roleUsageOf(detail.tasks, [])
+  assert.deepEqual(client.map((row) => row.duration), detail.roles.map((role) => role.duration))
+  assert.equal(client[0]?.duration?.text, detail.roles[0]?.duration?.text)
+})
+
+/* ─────────────── r21：修订 / 作废事实投影到 TaskDetailView（缺席不补） ─────────────── */
+
+test('r21：历史 run 详情透传修订/作废五字段；没发生过的任务保持字段缺席（不补 0/空串）', () => {
+  const at = 10_000
+  const state = stateOf({
+    plan: {
+      tasks: [
+        taskOf('t1', { status: 'ready', revisedAt: 2_000, revisionNote: '导出改成 CSV' }),
+        taskOf('t2', { status: 'cancelled', cancelledAt: 3_000, cancelReason: '被新需求替换', cancelledBy: 'revision' }),
+        taskOf('t3', { status: 'done' }),
+        // 旧数据：有时刻但没有说明文本 —— 说明文本必须缺席，而不是空串。
+        taskOf('t4', { status: 'ready', revisedAt: 4_000, revisionNote: '' }),
+        taskOf('t5', { status: 'cancelled', cancelledAt: 5_000, cancelReason: '', cancelledBy: 'user' }),
+      ],
+    },
+  })
+  const [revised, cancelled, plain, noteMissing, reasonMissing] = runDetailOf(state, at).tasks
+
+  assert.equal(revised.revisedAt, 2_000)
+  assert.equal(revised.revisionNote, '导出改成 CSV')
+  assert.equal('cancelledAt' in revised, false, '只修订过的任务不得带作废字段')
+  assert.equal(cancelled.cancelledAt, 3_000)
+  assert.equal(cancelled.cancelReason, '被新需求替换')
+  assert.equal(cancelled.cancelledBy, 'revision')
+  assert.equal('revisedAt' in cancelled, false, '只作废的任务不得带修订字段')
+
+  // 没发生过 = 键不存在（客户端已按可选渲染「未修订」；补 0 会把「没记录」装成「发生过」）。
+  for (const key of ['revisedAt', 'revisionNote', 'cancelledAt', 'cancelReason', 'cancelledBy']) {
+    assert.equal(key in plain, false, `未修订/未作废的任务不应有 ${key}`)
+  }
+  assert.equal(noteMissing.revisedAt, 4_000)
+  assert.equal('revisionNote' in noteMissing, false, '空说明不投影为空串')
+  assert.equal(reasonMissing.cancelledAt, 5_000)
+  assert.equal('cancelReason' in reasonMissing, false, '空原因不投影为空串')
+})
+
+test('r20：历史行用时 —— 客户端派生与宿主 durationOfSummary 同一夹具逐字一致（含旧数据降级）', () => {
+  const at = 10_000
+  const summaries: RunSummary[] = [
+    // 缺 plannedAt 的旧摘要（只有 fake store 能造出来：load 会把 plannedAt 补成 plan.createdAt）
+    { runId: 'r-no-planned', sessionId: 's1', createdAt: 900, status: 'terminated', tasks: 1, done: 1, project: WORKSPACE },
+    // 终态但缺 finishedAt（历史宿主未落盘）→ 不可得
+    { runId: 'r-no-end', sessionId: 's1', createdAt: 950, status: 'terminated', tasks: 1, done: 1, project: WORKSPACE, plannedAt: 1_000 },
+    // done：plannedAt → finishedAt
+    { runId: 'r-done', sessionId: 's1', createdAt: 960, status: 'terminated', tasks: 1, done: 1, project: WORKSPACE, plannedAt: 1_000, finishedAt: 4_000 },
+    // running：plannedAt → at
+    { runId: 'r-running', sessionId: 's1', createdAt: 970, status: 'dispatching', tasks: 1, done: 0, project: WORKSPACE, plannedAt: 1_000 },
+  ]
+  const view = buildLibrary({
+    store: { list: () => summaries, load: () => null },
+    workspace: WORKSPACE,
+    now: () => at,
+    publicMemories: () => [],
+    projectMemories: () => [],
+  })
+  const hostRows = new Map(view.projects.flatMap((project) => project.recentRuns).map((row) => [row.runId, row]))
+  assert.equal(hostRows.size, 4)
+
+  for (const summary of summaries) {
+    const hostRow = hostRows.get(summary.runId)
+    assert.ok(hostRow, `${summary.runId} 必须出现在项目行里`)
+    const clientRow = runSummaryRowOf(summary, at)
+    // 行视图把单元格摊平为 durationText / durationState（客户端不重算，只搬运）。
+    assert.equal(clientRow.durationText, hostRow.duration?.text, `${summary.runId}：可见文本逐字相等`)
+    assert.equal(clientRow.durationState, hostRow.duration?.state, `${summary.runId}：状态与宿主同值`)
+    assert.ok(clientRow.durationTitle.length > 0, `${summary.runId}：title 必须解释口径`)
+  }
+
+  assert.deepEqual(hostRows.get('r-no-planned')?.duration, { state: 'unavailable', text: '不可得' })
+  assert.deepEqual(hostRows.get('r-no-end')?.duration, { state: 'unavailable', text: '不可得' })
+  assert.deepEqual(hostRows.get('r-done')?.duration, { startAt: 1_000, endAt: 4_000, ms: 3_000, text: '3 秒', state: 'done' })
+  assert.deepEqual(hostRows.get('r-running')?.duration, { startAt: 1_000, endAt: at, ms: 9_000, text: '9 秒', state: 'running' })
 })
 
 test('AC-5：flowOf 节点带上角色名与 roleId（客户端按角色分列的唯一依据）', () => {

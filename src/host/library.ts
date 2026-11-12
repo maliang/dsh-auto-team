@@ -35,8 +35,11 @@ import type {
   UsageCell,
 } from '../shared/types.ts'
 import { roleStateOf, roleUsageCellOf } from '../shared/role-view.ts'
-import { durationCellOf, usageCellOf } from './format.ts'
-import type { RunState } from './store.ts'
+// 只 import **类型**：adapters 是宿主 API 的唯一入口，library 不该在装配层之外碰 ctx。
+// host→host 的类型 import 不产生运行期依赖，也不会成环（adapters 不 import library）。
+import type { HostWorkspaceEntry } from './adapters.ts'
+import { durationCellOf, taskDurationCellOf, usageCellOf } from './format.ts'
+import { finishedAtOf, type RunState } from './store.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
 import { pendingViewOf } from './team/confirm.ts'
 import { runUsageOf, taskUsageOf } from './team/usage.ts'
@@ -75,6 +78,17 @@ export interface LibraryDeps {
    * 不传也能用（退化为 5s TTL 缓存），但 100 run 时冷/热判据靠它（AC-23）。
    */
   runsDir?: string
+  /**
+   * 宿主工作区注册表（r19，可选）：项目名的**真源**。
+   *
+   * 为什么需要：run 落盘时记录的 `project` 在桌面宿主里可能是 profile 目录
+   * （`~/.dsh/profiles/desktop`），basename 展示就是 `desktop`；用户自己改名后的
+   * 工作区标题（`nengtan` / `tuoluojiang`）只存在宿主的 registry 里。
+   * 另外 `sessionIds` 能把老 run（project 写歪）按会话 id 反查回真实工作区。
+   *
+   * 缺省 = 完全旧行为（路径 basename 展示、project 原样分桶），单测与旧宿主都走这条。
+   */
+  workspaces?: () => HostWorkspaceEntry[]
 }
 
 /**
@@ -122,6 +136,9 @@ function knownWorkspaces(deps: LibraryDeps): string[] {
   }
   push(deps.workspace)
   for (const summary of deps.store.list()) push(summary.project)
+  // r19：项目桶的 path 现在可能是 registry 的工作区路径（老 run 的 project 写的是 profile 目录，
+  // 按 sessionId 映射后桶路径变成真实工作区）——记忆读口必须认它，否则点项目记忆会 403。
+  for (const entry of deps.workspaces?.() ?? []) push(entry.path)
   return out
 }
 
@@ -138,7 +155,12 @@ export function buildLibrary(deps: LibraryDeps, query: LibraryQuery = {}): Libra
     projects: groupProjects(deps, summaries, at),
     global: { memories: deps.publicMemories().slice(0, MEMORY_INDEX_LIMIT) },
     currentProject: (deps.workspace ?? '').trim(),
-    runs: summaries.slice(0, HISTORY_PAGE_SIZE),
+    // r17：历史页在 snapshot 缺席时会退回本列表（`props.snapshot?.runs ?? props.library?.runs`），
+    // 所以这里必须与 `bridge.historyOf` 派生同一份 `UsageCell`（`text` + 六项 `details`）；
+    // 否则同一条 run 在两条链路上一个有六项、一个只有合计。只派生不落盘。
+    runs: summaries
+      .slice(0, HISTORY_PAGE_SIZE)
+      .map((summary) => ({ ...summary, usage: usageCellOf(summary.usageTotals, NO_USAGE_REASON) })),
   }
   const runId = (query.runId ?? '').trim()
   if (runId !== '') {
@@ -216,7 +238,10 @@ export function runDetailOf(
     flow: flowOf(tasks),
   }
   if (state.project !== undefined) detail.project = state.project
-  if (state.finishedAt !== undefined) detail.finishedAt = state.finishedAt
+  // r21：终止原因与结束时刻同源落盘（旧 run 文件没有该字段 → 字段缺席，客户端显示不可得）。
+  if (state.termination !== undefined) detail.terminationReason = state.termination.reason
+  const finishedAt = finishedAtOf(state)
+  if (finishedAt !== undefined) detail.finishedAt = finishedAt
   const pending = pendingViewOf(state.pendingConfirmation, at)
   if (pending !== undefined) detail.pendingConfirmation = pending
   return detail
@@ -225,28 +250,32 @@ export function runDetailOf(
 /** run 级用时：`plannedAt → finishedAt`；进行中用 now，终态却缺结束时刻记「不可得」。 */
 export function runDurationOf(state: RunState | null, at: number): DurationCell {
   if (state === null) return durationCellOf({ state: 'unavailable', now: at })
-  const ended = state.finishedAt !== undefined
+  // r20：与 `bridge.runDurationOf` / `store.list()` 同源（落盘值优先，历史 run 走可核实回退）。
+  const endedAt = finishedAtOf(state)
+  const ended = endedAt !== undefined
   const terminal = state.plan.status === 'cancelled' || state.plan.status === 'terminated'
   if (!ended && terminal) return durationCellOf({ startAt: state.plannedAt, state: 'unavailable', now: at })
   return durationCellOf({
     startAt: state.plannedAt,
-    ...(ended ? { endAt: state.finishedAt } : {}),
+    ...(ended ? { endAt: endedAt } : {}),
     state: ended ? 'done' : 'running',
     now: at,
   })
 }
 
-/** 任务级用时：无起点 = 「未开始」（不是 0 秒）；有起点无终点且未终态 = 进行中。 */
+/**
+ * 任务级用时（r24）：判定与 `bridge.taskDurationsOf` 共用 `taskDurationCellOf`，两处不得漂移。
+ *
+ * 已结束（done/skipped/cancelled）但缺起止记录 → 不可得 + 原因（旧 run 早于记录上线）；
+ * 只有确实没开始的 pending/blocked 才显示「未开始」。
+ */
 export function taskDurationOf(state: RunState, task: PlanTask, at: number): DurationCell {
   const time = state.taskTimes?.[task.id]
-  const startAt = time?.startedAt
-  const endAt = time?.endedAt
-  const finished = endAt !== undefined || isTerminalTaskStatus(task.status)
-  const cellState = startAt === undefined ? 'not-started' : finished ? 'done' : 'running'
-  return durationCellOf({
-    ...(startAt === undefined ? {} : { startAt }),
-    ...(endAt === undefined ? {} : { endAt }),
-    state: cellState,
+  return taskDurationCellOf({
+    status: task.status,
+    ...(time?.startedAt === undefined ? {} : { startedAt: time.startedAt }),
+    ...(time?.endedAt === undefined ? {} : { endedAt: time.endedAt }),
+    terminal: isTerminalTaskStatus(task.status),
     now: at,
   })
 }
@@ -274,6 +303,13 @@ function taskDetailOf(
   if (task.evidence !== undefined) view.evidence = task.evidence
   if (task.attempts !== undefined) view.attempts = task.attempts
   if (task.waitReason !== undefined) view.waitReason = task.waitReason
+  // r21 修订/作废事实：发生过才存在。旧 run 文件没有这些键 → 字段缺席，客户端显示「未修订」，
+  // 这里不得补 0 / 空串（那会把「没记录」伪装成「没发生」）。
+  if (task.revisedAt !== undefined) view.revisedAt = task.revisedAt
+  if (task.revisionNote !== undefined && task.revisionNote !== '') view.revisionNote = task.revisionNote
+  if (task.cancelledAt !== undefined) view.cancelledAt = task.cancelledAt
+  if (task.cancelReason !== undefined && task.cancelReason !== '') view.cancelReason = task.cancelReason
+  if (task.cancelledBy !== undefined) view.cancelledBy = task.cancelledBy
   return view
 }
 
@@ -385,27 +421,77 @@ export function flowOf(tasks: TaskDetailView[]): FlowView {
 /* ───────────────────────────── 项目分组 ───────────────────────────── */
 
 interface ProjectBucket {
+  /** 已知项目 = `resolve()` 后的绝对路径；历史桶 = undefined。 */
   path: string | undefined
+  /** 用户命名的工作区标题（registry 命中时才有）；展示名优先于 basename。 */
+  title?: string
   summaries: RunSummary[]
   unknown: boolean
 }
 
+/** 分桶键归一：`resolve()` 去掉尾斜杠与 `./`，同一工作区的新旧 run 才落进同一个桶。 */
+function bucketKeyOf(path: string | undefined): string {
+  const text = (path ?? '').trim()
+  return text === '' ? '' : resolve(text)
+}
+
+/**
+ * 项目分组（r19 修正命名与归属）。
+ *
+ * 每个 summary 的**有效工作区**按优先级取：
+ *   ① `summary.project` 命中 registry 的 path（历史写对了的 run）；
+ *   ② registry 按 `sessionId` 反查（project 写成 profile 目录的老 run）；
+ *   ③ 都没有 → 沿用 `summary.project`（旧行为：按 basename 展示；空 = 历史桶）。
+ *
+ * 桶键一律用**解析后的 path**：同一个工作区的「旧 run（project=profile）」与
+ * 「新 run（project=workspace）」必须合并成一行，否则用户会看到两个同名项目。
+ */
 function groupProjects(deps: LibraryDeps, summaries: RunSummary[], at: number): ProjectView[] {
   const buckets = new Map<string, ProjectBucket>()
-  const bucketFor = (path: string | undefined, unknown: boolean): ProjectBucket => {
-    const key = unknown ? UNKNOWN_PROJECT_ID : (path ?? '').trim()
+  const bucketFor = (path: string | undefined, unknown: boolean, title?: string): ProjectBucket => {
+    const resolved = bucketKeyOf(path)
+    const key = unknown ? UNKNOWN_PROJECT_ID : resolved
     const existing = buckets.get(key)
-    if (existing !== undefined) return existing
-    const created: ProjectBucket = { path: unknown ? undefined : path, summaries: [], unknown }
+    if (existing !== undefined) {
+      // 先到先得：registry 的持久顺序就是用户的期望顺序，后到的同路径条目不该改名。
+      if (existing.title === undefined && title !== undefined) existing.title = title
+      return existing
+    }
+    const created: ProjectBucket = {
+      path: unknown ? undefined : (resolved !== '' ? resolved : path),
+      ...(unknown || title === undefined ? {} : { title }),
+      summaries: [],
+      unknown,
+    }
     buckets.set(key, created)
     return created
   }
 
+  // registry 索引：path → 实体（canonical path）、sessionId → 实体。服务缺失 = 两张空表。
+  const byPath = new Map<string, HostWorkspaceEntry>()
+  const bySession = new Map<string, HostWorkspaceEntry>()
+  for (const entry of deps.workspaces?.() ?? []) {
+    const key = bucketKeyOf(entry.path)
+    if (key !== '' && !byPath.has(key)) byPath.set(key, entry)
+    for (const sessionId of entry.sessionIds) {
+      const id = (sessionId ?? '').trim()
+      if (id !== '' && !bySession.has(id)) bySession.set(id, entry)
+    }
+  }
+
   // 当前工作区必须始终在列（哪怕它一次都没跑过）：否则「切回项目」找不到入口。
-  bucketFor(deps.workspace, false)
+  bucketFor(deps.workspace, false, byPath.get(bucketKeyOf(deps.workspace))?.title)
   for (const summary of summaries) {
     const project = (summary.project ?? '').trim()
-    bucketFor(project === '' ? undefined : project, project === '').summaries.push(summary)
+    // ① project 命中优先：已记录正确路径的 run 不许被 sessionId 映射拉回旧工作区。
+    const entry = (project === '' ? undefined : byPath.get(bucketKeyOf(project))) ?? bySession.get(summary.sessionId)
+    const projectless = project === ''
+    if (projectless && entry === undefined) {
+      // 无 project 且无会话映射 = 历史运行，语义不变。
+      bucketFor(undefined, true).summaries.push(summary)
+      continue
+    }
+    bucketFor(entry?.path ?? project, false, entry?.title).summaries.push(summary)
   }
 
   const known: ProjectView[] = []
@@ -433,7 +519,8 @@ function projectViewOf(deps: LibraryDeps, bucket: ProjectBucket, at: number): Pr
   }
   const view: ProjectView = {
     id: bucket.unknown ? UNKNOWN_PROJECT_ID : (bucket.path ?? ''),
-    name: bucket.unknown ? UNKNOWN_PROJECT_NAME : projectNameOf(bucket.path),
+    // r19：标题（用户命名）优先；没有 registry 时退回 basename（旧行为逐字不变）。
+    name: bucket.unknown ? UNKNOWN_PROJECT_NAME : (bucket.title ?? projectNameOf(bucket.path)),
     runs: runs.length,
     usage: usageCellOf(total, NO_USAGE_REASON),
     recentRuns: runs.slice(0, PROJECT_RUN_LIMIT).map((summary) => projectRunViewOf(summary, at)),

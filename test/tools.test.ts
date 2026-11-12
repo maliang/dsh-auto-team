@@ -35,7 +35,13 @@ interface Harness {
   tools: Map<string, ToolSpec>
 }
 
-function setup(options: { enabled?: boolean; workspace?: string } = {}): Harness {
+function setup(
+  options: {
+    enabled?: boolean
+    workspace?: string
+    workspaceOf?: (sessionId: string) => string | undefined
+  } = {},
+): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'auto-team-t3-'))
   const store = new RunsStore(join(dir, 'runs'))
   // 这些用例只走 plan/add_tasks，不需要完整 Bridge；能答 enabled 即可。
@@ -47,6 +53,7 @@ function setup(options: { enabled?: boolean; workspace?: string } = {}): Harness
     now: () => NOW,
     // 缺省不传 workspace：旧装配/旧夹具必须保持「不写 project」的行为（r14 AC-18 的可选字段）。
     ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+    ...(options.workspaceOf === undefined ? {} : { workspaceOf: options.workspaceOf }),
   })
   return { dir, store, specs, tools: new Map(specs.map((spec) => [spec.name, spec])) }
 }
@@ -258,6 +265,54 @@ test('r14 AC-14：装配层注入 workspace 时 plan 落盘写 project；未注�
     tasks: [{ title: '另一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
   })
   assert.equal(without.store.load(String(second.runId))?.project, undefined)
+})
+
+test('r19：workspaceOf 存在时 project=会话 cwd（不是装配 cwd）', async () => {
+  const fallback = '/Users/maliang/.dsh/profiles/desktop'
+  const sessionCwd = '/Users/maliang/Documents/develop/guangdahehui/nengtan'
+  const h = setup({
+    workspace: fallback,
+    workspaceOf: (sessionId) => {
+      assert.equal(sessionId, SESSION, '必须按真实会话 id 取（宿主的会话只在 agent.id 上）')
+      return sessionCwd
+    },
+  })
+
+  const result = await call(h, 'auto_team_plan', {
+    goal: '按会话 cwd 归项目',
+    tasks: [{ title: '一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
+  })
+  assert.equal(result.ok, true)
+  assert.equal(h.store.load(String(result.runId))?.project, sessionCwd)
+})
+
+test('r19：workspaceOf 返回 undefined / 空串时回退到装配 workspace（旧行为）', async () => {
+  const fallback = '/tmp/proj-r19-fallback'
+  for (const value of [undefined, '   ']) {
+    const h = setup({ workspace: fallback, workspaceOf: () => value })
+    const result = await call(h, 'auto_team_plan', {
+      goal: '回退兜底',
+      tasks: [{ title: '一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
+    })
+    assert.equal(result.ok, true)
+    assert.equal(h.store.load(String(result.runId))?.project, fallback)
+  }
+})
+
+test('r19：workspaceOf 抛错不崩，回退到装配 workspace（一次计划落盘不能因宿主读不到工作区而失败）', async () => {
+  const fallback = '/tmp/proj-r19-throw'
+  const h = setup({
+    workspace: fallback,
+    workspaceOf: () => {
+      throw new Error('registry gone')
+    },
+  })
+  const result = await call(h, 'auto_team_plan', {
+    goal: '读不到也要能落计划',
+    tasks: [{ title: '一件小事', roleId: 'dev', acceptance: 'pnpm typecheck' }],
+  })
+  assert.equal(result.ok, true)
+  assert.equal(h.store.load(String(result.runId))?.project, fallback)
 })
 
 test('AC-9/AC-11：add_tasks 幂等 —— 连调两次 added=0、tasks 与 runId 不变', async () => {

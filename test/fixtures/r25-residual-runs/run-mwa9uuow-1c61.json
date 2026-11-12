@@ -1,0 +1,204 @@
+{
+  "__fixture": "从真实 run 冻结的未收口形态（2026-11-12 15:01 前现场），仅用于回归；不得随宿主现场变化更新。",
+  "version": 3,
+  "plan": {
+    "runId": "run-mwa9uuow-1c61",
+    "sessionId": "session-b6814f6b-61ad-432e-bdb3-5c83a1b76003",
+    "createdAt": 1794289862624,
+    "status": "draft",
+    "tasks": [
+      {
+        "id": "t1",
+        "title": "前端：抽屉记录合并为唯一列表（去页签/去聚合表，保留图表与汇总）",
+        "roleId": "frontend",
+        "dependsOn": [],
+        "acceptance": "cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && ! grep -q \"相邻桶差值\" src/components/MeterDataDrawer.vue && ! grep -q \"el-tab-pane\" src/components/MeterDataDrawer.vue && npx vite build",
+        "status": "done",
+        "writeScopes": [
+          "client-web/src/components/MeterDataDrawer.vue",
+          "client-web/src/components/MeterRawReadings.vue"
+        ],
+        "memberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+        "attempts": 0,
+        "evidence": {
+          "taskId": "t1",
+          "command": "cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && ! grep -q \"相邻桶差值\" src/components/MeterDataDrawer.vue && ! grep -q \"el-tab-pane\" src/components/MeterDataDrawer.vue && npx vite build",
+          "exitCode": 0,
+          "tail": "gzip:   4.09 kB\ndist/assets/SystemOrg-7a5756dc.js                    8.50 kB │ gzip:   3.80 kB\ndist/assets/CarbonStat-e8cee7fa.js                   8.56 kB │ gzip:   4.61 kB\ndist/assets/EnergyOptimize-3582cba9.js               9.03 kB │ gzip:   4.73 kB\ndist/assets/User-0c147d08.js                         9.11 kB │ gzip:   3.43 kB\ndist/assets/CarbonLabel-b7de3328.js                  9.40 kB │ gzip:   4.10 kB\ndist/assets/index-e05ebc05.js                        9.58 kB │ gzip:   3.42 kB\ndist/assets/PlanVsActual-6b8a8c7c.js                 9.67 kB │ gzip:   3.87 kB\ndist/assets/EnergyRealtime-270843a9.js               9.68 kB │ gzip:   4.42 kB\ndist/assets/SystemRecalc-a0614c07.js                 9.99 kB │ gzip:   4.81 kB\ndist/assets/Cems-d1131f01.js                        10.39 kB │ gzip:   4.21 kB\ndist/assets/SystemFactors-4d513181.js               10.61 kB │ gzip:   5.52 kB\ndist/assets/ModelComponents-fdbee403.js             11.08 kB │ gzip:   4.99 kB\ndist/assets/EnergyBudget-d6c8c8dc.js                11.62 kB │ gzip:   5.03 kB\ndist/assets/index-444d17c8.js                       11.72 kB │ gzip:   4.35 kB\ndist/assets/index-fb2ccfee.js                       11.93 kB │ gzip:   4.10 kB\ndist/assets/index-36c28c5e.js                       12.75 kB │ gzip:   5.33 kB\ndist/assets/CarbonAudit-50e657b3.js                 13.12 kB │ gzip:   4.78 kB\ndist/assets/BigScreen-e366b2fd.js                   14.22 kB │ gzip:   5.60 kB\ndist/assets/EnergyIntensity-46d01622.js             14.64 kB │ gzip:   6.25 kB\ndist/assets/SupplyChain-ec365d25.js                 15.21 kB │ gzip:   4.88 kB\ndist/assets/index-e1c50635.js                       15.22 kB │ gzip:   5.57 kB\ndist/assets/MeterDataDrawer-4ee17167.js             15.36 kB │ gzip:   6.72 kB\ndist/assets/Alerts-751b2bed.js                      15.90 kB │ gzip:   6.35 kB\ndist/assets/WorkArea-bbf32ec3.js                    16.03 kB │ gzip:   6.63 kB\ndist/assets/Dashboard-93cda4f6.js                   16.76 kB │ gzip:   8.33 kB\ndist/assets/EnergyBalance-a6935865.js               17.71 kB │ gzip:   7.86 kB\ndist/assets/index-0f0f7860.js                       19.40 kB │ gzip:   7.10 kB\ndist/assets/DistributionRoom-8c89a5b9.js            22.90 kB │ gzip:   8.63 kB\ndist/assets/EnergyFlowSankey-b032b058.js            22.94 kB │ gzip:   9.25 kB\ndist/assets/SystemAiConfig-31731e92.js              23.76 kB │ gzip:   9.44 kB\ndist/assets/EnergyStat-279aa243.js                  23.91 kB │ gzip:   9.97 kB\ndist/assets/CarbonLedger-efd9fd6b.js                24.50 kB │ gzip:  10.30 kB\ndist/assets/PowerQuality-030d3445.js                26.15 kB │ gzip:   9.58 kB\ndist/assets/customParseFormat-60c9d948.js           27.66 kB │ gzip:  10.39 kB\ndist/assets/index-68906999.js                       27.73 kB │ gzip:   9.70 kB\ndist/assets/index-8c476268.js                       29.42 kB │ gzip:   9.78 kB\ndist/assets/index-4828ec48.js                       32.13 kB │ gzip:  10.95 kB\ndist/assets/SystemEnergyConfig-a9c22c62.js          33.22 kB │ gzip:  12.40 kB\ndist/assets/IotManage-546f9082.js                   46.98 kB │ gzip:  17.26 kB\ndist/assets/index-60c09df4.js                       48.49 kB │ gzip:  17.30 kB\ndist/assets/index-c5f52032.js                       65.29 kB │ gzip:  17.67 kB\ndist/assets/MainLayout-23ab6692.js                  68.95 kB │ gzip:  37.51 kB\ndist/assets/SystemIntegration-d74042f7.js           73.83 kB │ gzip:  24.58 kB\ndist/assets/index-9a97d977.js                       81.03 kB │ gzip:  28.10 kB\ndist/assets/index-f8ae8c8e.js                      329.75 kB │ gzip: 104.55 kB\ndist/assets/echarts-3d24349b.js                    564.49 kB │ gzip: 189.85 kB\n\n(!) Some chunks are larger than 500 kBs after minification. Consider:\n- Using dynamic import() to code-split the application\n- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks\n- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.\n✓ built in 6.60s\n",
+          "artifacts": [
+            "/Users/maliang/Documents/develop/guangdahehui/nengtan/.auto-team/artifacts/t1.log"
+          ],
+          "at": 1794290737513
+        }
+      },
+      {
+        "id": "t2",
+        "title": "QA：抽屉“唯一列表 + 首屏可见”验收（含反例自证）",
+        "roleId": "qa",
+        "dependsOn": [
+          "t1"
+        ],
+        "acceptance": "cd /Users/maliang/Documents/develop/guangdahehui/nengtan && test -f .screenshots/verify-drawer-single.cjs && node .screenshots/verify-drawer-single.cjs",
+        "status": "rework",
+        "writeScopes": [
+          ".screenshots"
+        ],
+        "attempts": 1,
+        "evidence": {
+          "taskId": "t2",
+          "command": "cd /Users/maliang/Documents/develop/guangdahehui/nengtan && test -f .screenshots/verify-drawer-single.cjs && node .screenshots/verify-drawer-single.cjs",
+          "exitCode": 1,
+          "tail": "\nFAIL：fetch failed\n",
+          "artifacts": [
+            "/Users/maliang/Documents/develop/guangdahehui/nengtan/.auto-team/artifacts/t2.log"
+          ],
+          "at": 1794291373499
+        }
+      }
+    ],
+    "maxConcurrent": 2,
+    "goal": "按主人最新口径重做表计「数据」抽屉：不要页签、不要第二张表，所有记录合并成唯一一张列表（时间 / 时段（尖峰平谷总）/ 上次原始值 / 当前原始值 / 本次用量 / 数据质量 + 分页），图表与汇总保留在列表上方，粒度选择只影响图表与汇总。"
+  },
+  "plannedAt": 1794289862624,
+  "messages": [
+    {
+      "at": 1794289863062,
+      "from": "captain",
+      "to": "frontend-t1-r9vi3s-2",
+      "body": "任务「前端：抽屉记录合并为唯一列表（去页签/去聚合表，保留图表与汇总）」已派发给你（角色 前端工程师）。验收判定：cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && ! grep -q \"相邻桶差值\" src/components/MeterDataDrawer.vue && ! grep -q \"el-tab-pane\" src/components/MeterDataDrawer.vue && npx vite build",
+      "messageId": "msg-1794289863062-22",
+      "toMemberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "taskId": "t1"
+    },
+    {
+      "at": 1794290078991,
+      "from": "captain",
+      "to": "user",
+      "body": "已暂停本次运行：冻结 1 个任务（在跑的成员不会被中断，门禁/恢复/派发暂停受理）",
+      "messageId": "msg-1794290078991-4"
+    },
+    {
+      "at": 1794290085658,
+      "from": "captain",
+      "to": "user",
+      "body": "已继续：1 个任务按暂停前的原状态还原，计划状态 paused → draft",
+      "messageId": "msg-1794290085658-5"
+    },
+    {
+      "at": 1794290096662,
+      "from": "captain",
+      "to": "user",
+      "body": "已暂停本次运行：冻结 1 个任务（在跑的成员不会被中断，门禁/恢复/派发暂停受理）",
+      "messageId": "msg-1794290096662-6"
+    },
+    {
+      "at": 1794290106128,
+      "from": "captain",
+      "to": "user",
+      "body": "已继续：1 个任务按暂停前的原状态还原，计划状态 paused → draft",
+      "messageId": "msg-1794290106128-7"
+    },
+    {
+      "at": 1794290745102,
+      "from": "member",
+      "to": "captain",
+      "body": "门禁通过：任务「前端：抽屉记录合并为唯一列表（去页签/去聚合表，保留图表与汇总）」（退出码 0）｜证据：exit=0 gzip:   4.09 kB\ndist/assets/SystemOrg-7a5756dc.js                    8.50 kB │ gzip:   3.80 kB\ndist/assets/CarbonStat-e8cee7fa.js                   8.56 kB │ gzip:   4.61 kB\ndist/assets/EnergyOptimize-3582cba9.js               9.03 kB │ gzip:   4.73 kB\ndist/assets/User-0c147d08.js                         9.11 kB │ gzip:   3.43 kB\ndist/assets/CarbonLabel-b7de3328.js                  9.40 kB │ gzip:   4.10 kB\ndist/assets/index-e05ebc05.js                        9.58 kB │ gzip:   3.42 kB\ndist/assets/PlanVsActual-6b8a8c7c.js                 9.67 kB │ gzip:   3.87 kB\ndist/assets/EnergyRealtime-270843a9.js               9.68 kB │ gzip:   4.42 kB\ndist/assets/SystemRecalc-a0614c07.js                 9.99 kB │ gzip:   4.81 kB\ndist/assets/Cems-d1131f01.js                        10.39 kB │ gzip:   4.21 kB\ndist/assets/SystemFactors-4d513181.js               10.61 kB │ gzip:   5.52 kB\ndist/assets/ModelComponents-fdbee403.js             11.08 kB │ gzip:   4.99 kB\ndist/assets/EnergyBudget-d6c8c8dc.js                11.62 kB │ gzip:   5.03 kB\ndist/assets/index-444d17c8.js                       11.72 kB │ gzip:   4.35 kB\ndist/assets/index-fb2ccfee.js                       11.93 kB │ gzip:   4.10 kB\ndist/assets/index-36c28c5e.js                       12.75 kB │ gzip:   5.33 kB\ndist/assets/CarbonAudit-50e657b3.js                 13.12 kB │ gzip:   4.78 kB\ndist/assets/BigScreen-e366b2fd.js                   14.22 kB │ gzip:   5.60 kB\ndist/assets/EnergyIntensity-46d01622.js             14.64 kB │ gzip:   6.25 kB\ndist/assets/SupplyChain-ec365d25.js                 15.21 kB │ gzip:   4.88 kB\ndist/assets/index-e1c50635.js                       15.22 kB │ gzip:   5.57 kB\ndist/assets/MeterDataDrawer-4ee17167.js             15.36 kB │ gzip:   6.72 kB\ndist/assets/Alerts-751b2bed.js                      15.90 kB │ gzip:   6.35 kB\ndist/assets/WorkArea-bbf32ec3.js                    16.03 kB │ gzip:   6.63 kB\ndist/assets/Dashboard-93cda4f6.js                   16.76 kB │ gzip:   8.33 kB\ndist/assets/EnergyBalance-a6935865.js               17.71 kB │ gzip:   7.86 kB\ndist/assets/index-0f0f7860.js                       19.40 kB │ gzip:   7.10 kB\ndist/assets/DistributionRoom-8c89a5b9.js            22.90 kB │ gzip:   8.63 kB\ndist/assets/EnergyFlowSankey-b032b058.js            22.94 kB │ gzip:   9.25 kB\ndist/assets/SystemAiConfig-31731e92.js              23.76 kB │ gzip:   9.44 kB\ndist/assets/EnergyStat-279aa243.js                  23.91 kB │ gzip:   9.97 kB\ndist/assets/CarbonLedger-efd9fd6b.js                24.50 kB │ gzip:  10.30 kB\ndist/assets/PowerQuality-030d3445.js                26.15 kB │ gzip:   9.58 kB\ndist/assets/customParseFormat-60c9d948.js           27.66 kB │ gzip:  10.39 kB\ndist/assets/index-68906999.js                       27.73 kB │ gzip:   9.70 kB\ndist/assets/index-8c476268.js                       29.42 kB │ gzip:   9.78 kB\ndist/assets/index-4828ec48.js                       32.13 kB │ gzip:  10.95 kB\ndist/assets/SystemEnergyConfig-a9c22c62.js          33.22 kB │ gzip:  12.40 kB\ndist/assets/IotManage-546f9082.js                   46.98 kB │ gzip:  17.26 kB\ndist/assets/index-60c09df4.js                       48.49 kB │ gzip:  17.30 kB\ndist/assets/index-c5f52032.js                       65.29 kB │ gzip:  17.67 kB\ndist/assets/MainLayout-23ab6692.js                  68.95 kB │ gzip:  37.51 kB\ndist/assets/SystemIntegration-d74042f7.js           73.83 kB │ gzip:  24.58 kB\ndist/assets/index-9a97d977.js                       81.03 kB │ gzip:  28.10 kB\ndist/assets/index-f8ae8c8e.js                      329.75 kB │ gzip: 104.55 kB\ndist/assets/echarts-3d24349b.js                    564.49 kB │ gzip: 189.85 kB\n\n(!) Some chunks are larger than 500 kBs after minification. Consider:\n- Using dynamic import() to code-split the application\n- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks\n- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.\n✓ built in 6.60s\n",
+      "messageId": "msg-1794290745102-24",
+      "toMemberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "taskId": "t1"
+    },
+    {
+      "at": 1794290745102,
+      "from": "peer",
+      "to": "task:t2",
+      "taskId": "t2",
+      "body": "【上游直投】t1 前端：抽屉记录合并为唯一列表（去页签/去聚合表，保留图表与汇总） 已通过门禁\n命令：cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && ! grep -q \"相邻桶差值\" src/components/MeterDataDrawer.vue && ! grep -q \"el-tab-pane\" src/components/MeterDataDrawer.vue && npx vite build\n退出码：0\n证据尾部（≤800 字）：\n（前文已截断，仅保留末 800 字）\n32.js                       65.29 kB │ gzip:  17.67 kB\ndist/assets/MainLayout-23ab6692.js                  68.95 kB │ gzip:  37.51 kB\ndist/assets/SystemIntegration-d74042f7.js           73.83 kB │ gzip:  24.58 kB\ndist/assets/index-9a97d977.js                       81.03 kB │ gzip:  28.10 kB\ndist/assets/index-f8ae8c8e.js                      329.75 kB │ gzip: 104.55 kB\ndist/assets/echarts-3d24349b.js                    564.49 kB │ gzip: 189.85 kB\n\n(!) Some chunks are larger than 500 kBs after minification. Consider:\n- Using dynamic import() to code-split the application\n- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks\n- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.\n✓ built in 6.60s\n\n产物：/Users/maliang/Documents/develop/guangdahehui/nengtan/.auto-team/artifacts/t1.log",
+      "messageId": "handoff:t1->t2"
+    },
+    {
+      "at": 1794290768255,
+      "from": "captain",
+      "to": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "toMemberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "body": "【追加任务（计划 t2 由你接力，QA 成员名额已满无法新建）】请把「唯一列表」这件事做端到端 QA 取证\n\n你刚交付的 t1 已过门禁。现在需要独立验收：写 `.screenshots/verify-drawer-single.cjs` 并跑通。\n\n## 环境（你自己刚起的，继续用）\n- 后端 8081（JDK8）、前端 5199（`APP_BASE=http://localhost:5199`）、账号 demoadmin / 888888\n- 演示库读数截止 2026-11-05；默认「小时」窗口可能空态，取证需要数据时切「天」粒度并在报告里说明\n\n## 断言清单（逐条 PASS/FAIL，输出 `.screenshots/verify-drawer-single.json`）\n1. 打开「采集与计量」→ 第一行「数据」→ 抽屉内 `.el-drawer .el-table` 数量 = 1；文本不含「相邻桶差值」「上次数值（相邻桶）」「采样点」；`.el-tabs/.el-tab-pane` = 0。\n2. **不滚动**（scrollTop=0）：`boundingBox()` 断言六个表头全在抽屉可视区内；≥5 行可见；分页可见。把坐标写进证据。\n3. 翻页 → 请求含 `page=2`、页码变 2；切 50 条/页 → 回第 1 页、渲染 50 行；`total` 与「共 N 条」一致。\n4. 切表计 → 回第 1 页；切数据类型（切到功率）→ 回第 1 页，时段列不再出现尖峰平谷。\n5. 回退场景：直插一条 `raw_value=NULL` 的 energy 行（选 2030 时间），刷新后两列显示回退值且带 `.is-fallback`；验完删除、残留 0 行。\n6. 口径回归：接口同表同窗口 `SUM(value)` 与页面「合计」比对（±0.05）；分时段汇总与接口 `by_period` 一致。\n7. 0 console error、0 个 /api 4xx-5xx。\n8. **反例自证**：`MUTATION=two-tables`（把聚合表加回来）、`MUTATION=hidden`（列表 hidden）都必须 exit=1；无变异时 exit=0。\n\n截图 `.screenshots/qa-drawer-single-firstscreen.png`（不滚动首屏）。\n\n## 交付\n把「退出码 + 每条断言结果 + 截图路径 + 未验证项」发回；门禁我提交（`node .screenshots/verify-drawer-single.cjs`）。你只允许改 `.screenshots/` 下的脚本/截图，不要再动 `client-web/src/**`（除修复本任务验收暴露的真 bug，且需在报告里说明）。",
+      "messageId": "msg-1794290768255-8"
+    },
+    {
+      "at": 1794291373670,
+      "from": "member",
+      "to": "captain",
+      "body": "返工第 1/5 次：任务「QA：抽屉“唯一列表 + 首屏可见”验收（含反例自证）」未通过门禁，请按证据修改后再次回报。QA 独立复核：20/20 通过。结构（抽屉内 .el-table=1、无「相邻桶差值/上次数值（相邻桶）/采样点」、.el-tabs=0）；不滚动首屏（表头 482–514、12 行可见、分页 702–736）；翻页 page=2 与 total=250 一致、切 50 条回第 1 页渲染 50 行；切表计/切数据类型回第 1 页；回退注入（raw_value=NULL，2030 时间）两列显示回退值并带 .is-fallback，验后残留 0 行；口径回归 页面合计 1231.16 = 去重口径 SQL 1231.1645（裸 SUM=1361.1645，差 130.00 是 DEDUP_CASE 正确去重）；0 console error / 0 个 API 4xx-5xx。反例自证：MUTATION=two-tables 与 MUTATION=hidden 均 exit=1，且由真实断言（表数量、表头高度）抓住而非专用守卫。｜证据：exit=1 \nFAIL：fetch failed\n",
+      "messageId": "msg-1794291373670-25",
+      "taskId": "t2"
+    },
+    {
+      "at": 1794291394249,
+      "from": "captain",
+      "to": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "toMemberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "body": "【t2 门禁未通过 —— 原因不是断言，是环境：请你把验收脚本做成自举的】\n\n门禁实跑结果：\n```\ncd /Users/maliang/Documents/develop/guangdahehui/nengtan && test -f .screenshots/verify-drawer-single.cjs && node .screenshots/verify-drawer-single.cjs\nexit=1   tail: \"FAIL：fetch failed\"\n```\n原因：你起的 8081 与 5199 已经随你的会话结束被回收（我刚探过，两个端口都 000）。门禁命令是固定的、只会执行那一行，**没有机会先跑 `start-qa-env.sh`**，所以现在这条验收是不可复现的 —— 这本身就是要修的问题：一个只能在\"作者本地恰好有服务\"时通过的验收，等于没有验收。\n\n## 请改 `.screenshots/verify-drawer-single.cjs`（只动这个脚本与相关启动脚本，不动 `client-web/src/**`）\n\n要求：**脚本自举、幂等、可重复执行**。\n\n1. 开场先做就绪探测：`GET {APP_BASE}/`（默认 `http://localhost:5199`）与 `GET http://127.0.0.1:8081/api/health`，任一不通就自己拉起：\n   - 后端：用仓库里打包好的 jar，JDK 8 起在 8081（`DB_NAME=nengtan_carbon` 之类有演示数据的库，`COLLECTOR_MODE=off`），日志写 `/tmp/qa-drawer-backend.log`；\n   - 前端：`cd client-web && npx vite --port 5199 --strictPort`，日志写 `/tmp/qa-drawer-vite.log`；\n   - 拉起后**轮询等待就绪**（最多 90 秒，每 2 秒一次，http 200 才算 ready），超时才 FAIL 并打印两个日志的最后 30 行。\n2. 若探测到端口已被别的项目占用（比如 5173/5199 属于别人）：不要 kill 别人的进程，自动换端口（如 5199→5200）并让 `APP_BASE` 跟着变，在输出里打印实际使用端口。\n3. 脚本开始与结束各打印一次\"本次用的 BASE / 后端 PID / 前端 PID\"，结束时**保留服务运行**（便于连续复跑）或按 `KEEP_ENV=0` 才清理 —— 默认保留。\n4. 其余断言一律不改（20 条都保留），两个 `MUTATION` 仍必须 exit=1。\n5. 自验：先 `pkill` 掉你自己起的 8081/5199 模拟\"干净机器\"，再**原样执行门禁那一行**，要求 exit 0；然后 `MUTATION=two-tables` 与 `MUTATION=hidden` 各跑一次，要求 exit 1。把三次的退出码与\"自举过程打印\"贴回给我。\n\n门禁命令不变（还是那一行），我拿到你的自验证据后再提交 t2。",
+      "messageId": "msg-1794291394249-10"
+    }
+  ],
+  "bindings": [
+    {
+      "taskId": "t1",
+      "roleId": "frontend",
+      "memberId": "7f04cf8f-a503-4dd2-a5ae-17de68163926",
+      "name": "frontend-t1-r9vi3s-2",
+      "spawnedAt": 1794289863062
+    }
+  ],
+  "routeAudits": [
+    {
+      "taskId": "t1",
+      "roleId": "frontend",
+      "declared": null,
+      "actual": null,
+      "at": 1794470315048,
+      "verdict": "unverified"
+    }
+  ],
+  "progress": {},
+  "stallAlerts": [],
+  "triggers": [],
+  "project": "/Users/maliang/Documents/develop/guangdahehui/nengtan",
+  "usage": {
+    "attribution": "per-member",
+    "byMember": {
+      "7f04cf8f-a503-4dd2-a5ae-17de68163926": {
+        "total": 16985979,
+        "input": 270950,
+        "output": 149653,
+        "cacheRead": 16565376,
+        "cacheWrite": 0,
+        "calls": 188
+      }
+    },
+    "byTask": {
+      "t1": {
+        "total": 16985979,
+        "input": 270950,
+        "output": 149653,
+        "cacheRead": 16565376,
+        "cacheWrite": 0,
+        "calls": 188
+      }
+    },
+    "updatedAt": 1794291949825,
+    "total": {
+      "total": 16985979,
+      "input": 270950,
+      "output": 149653,
+      "cacheRead": 16565376,
+      "cacheWrite": 0,
+      "calls": 188
+    }
+  },
+  "taskTimes": {
+    "t1": {
+      "startedAt": 1794289863062,
+      "endedAt": 1794290745102
+    }
+  }
+}

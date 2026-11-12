@@ -10,9 +10,32 @@
  * （角色/任务/时间）——来源标注由纯函数 formatSourcedLine 生成，可被 `node --test` 逐字断言。
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import type { MemoryFileInfo, MemoryItemView, MemoryTrack } from '../../shared/types.ts'
-import { MEMORY_LINES_PER_TASK } from '../config.ts'
+import type {
+  MemoryEntryView,
+  MemoryFileInfo,
+  MemoryFileView,
+  MemoryItemView,
+  MemoryQuotaView,
+  MemoryTrack,
+  MemoryTopicId,
+} from '../../shared/types.ts'
+import {
+  ENTRIES_PER_FILE,
+  MEMORY_LINES_PER_TASK,
+  MEMORY_NEAR_ENTRY_GAP,
+  MEMORY_NEAR_FILE_GAP,
+  PROJECT_MAX_FILES,
+  PUBLIC_MAX_FILES,
+} from '../config.ts'
 import { memoryTokenEstimate } from '../format.ts'
+import {
+  entryViewOf,
+  parseEntryFile,
+  renderEntryFile,
+  topicCatalogOf,
+  type ParsedEntry,
+  type ParsedEntryFile,
+} from './entries.ts'
 
 /** 双轨根：由调用方注入（便于单测与跨平台，模块内不读环境）。 */
 export interface MemoryRoots {
@@ -222,4 +245,195 @@ export function appendMemoryLines(
   const next = existing === '' ? `${block}\n` : `${existing.replace(/\n+$/, '')}\n${block}\n`
   writeFileSync(path, next, 'utf8')
   return { ok: true, written: kept.length, truncated }
+}
+
+// ---------------------------------------------------------------------------
+// r23：条目级视图（canonical 主题文件 + misc 手写文件 + legacy 旧流水）
+// ---------------------------------------------------------------------------
+
+/** 旧流水文件：`run-*.md` / `lessons-*.md`。只读、不参与注入与配额，由「整理」命令提炼。 */
+export const LEGACY_MEMORY_FILE_RE = /^(?:run-|lessons-).*\.md$/
+
+export function isLegacyMemoryFile(name: string): boolean {
+  return LEGACY_MEMORY_FILE_RE.test(name)
+}
+
+/** 文件名 → 主题；只认**本轨**目录里的主题（公共轨没有 ui/domain，`ui.md` 在公共轨算 misc）。 */
+export function topicOfMemoryFile(track: MemoryTrack, name: string): MemoryTopicId | null {
+  const stem = name.replace(/\.md$/i, '')
+  for (const spec of topicCatalogOf(track)) {
+    if (spec.id === stem) return spec.id
+  }
+  return null
+}
+
+export interface MemoryFileDetail {
+  file: MemoryFileView
+  parsed: ParsedEntryFile
+  body: string
+}
+
+function fileViewOf(
+  track: MemoryTrack,
+  name: string,
+  body: string,
+  updatedAt: number,
+  createdAt: number | undefined,
+  now: number,
+): MemoryFileView {
+  const legacy = isLegacyMemoryFile(name)
+  const topic = legacy ? null : topicOfMemoryFile(track, name)
+  const parsed = parseEntryFile(body, {
+    track,
+    file: name,
+    now,
+    fallbackAt: Number.isFinite(updatedAt) ? updatedAt : now,
+    acceptLegacy: true,
+  })
+  const levels = { P0: 0, P1: 0, P2: 0 }
+  let active = 0
+  let superseded = 0
+  for (const entry of parsed.entries) {
+    if (entry.superseded) {
+      superseded += 1
+      continue
+    }
+    active += 1
+    levels[entry.level] += 1
+  }
+  const view: MemoryFileView = {
+    track,
+    name,
+    chars: body.length,
+    updatedAt,
+    tokenEstimate: memoryTokenEstimate(body.length),
+    tokenBasis: 'estimate',
+    topic,
+    canonical: topic !== null,
+    readOnly: topic === null,
+    legacy,
+    entries: parsed.entries.length,
+    active,
+    superseded,
+    levels,
+  }
+  if (createdAt !== undefined) view.createdAt = createdAt
+  return view
+}
+
+/** 读单个文件并解析成条目视图；文件不存在/名字非法返回 null。 */
+export function readMemoryEntries(
+  track: MemoryTrack,
+  name: string,
+  roots: MemoryRoots,
+  now: number = Date.now(),
+): MemoryFileDetail | null {
+  const safe = safeMemoryName(name)
+  if (safe === null) return null
+  const path = `${memoryDirOf(track, roots)}/${safe}`
+  if (!existsSync(path)) return null
+  let stat: ReturnType<typeof statSync>
+  let body: string
+  try {
+    stat = statSync(path)
+    if (!stat.isFile()) return null
+    body = readFileSync(path, 'utf8')
+  } catch {
+    return null
+  }
+  const createdAt = Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : undefined
+  const file = fileViewOf(track, safe, body, stat.mtimeMs, createdAt, now)
+  const parsed = parseEntryFile(body, {
+    track,
+    file: safe,
+    now,
+    fallbackAt: stat.mtimeMs,
+    acceptLegacy: true,
+  })
+  return { file, parsed, body }
+}
+
+/**
+ * 目录 → `MemoryFileView[]`。默认**不含 legacy**（旧流水只计入 legacyFileCount），
+ * canonical 按主题目录顺序、misc 按文件名——界面顺序与主题目录一致。
+ */
+export function listMemoryViews(
+  track: MemoryTrack,
+  roots: MemoryRoots,
+  opts?: { now?: number; includeLegacy?: boolean },
+): MemoryFileView[] {
+  const now = opts?.now ?? Date.now()
+  const dir = memoryDirOf(track, roots)
+  if (!existsSync(dir)) return []
+  const catalog = topicCatalogOf(track)
+  const views: MemoryFileView[] = []
+  for (const entry of readdirSync(dir)) {
+    const safe = safeMemoryName(entry)
+    if (safe === null || safe !== entry) continue
+    if (!opts?.includeLegacy && isLegacyMemoryFile(entry)) continue
+    const detail = readMemoryEntries(track, entry, roots, now)
+    if (detail === null) continue
+    views.push(detail.file)
+  }
+  const orderOf = (view: MemoryFileView): number => {
+    if (view.topic === null) return catalog.length
+    const index = catalog.findIndex((spec) => spec.id === view.topic)
+    return index === -1 ? catalog.length : index
+  }
+  return views.sort(
+    (a, b) => orderOf(a) - orderOf(b) || (a.topic === null ? a.name.localeCompare(b.name) : 0),
+  )
+}
+
+/** 重写一个 canonical 主题文件（条目级写入唯一落盘点）。misc/legacy 不走这里。 */
+export function writeMemoryFile(
+  track: MemoryTrack,
+  name: string,
+  entries: readonly ParsedEntry[],
+  roots: MemoryRoots,
+): { ok: true; name: string } | { ok: false; error: string } {
+  const safe = safeMemoryName(name)
+  if (safe === null) return { ok: false, error: `记忆文件名不合法：「${name}」` }
+  const topic = topicOfMemoryFile(track, safe)
+  if (topic === null) {
+    return { ok: false, error: `不是 ${track === 'project' ? '项目' : '公共'}轨的主题文件，不能按条目重写：${safe}` }
+  }
+  const dir = memoryDirOf(track, roots)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(`${dir}/${safe}`, renderEntryFile(topic, entries), 'utf8')
+  return { ok: true, name: safe }
+}
+
+/** 单轨配额统计（§8.2）：只算 canonical，不含 misc/legacy。 */
+export function quotaOf(track: MemoryTrack, views: readonly MemoryFileView[]): MemoryQuotaView {
+  const canonical = views.filter((view) => view.canonical && !view.legacy)
+  const maxFiles = track === 'project' ? PROJECT_MAX_FILES : PUBLIC_MAX_FILES
+  const nearLimit = maxFiles - MEMORY_NEAR_FILE_GAP
+  const nearEntryLimit = ENTRIES_PER_FILE - MEMORY_NEAR_ENTRY_GAP
+  let totalEntries = 0
+  const nearFullFiles: string[] = []
+  const fullFiles: string[] = []
+  for (const view of canonical) {
+    totalEntries += view.active
+    if (view.active >= ENTRIES_PER_FILE) fullFiles.push(view.name)
+    else if (view.active >= nearEntryLimit) nearFullFiles.push(view.name)
+  }
+  nearFullFiles.sort((a, b) => a.localeCompare(b))
+  fullFiles.sort((a, b) => a.localeCompare(b))
+  return {
+    track,
+    files: canonical.length,
+    maxFiles,
+    totalEntries,
+    maxEntriesPerFile: ENTRIES_PER_FILE,
+    nearFiles: canonical.length >= nearLimit,
+    overFiles: canonical.length > maxFiles,
+    nearFullFiles,
+    fullFiles,
+  }
+}
+
+/** 条目视图便捷导出（bridge 用）：把一个文件的解析结果转成共享视图。 */
+export function entryViewsOf(entries: readonly ParsedEntry[]): MemoryEntryView[] {
+  return entries.map((entry) => entryViewOf(entry))
 }

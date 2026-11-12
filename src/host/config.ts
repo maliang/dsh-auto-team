@@ -130,6 +130,21 @@ export const MEMORY_EXPAND_MAX_CHARS = 4000
 /** 记忆展开的跳数上限（AC-9）：2 跳 = 「展开一条 + 顺着它的关联再展开一层」，防环形引用打转。 */
 export const MEMORY_EXPAND_MAX_DEPTH = 2
 
+/**
+ * r23 记忆策展配额：主题目录大小即文件上限（项目 8 / 公共 6），
+ * canonical 文件内活动条目上限 40，tombstone 保留上限 20。
+ */
+export const PROJECT_MAX_FILES = 8
+export const PUBLIC_MAX_FILES = 6
+export const ENTRIES_PER_FILE = 40
+export const SUPERSEDED_PER_FILE = 20
+/** 单条记忆正文上限：超出截到 499 + `…`（在 hash 之前截）。 */
+export const MEMORY_ENTRY_TEXT_MAX = 500
+/** 文件数「接近上限」判据：files >= maxFiles - 1。 */
+export const MEMORY_NEAR_FILE_GAP = 1
+/** 条目数「接近满」判据：active >= ENTRIES_PER_FILE - 4。 */
+export const MEMORY_NEAR_ENTRY_GAP = 4
+
 /** 宿主工具名前缀（工具名全局唯一，必须带前缀防撞）。 */
 export const TOOL_PREFIX = 'auto_team_'
 

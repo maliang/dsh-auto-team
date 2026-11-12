@@ -42,6 +42,18 @@ const ALL_STATUSES: readonly TaskStatus[] = [
 
 const DURATION: DurationCell = { state: 'running', ms: 61_000, text: '1m 1s', startAt: 1 }
 
+/** r20：已开始/已结束的任务在表驱动里各给一个真实单元格；未开始的状态不给（贡献 0）。 */
+const DONE_DURATION: DurationCell = { state: 'done', ms: 61_000, text: '1m 1s', startAt: 1, endAt: 62_000 }
+
+const STARTED_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  'running',
+  'gate',
+  'done',
+  'rework',
+  'failed',
+  'interrupted',
+])
+
 function task(id: string, status: TaskStatus, duration?: DurationCell): RoleTaskInput {
   const item: RoleTaskInput = { id, title: `任务 ${id}`, status }
   if (duration !== undefined) item.duration = duration
@@ -68,17 +80,23 @@ const EXPECTED: Record<TaskStatus, RoleStateKind> = {
 test('roleStateOf：13 种 TaskStatus 逐一表驱动（状态 / 分子 / 当前任务）', () => {
   assert.equal(ALL_STATUSES.length, 13, 'TaskStatus 必须是 13 种（AC-18 的形状普查）')
   for (const status of ALL_STATUSES) {
-    const view = roleStateOf([task('t1', status, DURATION)])
+    const started = STARTED_STATUSES.has(status)
+    const cell = started ? (status === 'done' ? DONE_DURATION : DURATION) : undefined
+    const view = roleStateOf([task('t1', status, cell)])
     assert.equal(view.state, EXPECTED[status], `${status} 的角色状态映射错误`)
     assert.equal(view.stateText, ROLE_STATE_TEXT[view.state], `${status} 的 stateText 必须查同一张表`)
     assert.equal(view.done, status === 'done' ? 1 : 0, `${status} 的已完成分子只认 done`)
     const active = status === 'running' || status === 'gate'
     assert.equal(view.activeTaskId, active ? 't1' : undefined, `${status} 的当前任务判定错误`)
     assert.equal(view.activeTaskTitle, active ? '任务 t1' : undefined)
+    // r20：角色用时 = 名下任务用时累计（未开始贡献 0）。文本由 formatDuration 重算，
+    // 不复用 cell.text，也不带 startAt/endAt；单个任务时聚合结果就等于它自己的用时。
     assert.deepEqual(
       view.duration,
-      active ? DURATION : { state: 'unavailable', text: '不可得' },
-      `${status} 的用时：有当前任务才取其实时值，否则「不可得」而不是 0`,
+      started
+        ? { state: status === 'done' ? 'done' : 'running', ms: 61_000, text: '1 分 01 秒' }
+        : { state: 'not-started', text: '未开始' },
+      `${status} 的用时：已开始的状态累计任务用时，未开始的状态合计「未开始」而不是 0/不可得`,
     )
   }
 })
@@ -121,15 +139,69 @@ test('roleStateOf：优先级 running > gate > 需处理 > 全 done > idle', () 
   assert.equal(e.done, 1)
 })
 
-test('roleStateOf：第一个 running 就是当前任务（顺序敏感），用时缺失回落不可得', () => {
+test('roleStateOf：第一个 running 就是当前任务（顺序敏感），用时缺口给出可核对的原因', () => {
   const view = roleStateOf([task('t1', 'running'), task('t2', 'running', DURATION)])
   assert.equal(view.activeTaskId, 't1')
   assert.equal(view.activeTaskTitle, '任务 t1')
-  assert.deepEqual(view.duration, { state: 'unavailable', text: '不可得' }, '没有 DurationCell 时不许编 0')
+  assert.deepEqual(
+    view.duration,
+    { state: 'unavailable', text: '不可得：任务 t1 没有用时数据' },
+    '已开始却没有任何用时数据 = 缺口，且必须说清是哪个任务',
+  )
 
   const second = roleStateOf([task('t1', 'pending'), task('t2', 'running', DURATION), task('t3', 'running')])
   assert.equal(second.activeTaskId, 't2')
-  assert.deepEqual(second.duration, DURATION)
+  assert.deepEqual(
+    second.duration,
+    { state: 'unavailable', text: '不可得：任务 t3 没有用时数据' },
+    '未开始的任务不算缺口；缺口只报真正缺数据的那个任务',
+  )
+})
+
+test('roleDurationOf：两个任务用时求和；进行中的 cell 已含按 now 推进的耗时', () => {
+  const view = roleStateOf([
+    task('t1', 'running', { state: 'running', ms: 61_000, text: '1 分 01 秒', startAt: 1, endAt: 62_000 }),
+    task('t2', 'done', { state: 'done', ms: 39_000, text: '39 秒', startAt: 1, endAt: 40_000 }),
+  ])
+  assert.deepEqual(view.duration, { state: 'running', ms: 100_000, text: '1 分 40 秒' }, '角色累计 = 两个任务之和')
+  assert.equal(view.duration?.startAt, undefined, '聚合格不带 startAt（没有单一区间）')
+  assert.equal(view.duration?.endAt, undefined, '聚合格不带 endAt（没有单一区间）')
+})
+
+test('roleDurationOf：全部任务未开始 → 未开始（不是 0 秒、也不是不可得）', () => {
+  const view = roleStateOf([task('t1', 'pending'), task('t2', 'blocked'), task('t3', 'ready')])
+  assert.deepEqual(view.duration, { state: 'not-started', text: '未开始' })
+})
+
+test('roleDurationOf：多个缺口只报首个 + 计数，绝不把缺口任务当 0 加进合计', () => {
+  const view = roleStateOf([task('t1', 'running'), task('t2', 'done'), task('t3', 'running', DURATION)])
+  assert.deepEqual(view.duration, {
+    state: 'unavailable',
+    text: '不可得：任务 t1 没有用时数据（另有 1 个任务同样不可得）',
+  })
+})
+
+test('角色累计用时：宿主 rolesOf 与客户端 roleUsageOf 逐字相等（求和 / 缺口两种形态）', () => {
+  const tasks: TaskDetailView[] = [
+    {
+      ...detail('t1', 'dev', '全栈工程师', 'done', provider(10)),
+      duration: { state: 'done', ms: 61_000, text: '61 秒', startAt: 1, endAt: 62_000 },
+    },
+    {
+      ...detail('t2', 'dev', '全栈工程师', 'running', provider(10)),
+      duration: { state: 'running', ms: 39_000, text: '39 秒', startAt: 1, endAt: 40_000 },
+    },
+    { ...detail('t3', 'qa', 'QA 测试工程师', 'gate', provider(10)), duration: { state: 'unavailable', text: '不可得' } },
+  ]
+  const host = rolesOf(tasks)
+  const client = roleUsageOf(tasks, ROLES)
+  assert.deepEqual(client, host, '两侧整个角色行都必须相等（含 duration）')
+  assert.deepEqual(host.map((row) => row.duration), [
+    { state: 'running', ms: 100_000, text: '1 分 40 秒' },
+    { state: 'unavailable', text: '不可得：任务 t3 缺少开始/结束时刻' },
+  ])
+  assert.equal(client[0]?.duration?.text, host[0]?.duration?.text, '可见文本逐字相等')
+  assert.equal(client[1]?.duration?.text, host[1]?.duration?.text)
 })
 
 test('ROLE_STATE_TEXT / ROLE_STATE_TONE：5 态各有文案与 tone，且不含空串', () => {

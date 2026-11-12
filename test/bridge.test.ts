@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -20,6 +20,7 @@ import { buildHttpRoutes } from '../src/host/http.ts'
 import { BUILTIN_ROLES } from '../src/host/roles/builtin.ts'
 import { createRoleRepo } from '../src/host/roles/repo.ts'
 import { createSettingsRepo } from '../src/host/settings.ts'
+import { createExpander } from '../src/host/memory/expand.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { NOT_ENABLED_MESSAGE, buildToolSpecs, sessionOf } from '../src/host/tools.ts'
 import { createDeviationRecorder } from '../src/host/team/deviation.ts'
@@ -629,6 +630,54 @@ test('snapshot 契约：plannedAt / concurrency 三元组 / messages / routeAudi
   assert.equal(snapshot.members.length, 1)
   assert.equal(snapshot.members[0].status, 'running')
   assert.equal(snapshot.members[0].taskId, 't1')
+})
+
+test('snapshot.runs（r17）：宿主把落盘 usageTotals 派生为历史行六项，无用量给 unavailable 原因', async () => {
+  const { bridge, store } = setup()
+  // 两个同 session 的 run：旧的用量齐全（含宿主通常不上报的 cacheWrite），新的完全没有用量。
+  store.save(
+    stateOf({
+      plan: planOf({ runId: 'run-old', createdAt: NOW - 60_000, status: 'terminated' }),
+      plannedAt: NOW - 60_000,
+      finishedAt: NOW,
+      usage: {
+        attribution: 'aggregate-only',
+        byMember: {},
+        byTask: {},
+        total: { total: 60_421, input: 29_229, cacheRead: 30_848, output: 344, calls: 3 },
+        updatedAt: NOW,
+      },
+    }),
+  )
+  store.save(stateOf({ plan: planOf({ runId: 'run-new', createdAt: NOW, status: 'dispatching' }) }))
+
+  const runs = bridge.snapshot(SESSION).runs ?? []
+  assert.deepEqual(runs.map((run) => run.runId), ['run-new', 'run-old'])
+
+  const withUsage = runs.find((run) => run.runId === 'run-old')
+  assert.ok(withUsage)
+  const usage = withUsage.usage
+  assert.ok(usage, '历史行必须带宿主派生的 usage 单元格')
+  assert.equal(usage.source, 'provider')
+  assert.equal(usage.text, '60.42K', '合计文本由宿主生成（r19：与六项同一动态单位口径）')
+  // 六项顺序固定、文案逐字；缺失分项写「不可得」且 available=false（不补 0）。
+  assert.deepEqual(usage.details, [
+    { key: 'input', label: '输入未命中', text: '29.23K', available: true },
+    { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
+    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
+    { key: 'output', label: '输出', text: '344', available: true },
+    { key: 'calls', label: '调用次数', text: '3', available: true },
+    { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
+  ])
+  // 派生只发生在读取时：摘要仍带原始 usageTotals（run 文件里没有 usage 字段）
+  assert.equal(withUsage.usageTotals?.total, 60_421)
+
+  const withoutUsage = runs.find((run) => run.runId === 'run-new')
+  assert.ok(withoutUsage)
+  assert.equal(withoutUsage.usage?.source, 'unavailable')
+  assert.equal(withoutUsage.usage?.reason, '宿主未上报本 run 的用量')
+  assert.equal(withoutUsage.usage?.details, undefined)
+  assert.equal(withoutUsage.usage?.text, undefined)
 })
 
 /* ─────────────── r4 第一期：停滞三字段 / activity 合并 / peer 交接实发 ─────────────── */
@@ -1489,4 +1538,334 @@ test('r11 三动作都走既有 POST /act 路由（r13 后路由恰 4 条，不�
   assert.equal(routes.length, 4, '路由数必须仍是 4（r13 只新增 GET /library）')
   const paths = routes.map((route) => route.path)
   assert.deepEqual(paths.filter((path) => path.includes('/act')).length, 1)
+})
+
+/* ───────────────────────────── r19：run 终态自动沉淀记忆 ───────────────────────────── */
+
+/**
+ * 用 `updateAcceptance` 触发 saveState：它是最轻的一条 saveState 路径（不跑门禁、不改状态机），
+ * 因此可以把 store 里预置的 terminated/paused 状态原样再落一次盘，专门观察记忆副作用。
+ */
+async function triggerSaveState(bridge: Bridge, taskId: string, acceptance = 'exit 0'): Promise<void> {
+  await actConfirmed(bridge, { type: 'updateAcceptance', taskId, acceptance })
+}
+
+function terminatedStateOf(over: Partial<RunState> = {}, tasks: PlanTask[] = [taskOf('t1', { status: 'done' }), taskOf('t2')]): RunState {
+  return stateOf({
+    project: 'dsh-auto-team',
+    finishedAt: NOW,
+    plan: planOf({ goal: '实现自动记忆', status: 'terminated', tasks }),
+    ...over,
+  })
+}
+
+test('r19 自动记忆：terminated 把失败证据写进 pitfalls（P1）、通过命令写进 commands（P2）；同一 state 重复保存幂等', async () => {
+  const { bridge, store, dir } = setup()
+  await enable(bridge)
+  store.save(
+    terminatedStateOf(
+      {},
+      [
+        taskOf('t1', {
+          status: 'failed',
+          attempts: 2,
+          evidence: { command: 'pnpm test', exitCode: 1, tail: '2 failing', artifacts: [], at: NOW, taskId: 't1' },
+        }),
+        taskOf('t2', {
+          status: 'done',
+          evidence: { command: 'pnpm typecheck', exitCode: 0, tail: '', artifacts: [], at: NOW, taskId: 't2' },
+        }),
+      ],
+    ),
+  )
+  await triggerSaveState(bridge, 't2')
+
+  const pitfallsPath = join(dir, 'memory-project', 'pitfalls.md')
+  const commandsPath = join(dir, 'memory-project', 'commands.md')
+  assert.ok(existsSync(pitfallsPath), '失败证据必须写进项目 pitfalls')
+  assert.ok(existsSync(commandsPath), '通过的门禁命令必须写进项目 commands')
+  const pitfalls = readFileSync(pitfallsPath, 'utf8')
+  assert.match(
+    pitfalls,
+    /^- \[P1\] 门禁 `pnpm test` 失败（退出码 1）；输出尾部：2 failing（来源：系统 · \d{2}-\d{2} \d{2}:\d{2} · 修正 \d{1,7}）$/m,
+  )
+  assert.match(readFileSync(commandsPath, 'utf8'), /^- \[P2\] 已验证命令：pnpm typecheck（来源：系统 · /m)
+  assert.equal(existsSync(join(dir, 'memory-project', 'run-run-t4.md')), false, '不得再写 run-*.md 流水')
+
+  // 同一个 state 已经带 memorySunkAt：再次 saveState 必须一条都不再写（不是靠「文件存在就跳过」）。
+  const before = [readFileSync(pitfallsPath, 'utf8'), readFileSync(commandsPath, 'utf8')]
+  await triggerSaveState(bridge, 't2')
+  assert.deepEqual([readFileSync(pitfallsPath, 'utf8'), readFileSync(commandsPath, 'utf8')], before, '幂等键必须挡住重复沉淀')
+})
+
+test('r19 自动记忆：paused / dispatching 状态不写任何记忆', async () => {
+  const { bridge, store, dir } = setup()
+  await enable(bridge)
+  store.save(
+    stateOf({
+      project: 'dsh-auto-team',
+      plan: planOf({ goal: '实现自动记忆', status: 'paused', tasks: [taskOf('t1'), taskOf('t2')] }),
+    }),
+  )
+  await triggerSaveState(bridge, 't2')
+  assert.equal(existsSync(join(dir, 'memory-project', 'pitfalls.md')), false, 'paused 不得写项目记忆')
+  assert.equal(existsSync(join(dir, 'memory-project', 'commands.md')), false, 'paused 不得写项目记忆')
+  assert.equal(existsSync(join(dir, 'memory-public', 'pitfalls.md')), false, 'paused 不得写公共记忆')
+  assert.equal(store.load('run-t4')?.memorySunkAt, undefined, '非终态不得写幂等键')
+})
+
+test('r19 自动记忆：有失败任务时额外写一条公共教训 pitfalls（P1）', async () => {
+  const { bridge, store, dir } = setup()
+  await enable(bridge)
+  store.save(
+    terminatedStateOf(
+      {},
+      [
+        taskOf('t1', {
+          status: 'failed',
+          attempts: 2,
+          evidence: { command: 'pnpm test', exitCode: 1, tail: '2 failing', artifacts: [], at: NOW, taskId: 't1' },
+        }),
+        taskOf('t2'),
+      ],
+    ),
+  )
+  await triggerSaveState(bridge, 't2')
+
+  const body = readFileSync(join(dir, 'memory-public', 'pitfalls.md'), 'utf8')
+  assert.match(
+    body,
+    /^- \[P1\] 门禁 `pnpm test` 失败（退出码 1）——先本地重跑确认，再把证据发回成员返工（来源：系统 · /m,
+  )
+  assert.equal(existsSync(join(dir, 'memory-public', 'lessons-run-t4.md')), false, '不得再写 lessons-*.md 流水')
+})
+
+test('r19 自动记忆 fail-open：记忆目录不可写也不影响 store.save 与动作结果', async () => {
+  // publicDir 指向一个**文件**路径：mkdirSync 会失败，正好模拟「记忆写盘炸了」。
+  // 把 publicDir 挂在**文件**下面：`existsSync` 为 false（快照读记忆不会红），
+  // 但 `mkdirSync(publicDir, { recursive: true })` 会 ENOTDIR —— 正好只炸写盘路径。
+  const brokenRoot = mkdtempSync(join(tmpdir(), 'auto-team-r19-broken-'))
+  const publicAsFile = join(brokenRoot, 'public-as-file')
+  writeFileSync(publicAsFile, 'not a directory', 'utf8')
+
+  const { bridge, store } = setup({
+    memoryRoots: { publicDir: join(publicAsFile, 'memory-public'), projectDir: join(brokenRoot, 'memory-project') },
+  })
+  await enable(bridge)
+  store.save(
+    terminatedStateOf(
+      {},
+      [
+        taskOf('t1', {
+          status: 'failed',
+          attempts: 2,
+          evidence: { command: 'pnpm test', exitCode: 1, tail: 'boom', artifacts: [], at: NOW, taskId: 't1' },
+        }),
+        taskOf('t2'),
+      ],
+    ),
+  )
+
+  const result = await triggerSaveStateResult(bridge, 't2')
+  assert.equal(result.rejected, undefined, '记忆写失败不能把动作变成拒绝')
+  const saved = store.latestForSession(SESSION)
+  assert.equal(saved?.plan.status, 'terminated', 'store.save 必须照常完成')
+  assert.equal(saved?.plan.tasks.find((task) => task.id === 't2')?.acceptance, 'exit 0')
+})
+
+/** 同 `triggerSaveState`，但把确认后的 act 结果返回给 fail-open 用例断言。 */
+async function triggerSaveStateResult(bridge: Bridge, taskId: string, acceptance = 'exit 0') {
+  return actConfirmed(bridge, { type: 'updateAcceptance', taskId, acceptance })
+}
+
+/* ─────────── r20：run 取消 = 终态，落 finishedAt；重复取消不覆盖首次时刻 ─────────── */
+
+test('cancel：首次取消落 finishedAt + cancelled，重复取消幂等且保留首次结束时刻', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(stateOf())
+
+  // r13：取消不可逆 → 必过确认闸；这里走确认后的执行结果。
+  const first = await actConfirmed(bridge, { type: 'cancel' })
+  assert.equal(first.rejected, undefined, '有计划时取消不应被拒')
+  const cancelled = store.load('run-t4')
+  assert.equal(cancelled?.plan.status, 'cancelled')
+  const firstFinishedAt = cancelled?.finishedAt
+  assert.equal(typeof firstFinishedAt, 'number', '取消是终态，必须与状态同一次落盘结束时刻')
+  assert.ok(Number.isFinite(firstFinishedAt ?? Number.NaN) && (firstFinishedAt ?? 0) > 0, '结束时刻必须是真实时间戳')
+  assert.ok(
+    (first.notices ?? []).some((text) => text.includes('已取消本次运行')),
+    '首次取消要有可读回执',
+  )
+
+  // 把落盘时刻改成哨兵：第二次取消若重新取 now，哨兵就被刷新 —— 这正是要防的。
+  assert.ok(cancelled)
+  store.save({ ...cancelled, finishedAt: NOW + 12_345 })
+  const again = await actConfirmed(bridge, { type: 'cancel' })
+  assert.equal(again.rejected, undefined, '重复取消是幂等成功（不是错误）')
+  assert.deepEqual(again.notices, ['本次运行已取消'])
+  assert.equal(store.load('run-t4')?.finishedAt, NOW + 12_345, '幂等分支不得覆盖首次结束时刻')
+  assert.equal(store.load('run-t4')?.plan.status, 'cancelled')
+})
+
+/* ───────────── r22：项目记忆按会话/run 的真实 workspace 落盘 ───────────── */
+
+test('r22 记忆落点：同一进程两个会话的终态 run 各自落到 <workspace>/.auto-team/memory', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'auto-team-r22-two-'))
+  const wsA = join(root, 'ws-a')
+  const wsB = join(root, 'ws-b')
+  const { bridge, store, dir } = setup({
+    workspaceOf: (sessionId) => (sessionId === 'sess-a' ? wsA : sessionId === 'sess-b' ? wsB : undefined),
+  })
+  await bridge.act('sess-a', { type: 'toggle', enabled: true })
+  await bridge.act('sess-b', { type: 'toggle', enabled: true })
+  store.save(
+    terminatedStateOf({
+      plan: planOf({
+        runId: 'run-a',
+        sessionId: 'sess-a',
+        goal: '项目 A',
+        status: 'terminated',
+        tasks: [
+          taskOf('t1', {
+            status: 'failed',
+            attempts: 2,
+            evidence: { command: 'pnpm test --ws-a', exitCode: 1, tail: 'A-fail', artifacts: [], at: NOW, taskId: 't1' },
+          }),
+          taskOf('t2', { status: 'done' }),
+        ],
+      }),
+    }),
+  )
+  store.save(
+    terminatedStateOf({
+      plan: planOf({
+        runId: 'run-b',
+        sessionId: 'sess-b',
+        goal: '项目 B',
+        status: 'terminated',
+        tasks: [
+          taskOf('t1', {
+            status: 'failed',
+            attempts: 2,
+            evidence: { command: 'pnpm test --ws-b', exitCode: 1, tail: 'B-fail', artifacts: [], at: NOW, taskId: 't1' },
+          }),
+          taskOf('t2', { status: 'done' }),
+        ],
+      }),
+    }),
+  )
+
+  for (const sessionId of ['sess-a', 'sess-b']) {
+    // updateAcceptance 不可逆 → 先拿 pendingId 再确认（与 actConfirmed 同一姿势，只是换成各自的会话）。
+    const first = await bridge.act(sessionId, { type: 'updateAcceptance', taskId: 't2', acceptance: 'exit 0' })
+    assert.equal(typeof first.pendingId, 'string', `${sessionId} 的不可逆动作必须进入确认闸`)
+    const confirmed = await bridge.act(sessionId, { type: 'confirmPending', pendingId: first.pendingId! })
+    assert.equal(confirmed.rejected, undefined, `${sessionId} 的确认不应被拒`)
+  }
+
+  const pitfallsA = readFileSync(join(wsA, '.auto-team/memory/pitfalls.md'), 'utf8')
+  const pitfallsB = readFileSync(join(wsB, '.auto-team/memory/pitfalls.md'), 'utf8')
+  assert.match(pitfallsA, /pnpm test --ws-a/, 'sess-a 的证据必须落到 ws-a')
+  assert.match(pitfallsB, /pnpm test --ws-b/, 'sess-b 的证据必须落到 ws-b')
+  assert.equal(pitfallsA.includes('--ws-b'), false, '不得把 B 的证据写进 A')
+  assert.equal(pitfallsB.includes('--ws-a'), false, '不得把 A 的证据写进 B')
+  assert.equal(existsSync(join(dir, 'memory-project', 'pitfalls.md')), false, '不得再写装配目录')
+})
+
+test('r22 记忆落点：没有 workspace 时退化到装配目录，并在快照给出可读原因', async () => {
+  const { bridge, store, dir } = setup()
+  await enable(bridge)
+  store.save(
+    terminatedStateOf(
+      {},
+      [
+        taskOf('t1', {
+          status: 'failed',
+          attempts: 2,
+          evidence: { command: 'pnpm test', exitCode: 1, tail: 'boom', artifacts: [], at: NOW, taskId: 't1' },
+        }),
+        taskOf('t2'),
+      ],
+    ),
+  )
+  await triggerSaveState(bridge, 't2')
+
+  // 无 workspaceOf、run.project 又是 basename → 只能退化，但必须写明为什么。
+  assert.ok(existsSync(join(dir, 'memory-project', 'pitfalls.md')), '退化路径仍要沉淀，不能静默不写')
+  const snapshot = bridge.snapshot(SESSION)
+  assert.equal(snapshot.memory.projectDir, join(dir, 'memory-project'))
+  assert.equal(snapshot.memory.degraded, true)
+  assert.match(snapshot.memory.degradeReason ?? '', /未能解析会话 sess-t4的项目工作区/)
+})
+
+test('r22 记忆落点：列表/注入/展开/读写删同源 —— 面板按 sessionId 读到的就是项目根里的正文', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'auto-team-r22-ports-'))
+  const wsA = join(root, 'ws-a')
+  const { bridge } = setup({
+    workspaceOf: (sessionId) => (sessionId === 'sess-a' ? wsA : undefined),
+    expander: (id, depth, roots) => createExpander({ roots }).expand(id, depth),
+  })
+  await bridge.act('sess-a', { type: 'toggle', enabled: true })
+
+  const saved = await bridge.act('sess-a', {
+    type: 'saveMemory',
+    track: 'project',
+    name: 'notes.md',
+    body: '# 项目 A 约定\n- 用 pnpm',
+  })
+  assert.equal(saved.rejected, undefined)
+  assert.ok(existsSync(join(wsA, '.auto-team/memory/notes.md')), '写口必须落到会话项目根')
+
+  const read = await bridge.readMemoryFile('project', 'notes.md', undefined, 'sess-a')
+  assert.equal(read.data?.body, '# 项目 A 约定\n- 用 pnpm')
+
+  const otherSession = await bridge.readMemoryFile('project', 'notes.md', undefined, 'sess-b')
+  assert.match(otherSession.error ?? '', /记忆文件不存在/, '别的会话不得读到 A 的项目记忆')
+
+  const expanded = await bridge.expandMemory('mem://project/notes.md', 0, 'sess-a')
+  assert.equal(expanded.data?.code, 'OK')
+  assert.equal(expanded.data?.body, '# 项目 A 约定\n- 用 pnpm')
+
+  const inline = bridge.snapshot('sess-a').memory.files.find((file) => file.name === 'notes.md')
+  assert.ok(inline, '列表口必须读同一个项目根')
+  assert.match(bridge.memoryFor('项目 A 约定', 'sess-a').text, /用 pnpm/)
+  assert.equal(bridge.memoryFor('项目 A 约定', 'sess-b').chars, 0, '别的会话的注入不得混入 A 的记忆')
+
+  const forbidden = await bridge.readMemoryFile('project', 'notes.md', '/not/known', 'sess-a')
+  assert.match(forbidden.error ?? '', /未授权的工作区/, '显式 workspace 仍走白名单，不能被 sessionId 绕过')
+
+  const deleted = await bridge.act('sess-a', { type: 'deleteMemory', track: 'project', name: 'notes.md' })
+  assert.equal(deleted.rejected, undefined)
+  assert.equal(existsSync(join(wsA, '.auto-team/memory/notes.md')), false, '删口必须删同一个项目根')
+})
+
+test('t5 面板：复用成员挂两条 binding 时只显示一行，且显示的是「当前任务」', () => {
+  const h = setup()
+  h.store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [taskOf('t1', { status: 'done', memberId: 'member-1' }), taskOf('t2', { status: 'running', memberId: 'member-1' })],
+      }),
+      bindings: [bindingOf({ taskId: 't1', spawnedAt: NOW + 1000 }), bindingOf({ taskId: 't2', spawnedAt: NOW + 2000 })],
+    }),
+  )
+
+  const snapshot = h.bridge.snapshot(SESSION)
+  assert.equal(snapshot.members.length, 1, '一个 memberId 只占面板一行（复用不是新成员）')
+  assert.equal(snapshot.members[0]?.taskId, 't2', '面板必须显示成员当前承接的任务，而不是已收口的旧任务')
+  assert.equal(snapshot.members[0]?.status, 'running')
+
+  const spawns = snapshot.activity.filter((event) => event.kind === 'spawn')
+  assert.equal(spawns.length, 2, '两条 binding 都该有活动记录（历史不能丢）')
+  assert.equal(
+    spawns.filter((event) => event.text === '创建成员 开发-1').length,
+    1,
+    '只有第一次是真的创建成员',
+  )
+  assert.ok(
+    spawns.some((event) => event.text.includes('复用成员 开发-1')),
+    `第二条必须是复用，不能谎报新建：${JSON.stringify(spawns.map((event) => event.text))}`,
+  )
 })

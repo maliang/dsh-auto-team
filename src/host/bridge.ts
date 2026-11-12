@@ -6,8 +6,9 @@
  *   - HTTP：POST /api/auto-team/act  →  bridge.act
  *   - 工具：auto_team_message / auto_team_receipt / auto_team_memory / auto_team_role → 同一个 bridge.act
  *
- * 18 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x；r7 新增 4 个动作与 PAUSED 码，
- * r11 新增 cancelTask / skipTask / updateAcceptance 三个单任务动作）：
+ * 20 个动作与拒绝码对照（TECHNICAL §4.2 / §5.x；r7 新增 4 个动作与 PAUSED 码，
+ * r11 新增 cancelTask / skipTask / updateAcceptance 三个单任务动作，
+ * r24 新增 closeRun 与「残留计划自动对账」）：
  *   toggle               → 只改开关并落盘，**绝不派发**（反目标 1）
  *   dispatch             → NOT_ENABLED / NO_PLAN / NOT_FOUND(runId) / PLAN_ALREADY_DISPATCHED /
  *                          ROLE_UNAVAILABLE / MODEL_UNRESOLVABLE / CONCURRENCY_FULL（后三者来自编排层 skipped 分类）
@@ -28,6 +29,8 @@
  *   skipTask             → NO_PLAN / NOT_FOUND / BAD_REQUEST（下游 blocked → pending）
  *   updateAcceptance     → NO_PLAN / NOT_FOUND / BAD_REQUEST（空串 → 三条模板全文）；
  *                          `done` 允许（r13 取代 r11#AC-26）并当场重跑门禁，结论走 applyReceipt
+ *   closeRun             → NOT_FOUND（不存在/不属于当前会话）/ BAD_REQUEST（仍有存活成员或名单不可读）；
+ *                          目标已是终态 → `unchanged`（幂等，不报错）
  *
  * **PAUSED 闸门**（r7 AC-16）：计划处于暂停态时，`dispatch` / `resume` / `receipt` 一律被拒
  * （这三个都会推进状态机），其余动作放行。闸门就在 `act()` 的入口处一处判断，不散落到组件。
@@ -44,19 +47,27 @@ import type {
   LibraryView,
   MemberStatus,
   MemberView,
+  MemoryEntryView,
+  MemoryFileView,
+  MemoryQuotaView,
+  MemoryTopicId,
   MemoryTrack,
   MessageRecord,
   ModelCatalogView,
   PanelAction,
   PanelSnapshot,
+  Plan,
+  PlanTask,
   RejectionCode,
   Result,
   Role,
+  RunStageCounts,
   RunSummary,
   SkillDraft,
   SkillInfo,
   SkillMutation,
   TaskStatus,
+  TokenTotals,
   UsageCell,
 } from '../shared/types.ts'
 import { HISTORY_PAGE_SIZE, LIBRARY_CACHE_MS } from '../shared/const.ts'
@@ -68,31 +79,65 @@ import {
 } from '../shared/task-actions.ts'
 import {
   DEVIATION_SNAPSHOT_LIMIT,
+  ENTRIES_PER_FILE,
   MAX_CONCURRENT_LIMIT,
   MEMORY_LINES_PER_TASK,
   STALL_MS,
 } from './config.ts'
 import { runGate } from './gate/gate.ts'
-import { durationCellOf, usageCellOf } from './format.ts'
+import { durationCellOf, taskDurationCellOf, usageCellOf } from './format.ts'
 import type { AutoDispatchCause } from './team/auto-dispatch.ts'
-import { selectMemory } from './memory/inject.ts'
-import { deleteMemory, listMemory, readMemory, safeMemoryName, writeMemory } from './memory/repo.ts'
+import { autoEntryDraftsOf } from './memory/auto.ts'
+import { curateMemory } from './memory/curate.ts'
+import {
+  applyMemoryMutation,
+  entryViewOf,
+  parseEntryFile,
+  type EntryDraft,
+  type MemoryMutationCode,
+  type ParsedEntry,
+} from './memory/entries.ts'
+import { selectMemoryEntries } from './memory/inject.ts'
+import { memoryLocationOf, usableWorkspaceOf } from './memory/locate.ts'
+import type { MemoryLocation } from './memory/locate.ts'
+import {
+  deleteMemory,
+  isLegacyMemoryFile,
+  listMemory,
+  listMemoryViews,
+  quotaOf,
+  readMemory,
+  readMemoryEntries,
+  safeMemoryName,
+  writeMemory,
+  writeMemoryFile,
+} from './memory/repo.ts'
 import type { MemoryRoots } from './memory/repo.ts'
-import { normalizeWorkspace, projectMemoryDir } from './paths.ts'
+import { normalizeWorkspace, projectArtifactsDir, projectMemoryDir } from './paths.ts'
 import { emptyAcceptanceError } from './plan/acceptance.ts'
 import { blockedTasks, depSatisfied, readyTasks } from './plan/graph.ts'
-import { progressOf } from './plan/plan.ts'
+import { progressOf, revisePlan, type RevisionInput, type RevisionResult } from './plan/plan.ts'
 import { deriveScopeLocks } from './plan/scope.ts'
 import { BUILTIN_SKILLS } from './roles/builtin.ts'
 import type { RoleRepo } from './roles/repo.ts'
 import type { SkillRecord, SkillRepo } from './roles/skills-repo.ts'
 import type { SystemSkillSource } from './roles/system-skills.ts'
 import { defaultSettings, type SettingsRepo } from './settings.ts'
-import { MESSAGES_LIMIT, type RunState, type RunsStore } from './store.ts'
+import {
+  advancePlanToDispatching,
+  cancelResidualTasks,
+  finishedAtOf,
+  MESSAGES_LIMIT,
+  reconcileStalePlans,
+  repairClosedRuns,
+  type RunState,
+  type RunsStore,
+} from './store.ts'
 import type { DeviationRecorder } from './team/deviation.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
+import { normalizeHostStatus, type HostMember } from './team/watcher.ts'
 import { isIrreversibleAction, pendingFor, pendingViewOf } from './team/confirm.ts'
-import { runUsageOf, taskUsageOf } from './team/usage.ts'
+import { applyProjectionUsage, runUsageOf, taskUsageOf, type ProjectionUsageEntry } from './team/usage.ts'
 import { releaseScopes } from './team/scope-locks.ts'
 import { secondsText, stallOf } from './team/stall.ts'
 
@@ -106,12 +151,37 @@ const ACTIVITY_LIMIT = 50
 /** peer 交接消息的 messageId 前缀（`handoff:<上游>-><下游>`，AC-5 的幂等键，由 team/handoff.ts 生成）。 */
 const HANDOFF_MESSAGE_PREFIX = 'handoff:'
 
+/** 历史行没有用量记录时 `UsageCell.reason` 的统一文案（与 library 的项目 run 行同一口径）。 */
+const HISTORY_USAGE_REASON = '宿主未上报本 run 的用量'
+
 /** 回执：门禁判定结果（done 的唯一写点在 team/dispatch.ts 的 applyReceipt）。 */
 export interface ReceiptInput {
   verdict: 'done' | 'rework' | 'failed'
   note?: string
   evidence?: GateEvidence
 }
+
+/**
+ * r21：需求修订的成员副作用结果。
+ *
+ * 四个列表分开而不是合成一句：`stopped`/`notified` 是「已经发生的事实」，
+ * `stopFailed`/`notifyFailed` 是「没做到、面板要如实显示」的部分 —— 合并就分不清了。
+ */
+export interface RevisionMemberOutcome {
+  /** 已确认停止的成员名（作废任务上的 running 成员）。 */
+  stopped: string[]
+  /** 停止失败的成员名 → 原因；对应 binding 保持 `stopping: true`（显示「停止中」，绝不显示已停止）。 */
+  stopFailed: Array<{ name: string; error: string }>
+  /** 已成功收到需求修订直达消息的成员名。 */
+  notified: string[]
+  /** 直达消息发送失败的成员名 → 原因。 */
+  notifyFailed: Array<{ name: string; error: string }>
+}
+
+/** `Bridge.revise` 的返回：成功时是修订结果 + 成员副作用，失败时带拒绝码与可读原因。 */
+export type ReviseRunResult =
+  | ({ ok: true } & RevisionResult & RevisionMemberOutcome)
+  | { ok: false; reason: string; code: RejectionCode }
 
 /** 编排层（team/dispatch.ts dispatchReady）的结果投影：桥只需要这几项来分类拒绝码。 */
 export interface DispatchOutcome {
@@ -162,7 +232,7 @@ export type ApplyReceiptPort = (
   maxAttempts?: number,
 ) => RunState
 
-/** 直达消息端口（adapters 注入 agentTeams.sendMessage；无 caller 时带 code='NO_CALLER'）。 */
+/** 直达消息端口（adapters 注入：新宿主 subagents.sendMessage 按 SessionId 直发；无 caller 时带 code='NO_CALLER'）。 */
 export type SendPort = (
   memberId: string,
   text: string,
@@ -171,7 +241,21 @@ export type SendPort = (
 export interface BridgeDeps {
   store: RunsStore
   roles: RoleRepo
+  /**
+   * 装配期算出的记忆根（r22 起只作为**兜底**）。
+   *
+   * `projectDir` 是 apply 时刻的 workspace 派生目录（真实宿主里是 profile 目录），
+   * 只在解析不到项目工作区时退化使用，并在快照里带 `degraded/degradeReason`，不得静默。
+   */
   memoryRoots: { publicDir: string; projectDir: string }
+  /**
+   * 会话 → 真实项目工作区（r22 记忆落点的动态解析口）。
+   *
+   * 装配层注入「会话 cwd（`agents.get(sessionId)`）+ workspace 注册表反查」的组合，
+   * **每次读写现算**，不缓存 apply 时刻的 workspace。缺省（单测桩）时项目记忆回退
+   * `memoryRoots.projectDir` —— 旧行为不变，但快照会如实标记退化。
+   */
+  workspaceOf?: (sessionId: string) => string | undefined
   /** `<home>/.dsh/auto-team` —— 会话开关状态的持久化根。 */
   dataRoot: string
   /** 派发端口：并发切片/成员命名/幂等都在 team/dispatch.ts，桥不重复实现。 */
@@ -182,8 +266,19 @@ export interface BridgeDeps {
   applyReceipt: ApplyReceiptPort
   /** 直达消息端口。 */
   sendMessage: SendPort
-  /** 门禁执行上下文：cwd 用于跑验收命令，artifactsDir 落全量日志（AC-19）。 */
-  gate: { cwd: string; artifactsDir: string; timeoutMs?: number }
+  /**
+   * 门禁执行上下文：cwd 用于跑验收命令，artifactsDir 落全量日志（AC-19）。
+   *
+   * `workspaceOf` 是本次修复的注入点：装配层用 `agents.get(sessionId)` 拿到**会话工作区**
+   * （`agent.session.header.cwd`），门禁按会话取真实仓库根，而不是宿主进程启动目录。
+   * 缺省（单测桩 / 旧宿主取不到 session）时保持旧行为：`cwd` + `artifactsDir` 原样使用。
+   */
+  gate: {
+    cwd: string
+    artifactsDir: string
+    workspaceOf?: (sessionId: string) => string | undefined
+    timeoutMs?: number
+  }
   /** 宿主并发上限（adapters.resolveConcurrencyLimit）；缺省按 MAX_CONCURRENT_LIMIT 且标注 default。 */
   hostConcurrency?: () => { limit: number; source: 'host' | 'default'; requested?: number; clamped?: boolean }
   /**
@@ -205,12 +300,16 @@ export interface BridgeDeps {
    */
   triggerHealth?: () => { degraded: boolean; reason?: string }
   /**
-   * 记忆展开端口（AC-9/AC-11）：`createExpander({roots})` 的 `expand`。
+   * 记忆展开端口（AC-9/AC-11）：`createExpander({roots}).expand`。
+   *
+   * r22：第三参是**本次解析出的记忆根**。装配层必须按它构造 expander
+   * （`(id, depth, roots) => createExpander({ roots: roots ?? memoryRoots }).expand(id, depth)`），
+   * 否则展开仍读 apply 时刻的目录；旧两参实现仍可注入（单测兼容，忽略第三参）。
    *
    * 依赖用可选注入而不是在这里 `import` 文件系统实现：缺省时 `expandMemory` 明确报「不可用」，
    * 单测可以传一个只返回固定 payload 的桩，不必造临时目录。
    */
-  expander?: (id: string, depth?: number) => ExpandPayload
+  expander?: (id: string, depth: number | undefined, roots: MemoryRoots) => ExpandPayload
   /**
    * settings.json 仓储（r7 AC-13 的**唯一**可配参数来源）。
    *
@@ -294,6 +393,37 @@ export interface BridgeDeps {
    * 之所以只收 `recent` 而不收整个 store，是因为桥只需要「读」——写入点只有装配层的 onError/onClear。
    */
   dispatchNotices?: { recent(runId: string): ActivityEvent[] }
+  /**
+   * r17：读某个**成员会话**此刻在宿主会话投影里的累计 token 用量
+   * （装配层接 `adapters.readSessionTokenUsage`，宿主 API 不许在 bridge 里出现）。
+   *
+   * 为什么是可选注入：单测夹具与旧宿主都没有这个读口，缺省时快照照旧只显示已落盘的用量，
+   * 没有就「不可得 + 原因」，绝不补 0。
+   */
+  readSessionUsage?: (sessionId: string) => TokenTotals | undefined
+  /**
+   * r20：读某个成员会话**自己的**模型调用次数（装配层接 `adapters.readSessionCallCount`）。
+   *
+   * 为什么与 token 分两个读口：调用次数不在宿主用量投影里（投影只有 token），只能数成员会话
+   * 日志里的 `assistant/message`；两者都是「会话可读才有值」，在 `refreshUsage` 里合成同一个
+   * `TokenTotals`，落盘后 `byMember` / `byTask` / run `total` 自然都带上次数。
+   * 可选注入：旧宿主/单测夹具没有这个读口时，行为与 r19 完全一致。
+   */
+  readSessionCalls?: (sessionId: string) => number | undefined
+  /**
+   * r17：用量刷新落盘失败时的告警出口（装配层接 `warn(ctx, …)`）。
+   *
+   * 落盘失败不能让面板整轮快照失败（fail-open）：这一帧用内存里的新值，盘上保留旧值，
+   * 下一帧再试。吞掉异常是禁止的，所以错误从这里出去、进宿主日志。
+   */
+  onUsagePersistError?: (message: string) => void
+  /**
+   * r24：宿主成员名单读口（`adapters.listHostMembers`）。`closeRun` 用它确认「没有存活成员」；
+   * 缺省 = 只能按落盘 `bindings` + 任务状态保守判断，属于降级路径（单测夹具用）。
+   */
+  listMembers?: () => Promise<HostMember[]>
+  /** r24：非致命告警出口（残留计划对账失败等）。装配层接 `warn(ctx, …)`；缺省即静默。 */
+  onWarn?: (message: string) => void
 }
 
 export interface Bridge {
@@ -301,6 +431,14 @@ export interface Bridge {
   setEnabled(sessionId: string, enabled: boolean): void
   snapshot(sessionId: string): PanelSnapshot
   act(sessionId: string, action: PanelAction): Promise<ActResult>
+  /**
+   * r21：把「同一条需求的修改」并入既有 run（显式通道，队长判定后由 auto_team_plan 调用）。
+   *
+   * 与 `act()` 分开的原因：修订要**先落盘再中断成员**（停止中必须可见），还会发直达消息、
+   * 记消息账本；这些是异步副作用，不是一次面板动作。判据（runId 归属、计划终态）在桥里，
+   * 纯计划变换在 `plan/plan.ts` 的 `revisePlan`。
+   */
+  revise(sessionId: string, runId: string, input: RevisionInput): Promise<ReviseRunResult>
   /**
    * r14 AC-1：**同步**派发预检（不碰 spawn、不读门禁、不落盘）。
    *
@@ -315,12 +453,28 @@ export interface Bridge {
    * 因此「右栏看到的 run」与「左栏点开的历史 run」是同一份 `RunDetailView`。
    */
   library(query: { sessionId?: string; runId?: string }): LibraryView
-  /** 面板记忆页：先读正文再编辑（否则保存会把已有记忆清空，缺陷 D7）。 */
+  /**
+   * 面板记忆页：先读正文再编辑（否则保存会把已有记忆清空，缺陷 D7）。
+   *
+   * r22：`workspace` 是 HTTP 显式指定的项目（仍走白名单）；缺省时按 `sessionId`
+   * 解析当前会话的项目工作区 —— 面板不带 workspace，读到的必须是**本项目**
+   * `<workspace>/.auto-team/memory` 里的正文，而不是装配目录里的同名文件。
+   */
   readMemoryFile(
     track: MemoryTrack,
     name: string,
     workspace?: string,
-  ): Promise<Result<{ track: MemoryTrack; name: string; body: string; chars: number }>>
+    sessionId?: string,
+  ): Promise<
+    Result<{
+      track: MemoryTrack
+      name: string
+      body: string
+      chars: number
+      file: MemoryFileView
+      entries: MemoryEntryView[]
+    }>
+  >
   /**
    * 面板技能编辑弹层：按需读技能正文（r10 AC-17）。
    *
@@ -328,18 +482,31 @@ export interface Bridge {
    * 与 `readMemoryFile` 同族；`title` 一并带出，弹层标题不必再从 `snapshot.skills` 里反查。
    */
   readSkillBody(id: string): Promise<Result<{ id: string; title: string; body: string; chars: number }>>
-  /** 队长侧（工具/提示词）用的记忆注入文本。 */
-  memoryFor(goal: string): { text: string; truncated: boolean; chars: number }
+  /** 队长侧（工具/提示词）用的记忆注入文本；r22 起按会话解析项目工作区。 */
+  memoryFor(goal: string, sessionId?: string): { text: string; truncated: boolean; chars: number }
   /** 队长侧：写入一条记忆（可带 track），按 MEMORY_LINES_PER_TASK 裁剪。 */
-  remember(track: MemoryTrack, name: string, body: string): Result<{ name: string }>
+  remember(track: MemoryTrack, name: string, body: string, sessionId?: string): Result<{ name: string }>
+  /**
+   * r23：条目级写入（`auto_team_memory` 的 write 动作唯一入口）。
+   *
+   * 与 `remember` 的裸行追加不同，这里走 §7 的 upsert/supersede/淘汰/配额整套语义；
+   * 全内存完成后才落盘，任一条失败则一条都不写（原子）。
+   */
+  mutateMemory(
+    track: MemoryTrack,
+    drafts: readonly EntryDraft[],
+    sessionId?: string,
+  ): MemoryMutationResult
   /**
    * 按 `mem://<track>/<stem>` 展开记忆原文（AC-9/AC-11）。
    *
    * 成功与失败都包成 `Result`：`code !== 'OK'` 的 payload 也走 `data`，因为**码本身是结论**
    * （`EXPAND_NOT_FOUND` / `EXPAND_PATH_ESCAPE` …），压成一句 `error` 字符串工具层就透不出码了。
    * 只有「端口没装配」这一种装配期缺失才用 `error`（那不是展开语义的一部分）。
+   *
+   * r22：`sessionId` 决定展开时读哪个项目的记忆根（与列表/注入/读写删同一解析）。
    */
-  expandMemory(id: string, depth?: number): Result<ExpandPayload>
+  expandMemory(id: string, depth?: number, sessionId?: string): Result<ExpandPayload>
 }
 
 interface SessionFlag {
@@ -362,8 +529,45 @@ const PAUSED_BLOCKED: ReadonlySet<PanelAction['type']> = new Set<PanelAction['ty
   'receipt',
 ])
 
+/**
+ * r24：已做过残留计划对账的 `dataRoot`（进程级、每个盘只跑一次）。
+ *
+ * 放在模块级而不是 bridge 实例上：同一进程可能装配多个 bridge（测试夹具 / 多 profile），
+ * 但对同一份 runs 目录重复对账没有意义；第二次进来时状态已是 `terminated`，结果也必须一致。
+ */
+const reconciledDataRoots = new Set<string>()
+
+/** r24：用户手动终止残留计划时落的收口文案（逐字由需求给定）。 */
+const CLOSE_RUN_REASON = '用户终止残留计划'
+
 export function createBridge(deps: BridgeDeps): Bridge {
   const now = deps.now ?? (() => Date.now())
+
+  // r24：残留计划自动对账 —— **必须在任何 snapshot/list 读取之前**完成，否则面板会先
+  // 看见「还活着」的残留 run。装配期还没有任何成员（createBridge 早于所有 spawn），
+  // 所以「本进程无存活成员」这个条件是天然成立的，不需要也不应该去问宿主名单。
+  //
+  // r25：同一启动窗口里先修历史脏数据（终态 run 里残留的非终态任务），再对账剩余计划；
+  // 两步各自 try/catch —— 历史文件坏了不能连带跳过自动收口，更不能让面板读不到数据。
+  if (!reconciledDataRoots.has(deps.dataRoot)) {
+    reconciledDataRoots.add(deps.dataRoot)
+    try {
+      const repairedRuns = repairClosedRuns(deps.store, { onWarn: deps.onWarn })
+      if (repairedRuns.length > 0) {
+        deps.onWarn?.(`自动团队：已修正 ${repairedRuns.length} 个已收口运行的残留任务（${repairedRuns.join('、')}）`)
+      }
+    } catch (error) {
+      deps.onWarn?.(`自动团队：修正已收口运行失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    try {
+      const reconciledRuns = reconcileStalePlans(deps.store, { now: now() })
+      if (reconciledRuns.length > 0) {
+        deps.onWarn?.(`自动团队：已自动收口 ${reconciledRuns.length} 个残留计划（${reconciledRuns.join('、')}）`)
+      }
+    } catch (error) {
+      deps.onWarn?.(`自动团队：残留计划对账失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 
   /**
    * 生效设置（r7 AC-13）：**每次读盘**而不是装配时读一次 —— 用户在设置页改完立刻生效，
@@ -371,6 +575,28 @@ export function createBridge(deps: BridgeDeps): Bridge {
    */
   function settingsOf(): AutoTeamSettings {
     return deps.settingsRepo === undefined ? defaultSettings() : deps.settingsRepo.read()
+  }
+
+  /**
+   * 本次门禁要用的执行目录与产物目录（按会话解析）。
+   *
+   * 判定顺序刻意如此：
+   *  1. `workspaceOf(sessionId)` 给得出**非空白**路径 → 它就是会话工作区；产物跟着会话走
+   *     （`<workspace>/.auto-team/artifacts`，与项目记忆同根）。
+   *  2. 取不到（旧宿主 / 该会话尚无 Agent / 解析抛错）→ 回退装配时的 `cwd`/`artifactsDir`。
+   *
+   * 解析异常绝不冒泡：门禁失败的原因必须是验收命令本身，而不是「找目录时崩了」。
+   */
+  function gateContextOf(sessionId: string): { cwd: string; artifactsDir: string } {
+    let workspace: string | undefined
+    try {
+      workspace = deps.gate.workspaceOf?.(sessionId)
+    } catch {
+      workspace = undefined
+    }
+    const value = (workspace ?? '').trim()
+    if (value === '') return { cwd: deps.gate.cwd, artifactsDir: deps.gate.artifactsDir }
+    return { cwd: value, artifactsDir: projectArtifactsDir(value) }
   }
 
   /**
@@ -460,7 +686,81 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return deps.store.latestForSession(sessionId)
   }
 
+  /**
+   * 自动记忆沉淀（r23）：run 到终态时把失败证据提炼成**条目**写进 pitfalls/commands。
+   *
+   * 与 r19 的文件级流水（`run-<id>.md`）相比：
+   *  - 不再生成 run 流水文件：失败教训直接成为可注入的 P1 条目，通过的门禁命令成为 P2 条目；
+   *  - `state.memorySunkAt` 是幂等键：`saveState` 会被反复调用，没有它同一条教训会被反复
+   *    upsert、`修正 N` 一路涨。只有**终态且成功（含 0 条草稿）**才写它；
+   *  - 逐条 apply，坏条目跳过；每个文件只在最后写一次（多次 upsert 不产生中间文件）；
+   *  - fail-open：记忆失败不得影响 run 落盘与派发；异常不写幂等键，下一次保存重试。
+   */
+  function recordRunMemory(state: RunState): void {
+    if (Number.isFinite(state.memorySunkAt)) return
+    const status = state.plan.status
+    if (status !== 'terminated' && status !== 'cancelled') return
+    try {
+      // r22：落点按**这个 run 的真实工作区**现解析（run.project 优先，其次会话 cwd/注册表），
+      // 不再用 apply 时刻捕获的装配目录 —— 否则同一进程里两个项目的 run 会把记忆写进同一个
+      // profile 目录，项目自己的 `.auto-team/memory` 永远为空。
+      const location = memoryLocationFor({
+        sessionId: state.plan.sessionId,
+        runProject: state.project,
+        origin: `run ${state.plan.runId}`,
+      })
+      if (location === null) return
+      const drafts = autoEntryDraftsOf({
+        runId: state.plan.runId,
+        goal: state.plan.goal,
+        status: state.plan.status,
+        createdAt: state.plan.createdAt,
+        plannedAt: state.plannedAt,
+        finishedAt: state.finishedAt,
+        project: state.project,
+        sessionId: state.plan.sessionId,
+        tasks: state.plan.tasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          attempts: task.attempts,
+          evidence:
+            task.evidence === undefined
+              ? undefined
+              : {
+                  command: task.evidence.command,
+                  exitCode: task.evidence.exitCode,
+                  tail: task.evidence.tail,
+                },
+        })),
+      })
+      const entriesByTrack: Record<MemoryTrack, ParsedEntry[]> = {
+        project: readTrackEntries('project', location.roots),
+        public: readTrackEntries('public', location.roots),
+      }
+      const changed: Record<MemoryTrack, Set<string>> = { project: new Set(), public: new Set() }
+      for (const draft of drafts) {
+        const outcome = applyMemoryMutation(entriesByTrack[draft.track], draft, { maxPerFile: ENTRIES_PER_FILE })
+        if (!outcome.ok) continue
+        entriesByTrack[draft.track] = outcome.entries
+        for (const file of outcome.changedFiles) changed[draft.track].add(file)
+      }
+      for (const track of ['project', 'public'] as const) {
+        for (const file of changed[track]) {
+          const written = writeMemoryFile(track, file, entriesByTrack[track], location.roots)
+          // 写失败必须抛出去：吞掉的话幂等键会被写上，这一轮教训就永久丢了。
+          if (!written.ok) throw new Error(written.error)
+        }
+      }
+      state.memorySunkAt = Date.now()
+    } catch {
+      // 刻意空 catch：记忆失败不回传、不落日志噪音，更不能挡住 store.save 与变更通知。
+      // 幂等键未写 → 下一次 saveState 会重试（fail-open 的另一半）。
+    }
+  }
+
   function saveState(state: RunState, cause: AutoDispatchCause = 'plan-saved'): RunState {
+    recordRunMemory(state)
     deps.store.save(state)
     // r13 AC-8：状态变了就通知装配层（自动派发的触发点之一）。回调由装配层提供，
     // 这里只负责「说一声」——派发语义不进入 bridge，否则就是第二条派发路径。
@@ -513,6 +813,238 @@ export function createBridge(deps: BridgeDeps): Bridge {
   function withMessage(state: RunState, message: MessageRecord): RunState {
     const messages = [...state.messages, message]
     return { ...state, messages: messages.slice(Math.max(0, messages.length - MESSAGES_LIMIT)) }
+  }
+
+  // ---------- r21：需求修订（显式并入） ----------
+
+  /** 一次修订的展示时刻文本（与 plan.ts 的 goal 段落同一时区口径）。 */
+  function revisionStampOf(at: number): string {
+    const date = new Date(at)
+    const pad = (value: number): string => String(value).padStart(2, '0')
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+
+  /** 修订直达消息正文（模板固定在这里，t2/t3 的断言直接对这段文案）。 */
+  function revisionMessageOf(input: {
+    runId: string
+    at: number
+    changeSummary: string
+    task: PlanTask
+    changed: boolean
+    cancelled: boolean
+  }): string {
+    const { task } = input
+    const lines = [
+      `【需求修订】run ${input.runId} 于 ${revisionStampOf(input.at)} 并入新需求。`,
+      `变更要点：${input.changeSummary}`,
+    ]
+    if (input.cancelled) {
+      lines.push(
+        `你所在任务 ${task.id}《${task.title}》已被新需求作废（原因：${task.cancelReason ?? '需求修订'}）。`,
+        '请立即停止当前实现，不要再按旧理解提交回执；如需继续，等队长派发新的任务卡。',
+      )
+    } else if (input.changed) {
+      lines.push(
+        `你的任务 ${task.id} 已修订：目标=《${task.title}》，验收命令=${task.acceptance}。`,
+        '请按修订后的目标与验收继续，完成照常走 auto_team_receipt。',
+      )
+    } else {
+      lines.push(
+        `你的任务 ${task.id}《${task.title}》的目标与验收未变；但整体需求已修订，注意依赖任务可能调整。`,
+        '完成照常走 auto_team_receipt。',
+      )
+    }
+    return lines.join('\n')
+  }
+
+  /**
+   * r21：并入需求修订的宿主侧编排。
+   *
+   * 顺序是刻意的：
+   *  1. `revisePlan` 纯校验（失败零写入）；
+   *  2. 先把「停止中」与作废任务的下游阻塞落盘 —— 中断是异步的，界面在等待期间必须看到真相；
+   *  3. 依次中断作废任务上的 running 成员，失败**保持 stopping=true**（显示停止中）；
+   *  4. 给仍在跑的成员发直达消息（修订点 + 自己的任务是否变化），逐条记消息账本；
+   *  5. 最后一次性落盘（退役已停止的 binding、消息账本、队长告知）。
+   */
+  async function reviseRun(sessionId: string, runId: string, input: RevisionInput): Promise<ReviseRunResult> {
+    const state = deps.store.load(runId)
+    if (state === null) return { ok: false, code: 'NOT_FOUND', reason: `找不到 run ${runId}` }
+    if (state.plan.sessionId !== sessionId) {
+      return { ok: false, code: 'NOT_FOUND', reason: `run ${runId} 不属于当前会话，拒绝并入` }
+    }
+
+    const at = now()
+    const revised = revisePlan(state.plan, input, at)
+    if (!revised.ok) return { ok: false, code: 'BAD_REQUEST', reason: revised.reason }
+
+    const beforeStatus = new Map(state.plan.tasks.map((task) => [task.id, task.status]))
+    const changedIds = new Set(revised.updated.map((task) => task.id))
+    const cancelledIds = new Set(revised.cancelled.map((task) => task.id))
+    const liveBindings = state.bindings.filter((binding) => binding.retired !== true)
+    const toStop = liveBindings.filter((binding) => {
+      const before = beforeStatus.get(binding.taskId)
+      return cancelledIds.has(binding.taskId) && (before === 'running' || before === 'gate')
+    })
+    const stopIds = new Set(toStop.map((binding) => binding.taskId))
+
+    // 2) 先把「停止中」落盘；并把作废任务的下游转阻塞（理由写在任务卡上）。
+    let next: RunState = {
+      ...state,
+      plan: revised.plan,
+      bindings: state.bindings.map((binding) =>
+        binding.retired !== true && stopIds.has(binding.taskId) ? { ...binding, stopping: true } : binding,
+      ),
+    }
+    for (const task of revised.cancelled) {
+      for (const child of downstreamOf(state, task.id)) {
+        if (child.status === 'running' || child.status === 'gate') continue
+        if (child.status === 'done' || child.status === 'cancelled' || child.status === 'skipped') continue
+        next = withTask(next, child.id, (item) => ({
+          ...item,
+          status: 'blocked' as const,
+          waitingOn: [task.id],
+          waitReason: `上游 ${task.id} 已在需求修订中作废`,
+        }))
+      }
+    }
+    saveState(next, 'plan-saved')
+
+    // 3) 尽力停止被作废任务的成员；失败保持 stopping=true，绝不标成已停止。
+    const stopped: string[] = []
+    const stopFailed: Array<{ name: string; error: string }> = []
+    const retired = new Set<string>()
+    for (const binding of toStop) {
+      const interrupt = deps.interruptMember
+      if (typeof interrupt !== 'function') {
+        stopFailed.push({ name: binding.name, error: '宿主未装配成员中断端口' })
+        continue
+      }
+      const result = await interrupt(binding.name)
+      if (result.ok) {
+        stopped.push(binding.name)
+        retired.add(binding.memberId)
+      } else {
+        stopFailed.push({ name: binding.name, error: result.error ?? '未知原因' })
+      }
+    }
+
+    const changeSummary =
+      (input.changeSummary ?? '').trim() ||
+      (input.goal ?? '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line !== '') ||
+      (revised.revision.cancelledTaskIds.length > 0 ? '部分任务作废' : '任务目标/验收已更新')
+
+    // 4) 直达消息：仍在跑的成员全部通知（修订点 + 自己的任务是否变化）。
+    //    已经停止的成员不再发（发送会把它重新拉起来），停止失败的成员发「立即停止」。
+    const notified: string[] = []
+    const notifyFailed: Array<{ name: string; error: string }> = []
+    const messages: MessageRecord[] = []
+    const taskById = new Map(revised.plan.tasks.map((task) => [task.id, task]))
+
+    const sendTo = async (binding: (typeof state.bindings)[number], task: PlanTask): Promise<void> => {
+      const text = revisionMessageOf({
+        runId,
+        at,
+        changeSummary,
+        task,
+        changed: changedIds.has(task.id),
+        cancelled: cancelledIds.has(task.id),
+      })
+      const sent = await deps.sendMessage(binding.memberId, text)
+      if (sent.ok) {
+        notified.push(binding.name)
+        messages.push(
+          recordOf({
+            from: 'captain',
+            to: binding.name,
+            toMemberId: binding.memberId,
+            taskId: task.id,
+            body: text,
+            at,
+          }),
+        )
+        return
+      }
+      notifyFailed.push({ name: binding.name, error: sent.error ?? sent.code ?? '直达消息发送失败' })
+    }
+
+    for (const binding of next.bindings) {
+      if (binding.retired === true || retired.has(binding.memberId)) continue
+      const task = taskById.get(binding.taskId)
+      if (task === undefined) continue
+      const before = beforeStatus.get(task.id) ?? 'pending'
+      const stillRunning = before === 'running' || before === 'gate'
+      if (cancelledIds.has(task.id)) {
+        if (binding.stopping !== true) continue
+        await sendTo(binding, task)
+        continue
+      }
+      if (stillRunning) await sendTo(binding, task)
+    }
+
+    // 5) 退役已停止的 binding（清掉 stopping），记录队长告知，最后落盘一次。
+    let finalState: RunState = {
+      ...next,
+      bindings: next.bindings.map((binding) => {
+        if (!retired.has(binding.memberId)) return binding
+        const { stopping: _stopping, ...rest } = binding
+        return { ...rest, retired: true, stoppedAt: rest.stoppedAt ?? at }
+      }),
+    }
+    const notices = [
+      `已并入需求修订（run ${runId}）：更新 ${revised.updated.length}、追加 ${revised.added.length}、作废 ${revised.cancelled.length}`,
+    ]
+    if (stopped.length > 0) notices.push(`已停止成员 ${stopped.join('、')}`)
+    if (stopFailed.length > 0) {
+      notices.push(
+        `成员停止失败：${stopFailed.map((item) => `${item.name}（${item.error}）`).join('、')}（面板标记为停止中，待 watcher 对账）`,
+      )
+    }
+    if (notified.length > 0) notices.push(`已直达通知 ${notified.join('、')}`)
+    if (notifyFailed.length > 0) {
+      notices.push(`修订通知失败：${notifyFailed.map((item) => `${item.name}（${item.error}）`).join('、')}`)
+    }
+
+    // 修订把最后一批任务也作废时，run 必须收口：否则面板会永远显示一个「在跑」的空 plan。
+    // 结束时刻与终止原因同一次落盘（r20 口径：finishedAt 是唯一结束时刻，终态不允许缺）。
+    const settled = new Set(['done', 'failed', 'cancelled', 'skipped'])
+    const allSettled =
+      finalState.plan.tasks.length > 0 && finalState.plan.tasks.every((task) => settled.has(task.status))
+    if (allSettled && finalState.plan.status !== 'terminated' && finalState.plan.status !== 'cancelled') {
+      finalState = {
+        ...finalState,
+        finishedAt: finalState.finishedAt ?? at,
+        termination:
+          finalState.termination ?? { reason: '需求修订后本次运行已无待执行任务', kind: 'superseded' },
+        plan: { ...finalState.plan, status: 'terminated' },
+      }
+      notices.push('本次运行已无待执行任务，run 已终止（原因：需求修订）')
+    }
+
+    for (const message of messages) finalState = withMessage(finalState, message)
+    finalState = withMessage(
+      finalState,
+      recordOf({ from: 'captain', to: 'user', at, body: notices.join('；') }),
+    )
+    saveState(finalState, 'plan-saved')
+
+    return {
+      ok: true,
+      plan: finalState.plan,
+      mode: revised.mode,
+      updated: revised.updated,
+      added: revised.added,
+      cancelled: revised.cancelled,
+      skipped: revised.skipped,
+      revision: revised.revision,
+      stopped,
+      stopFailed,
+      notified,
+      notifyFailed,
+    }
   }
 
   // ---------- 门禁串行队列 ----------
@@ -581,13 +1113,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // AC-17：计划是用户/队长发起的一步，标成 user；客户端「最近推进」条靠 source 分自动/用户。
       source: 'user',
     })
+    // t5：复用成员不会新建成员 —— 同一个 memberId 在本次 run 的第二条 binding 起就是复用，
+    // 活动流里再写「创建成员」会对不上宿主的真实名额（用户看到的是「怎么又建了一个」）。
+    const spawnedMembers = new Set<string>()
     for (const binding of state.bindings) {
+      const reused = spawnedMembers.has(binding.memberId)
+      spawnedMembers.add(binding.memberId)
       events.push({
         at: binding.spawnedAt,
         memberId: binding.memberId,
         taskId: binding.taskId,
         kind: 'spawn',
-        text: `创建成员 ${binding.name}`,
+        text: reused ? `复用成员 ${binding.name} 承接 ${binding.taskId}` : `创建成员 ${binding.name}`,
         source: 'user',
       })
     }
@@ -658,19 +1195,55 @@ export function createBridge(deps: BridgeDeps): Bridge {
     const roleById = new Map(roles.map((role) => [role.id, role]))
     const taskById = new Map(state.plan.tasks.map((task) => [task.id, task]))
     const views: MemberView[] = []
-    const seen = new Set<string>()
 
-    for (const binding of state.bindings) {
-      if (binding.retired === true || seen.has(binding.memberId)) continue
-      seen.add(binding.memberId)
+    /**
+     * t5：复用成员后，同一个 memberId 会挂多条 binding（旧任务已收口 + 新任务在跑）。
+     * 面板一行 = 一个成员，必须回答「它现在在干什么」：
+     * 停止中的事实位 > 已确认停止 > 有在飞任务 > 最近一条（bindings 是追加序）。
+     */
+    const priorityOf = (binding: RunState['bindings'][number]): number => {
+      if (binding.stopping === true) return 3
+      if (binding.stoppedAt !== undefined) return 2
       const task = taskById.get(binding.taskId)
-      const status = toMemberStatus(task?.status ?? 'pending')
+      if (task && (task.status === 'running' || task.status === 'gate' || task.status === 'interrupted')) return 1
+      return 0
+    }
+    // 已退役的历史成员默认不再展示；唯独「确认停止」的成员要留一个「已停止」位（AC-4：
+    // 停了就该看得见，而不是从列表里悄悄消失）。
+    const chosen = new Map<string, RunState['bindings'][number]>()
+    const order: string[] = []
+    for (const binding of state.bindings) {
+      if (binding.retired === true && binding.stoppedAt === undefined) continue
+      const current = chosen.get(binding.memberId)
+      if (current === undefined) {
+        chosen.set(binding.memberId, binding)
+        order.push(binding.memberId)
+        continue
+      }
+      if (priorityOf(binding) >= priorityOf(current)) chosen.set(binding.memberId, binding)
+    }
+
+    for (const memberId of order) {
+      const binding = chosen.get(memberId)
+      if (binding === undefined) continue
+      const stopped = binding.stoppedAt !== undefined
+      const task = taskById.get(binding.taskId)
+      // r21 AC-4：中断已发出、尚未确认停止 → 「停止中」。这是 binding 上的事实位，不靠任务状态猜。
+      const status: MemberStatus =
+        binding.stopping === true && task?.status !== 'done'
+          ? 'stopping'
+          : stopped
+            ? 'stopped'
+            : toMemberStatus(task?.status ?? 'pending')
       views.push({
         memberId: binding.memberId,
         name: binding.name,
         roleId: binding.roleId,
         taskId: binding.taskId,
         status,
+        // r21 AC-4：两个停止事实位只在 binding 上真的存在时才出现（缺席 = 没发生过，客户端不补 0）。
+        ...(binding.stopping === true ? { stopping: true } : {}),
+        ...(binding.stoppedAt !== undefined ? { stoppedAt: binding.stoppedAt } : {}),
         ...stallFieldsOf(state, binding.memberId, status, binding.spawnedAt, stallMs),
         lastEventAt: lastEventAtOf(state, binding.memberId, binding.spawnedAt),
         modelRoute: describeRoute(roleById.get(binding.roleId)),
@@ -679,6 +1252,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     }
 
     // 兼容 v1 落盘的裸 Plan：task.memberId 有值但没有 binding（wrapLegacy 已升级结构，这里只兜底展示）。
+    const seen = new Set(order)
     for (const task of state.plan.tasks) {
       if (task.memberId === undefined || seen.has(task.memberId)) continue
       seen.add(task.memberId)
@@ -749,24 +1323,190 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return { publicDir: deps.memoryRoots.publicDir, projectDir: projectMemoryDir(requested) }
   }
 
-  function memoryFiles(): MemorySnapshotFiles {
-    const files = [...listMemory('project', deps.memoryRoots), ...listMemory('public', deps.memoryRoots)]
+  /**
+   * r22：项目记忆落点的**唯一**解析入口（列表/注入/expand/read/write/delete 全部走这里）。
+   *
+   * 优先级：
+   *  1. 显式 `workspace`（HTTP 参数）→ 仍走 `isKnownWorkspace` 白名单，未知返回 `null`（未授权）；
+   *  2. `runProject`（run 落盘时的真实项目）→ 绝对路径且**不等于装配目录**时优先；
+   *  3. `workspaceOf(sessionId)`（会话 cwd + workspace 注册表反查，装配层每次现查）；
+   *  4. 都没有 → `memoryLocationOf` 明确退化到装配目录并给出可读原因（不静默）。
+   */
+  function memoryLocationFor(input: {
+    sessionId?: string
+    workspace?: string
+    runProject?: string
+    origin?: string
+  }): MemoryLocation | null {
+    if (input.workspace !== undefined && input.workspace.trim() !== '') {
+      const roots = rootsFor(input.workspace)
+      if (roots === null) return null
+      const workspace = normalizeWorkspace(input.workspace)
+      return { roots, projectDir: roots.projectDir, workspace, degraded: false }
+    }
+    return resolvedMemoryLocation(input.sessionId, input.runProject, input.origin)
+  }
+
+  /** 无显式 workspace 时的解析（不会返回 null）：run.project → 会话 cwd → 明确退化。 */
+  function resolvedMemoryLocation(
+    sessionId: string | undefined,
+    runProject?: string,
+    origin?: string,
+  ): MemoryLocation {
+    const runWorkspace = usableWorkspaceOf(runProject)
+    // 旧 run 的 project 是 apply 时刻的装配 workspace（真实宿主 = profile 目录）：
+    // 它派生出的目录与 memoryRoots.projectDir 相同，说明这不是「项目」，继续用会话/注册表解析。
+    const runIsAssembly =
+      runWorkspace !== undefined && projectMemoryDir(runWorkspace) === deps.memoryRoots.projectDir
+    const fromRun = runWorkspace !== undefined && !runIsAssembly ? runWorkspace : undefined
+    const fromSession =
+      fromRun ?? (sessionId === undefined ? undefined : deps.workspaceOf?.(sessionId))
+    return memoryLocationOf({
+      publicDir: deps.memoryRoots.publicDir,
+      fallbackProjectDir: deps.memoryRoots.projectDir,
+      workspace: fromSession,
+      origin: origin ?? (sessionId === undefined ? undefined : `会话 ${sessionId}`),
+    })
+  }
+
+  /**
+   * 读一批轨道的主题文件 → 条目（含 tombstone）。注入、快照、写入口共用这一份解析，
+   * 保证「面板看到的条目」与「注入拿到的条目」来自同一次读。
+   */
+  function readTrackEntries(track: MemoryTrack, roots: MemoryRoots, at: number = now()): ParsedEntry[] {
+    const out: ParsedEntry[] = []
+    for (const view of listMemoryViews(track, roots, { now: at })) {
+      const body = readMemory(track, view.name, roots)
+      const parsed = parseEntryFile(body, {
+        track,
+        file: view.name,
+        now: at,
+        fallbackAt: view.updatedAt,
+        acceptLegacy: true,
+      })
+      out.push(...parsed.entries)
+    }
+    return out
+  }
+
+  /**
+   * 快照用的记忆投影：canonical/misc 文件视图 + 两轨配额 + 旧流水文件数 + 可注入条目。
+   *
+   * 旧 `run-*.md` / `lessons-*.md` **不参与**注入与配额，只计入 `legacyFileCount`；
+   * 它们的内容由「整理」命令一次性提炼进 `pitfalls.md`。
+   */
+  function memoryOverview(roots: MemoryRoots, at: number = now()): MemoryOverview {
+    const projectFiles = listMemoryViews('project', roots, { now: at })
+    const publicFiles = listMemoryViews('public', roots, { now: at })
+    const files = [...projectFiles, ...publicFiles]
+    const entries: ParsedEntry[] = []
+    for (const view of files) {
+      const body = readMemory(view.track, view.name, roots)
+      const parsed = parseEntryFile(body, {
+        track: view.track,
+        file: view.name,
+        now: at,
+        fallbackAt: view.updatedAt,
+        acceptLegacy: true,
+      })
+      entries.push(...parsed.entries)
+    }
+    const legacyFileCount = [...listMemory('project', roots), ...listMemory('public', roots)].filter((file) =>
+      isLegacyMemoryFile(file.name),
+    ).length
     return {
       files,
-      candidates: files.map((file) => ({
-        track: file.track,
-        name: file.name,
-        body: readMemory(file.track, file.name, deps.memoryRoots),
-        updatedAt: file.updatedAt,
-      })),
+      entries,
+      quotas: {
+        project: quotaOf('project', projectFiles),
+        public: quotaOf('public', publicFiles),
+      },
+      legacyFileCount,
     }
+  }
+
+  /**
+   * 条目级写入：在**内存里**逐条 apply，全部成功后才按文件各写一次。
+   *
+   * 原子性：任一条失败（BAD_TEXT / BAD_TOPIC / 配额满 / supersede 冲突）直接返回错误，
+   * 此时盘上零改动；成功后 `changedFiles` 里的每个文件只渲染一次。
+   */
+  function mutateMemoryEntries(
+    track: MemoryTrack,
+    roots: MemoryRoots,
+    drafts: readonly EntryDraft[],
+  ): MemoryMutationResult {
+    let entries = readTrackEntries(track, roots)
+    const changed = new Set<string>()
+    const touched: ParsedEntry[] = []
+    const evicted: ParsedEntry[] = []
+    let added = 0
+    let updated = 0
+    let revived = 0
+    let superseded = 0
+    for (const draft of drafts) {
+      const outcome = applyMemoryMutation(entries, draft, { maxPerFile: ENTRIES_PER_FILE })
+      if (!outcome.ok) return { ok: false, code: outcome.code, message: outcome.message }
+      entries = outcome.entries
+      touched.push(...outcome.touched)
+      evicted.push(...outcome.evicted)
+      added += outcome.added
+      updated += outcome.updated
+      revived += outcome.revived
+      superseded += outcome.superseded.length
+      for (const file of outcome.changedFiles) changed.add(file)
+    }
+    const changedFiles = [...changed].sort((a, b) => a.localeCompare(b))
+    for (const file of changedFiles) {
+      const written = writeMemoryFile(track, file, entries, roots)
+      if (!written.ok) return { ok: false, code: 'BAD_REQUEST', message: written.error }
+    }
+    const topics: MemoryTopicId[] = []
+    for (const entry of touched) {
+      if (entry.topic !== null && !topics.includes(entry.topic)) topics.push(entry.topic)
+    }
+    return {
+      ok: true,
+      entries: touched.map(entryViewOf),
+      added,
+      updated,
+      revived,
+      superseded,
+      topics,
+      evicted: evicted.map(entryViewOf),
+      notices: [],
+      changedFiles,
+    }
+  }
+
+  /**
+   * r26：run 阶段判定的唯一派生点（历史行 `RunSummary` 与当前 run 快照共用）。
+   *
+   * - `running` = running + gate 任务数（与并发视图同一口径，见 `concurrencyOf`）；
+   * - `failed` / `interrupted` = 对应终态任务数（每个 interrupted 任务对应一个可续聊成员）；
+   * - `members` = 非 retired 的绑定数（成员已退出但绑定保留，不算在跑）。
+   *
+   * 返回 `undefined` 只表示「还没有 run」，不表示这些数字不可得；有 state 时四个数
+   * 都是从真实任务/绑定数出来的（0 是合法事实）。不落盘，每次读取现算。
+   */
+  function runStageCountsOf(state: RunState | null): RunStageCounts | undefined {
+    if (state === null) return undefined
+    let running = 0
+    let failed = 0
+    let interrupted = 0
+    for (const task of state.plan.tasks) {
+      if (task.status === 'running' || task.status === 'gate') running += 1
+      else if (task.status === 'failed') failed += 1
+      else if (task.status === 'interrupted') interrupted += 1
+    }
+    const members = state.bindings.filter((binding) => binding.retired !== true).length
+    return { running, failed, interrupted, members }
   }
 
   function concurrencyOf(state: RunState | null): PanelSnapshot['concurrency'] {
     const host = deps.hostConcurrency?.() ?? { limit: MAX_CONCURRENT_LIMIT, source: 'default' as const }
-    const running = state
-      ? state.plan.tasks.filter((task) => task.status === 'running' || task.status === 'gate').length
-      : 0
+    // 与 `RunStageCounts.running` 共用同一派生点，禁止在这里再写一份过滤条件。
+    const running = runStageCountsOf(state)?.running ?? 0
     const limit = state
       ? Math.min(state.plan.maxConcurrent, host.limit, MAX_CONCURRENT_LIMIT)
       : Math.min(host.limit, MAX_CONCURRENT_LIMIT)
@@ -864,32 +1604,34 @@ export function createBridge(deps: BridgeDeps): Bridge {
    */
   function runDurationOf(state: RunState | null, at: number): DurationCell {
     if (!state) return durationCellOf({ state: 'unavailable', now: at })
-    const ended = state.finishedAt !== undefined
+    // r20：落盘值优先，历史 run 用 `finishedAtOf` 的可核实回退（任务结束时刻/最后消息时间）。
+    const endedAt = finishedAtOf(state)
+    const ended = endedAt !== undefined
     if (!ended && (state.plan.status === 'cancelled' || state.plan.status === 'terminated')) {
       return durationCellOf({ startAt: state.plannedAt, state: 'unavailable', now: at })
     }
     return durationCellOf({
       startAt: state.plannedAt,
-      ...(ended ? { endAt: state.finishedAt } : {}),
+      ...(ended ? { endAt: endedAt } : {}),
       state: ended ? 'done' : 'running',
       now: at,
     })
   }
 
-  /** 任务级用时（快照 `taskDurations`，key = taskId）：没有起点 = 未开始，不是 0 秒。 */
+  /**
+   * 任务级用时（快照 `taskDurations`，key = taskId）；r24 起与 `library.taskDurationOf`
+   * 共用 `taskDurationCellOf`：已结束但缺起止记录 → 不可得 + 原因，不再误报「未开始」。
+   */
   function taskDurationsOf(state: RunState | null, at: number): Record<string, DurationCell> {
     const out: Record<string, DurationCell> = {}
     if (!state) return out
     for (const task of state.plan.tasks) {
       const time = state.taskTimes?.[task.id]
-      const startAt = time?.startedAt
-      const endAt = time?.endedAt
-      const finished = endAt !== undefined || isTerminalTaskStatus(task.status)
-      const cellState = startAt === undefined ? 'not-started' : finished ? 'done' : 'running'
-      out[task.id] = durationCellOf({
-        ...(startAt === undefined ? {} : { startAt }),
-        ...(endAt === undefined ? {} : { endAt }),
-        state: cellState,
+      out[task.id] = taskDurationCellOf({
+        status: task.status,
+        ...(time?.startedAt === undefined ? {} : { startedAt: time.startedAt }),
+        ...(time?.endedAt === undefined ? {} : { endedAt: time.endedAt }),
+        terminal: isTerminalTaskStatus(task.status),
         now: at,
       })
     }
@@ -911,33 +1653,135 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 历史列表（AC-21，≤50）：每个会话自己的 run，最近的在前。
    *
    * 5 秒 memo（与 `LIBRARY_CACHE_MS` 同量级、独立对象）：`store.list()` 会读**每一个** run 文件，
-   * 面板 2 秒一刷时不该把历史列表变成每刷一次的磁盘风暴；新建的 run 最多晚 5 秒出现，
-   * 而当前 run 本身来自 `latestForSession`，不受影响。
+   * 面板 2 秒一刷时不该把历史列表变成每刷一次的磁盘风暴。
+   *
+   * t4：memo 额外以 `store.writeEpoch()` 为失效判据 —— 任何一次落盘（saveState / applyReceipt
+   * 落账 / closeRun / cancel / 自动对账 / dispatch / watcher / tools，全部收敛到 `RunsStore.save`）
+   * 之后，下一次 `historyOf` 必须重新读盘，否则「终止成功」后历史行还会最多 5 秒显示旧状态。
+   * 反向约束（AC：不得退化）保留：**没有写盘**时仍按 5 秒合并读；只改 usage 的投影写盘
+   * 走 `historyNeutral`，不推进 epoch（见 `store.SaveOptions`），避免轮询帧把 memo 打穿。
    */
-  let historyMemo: { sessionId: string; at: number; runs: RunSummary[] } | null = null
+  let historyMemo: { sessionId: string; at: number; epoch: number; runs: RunSummary[] } | null = null
   function historyOf(sessionId: string): RunSummary[] {
     const at = now()
-    if (historyMemo && historyMemo.sessionId === sessionId && at - historyMemo.at < LIBRARY_CACHE_MS) {
+    const epoch = deps.store.writeEpoch()
+    if (
+      historyMemo &&
+      historyMemo.sessionId === sessionId &&
+      historyMemo.epoch === epoch &&
+      at - historyMemo.at < LIBRARY_CACHE_MS
+    ) {
       return historyMemo.runs
     }
+    // r17：历史行要显示 token 六项。六项文案的唯一来源是宿主 `format.ts`，客户端不许自己拆，
+    // 所以在这里把落盘的 `usageTotals` 派生为 `UsageCell`（含 `text` + `details`）。
+    // 只派生不落盘：`usage` 是视图字段，run 文件里仍只有原始 `usageTotals`。
     const runs = deps.store
       .list()
       .filter((run) => run.sessionId === sessionId)
       .slice(0, HISTORY_PAGE_SIZE)
-    historyMemo = { sessionId, at, runs }
+      .map((run) => {
+        // r26：阶段判定计数从 RunState 现算（落盘只保留原始事实，不新增字段）。
+        // 读盘失败时四项缺席 —— 宁可显示「不可得」，也不拿 0 冒充「没有失败/没有成员」。
+        let counts: RunStageCounts | undefined
+        try {
+          counts = runStageCountsOf(deps.store.load(run.runId))
+        } catch {
+          counts = undefined
+        }
+        return {
+          ...run,
+          ...(counts === undefined ? {} : counts),
+          usage: usageCellOf(run.usageTotals, HISTORY_USAGE_REASON),
+        }
+      })
+    historyMemo = { sessionId, at, epoch, runs }
     return runs
   }
 
+  /**
+   * r17：用宿主会话投影刷新落盘 usage（**覆盖**语义），返回可继续用于本帧快照的 state。
+   *
+   * 为什么在这里刷：真机 `session/event` 从未投递到插件（r13 的用量账一直空着），
+   * 而 `sessionProjections.stateOf(memberSession,'tokenUsage')` 从会话日志回放、不依赖事件。
+   * 快照是面板 2 秒轮询的唯一入口，也是工具拿状态的入口 —— 在入口刷一次就够。
+   *
+   * 只有**数值真的变了**才落盘：`applyProjectionUsage` 在内容不变时返回同一引用，
+   * 2 秒一刷都写盘会把 run 文件变成磁盘风暴（mtime 也没有信息量了）。
+   * 这里只写盘、不触发派发：用量变化不代表计划/任务变了，走 `saveState` 会让
+   * autoDispatcher 每 2 秒收到一次 `plan-saved`，把退避统计污染成噪声。
+   */
+  function refreshUsage(state: RunState | null): RunState | null {
+    const read = deps.readSessionUsage
+    if (state === null || typeof read !== 'function') return state
+    const readCalls = deps.readSessionCalls
+    /** 读次数：未注入/抛错都当「这次读不到」（保留已落盘值），绝不让它打断快照。 */
+    const readCallsOf = (memberId: string): number | undefined => {
+      if (typeof readCalls !== 'function') return undefined
+      try {
+        return readCalls(memberId)
+      } catch {
+        return undefined
+      }
+    }
+    const entries: ProjectionUsageEntry[] = []
+    for (const binding of state.bindings ?? []) {
+      // 已退出的成员不再刷新（会话多半已卸载）；它的累计值留在落盘 usage 里。
+      if (binding.retired === true) continue
+      const memberId = binding.memberId
+      if (typeof memberId !== 'string' || memberId === '') continue
+      let totals: TokenTotals | undefined
+      try {
+        totals = read(memberId)
+      } catch {
+        // fail-open：读不到就保持已落盘的值，绝不让一次投影异常打断整轮快照。
+        totals = undefined
+      }
+      // token 投影整个读不到时**连 calls 也不单独写**：`applyProjectionUsage` 是覆盖语义，
+      // 只带 calls 的 totals 会把已落盘的 token 数字抹掉（上一帧读到了、这一帧读不到很常见）。
+      if (totals === undefined) continue
+      /**
+       * r20：调用次数来自成员会话事件计数，与 token 是两次读、同一份会话。
+       *  - 读到数字（含真实的 0）→ 合并进 totals，跟着 byMember/byTask/total 一起落盘；
+       *  - 读不到（日志异常）→ **保留上一帧已落盘的 calls**，不能把历史数字覆盖成「不可得」。
+       */
+      const calls = readCallsOf(memberId)
+      const previousCalls = state.usage?.byMember?.[memberId]?.calls
+      const mergedCalls = calls ?? previousCalls
+      if (mergedCalls !== undefined) totals = { ...totals, calls: mergedCalls }
+      entries.push({ memberId, taskId: binding.taskId, totals })
+    }
+    if (entries.length === 0) return state
+    const next = applyProjectionUsage(state.usage, entries, now())
+    if (next === undefined || next === state.usage) return state
+    const updated: RunState = { ...state, usage: next }
+    try {
+      // t4：`historyNeutral` —— 这一笔只改 usage（`RunState` 的视图字段），不改变 run 的状态、
+      // 终止原因或任务状态。若它也推进 `writeEpoch`，正在跑的 run 每个 2 秒轮询帧都会因
+      // token 增长写一次盘，历史 memo 就退化成「每刷全量读盘」；所以这里刻意不失效历史缓存
+      // （历史行的 token 数字最多晚 5 秒，与 t4 之前的行为一致，不是新的陈旧点）。
+      deps.store.save(updated, { historyNeutral: true })
+    } catch (error) {
+      // 落盘失败：本帧仍用内存新值，盘上保留旧值（下一帧再试）；错误交给装配层进日志。
+      deps.onUsagePersistError?.(`用量落盘失败（${error instanceof Error ? error.message : String(error)}）`)
+    }
+    return updated
+  }
+
   function snapshot(sessionId: string): PanelSnapshot {
-    const state = loadState(sessionId)
+    const state = refreshUsage(loadState(sessionId))
     const roles = deps.roles.list()
-    const { files, candidates } = memoryFiles()
+    // 一次快照只取一次时间：记忆视图的「相对时刻」与页脚时间必须来自同一个 now。
+    const at = now()
+    // r22：每次快照现解析项目记忆根（run.project 不在快照路径里，按会话工作区）。
+    const memoryLocation = resolvedMemoryLocation(sessionId)
+    const overview = memoryOverview(memoryLocation.roots, at)
     // 生效设置只取一次：同一份快照里的预算与停滞阈值必须来自同一次读，否则会出现
     // 「预算 4000 但只注入了 200」这种自相矛盾（一次 snapshot 读两次盘就会发生）。
     const settings = settingsOf()
     const stallMs = stallMsOf(settings)
     const goal = state?.plan.tasks.map((task) => task.title).join(' ') ?? ''
-    const selected = selectMemory(goal, candidates, settings.memoryBudget)
+    const selected = selectMemoryEntries(goal, overview.entries, settings.memoryBudget)
     // 事件源健康度与队长模型都由装配层注入（见 BridgeDeps 注释）：缺失就是「未投影」，
     // 不能在这里编一个默认值假装正常——面板的职责是把「我不知道」显示出来（anti-goal 5）。
     const health = deps.triggerHealth?.()
@@ -950,18 +1794,23 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // store.normalizePause 丢掉，但 plan.status 一定还在）。
     const paused = state?.plan.status === 'paused'
     const pausedAt = state?.pause?.at
-    // r13：一次快照只取一次时间，所有「已等待 / 运行中用时」都基于同一个 now ——
-    // 否则同一份快照里两条时间文本会差几毫秒，左栏右栏对不上。
-    const at = now()
+    // r13：所有「已等待 / 运行中用时」都基于上面同一个 at —— 否则同一份快照里两条时间文本
+    // 会差几毫秒，左栏右栏对不上。
     const pending = pendingViewOf(state?.pendingConfirmation, at)
+    // r26：当前 run 与历史行共用同一组阶段计数（与 `RunSummary` 的四个字段同构）。
+    const runCounts = runStageCountsOf(state)
 
     return {
       enabled: flags[sessionId]?.enabled === true,
       runId: state?.plan.runId,
       planStatus: state?.plan.status,
       plannedAt: state?.plannedAt,
+      // r21：目标全文与修订史（含「需求修订」段落）。缺省时字段缺席，客户端显示「不可得」而不是空串。
+      ...(state?.plan.goal === undefined ? {} : { goal: state.plan.goal }),
+      ...(state?.plan.revisions === undefined ? {} : { revisions: state.plan.revisions }),
       tasks: state?.plan.tasks ?? [],
       members: membersOf(state, roles, stallMs),
+      ...(runCounts === undefined ? {} : { runCounts }),
       messages: state?.messages ?? [],
       routeAudits: state?.routeAudits ?? [],
       concurrency: concurrencyOf(state),
@@ -969,10 +1818,19 @@ export function createBridge(deps: BridgeDeps): Bridge {
         injectedChars: selected.chars,
         budget: settings.memoryBudget,
         truncated: selected.truncated,
-        files,
+        files: overview.files,
+        // r23：两轨配额与旧流水计数。旧 `run-*.md` 不参与注入，只在这里让人看见「还有谁没整理」。
+        quotas: overview.quotas,
+        legacyFileCount: overview.legacyFileCount,
         // 内联索引明细（AC-7）与未内联条目（AC-8）：面板据此说「哪几条进了上下文 / 哪几条可展开」。
         inline: selected.entries,
-        omitted: selected.notInlined,
+        omitted: selected.omitted,
+        // r22：让「记忆写到哪儿 / 为什么没写进项目」在面板与工具返回值里可见，不静默。
+        projectDir: memoryLocation.projectDir,
+        ...(memoryLocation.workspace === undefined ? {} : { workspace: memoryLocation.workspace }),
+        ...(memoryLocation.degraded
+          ? { degraded: true, degradeReason: memoryLocation.degradeReason ?? '项目记忆退化到装配目录' }
+          : {}),
       },
       roles,
       activity: activityOf(state),
@@ -1027,6 +1885,45 @@ export function createBridge(deps: BridgeDeps): Bridge {
   function bindingFor(state: RunState, taskId: string | undefined): RunState['bindings'][number] | undefined {
     if (taskId === undefined) return undefined
     return state.bindings.find((binding) => binding.taskId === taskId && binding.retired !== true)
+  }
+
+  /**
+   * r24：一个 run 此刻是否还有**存活成员**（`closeRun` 的唯一判据）。
+   *
+   * 判定顺序刻意保守：
+   *  1. 没有未退休的 binding → 没有成员，直接放行；
+   *  2. 有 binding 但装配层没给名单读口 → 视为「可能还活着」，拒绝终止（宁可让用户多一步，
+   *     也不把正在跑的工作判死）；
+   *  3. 有读口但读失败 → 同上（未知 ≠ 没有）；
+   *  4. 读到了就按宿主的 4 态归一：`alive` 才算存活（`normalizeHostStatus` 与 watcher 同源）。
+   */
+  async function liveMemberNamesOf(state: RunState): Promise<{ names: string[]; unknown?: string }> {
+    const bindings = state.bindings.filter((binding) => binding.retired !== true)
+    if (bindings.length === 0) return { names: [] }
+    const namesOf = (): string[] =>
+      bindings.map((binding) => binding.name || binding.memberId || binding.taskId)
+    if (deps.listMembers === undefined) {
+      return { names: namesOf(), unknown: '装配层未提供宿主成员名单读口，无法确认成员是否已退出' }
+    }
+    let rows: HostMember[]
+    try {
+      rows = await deps.listMembers()
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      return { names: namesOf(), unknown: `宿主成员名单读取失败（${reason}）` }
+    }
+    const names: string[] = []
+    for (const binding of bindings) {
+      const row = rows.find(
+        (item) =>
+          (binding.memberId !== undefined && item.id === binding.memberId) ||
+          (binding.name !== '' && item.name === binding.name),
+      )
+      if (row !== undefined && normalizeHostStatus(row.status) === 'alive') {
+        names.push(binding.name || row.name || binding.memberId || binding.taskId)
+      }
+    }
+    return { names }
   }
 
   /**
@@ -1322,8 +2219,44 @@ export function createBridge(deps: BridgeDeps): Bridge {
           for (const error of outcome.errors) {
             notices.push(`${error.taskId} 失败：${error.error}`)
           }
+          // t5：复用成员不新建成员，「已创建 N 个成员」里必须剔掉复用的那几个，否则面板会
+          // 报出一个不存在的成员数。dispatch 的对外形状是固定的（装配层只投影
+          // started/skipped/errors/renamed），这里按落盘后的 binding 反查：同一 memberId
+          // 在派发前已被别的任务占用 → 这次是复用了它。
+          //
+          // 跨 run 复用（修名额泄漏的主场景）要看**同会话历史 run** 的 binding：成员是在上一个
+          // run 里建的，当前 run 派发前的 bindings 里没有它。因此先把派发前所有已知 binding 的
+          // memberId 收进集合，再对照派发后新任务的 binding。
+          const beforeMemberIds = new Set<string>()
+          for (const item of state.bindings) beforeMemberIds.add(item.memberId)
+          try {
+            for (const summary of deps.store.list()) {
+              if (summary.runId === state.plan.runId || summary.sessionId !== state.plan.sessionId) continue
+              const prior = deps.store.load(summary.runId)
+              if (!prior) continue
+              for (const item of prior.bindings) beforeMemberIds.add(item.memberId)
+            }
+          } catch {
+            /* 历史不可读时只按当前 run 判定（提示可能把复用说成新建，不影响派发） */
+          }
+          const after = deps.store.load(state.plan.runId) ?? state
+          // r26 ①：本批真的建起/复用了成员才算「派发成功」→ 计划态 draft → dispatching。
+          // 全部失败/全部跳过时保持 draft（失败后用户还能再点派发，不被误标成「已派发」）。
+          // `advancePlanToDispatching` 幂等且只进不退：已是 dispatching/暂停/终态时返回 null。
           if (outcome.started.length > 0) {
-            notices.unshift(`已创建 ${outcome.started.length} 个成员：${outcome.started.join('、')}`)
+            const advanced = advancePlanToDispatching(after)
+            if (advanced !== null) saveState(advanced)
+          }
+          const reusedTasks = outcome.started.filter((taskId) => {
+            const binding = after.bindings.find((item) => item.taskId === taskId && !item.retired)
+            return binding !== undefined && beforeMemberIds.has(binding.memberId)
+          })
+          const createdTasks = outcome.started.filter((taskId) => !reusedTasks.includes(taskId))
+          if (outcome.started.length > 0) {
+            const parts: string[] = []
+            if (createdTasks.length > 0) parts.push(`已创建 ${createdTasks.length} 个成员：${createdTasks.join('、')}`)
+            if (reusedTasks.length > 0) parts.push(`已复用 ${reusedTasks.length} 个空闲成员：${reusedTasks.join('、')}`)
+            notices.unshift(parts.join('；'))
           } else if (outcome.skipped.length === 0 && outcome.errors.length === 0) {
             const blocked = blockedTasks(state.plan.tasks)
             notices.push(
@@ -1350,8 +2283,62 @@ export function createBridge(deps: BridgeDeps): Bridge {
           const state = loadState(sessionId)
           if (!state) return reject('NO_PLAN', '当前会话没有进行中的运行', sessionId)
           if (state.plan.status === 'cancelled') return accept(sessionId, ['本次运行已取消'])
-          saveState({ ...state, plan: { ...state.plan, status: 'cancelled' } })
+          if (state.plan.status === 'terminated') {
+            return reject('BAD_REQUEST', '本次运行已终止，取消不会改变它的终态', sessionId)
+          }
+          // r20/r21：取消是终态，结束时刻与状态、终止原因同一次落盘
+          // （重复取消走上面的幂等分支，不覆盖首次时刻；finishedAt 仍是唯一结束时刻）。
+          const at = now()
+          saveState({
+            ...state,
+            finishedAt: state.finishedAt ?? at,
+            termination: state.termination ?? { reason: '队长取消了本次运行', kind: 'cancelled' },
+            plan: { ...state.plan, status: 'cancelled' },
+          })
           return accept(sessionId, ['已取消本次运行：不会再有新的派发（已创建的成员仍可对话）'])
+        }
+
+        /**
+         * r24：终止残留计划（用户手动收口）。
+         *
+         * 只允许「非终态 + 没有任何存活成员」的 run；目标已是终态时返回 `unchanged`
+         * （幂等、不报错 —— 用户重复点同一行不该看到红字）；还有成员在跑时拒绝：
+         * 终止正在推进的 run 必须走「取消本次运行」，两条路径的副作用与文案都不同。
+         */
+        case 'closeRun': {
+          const state = deps.store.load(action.runId)
+          if (!state) return reject('NOT_FOUND', `找不到运行 ${action.runId}`, sessionId)
+          if (state.plan.sessionId !== sessionId) {
+            return reject('NOT_FOUND', `运行 ${action.runId} 不属于当前会话`, sessionId)
+          }
+          if (state.plan.status === 'terminated' || state.plan.status === 'cancelled') {
+            return {
+              ...accept(sessionId, [`运行 ${action.runId} 已是终态，无需重复终止`]),
+              unchanged: true,
+            }
+          }
+          const live = await liveMemberNamesOf(state)
+          if (live.unknown !== undefined) {
+            return reject('BAD_REQUEST', `无法终止运行 ${action.runId}：${live.unknown}`, sessionId)
+          }
+          if (live.names.length > 0) {
+            return reject(
+              'BAD_REQUEST',
+              `运行 ${action.runId} 仍有存活成员（${live.names.join('、')}）在跑：请先取消本次运行，或等成员结束再终止`,
+              sessionId,
+            )
+          }
+          const at = now()
+          // r25：残留任务与终态必须落在**同一次写盘**里（saveState 内部只 save 一次）——
+          // 先写 terminated 再补任务，中间态被面板读到就会出现「已终止但还有 running 任务」。
+          const cancelled = cancelResidualTasks(state, at, CLOSE_RUN_REASON)
+          saveState({
+            ...state,
+            finishedAt: at,
+            termination: { reason: CLOSE_RUN_REASON, kind: 'stale' },
+            plan: { ...state.plan, status: 'terminated', tasks: cancelled.tasks },
+          })
+          return accept(sessionId, [`已终止残留计划 ${action.runId}：不会再产生新的派发`])
         }
 
         /**
@@ -1420,25 +2407,58 @@ export function createBridge(deps: BridgeDeps): Bridge {
           const notices: string[] = [
             `任务 ${task.id} 已取消（${TASK_STATUS_LABELS[task.status]} → ${TASK_STATUS_LABELS.cancelled}）${reason === '' ? '' : `：${reason}`}`,
           ]
-          if (task.status === 'running') {
-            const binding = bindingFor(state, task.id)
-            const memberName = binding?.name ?? binding?.memberId
+          const binding = task.status === 'running' ? bindingFor(state, task.id) : undefined
+          // r21 AC-4：中断是异步的 —— 先把 `stopping` 落盘，等待期间面板显示「停止中」，
+          // 而不是「还在跑」或（中断失败后）假的「已停止」。
+          let base = state
+          if (binding !== undefined && binding.retired !== true) {
+            base = {
+              ...state,
+              bindings: state.bindings.map((item) =>
+                item.memberId === binding.memberId ? { ...item, stopping: true } : item,
+              ),
+            }
+            saveState(base)
+          }
+          let stoppedOk = false
+          if (binding !== undefined && binding.retired !== true) {
+            const memberName = binding.name
             const interrupt = deps.interruptMember
-            if (typeof interrupt === 'function' && memberName !== undefined) {
+            if (typeof interrupt === 'function') {
               const stopped = await interrupt(memberName)
+              stoppedOk = stopped.ok
               notices.push(
                 stopped.ok
                   ? `已中断成员 ${memberName}`
-                  : `成员 ${memberName} 中断失败：${stopped.error ?? '未知原因'}（任务状态已取消，成员由 watcher 对账）`,
+                  : `成员 ${memberName} 中断失败：${stopped.error ?? '未知原因'}（任务状态已取消，成员保持停止中，由 watcher 对账）`,
               )
+            } else {
+              notices.push(`宿主未装配成员中断端口：成员 ${memberName} 保持停止中，由 watcher 对账`)
             }
           }
 
           const downstream = downstreamOf(state, task.id)
-          let next = withTask(state, task.id, (item) => {
+          let next = withTask(base, task.id, (item) => {
             const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
-            return { ...rest, status: 'cancelled' as const }
+            return {
+              ...rest,
+              status: 'cancelled' as const,
+              cancelledAt: at,
+              cancelledBy: 'user' as const,
+              cancelReason: reason === '' ? '队长取消任务' : reason,
+            }
           })
+          // 中断确认成功才退役 binding（清 stopping）；失败/未装配时保持 stopping=true（停止中）。
+          if (stoppedOk && binding !== undefined) {
+            next = {
+              ...next,
+              bindings: next.bindings.map((item) => {
+                if (item.memberId !== binding.memberId) return item
+                const { stopping: _stopping, ...rest } = item
+                return { ...rest, retired: true, stoppedAt: rest.stoppedAt ?? at }
+              }),
+            }
+          }
           for (const child of downstream) {
             next = withTask(next, child.id, (item) => ({
               ...item,
@@ -1536,13 +2556,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
           // 这样自动派发不会把下游重新排一遍；结论仍由 applyReceipt 一次落定。
           const settings = settingsOf()
           const gateTask = nextState.plan.tasks.find((item) => item.id === task.id) ?? task
+          const gateContext = gateContextOf(sessionId)
           let outcome: { ok: boolean; evidence: GateEvidence }
           try {
             outcome = await enqueueGate(() =>
               Promise.resolve(
                 runGate(gateTask, {
-                  cwd: deps.gate.cwd,
-                  artifactsDir: deps.gate.artifactsDir,
+                  cwd: gateContext.cwd,
+                  artifactsDir: gateContext.artifactsDir,
                   timeoutMs: deps.gate.timeoutMs ?? settings.gateTimeoutMs,
                   now,
                 }),
@@ -1645,6 +2666,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
           const settings = settingsOf()
           const gateState = withTask(state, action.taskId, (item) => ({ ...item, status: 'gate' }))
           saveState(gateState)
+          const gateContext = gateContextOf(sessionId)
 
           let outcome: { ok: boolean; evidence: GateEvidence }
           try {
@@ -1653,8 +2675,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
             outcome = await enqueueGate(() =>
               Promise.resolve(
                 runGate(task, {
-                  cwd: deps.gate.cwd,
-                  artifactsDir: deps.gate.artifactsDir,
+                  cwd: gateContext.cwd,
+                  artifactsDir: gateContext.artifactsDir,
                   // AC-13 生效点：装配层显式注入优先（测试要定值），否则取 settings.gateTimeoutMs。
                   timeoutMs: deps.gate.timeoutMs ?? settings.gateTimeoutMs,
                   now,
@@ -1740,9 +2762,24 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (!track) return reject('BAD_REQUEST', 'track 必须是 public 或 project', sessionId)
           const name = safeMemoryName(action.name)
           if (name === null) return reject('BAD_REQUEST', '非法文件名：只允许单段名称（字母/数字/._-，自动补 .md）', sessionId)
-          const written = writeMemory(track, name, action.body ?? '', deps.memoryRoots)
+          const location = resolvedMemoryLocation(sessionId)
+          const written = writeMemory(track, name, action.body ?? '', location.roots)
           if (!written.ok) return reject('BAD_REQUEST', written.error, sessionId)
           return accept(sessionId, [`已保存 ${track}/${written.name}`])
+        }
+
+        case 'curateMemory': {
+          // r23：整理旧流水。track 缺省 project；失败也要返回快照（面板不清空列表），
+          // 因此 reject() 里仍带 snapshot。成功把报告合并进 ActResult.curation。
+          const track = trackOf(action.track) ?? 'project'
+          const report = curateMemory({
+            track,
+            roots: resolvedMemoryLocation(sessionId).roots,
+            dryRun: action.dryRun !== false,
+          })
+          if (!report.ok) return reject('BAD_REQUEST', report.warnings[0] ?? '整理失败', sessionId)
+          const accepted = accept(sessionId, [curateSummaryOf(report)])
+          return { ...accepted, curation: report }
         }
 
         case 'deleteMemory': {
@@ -1750,7 +2787,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (!track) return reject('BAD_REQUEST', 'track 必须是 public 或 project', sessionId)
           const name = safeMemoryName(action.name)
           if (name === null) return reject('BAD_REQUEST', '非法文件名：只允许单段名称（字母/数字/._-，自动补 .md）', sessionId)
-          const removed = deleteMemory(track, name, deps.memoryRoots)
+          const removed = deleteMemory(track, name, resolvedMemoryLocation(sessionId).roots)
           if (!removed.ok) return reject('NOT_FOUND', removed.error, sessionId)
           return accept(sessionId, [`已删除 ${track}/${name}`])
         }
@@ -1886,6 +2923,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
     act,
 
+    revise: reviseRun,
+
     /**
      * r14 AC-1：同步预检（工具受理制的「先问能不能派」）。
      *
@@ -1906,15 +2945,32 @@ export function createBridge(deps: BridgeDeps): Bridge {
       return { projects: [], global: { memories: [] } }
     },
 
-    async readMemoryFile(track: MemoryTrack, name: string, workspace?: string) {
+    async readMemoryFile(track: MemoryTrack, name: string, workspace?: string, sessionId?: string) {
       const safe = safeMemoryName(name)
       if (safe === null) return { error: '非法文件名' }
-      const roots = rootsFor(workspace)
-      if (roots === null) return { error: `未授权的工作区：${workspace ?? ''}` }
-      const exists = listMemory(track, roots).some((file) => file.name === safe)
-      if (!exists) return { error: `记忆文件不存在：${track}/${safe}` }
-      const body = readMemory(track, safe, roots)
-      return { data: { track, name: safe, body, chars: body.length } }
+      // r22：显式 workspace 仍走白名单；面板不带 workspace 时按会话解析项目根。
+      let roots: MemoryRoots
+      if (workspace !== undefined && workspace.trim() !== '') {
+        const requested = rootsFor(workspace)
+        if (requested === null) return { error: `未授权的工作区：${workspace ?? ''}` }
+        roots = requested
+      } else {
+        roots = resolvedMemoryLocation(sessionId).roots
+      }
+      // r23：详情由宿主解析成结构化条目（客户端/模型不解析 md）；legacy 文件允许读，
+      // `file.legacy=true`，其条目**不参与**注入与配额。
+      const detail = readMemoryEntries(track, safe, roots)
+      if (detail === null) return { error: `记忆文件不存在：${track}/${safe}` }
+      return {
+        data: {
+          track,
+          name: safe,
+          body: detail.body,
+          chars: detail.body.length,
+          file: detail.file,
+          entries: detail.parsed.entries.map(entryViewOf),
+        },
+      }
     },
 
     /**
@@ -1934,22 +2990,35 @@ export function createBridge(deps: BridgeDeps): Bridge {
       return { data: { id: key, title: record?.title ?? key, body: read.data, chars: read.data.length } }
     },
 
-    memoryFor(goal: string) {
-      const { candidates } = memoryFiles()
+    memoryFor(goal: string, sessionId?: string) {
+      const overview = memoryOverview(resolvedMemoryLocation(sessionId).roots)
       // AC-13 生效点③：队长侧注入预算与面板 `memory.budget` 必须**同源**（都读 settings），
       // 否则面板显示 4000 而成员实际只拿到 200 —— 本项目历史高频 bug 族的形态。
-      const selected = selectMemory(goal, candidates, settingsOf().memoryBudget)
+      const selected = selectMemoryEntries(goal, overview.entries, settingsOf().memoryBudget)
       return { text: selected.text, truncated: selected.truncated, chars: selected.chars }
     },
 
-    remember(track: MemoryTrack, name: string, body: string): Result<{ name: string }> {
+    remember(
+      track: MemoryTrack,
+      name: string,
+      body: string,
+      sessionId?: string,
+    ): Result<{ name: string }> {
       const lines = (body ?? '').split('\n').slice(0, MEMORY_LINES_PER_TASK)
-      const written = writeMemory(track, name, lines.join('\n'), deps.memoryRoots)
+      const written = writeMemory(track, name, lines.join('\n'), resolvedMemoryLocation(sessionId).roots)
       if (!written.ok) return { error: written.error }
       return { data: { name: written.name } }
     },
 
-    expandMemory(id: string, depth?: number): Result<ExpandPayload> {
+    mutateMemory(
+      track: MemoryTrack,
+      drafts: readonly EntryDraft[],
+      sessionId?: string,
+    ): MemoryMutationResult {
+      return mutateMemoryEntries(track, resolvedMemoryLocation(sessionId).roots, drafts)
+    },
+
+    expandMemory(id: string, depth?: number, sessionId?: string): Result<ExpandPayload> {
       const expander = deps.expander
       // 装配期缺失（宿主没接端口）→ 明确的 error；展开本身的失败（坏 ID / 越权 / 不存在 /
       // 跳数超限）走 data，因为码是结论，工具与模型都要看见（AC-11）。
@@ -1957,7 +3026,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
         return { error: `记忆展开不可用：宿主未装配记忆目录（无法展开 ${id}）` }
       }
       try {
-        return { data: expander(id, depth) }
+        // r22：把本次解析出的根交给 expander —— 与列表/注入/读写删同一份解析。
+        return { data: expander(id, depth, resolvedMemoryLocation(sessionId).roots) }
       } catch (error) {
         // createExpander 按契约不抛；真抛了也不能连累工具调用链（AC-9）。
         return { error: `记忆展开失败：${error instanceof Error ? error.message : String(error)}` }
@@ -1966,9 +3036,35 @@ export function createBridge(deps: BridgeDeps): Bridge {
   }
 }
 
-interface MemorySnapshotFiles {
-  files: PanelSnapshot['memory']['files']
-  candidates: Array<{ track: MemoryTrack; name: string; body: string; updatedAt: number }>
+/** `mutateMemory` 的成功回执：条目视图是本次新增/更新的那几条。 */
+export interface MemoryMutationReceipt {
+  ok: true
+  entries: MemoryEntryView[]
+  added: number
+  updated: number
+  revived: number
+  superseded: number
+  topics: MemoryTopicId[]
+  evicted: MemoryEntryView[]
+  notices: string[]
+  changedFiles: string[]
+}
+
+export type MemoryMutationResult =
+  | MemoryMutationReceipt
+  | { ok: false; code: MemoryMutationCode | 'BAD_REQUEST'; message: string }
+
+interface MemoryOverview {
+  files: MemoryFileView[]
+  entries: ParsedEntry[]
+  quotas: { project: MemoryQuotaView; public: MemoryQuotaView }
+  legacyFileCount: number
+}
+
+/** 整理报告的一行人类可读摘要（面板 notice 与工具返回值共用）。 */
+function curateSummaryOf(report: { dryRun: boolean; track: MemoryTrack; scannedFiles: number; added: number; skippedExisting: number; skippedFull: number }): string {
+  const phase = report.dryRun ? '预演' : '已写入'
+  return `整理${phase}（${report.track}）：扫描 ${report.scannedFiles} 个旧文件，新增 ${report.added} 条，已存在 ${report.skippedExisting} 条，已满 ${report.skippedFull} 条`
 }
 
 function trackOf(raw: unknown): MemoryTrack | null {
@@ -2043,8 +3139,11 @@ export function describeRoute(role: Role | undefined): string {
 }
 
 /**
- * 任务状态 / 宿主成员状态 → 面板 7 态（**唯一映射表**，watcher 复用，组件里禁止再写一份）。
+ * 任务状态 / 宿主成员状态 → 面板成员态（**唯一映射表**，watcher 复用，组件里禁止再写一份**）。
  * 宿主 4 态：running / inactive / provisioning / failed。
+ *
+ * r21 AC-4：`cancelled` / `stopped` / `stopping` / `waiting` 是新增的真实语义，
+ * 不允许被 default 吞成 `idle`（"看不出任务停了"正是这条要修的 bug）。
  */
 export function toMemberStatus(status: string): MemberStatus {
   switch (status) {
@@ -2065,6 +3164,14 @@ export function toMemberStatus(status: string): MemberStatus {
     case 'inactive':
     case 'interrupted':
       return 'interrupted'
+    case 'cancelled':
+      return 'cancelled'
+    case 'stopped':
+      return 'stopped'
+    case 'stopping':
+      return 'stopping'
+    case 'waiting':
+      return 'waiting'
     default:
       return 'idle'
   }

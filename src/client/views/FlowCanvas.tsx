@@ -22,12 +22,16 @@
  * 画布甩到永远找不回来的地方）。
  */
 import * as React from 'react'
-import type { FlowView } from '../../shared/types.ts'
+import type { FlowView, MemberView } from '../../shared/types.ts'
+import { memberForRole } from '../nav.ts'
 import { flowLayoutOf } from '../viewmodel.ts'
 
 export interface FlowCanvasProps {
   flow: FlowView
   onSelectTask: (taskId: string) => void
+  /** r17：点节点优先打开执行它的子智能体。 */
+  members?: MemberView[]
+  onOpenMember?: (member: MemberView, taskId: string) => void
 }
 
 /** 平移上限（±）：与 DESIGN §2.4 一致，够远但不会迷失。 */
@@ -49,7 +53,7 @@ function stageNumberText(index: number): string {
 }
 
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { flow, onSelectTask } = props
+  const { flow, onSelectTask, members, onOpenMember } = props
   const layout = React.useMemo(() => flowLayoutOf(flow), [flow])
   const instanceId = React.useId().replace(/[^a-zA-Z0-9_-]/g, '')
   const markerId = `auto-team-flow-arrow-${instanceId}`
@@ -337,7 +341,15 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               style={{ left: `${x}px`, top: `${y}px` }}
               title={cell.title}
               aria-label={cell.label}
-              onClick={() => onSelectTask(node.id)}
+              onClick={() => {
+                const member =
+                  node.roleId === undefined ? undefined : memberForRole(members, node.roleId, node.id)
+                if (member !== undefined && onOpenMember !== undefined) {
+                  onOpenMember(member, node.id)
+                  return
+                }
+                onSelectTask(node.id)
+              }}
             >
               <span data-flow-line="title">
                 <span data-flow-node-id>{node.id}</span>

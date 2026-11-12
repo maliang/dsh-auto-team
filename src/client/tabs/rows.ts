@@ -11,24 +11,38 @@
  * 放 useState 会在每次切页签时丢掉「我刚才展开的是哪个任务」。模块级 Map 让这三个小状态
  * 跨卸载存活，又不会触发额外渲染。
  */
+import { durationCellOf } from '../../shared/duration.ts'
 import * as React from 'react'
-import type { DurationCell, ProjectRunSummaryView, ProjectView, RunSummary, UsageCell } from '../../shared/types.ts'
+import type {
+  DurationCell,
+  ProjectRunSummaryView,
+  ProjectView,
+  RunSummary,
+  UsageCell,
+  UsageMetric,
+} from '../../shared/types.ts'
 import {
   durationTextOf,
   durationTitleOf,
   formatStamp,
   goalTitleOf,
+  isClosedRun,
+  isResidualRun,
+  RESIDUAL_RUN_BADGE,
+  runStageBadge,
+  runStageOf,
   statusBadge,
   tokenTextOf,
   tokenTitleOf,
+  usageMetricsOf,
 } from '../viewmodel.ts'
-import type { BadgeTone } from '../viewmodel.ts'
+import type { Badge, BadgeTone } from '../viewmodel.ts'
 
 /* ───────────────────────────── 行视图 ───────────────────────────── */
 
 export interface RunRowView {
   runId: string
-  /** 主标题：项目库 run 行 = run 级 goal（截断 24 字），历史行 = 项目名/runId。 */
+  /** 主标题：run 级 goal（截断 24 字）。r17 起历史行与项目 run 行同口径，都是「任务名」。 */
   title: string
   /**
    * r14 AC-15：标题来源。`goal` = 真的记录了目标；`fallback` = 旧 run / 无目标，
@@ -42,13 +56,24 @@ export interface RunRowView {
   statusText: string
   statusTone: BadgeTone
   statusIcon: string
+  /** r26：阶段 detail（人话解释），渲染为徽标 title；缺席时只显示 `状态：…`。 */
+  statusTitle?: string
   tokenText: string
   tokenTitle: string
   tokenSource: 'provider' | 'unavailable'
+  /** r17：宿主给好的六项指标（顺序固定）；空数组 = 旧数据，只显示合计，不自己拆。 */
+  usageMetrics: UsageMetric[]
   durationText: string
   durationTitle: string
   durationState: DurationCell['state']
   active: boolean
+  /** r21：宿主记录的终止原因（旧 run 没有 → 缺席，行内不渲染、不占位）。 */
+  terminationText?: string
+  /**
+   * r24：残留计划徽标（warn）。存在 = 这一行是「未收口、可能残留」的 run，
+   * 调用方要同时给出「终止计划」入口；缺席 = 不渲染徽标、不占位。
+   */
+  residualBadge?: Badge
 }
 
 function rowOf(input: {
@@ -58,11 +83,21 @@ function rowOf(input: {
   titleTitle?: string
   metaText: string
   status: string
+  /** r18b t7：计划行传 `runStageBadge()`；不传则沿用任务/成员态映射（既有调用方零变化）。 */
+  badge?: Badge
+  /** r26：阶段 detail（徽标悬停解释）；由 `runSummaryRowOf` / `projectRunRowOf` 传入。 */
+  statusTitle?: string
   usage: UsageCell
   duration: DurationCell
+  /** r20：标题可覆盖（历史行「算不出用时」要给具体原因，通用文案在这几种情况下不准）。 */
+  durationTitle?: string
   active: boolean
+  /** r21：宿主下发的终止原因（已 `trim`，空串视同缺席）。 */
+  terminationText?: string
+  /** r24：残留计划徽标；由 `runSummaryRowOf` 按宿主事实判定后传入（投影本身不判定）。 */
+  residualBadge?: Badge
 }): RunRowView {
-  const badge = statusBadge(input.status)
+  const badge = input.badge ?? statusBadge(input.status)
   const view: RunRowView = {
     runId: input.runId,
     title: input.title,
@@ -74,39 +109,113 @@ function rowOf(input: {
     tokenText: tokenTextOf(input.usage),
     tokenTitle: tokenTitleOf(input.usage),
     tokenSource: input.usage.source,
+    usageMetrics: usageMetricsOf(input.usage),
     durationText: durationTextOf(input.duration),
-    durationTitle: durationTitleOf(input.duration),
+    durationTitle: input.durationTitle ?? durationTitleOf(input.duration),
     durationState: input.duration.state,
     active: input.active,
   }
   if (input.titleTitle !== undefined) view.titleTitle = input.titleTitle
+  if (input.statusTitle !== undefined) view.statusTitle = input.statusTitle
+  // r21：终止原因只透传宿主字段（历史 / 当前 run 同口径），空串不落成占位。
+  if (input.terminationText !== undefined && input.terminationText.trim() !== '') {
+    view.terminationText = input.terminationText.trim()
+  }
+  // r24：残留徽标只透传判定结果；未残留的 run 保持字段缺席（行内不占位）。
+  if (input.residualBadge !== undefined) view.residualBadge = input.residualBadge
   return view
 }
 
-/** 无 DurationCell 时的降级：只给时间戳，**不给时长**（客户端没有第二套时长格式化）。 */
-const NO_DURATION: DurationCell = { text: '—', state: 'unavailable' }
+/**
+ * 历史行的用量单元格：宿主派生的 `usage` 优先（含 `text` + 六项 `details`）；
+ * 旧快照只有 `usageTotals` 时退回合计，**不**在客户端拆六项（六项文案的单一来源是宿主）。
+ */
+function summaryUsageOf(run: RunSummary): UsageCell {
+  if (run.usage !== undefined) return run.usage
+  if (run.usageTotals !== undefined && typeof run.usageTotals.total === 'number') {
+    return { source: 'provider', tokens: run.usageTotals }
+  }
+  return { source: 'unavailable', reason: '该次运行没有用量记录' }
+}
+
+/**
+ * 历史列表行的用时（r20）。
+ *
+ * 这里**没有**宿主下发的 `DurationCell`：`RunSummary`（`shared/types.ts:667`）只有
+ * `plannedAt`/`finishedAt`，宿主 `bridge.historyOf` 也只额外派生了 `usage`。
+ * 但 r20 t1 已经把 `finishedAt` 补成可核实值（终态落盘优先，历史 run 用
+ * `store.finishedAtOf` 回退），所以列表行可以用**宿主给的时间戳 + shared/duration.ts
+ * 的唯一实现**算出同一个单元格 —— 不是第二套格式化，也没有 0 或估算补位：
+ *  - 没有 `plannedAt`（旧 run）→ 不可得；
+ *  - 终态（cancelled/terminated）但没有 `finishedAt` → 不可得（不算到「现在」）；
+ *  - 有 `finishedAt` → done；否则 running（按 `now` 计时）。
+ *
+ * 策略与宿主 `library.durationOfSummary` 逐条对齐（同一份判定，避免两端口径漂移）。
+ */
+function historyDurationOf(run: RunSummary, now: number): DurationCell {
+  if (run.plannedAt === undefined) return durationCellOf({ state: 'unavailable', now })
+  const ended = run.finishedAt !== undefined
+  const terminal = run.status === 'cancelled' || run.status === 'terminated'
+  if (!ended && terminal) return durationCellOf({ startAt: run.plannedAt, state: 'unavailable', now })
+  return durationCellOf({
+    startAt: run.plannedAt,
+    ...(ended ? { endAt: run.finishedAt } : {}),
+    state: ended ? 'done' : 'running',
+    now,
+  })
+}
+
+/** 历史行「算不出用时」的具体原因（`durationTitleOf` 的通用文案在这几种情况下不够准）。 */
+function historyDurationTitleOf(cell: DurationCell, run: RunSummary): string {
+  if (cell.state !== 'unavailable') return durationTitleOf(cell)
+  if (run.plannedAt === undefined) return '该次运行没有记录开始时刻（旧数据），算不出用时'
+  if (run.finishedAt === undefined) return '该次运行没有结束时刻（宿主未落盘），算不出用时'
+  return durationTitleOf(cell)
+}
 
 /**
  * 历史列表行（右栏「历史」页）—— 数据来自 `snapshot.runs` / `library.runs`（`RunSummary`）。
  *
- * `RunSummary` 只有 `usageTotals`（没有用法单元格），所以这里把总量包成 `UsageCell`；
- * 文本仍由 `tokenTextOf` 生成，不存在第二套格式化。用时则退化为时间戳（同上）。
+ * r17：顶部是「任务名」（run 级 goal；缺省走 `goalTitleOf` 的诚实 fallback），
+ * 底部是 token 六项（`RunSummary.usage.details`，宿主 `format.ts` 单一来源，客户端只透传）。
+ * 旧数据没有 `usage` 时退回 `usageTotals`：只显示合计，不自己拆六项。
+ * r20：次行补上用时（`historyDurationOf`，宿主时间戳 + shared 唯一实现；缺值即不可得）。
  */
 export function runSummaryRowOf(run: RunSummary, now: number = Date.now()): RunRowView {
-  const usage: UsageCell =
-    run.usageTotals !== undefined && typeof run.usageTotals.total === 'number'
-      ? { source: 'provider', tokens: run.usageTotals }
-      : { source: 'unavailable', reason: '该次运行没有用量记录' }
+  const goal = goalTitleOf(run.goal, run.runId)
   const start = formatStamp(run.plannedAt ?? run.createdAt)
-  const end = run.active === true ? '进行中' : formatStamp(run.finishedAt)
+  // r25：终态 run 即使旧宿主还下发 active=true/ongoing>0，也不能显示成「进行中」。
+  const live = run.active === true && !isClosedRun(run)
+  const end = live ? '进行中' : formatStamp(run.finishedAt)
+  const duration = historyDurationOf(run, now)
+  // r26：历史行 / 顶部 run 卡共用同一个阶段判定（计数由宿主补齐，旧数据缺省时保持 undefined）。
+  const stage = runStageOf({
+    planStatus: run.status,
+    total: run.tasks,
+    done: run.done,
+    ...(run.running !== undefined ? { running: run.running } : {}),
+    ...(run.failed !== undefined ? { failed: run.failed } : {}),
+    ...(run.interrupted !== undefined ? { interrupted: run.interrupted } : {}),
+    ...(run.members !== undefined ? { members: run.members } : {}),
+    ...(run.terminationReason !== undefined ? { terminationReason: run.terminationReason } : {}),
+    ...(run.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
+  })
   return rowOf({
     runId: run.runId,
-    title: run.project !== undefined && run.project !== '' ? run.project : run.runId,
+    title: goal.text,
+    titleSource: goal.source,
+    titleTitle: goal.title,
     metaText: `开始 ${start} · 结束 ${end} · 任务 ${run.done}/${run.tasks}`,
     status: run.status,
-    usage,
-    duration: NO_DURATION,
-    active: run.active === true,
+    badge: runStageBadge(stage),
+    ...(stage.detail !== undefined ? { statusTitle: stage.detail } : {}),
+    usage: summaryUsageOf(run),
+    duration,
+    durationTitle: historyDurationTitleOf(duration, run),
+    active: live,
+    ...(run.terminationReason !== undefined ? { terminationText: run.terminationReason } : {}),
+    // r24：三种未收口计划态且没有结束时刻 → 历史行/顶部 run 卡都可见「可能残留」并给终止入口。
+    ...(isResidualRun(run) ? { residualBadge: RESIDUAL_RUN_BADGE } : {}),
   })
 }
 
@@ -116,6 +225,15 @@ export function projectRunRowOf(run: ProjectRunSummaryView): RunRowView {
   const end = formatStamp(run.finishedAt)
   // r14 AC-15：标题 = run 级 goal（24 字截断在 goalTitleOf 单点做，组件不再截）。
   const goal = goalTitleOf(run.goal, run.runId)
+  // r26：项目页行没有计数（`ProjectRunSummaryView` 不带 running/failed/members），
+  // 只按已知的 total/done 判定；缺计数时规则 5/6/7/10 不命中，保守落到待派发/派发中/待收口，
+  // 绝不拿 0 补猜。
+  const stage = runStageOf({
+    planStatus: run.planStatus,
+    total: run.tasks,
+    done: run.done,
+    ...(run.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
+  })
   return rowOf({
     runId: run.runId,
     title: goal.text,
@@ -123,6 +241,8 @@ export function projectRunRowOf(run: ProjectRunSummaryView): RunRowView {
     titleTitle: goal.title,
     metaText: `开始 ${start} · 结束 ${end} · 任务 ${run.done}/${run.tasks}`,
     status: run.planStatus,
+    badge: runStageBadge(stage),
+    ...(stage.detail !== undefined ? { statusTitle: stage.detail } : {}),
     usage: run.usage,
     duration: run.duration,
     active: false,

@@ -19,6 +19,7 @@
 import * as React from 'react'
 import { useAutoTeamStyle } from './styles.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
+import { currentRunStageInputOf } from './viewmodel.ts'
 import { headerButtonView } from './ui.ts'
 
 /** 面板未就绪时的回退通道（`Panel.tsx` 订阅它切到「计划」页）。 */
@@ -47,8 +48,8 @@ export function AutoTeamHeaderButton(props: HeaderButtonProps): React.ReactEleme
   const [localOpen, setLocalOpen] = React.useState(false)
   const closeRefused = React.useRef(false)
 
-  const tasks = snapshot?.tasks ?? []
-  const done = tasks.filter((task) => task.status === 'done').length
+  // 阶段计数与输入框胶囊同源（runCounts 优先，旧快照按 tasks/members 精确派生）。
+  const stage = currentRunStageInputOf(snapshot)
   const hasOpen = typeof props.openPanel === 'function'
   const hasClose = typeof props.closePanel === 'function'
   const canProbe = typeof props.isPanelOpen === 'function'
@@ -62,9 +63,7 @@ export function AutoTeamHeaderButton(props: HeaderButtonProps): React.ReactEleme
 
   const ui = headerButtonView({
     enabled: snapshot?.enabled === true,
-    planStatus: snapshot?.planStatus,
-    done,
-    total: tasks.length,
+    ...stage,
     opened,
     available: hasOpen,
     canClose: hasClose,

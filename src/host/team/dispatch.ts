@@ -12,7 +12,7 @@
  * 本文件纯依赖注入（store/spawn/roles/buildPrompt/listMembers 全由外部传入），
  * 因此不需要起宿主就能用 node --test 完全覆盖。
  */
-import type { Plan, PlanTask, RejectionCode, Role, RoleModelRoute } from '../../shared/types.ts'
+import type { MemberBinding, Plan, PlanTask, RejectionCode, Role, RoleModelRoute } from '../../shared/types.ts'
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
 import type { TaskTimeRecord } from '../store.ts'
@@ -29,7 +29,7 @@ import { depSatisfied, readyTasks } from '../plan/graph.ts'
 import { waitReasonOf } from '../plan/scope.ts'
 import { handoffBodiesFor, handoffMessages } from './handoff.ts'
 import { appendMessage, makeMessage } from './messages.ts'
-import { auditRoute, preflightRoutes, type RoutePort } from './route.ts'
+import { auditRoute, describeRouteOf, preflightRoutes, routeDrift, type RoutePort } from './route.ts'
 import { applyScopeWaits, releaseScopes, waitFor } from './scope-locks.ts'
 
 /** 创建成员的入参：名字是确定性的，路由是角色声明的（宿主可能不支持 model，见 L1）。 */
@@ -69,6 +69,14 @@ export interface DispatchDeps {
   listMembers(): Promise<HostMember[]>
   /** 可选：逐角色模型预校验端口（AC-22）；未提供时视为「不预校验」。 */
   routePort?: RoutePort
+  /**
+   * 可选：读某个成员会话**当前真实**的模型路由（r27）。宿主名单里的 memberId 就是会话 id。
+   *
+   * 未提供 = 旧装配：复用闸门不启用（读不到路由不能变成「永远不复用」）。
+   */
+  readSessionRoute?(sessionId: string): RoleModelRoute | undefined
+  /** 可选：读当前队长会话的真实路由；未声明模型的角色以它为复用目标路由。 */
+  readCallerRoute?(): RoleModelRoute | undefined
   /** 可选：续跑/返工消息发送端口；未提供时只记账不发消息。 */
   sendMessage?: SendPort
   /** 可选：宿主实际并发上限（缺省用 DEFAULT_MAX_CONCURRENT）。 */
@@ -108,6 +116,9 @@ export interface ResumeResult {
 
 /** 可读段每段字符上限（只服务可读性，身份由哈希承担）。 */
 const READABLE_MAX = 20
+
+/** 消息账本里短任务标签的字符上限（含省略号；r28）。 */
+const TASK_LABEL_MAX = 60
 
 /** 身份短哈希位数（base36 末 6 位）。 */
 const HASH_LEN = 6
@@ -334,6 +345,190 @@ export function runningCount(tasks: PlanTask[]): number {
   return tasks.filter((task) => task.status === 'running' || task.status === 'gate').length
 }
 
+/* ------------------------------------------------------------------ *
+ * t5 按角色复用成员
+ *
+ * 宿主 Team 的 `maxMembers` 是**终身**名额：已结束的成员仍然占位（错误原文形如
+ * `Team member limit 8 reached`）。旧实现每个任务都 spawn 一个新成员，一个会话跑两轮
+ * 就把名额耗光，之后 dispatch 全部失败在创建成员那一步。
+ *
+ * 现在同一会话内**同 roleId 优先复用空闲成员**：用直达消息续聊、把新任务卡发给它；
+ * 只有角色首次使用（或没有可复用的空闲成员）才真的 spawn。绑定仍按 taskId 逐条记录
+ * （面板 / 门禁 / 停止逻辑全部读 binding），停止与退休语义不变。
+ * ------------------------------------------------------------------ */
+
+/** 成员空闲的判据：它上一个任务已经收口 —— 这一轮不会再产出，可以被派新活。 */
+const MEMBER_FREE_TASK_STATUSES: ReadonlySet<PlanTask['status']> = new Set<PlanTask['status']>([
+  'done',
+  'failed',
+  'cancelled',
+  'skipped',
+])
+
+/**
+ * 宿主名单里**不能**再派活的状态。`inactive` 刻意不在里面：那是「这一轮跑完了」，
+ * 续聊消息能把它唤醒（把 inactive 当死亡会让我们白白多建一个成员）。
+ */
+const NON_REUSABLE_MEMBER_STATUSES: ReadonlySet<string> = new Set([
+  'failed',
+  'stopped',
+  'terminated',
+  'provisioning',
+  'stopping',
+])
+
+/** 一个可复用的候选成员：角色 + 空闲成员 + 它上一个任务的路由审计。 */
+interface ReuseCandidate {
+  roleId: string
+  memberId: string
+  name: string
+  /** 上一个任务的路由审计；null = 那个任务没声明模型（spawn 侧只有声明了才审计）。 */
+  audit: { declared: RoleModelRoute | null; actual: RoleModelRoute | null } | null
+}
+
+/** 一条 binding 是否允许复用：未退休、不在停止过程中、且记着角色。 */
+function reusableBinding(binding: MemberBinding): boolean {
+  return binding.retired !== true && binding.stopping !== true && typeof binding.roleId === 'string' && binding.roleId !== ''
+}
+
+function auditOf(state: RunState, taskId: string): ReuseCandidate['audit'] {
+  const audit = state.routeAudits.find((item) => item.taskId === taskId)
+  if (!audit) return null
+  return { declared: audit.declared ?? null, actual: audit.actual ?? null }
+}
+
+/**
+ * 收集本次派发可复用的空闲成员：**当前 run** 已收口任务的绑定 + **同一会话其他已收口 run**
+ * 的绑定。
+ *
+ * 跨 run 是必须的：每轮需求都是一个新 runId、`bindings` 从空开始，只扫本 run 等于没修
+ * （「跑两轮就把名额用完」正是跨 run 的场景）。
+ */
+function collectReuseCandidates(state: RunState, store: RunsStore): ReuseCandidate[] {
+  const out: ReuseCandidate[] = []
+  const add = (run: RunState, binding: MemberBinding): void => {
+    if (!reusableBinding(binding)) return
+    const task = run.plan.tasks.find((item) => item.id === binding.taskId)
+    if (!task || !MEMBER_FREE_TASK_STATUSES.has(task.status)) return
+    out.push({
+      roleId: binding.roleId,
+      memberId: binding.memberId,
+      name: binding.name,
+      audit: auditOf(run, binding.taskId),
+    })
+  }
+
+  for (const binding of state.bindings) add(state, binding)
+
+  let summaries: ReturnType<RunsStore['list']>
+  try {
+    summaries = store.list()
+  } catch {
+    return out
+  }
+  for (const summary of summaries) {
+    if (summary.runId === state.plan.runId || summary.sessionId !== state.plan.sessionId) continue
+    // 只复用**已收口**的历史 run：还在跑/暂停的 run 恢复后仍要用自己的成员，
+    // 两条 run 共用一个上下文会互相串任务（r21 修的正是「新旧两个 run 同时跑」）。
+    if (summary.status !== 'terminated' && summary.status !== 'cancelled') continue
+    const run = store.load(summary.runId)
+    if (run === null) continue
+    for (const binding of run.bindings) add(run, binding)
+  }
+  return out
+}
+
+/**
+ * 复用前的路由一致性（AC-22 的「不静默换模型」同样适用于复用）。
+ *
+ * 判据：上个任务**声明**的路由必须与本次角色声明一致；若上个任务测到了**实际**路由，
+ * 实际值也必须一致（漂移过的成员不能被派去跑新任务，否则 drift 就绕过了审计）。
+ */
+export function routeReusable(role: Role, audit: ReuseCandidate['audit']): boolean {
+  const declared = role.model ?? null
+  if (audit === null) return declared === null
+  if (routeDrift(declared, audit.declared)) return false
+  if (audit.actual !== null && routeDrift(declared, audit.actual)) return false
+  return true
+}
+
+/**
+ * 选一个可复用的空闲成员：同角色 + 宿主名单里没死 + 本次派发尚未占用 + 路由一致。
+ *
+ * 名单不可得（`members === null`）时调用方不应调用本函数 —— 宁可多建一个成员，也不把活
+ * 派给一个可能已经死掉的上下文。
+ */
+function pickReuseCandidate(
+  candidates: readonly ReuseCandidate[],
+  role: Role,
+  members: readonly HostMember[],
+  claimed: ReadonlySet<string>,
+  busy: ReadonlySet<string>,
+): ReuseCandidate | null {
+  for (const candidate of candidates) {
+    if (candidate.roleId !== role.id) continue
+    if (claimed.has(candidate.memberId)) continue
+    // 成员可能一边挂着已收口任务的旧 binding、一边正在跑另一个任务（复用后就是这个形状）。
+    if (busy.has(candidate.memberId)) continue
+    if (!routeReusable(role, candidate.audit)) continue
+    const member =
+      members.find((item) => item.id === candidate.memberId) ??
+      members.find((item) => item.name === candidate.name && item.name !== '')
+    if (!member) continue
+    const status = typeof member.status === 'string' ? member.status.toLowerCase() : ''
+    if (NON_REUSABLE_MEMBER_STATUSES.has(status)) continue
+    // 宿主名单里的 id/name 是权威值：binding 用的是它的 id，消息 target 用的是它的名字。
+    const name = typeof member.name === 'string' && member.name !== '' ? member.name : candidate.name
+    return { ...candidate, memberId: member.id, name }
+  }
+  return null
+}
+
+/**
+ * 复用闸门的路由一致性判据（r27）。
+ *
+ * 只比较 provider/model（`reasoningEffort` 不参与：会话默认可能补上默认档位，但那不代表
+ * 成员跑错了模型）。缺失语义：
+ *  - 目标与成员两边都读不到 → 视为一致（旧宿主没有 `requestHeader.config`，不能因此永远不复用）；
+ *  - 只有一边读得到 → 视为不一致（无法确认成员跑的就是本次目标路由，宁可新建成员）；
+ *  - 两边都有但 provider 或 model 任一不同 → 不一致。
+ */
+export function routeAllowsReuse(
+  target: RoleModelRoute | undefined,
+  actual: RoleModelRoute | undefined,
+): boolean {
+  if (target === undefined && actual === undefined) return true
+  if (target === undefined || actual === undefined) return false
+  return target.provider === actual.provider && target.model === actual.model
+}
+
+/** 活动流里的路由文本：读不到写「不可得」，不拿空串假装一个模型。 */
+function routeTextOf(route: RoleModelRoute | undefined): string {
+  return route === undefined ? '不可得' : describeRouteOf(route)
+}
+
+/**
+ * 复用成员时发出的「新任务卡」正文（t5）：只含本次任务，不再重复角色 / 技能 / 团队记忆
+ * （那些已经在这个成员的上下文里），但上游交接必须带 —— 那是本任务新拿到的证据。
+ */
+export function taskCardText(task: PlanTask, role: Role | undefined, handoffs: readonly string[]): string {
+  const lines = [
+    `## 新任务（${task.id}）：${task.title}`,
+    `角色：${role?.name ?? task.roleId}。你继续以同一角色工作；上一个任务已经结束，本次只执行下面这一张任务卡。`,
+    task.dependsOn.length > 0 ? `前置任务（已完成）：${task.dependsOn.join('、')}` : '',
+    '',
+    ...(handoffs.length > 0
+      ? ['## 上游交接', '以下内容由上游任务的门禁证据直接投递，不需要再问队长：', ...handoffs, '']
+      : []),
+    '## 验收判定（必须实际执行并回报退出码）',
+    task.acceptance === '' ? '（未声明；视为需要人工确认，不得自称完成）' : `\`${task.acceptance}\``,
+    '',
+    `完成后按验收判定回报回执（taskId = ${task.id}）；回执只针对本次任务，不要把上一个任务的结论混进来。`,
+  ]
+  return lines.filter((line) => line !== '').join('\n')
+}
+
+
 /** 派发：把 ready 的任务按空闲并发位创建成员。 */
 export async function dispatchReady(state: RunState, deps: DispatchDeps): Promise<DispatchResult> {
   const now = deps.now ?? Date.now
@@ -430,6 +625,20 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
   const hostNames = members === null ? [] : members.map((member) => member.name)
   const names = allocateMemberNames(next.plan.tasks, { nameOf, reserved, hostNames })
 
+  // t5：可复用成员候选（同角色优先复用，见上方「按角色复用成员」）。名单不可得 → 不复用。
+  const reuseCandidates = members === null ? [] : collectReuseCandidates(next, deps.store)
+  const claimedMembers = new Set<string>()
+  // 当前 run 里还被未收口任务占着的成员（复用后同一成员会挂多条 binding）。
+  const busyMembers = new Set(
+    next.bindings
+      .filter((item) => {
+        if (item.retired === true) return false
+        const task = next.plan.tasks.find((candidate) => candidate.id === item.taskId)
+        return task === undefined || !MEMBER_FREE_TASK_STATUSES.has(task.status)
+      })
+      .map((item) => item.memberId),
+  )
+
   for (const taskId of ready) {
     const task = next.plan.tasks.find((item) => item.id === taskId)
     if (!task) continue
@@ -521,6 +730,102 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
       }
     }
 
+    // 步 c2（t5）：同角色已有空闲成员 → 续聊派新任务卡，不再 spawn 新成员。
+    //
+    // 位置在模型预校验之后、名字分配之前：复用一个已有成员不消耗名字空间，也不该产生
+    // rename notice。任何一环不满足（没有发送端口 / 名单不可得 / 没有空闲候选 / 发送失败）
+    // 都**落回**下面的 spawn —— 复用是名额优化，绝不能变成「任务静默没派出去」。
+    if (deps.sendMessage && members !== null) {
+      const reusable = pickReuseCandidate(reuseCandidates, role, members, claimedMembers, busyMembers)
+      if (reusable) {
+        // r27 复用闸门：成员会一直停在它创建时的模型上，所以复用前必须核对**它会话当前**
+        // 的真实路由。目标 = 角色声明；角色未声明 = 跟随当前会话默认（用 run 的 sessionId 读，
+        // 后台派发没有 initiator 时也能读对）。装配层读不到任何会话路由（老宿主）时根本不接
+        // 这个端口 → 闸门整体跳过；能读但某一侧缺失时 routeAllowsReuse 判为不一致，落回 spawn。
+        const targetRoute =
+          role.model ?? deps.readCallerRoute?.() ?? deps.readSessionRoute?.(next.plan.sessionId)
+        const actualRoute = deps.readSessionRoute?.(reusable.memberId)
+        const routeMatches = deps.readSessionRoute === undefined || routeAllowsReuse(targetRoute, actualRoute)
+        if (!routeMatches) {
+          const at = now()
+          next = appendMessage(
+            next,
+            makeMessage({
+              from: 'captain',
+              to: 'user',
+              taskId,
+              at,
+              body: `成员 ${reusable.name} 的模型是 ${routeTextOf(actualRoute)}，本次目标模型是 ${routeTextOf(targetRoute)}，模型不一致，改为新建成员`,
+            }),
+          )
+          changed = true
+          // 这批不再选它；落回 spawn 新建成员。
+          claimedMembers.add(reusable.memberId)
+        } else {
+          let card = ''
+          try {
+            card = taskCardText(task, role, handoffBodiesFor(next.messages, taskId))
+          } catch (error) {
+            errors.push({ taskId, error: `生成提示词失败：${messageOf(error)}` })
+            continue
+          }
+          let sent = false
+          try {
+            const result = await deps.sendMessage(reusable.memberId, card)
+            sent = result.ok === true
+          } catch {
+            sent = false
+          }
+          if (!sent) {
+            // 发送失败可能是成员刚死/名单过期：本批不再选它，直接落回 spawn 新建。
+            // 不静默跳过任务，也不把这次失败算成派发成功。
+            claimedMembers.add(reusable.memberId)
+          } else {
+            const at = now()
+            // 旧任务的推进记录属于旧任务：不清掉会让新一轮停滞告警按旧时间戳误报。
+            const progressRest = { ...(next.progress ?? {}) }
+            delete progressRest[reusable.memberId]
+            next = {
+              ...next,
+              bindings: [
+                ...next.bindings,
+                { taskId, roleId: task.roleId, memberId: reusable.memberId, name: reusable.name, spawnedAt: at },
+              ],
+              ...(next.progress === undefined ? {} : { progress: progressRest }),
+            }
+            next = patchTask(next, taskId, {
+              status: 'running',
+              memberId: reusable.memberId,
+              attempts: task.attempts ?? 0,
+            })
+            next = stampTaskTime(next, taskId, { startedAt: at })
+            // 复用不换模型：优先记成员会话**此刻**读到的真实路由；读不到才退回上次审计值
+            // （都没有 → null → unverified，不拿声明值假装生效）。
+            if (role.model) {
+              const liveActual = deps.readSessionRoute?.(reusable.memberId)
+              next = auditRoute(next, taskId, role.model, liveActual ?? reusable.audit?.actual ?? null, at)
+            }
+            next = appendMessage(
+              next,
+              makeMessage({
+                from: 'captain',
+                to: reusable.name,
+                toMemberId: reusable.memberId,
+                taskId,
+                at,
+                body: card,
+              }),
+            )
+            started.push(taskId)
+            claimedMembers.add(reusable.memberId)
+            changed = true
+            slots -= 1
+            continue
+          }
+        }
+      }
+    }
+
     // 步 d：取本任务的分配结果（AC-4）——名字已在循环前算好，这里只做一次 Map 查表。
     // 位置在角色/模型预校验之后、`buildPrompt` 之前：名字定不下来就没有拼提示词的意义，
     // 而预校验仍排在更前面，保证「角色缺失」这类更有信息量的原因优先暴露。
@@ -591,7 +896,13 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
       // 角色没声明模型时不审计：那不是「未下发」，面板本来就该显示「会话默认模型」。
       // 声明了却拿不到实际值 → auditRoute 落 unverified（绝不拿声明值假装生效）。
       if (role.model) {
-        next = auditRoute(next, taskId, role.model, spawned.actual ?? null, at)
+        next = auditRoute(
+          next,
+          taskId,
+          role.model,
+          deps.readSessionRoute?.(spawned.memberId) ?? spawned.actual ?? null,
+          at,
+        )
       }
       next = appendMessage(
         next,
@@ -601,7 +912,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
           toMemberId: spawned.memberId,
           taskId,
           at,
-          body: `任务「${task.title}」已派发给你（角色 ${role.name}）。验收判定：${task.acceptance === '' ? '（未声明，需人工确认）' : task.acceptance}`,
+          body: `任务 ${task.id}「${taskLabelOf(task)}」已派发给你（角色 ${role.name}）。验收判定：${task.acceptance === '' ? '（未声明，需人工确认）' : task.acceptance}`,
         }),
       )
       started.push(taskId)
@@ -751,8 +1062,8 @@ export function applyReceipt(
       evidence,
     })
     body = giveUp
-      ? `返工已达上限（${nextAttempts}/${limit} 次）：任务「${task.title}」已转人工，下游保持阻塞。${receipt.note ?? ''}`.trim()
-      : `返工第 ${nextAttempts}/${limit} 次：任务「${task.title}」未通过门禁，请按证据修改后再次回报。${receipt.note ?? ''}`.trim()
+      ? `返工已达上限（${nextAttempts}/${limit} 次）：任务 ${task.id}「${taskLabelOf(task)}」已转人工，下游保持阻塞。${receipt.note ?? ''}`.trim()
+      : `返工第 ${nextAttempts}/${limit} 次：任务 ${task.id}「${taskLabelOf(task)}」未通过门禁，请按证据修改后再次回报。${receipt.note ?? ''}`.trim()
   }
 
   next = appendMessage(
@@ -829,20 +1140,44 @@ export function applyReceipt(
   // interrupted **不算**——它的出路是续聊或改验收后重派，把计划终止掉会让恢复失去入口。
   const allSettled = next.plan.tasks.every((item) => SETTLED_PLAN_STATUSES.has(item.status))
   if (allSettled && next.plan.tasks.length > 0) {
-    next = { ...next, plan: { ...next.plan, status: 'terminated' } }
+    // r20：收口与结束时刻同一次落盘 —— 否则「已终止但没有结束时刻」的 run 只能永远显示
+    // 「不可得」（历史缺值是回退口径，不能反过来把新 run 也留成缺口）。
+    next = {
+      ...next,
+      finishedAt: next.finishedAt ?? at,
+      plan: { ...next.plan, status: 'terminated' },
+    }
   }
 
   return next
 }
 
+/**
+ * 消息账本里的**短任务标签**（r28）：只取标题第一行并按 code point 截到 ≤60 字符。
+ *
+ * 为什么必须有：`task.title` 现在鼓励写「实现什么 + 关键文件/符号」，一条长标题 2~3k 字；
+ * 把它整段拼进每条门禁/续聊消息，会让 run JSON（账本）与 `auto_team_status` 的返回按条数放大。
+ * 标签只服务「这条消息说的是哪个任务」——任务全文仍在 `plan.tasks[].title`，面板与成员都能看全。
+ *
+ * 额外返回 `task.id` 的调用点（gateSummary/resumeText 等）负责把 id 放在标签外，
+ * 所以本函数**只处理标题**，避免同一个 id 在文案里出现两次。
+ */
+export function taskLabelOf(task: Pick<PlanTask, 'title'>): string {
+  const firstLine = (task.title ?? '').split(/\r?\n/, 1)[0].trim()
+  // 按 code point 而不是 UTF-16 code unit 截断：emoji / 代理对不能被切成半个字符。
+  const chars = Array.from(firstLine)
+  if (chars.length <= TASK_LABEL_MAX) return firstLine
+  return `${chars.slice(0, TASK_LABEL_MAX - 1).join('')}…`
+}
+
 /** 续跑文案：明确「从哪继续」，避免成员当作新任务重头做一遍。 */
 export function resumeText(task: PlanTask): string {
-  return `继续执行任务「${task.title}」（${task.id}）：沿用你已有的上下文，补齐未完成部分；完成后按验收判定回报回执。`
+  return `继续执行任务 ${task.id}「${taskLabelOf(task)}」：沿用你已有的上下文，补齐未完成部分；完成后按验收判定回报回执。`
 }
 
 function gateSummary(task: PlanTask, evidence: PlanTask['evidence'], prefix: string): string {
   const exit = evidence ? `退出码 ${evidence.exitCode ?? 'null（超时/被杀）'}` : '无门禁证据'
-  return `${prefix}：任务「${task.title}」（${exit}）`
+  return `${prefix}：任务 ${task.id}「${taskLabelOf(task)}」（${exit}）`
 }
 
 function liveBinding(state: RunState, taskId: string) {

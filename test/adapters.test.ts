@@ -13,6 +13,7 @@ import {
   installCaptainRoute,
   listHostMembers,
   losslessJson,
+  memberIdentityOf,
   onHostTriggerEvents,
   onMemberProgress,
   optionalService,
@@ -22,7 +23,10 @@ import {
   registerPromptSection,
   registerTool,
   registerToolGuard,
+  readSessionCallCount,
+  readWorkspaces,
   resolveConcurrencyLimit,
+  spawnFailureText,
   spawnMember,
   toHostToolDefinition,
   type HostContext,
@@ -334,7 +338,9 @@ test('spawnMember：返回 memberId + 我们声明的名字（恢复靠名字重
     agents: { currentInitiator: () => ({ id: 'captain' }) },
     // agentDefaultModel 是可选服务：只经 ctx.get 交付（见 optionalService 的白名单纪律）。
     get: (name: string) =>
-      name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'session-default' }) } : undefined,
+      name === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'session-default', model: 'session-default-model' }) }
+        : undefined,
     agentTeams: {
       spawnTeammate: async (_caller: unknown, request: unknown) => {
         requests.push(request as Record<string, unknown>)
@@ -359,7 +365,11 @@ test('spawnMember：返回 memberId + 我们声明的名字（恢复靠名字重
     'spawn',
     'provider 是 subagent provider 名（不是 LLM provider）——填会话默认模型名会让宿主报 no subagent provider registered',
   )
-  assert.deepEqual(requests[0]?.agentOptions, { provider: 'session-default' }, '未声明角色模型时会话默认模型经 agentOptions 下发')
+  assert.deepEqual(
+    requests[0]?.agentOptions,
+    { provider: 'session-default', model: 'session-default-model' },
+    '未声明角色模型时，会话默认的完整路由（provider+model 成对）经 agentOptions 下发',
+  )
   assert.deepEqual(requests[0]?.prompt, [{ type: 'text', text: '去做 t1' }])
 })
 
@@ -869,7 +879,7 @@ test('createSpawnPorts：provider 必须是 subagent provider 名，LLM 模型�
     '逐角色模型经 agentOptions 下发（SubagentStartRequest 的官方字段）',
   )
 
-  // 只有会话默认模型：provider 仍是 spawn，agentOptions 只带 provider。
+  // 只有会话默认模型 **且只有 provider**：r27 起不再下发半截路由（会把宿主拼出混合模型）。
   const withDefault = {
     agents: { currentInitiator: () => ({ id: 'captain' }) },
     get: (name: string) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'host-default' }) } : undefined),
@@ -884,7 +894,7 @@ test('createSpawnPorts：provider 必须是 subagent provider 名，LLM 模型�
   const ok = await createSpawnPorts(withDefault).spawn({ prompt: '去做 t3', name: 'dev-t3', sessionId: 's1', taskId: 't3' })
   assert.equal(ok.ok, true)
   assert.equal(requests[2]?.provider, 'spawn')
-  assert.deepEqual(requests[2]?.agentOptions, { provider: 'host-default' }, '会话默认模型只补 provider')
+  assert.equal(requests[2]?.agentOptions, undefined, '只有 provider 是半截路由，宁可不传也不让宿主猜 model（r27）')
 
   // 注册表给了多个名字：优先 spawn；没有 spawn 时取第一个已注册的名字。
   const multi = {
@@ -915,6 +925,142 @@ test('createSpawnPorts：provider 必须是 subagent provider 名，LLM 模型�
   } as unknown as HostContext
   await createSpawnPorts(onlyCustom).spawn({ prompt: '去做 t5', name: 'dev-t5', sessionId: 's1', taskId: 't5' })
   assert.equal(requests[4]?.provider, 'custom-provider', '没有 spawn 时取注册表第一个名字')
+})
+
+test('createSpawnPorts：新宿主走 subagents.startActivation（label 截断 / delivery=parent / 不 await result）', async () => {
+  const specs: Array<Record<string, unknown>> = []
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) =>
+      name === 'subagents'
+        ? {
+            getProvider: (provider: string) => (provider === 'spawn' ? { name: 'spawn' } : undefined),
+            startActivation: async (spec: Record<string, unknown>) => {
+              specs.push(spec)
+              // 宿主真实形状：childId 就是 SessionId；result 是成员完成结果（可能 reject）
+              return { childId: 'child-1', name: 'dev-t1', result: Promise.reject(new Error('member crashed')) }
+            },
+          }
+        : undefined,
+    logger: { warn: () => {} },
+    // 故意不提供 spawnTeammate：0.2.2-rc.2 已移除，若实现回退旧路径这里会直接失败
+  } as unknown as HostContext
+
+  const longTitle = '实现'.repeat(40) // 80 字符：超过宿主 label 上限，必须截断而不是报错
+  const result = await createSpawnPorts(ctx).spawn({
+    prompt: '去做 t1',
+    name: 'dev-t1',
+    sessionId: 's1',
+    taskId: 't1',
+    description: longTitle,
+    route: { provider: 'deepseek', model: 'deepseek-reasoner' },
+  })
+
+  assert.equal(result.ok, true)
+  assert.deepEqual(result, { ok: true, memberId: 'child-1' }, '观测不到实际路由时不许伪造 actual')
+  assert.equal(specs.length, 1)
+  assert.equal(specs[0]?.provider, 'spawn', 'provider 是 subagent provider 名（不是 LLM provider）')
+  assert.equal(specs[0]?.name, 'dev-t1')
+  assert.equal((specs[0]?.label as string).length, 64, 'label 截断到宿主上限 64')
+  assert.deepEqual(specs[0]?.prompt, [{ type: 'text', text: '去做 t1' }])
+  assert.equal(specs[0]?.delivery, 'parent', '完成时通知父会话模型')
+  assert.deepEqual(specs[0]?.parent, { id: 'captain' })
+  assert.ok(specs[0]?.signal instanceof AbortSignal)
+  assert.deepEqual(specs[0]?.agentOptions, { provider: 'deepseek', model: 'deepseek-reasoner' })
+  // 成员的失败结果必须被就地吞掉：等一个 macrotask，未处理 rejection 会让本测试进程直接红
+  await new Promise((resolve) => setTimeout(resolve, 20))
+})
+
+test('createSpawnPorts：新旧宿主能力都没有时给明确文案（不再只报 agentTeams.spawnTeammate）', async () => {
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: () => undefined,
+  } as unknown as HostContext
+  const result = await createSpawnPorts(ctx).spawn({ prompt: 'x', name: 'dev-t1', sessionId: 's1', taskId: 't1' })
+  assert.equal(result.ok, false)
+  const error = result.ok ? '' : result.error
+  assert.match(error, /subagents\.startActivation/)
+  assert.match(error, /agentTeams\.spawnTeammate/)
+})
+
+test('sendMessage / interruptMember：新宿主按 SessionId 直发，中断带 ancestor 授权', async () => {
+  const sent: Array<Record<string, unknown>> = []
+  const interrupted: Array<Record<string, unknown>> = []
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) =>
+      name === 'subagents'
+        ? {
+            sendMessage: async (sender: unknown, targetId: string, content: unknown, options: unknown) => {
+              sent.push({ sender, targetId, content, options })
+              return 'msg-1'
+            },
+            resolveName: async (_caller: unknown, name: string) => (name === 'dev-t1' ? 'child-1' : name),
+            interrupt: (id: string, authority: unknown) => void interrupted.push({ id, authority }),
+          }
+        : undefined,
+  } as unknown as HostContext
+
+  const ports = createSpawnPorts(ctx)
+  assert.deepEqual(await ports.sendMessage('child-1', '改一下'), { ok: true })
+  assert.equal(sent[0]?.targetId, 'child-1', '新 API 直发 SessionId，不经名字表')
+  assert.deepEqual(sent[0]?.content, [{ type: 'text', text: '改一下' }])
+  assert.ok((sent[0]?.options as { signal?: unknown })?.signal instanceof AbortSignal)
+
+  assert.deepEqual(await ports.interruptMember!('dev-t1'), { ok: true })
+  assert.deepEqual(interrupted[0], {
+    id: 'child-1',
+    authority: { kind: 'ancestor', agent: { id: 'captain' } },
+  })
+})
+
+test('listHostMembers：新宿主读 subagents.listDescendants，跳过 diagnostic，路径取最后一段', async () => {
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) =>
+      name === 'subagents'
+        ? {
+            rootOf: () => ({ id: 'root-1' }),
+            listDescendants: async (rootId: string) => {
+              assert.equal(rootId, 'root-1')
+              return [
+                { kind: 'child', id: 'c1', activity: 'running', path: 'lead/dev-t1', parentId: 'root-1', depth: 1, hasChildren: false },
+                { kind: 'child', id: 'c2', activity: 'inactive', path: 'lead/qa-t1', parentId: 'root-1', depth: 1, hasChildren: false },
+                { kind: 'child', id: 'c3', activity: 'running', parentId: 'root-1', depth: 1, hasChildren: false },
+                { kind: 'diagnostic', id: 'x1', reason: 'inbox unreadable', parentId: 'root-1', depth: 1 },
+              ]
+            },
+          }
+        : undefined,
+  } as unknown as HostContext
+
+  assert.deepEqual(await listHostMembers(ctx), [
+    { id: 'c1', name: 'dev-t1', status: 'running' },
+    { id: 'c2', name: 'qa-t1', status: 'inactive' },
+    { id: 'c3', name: '', status: 'running' },
+  ])
+
+  // 返回值不是数组 = 契约不符 → 必须抛错（空数组会被 watcher 当成「成员全死」）
+  const broken = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: (name: string) => (name === 'subagents' ? { rootOf: () => ({ id: 'root-1' }), listDescendants: async () => undefined } : undefined),
+  } as unknown as HostContext
+  await assert.rejects(listHostMembers(broken), (error: Error & { code?: string }) => {
+    assert.equal(error.code, 'NOT_FOUND')
+    return true
+  })
+})
+
+test('memberIdentityOf：新宿主优先 subagents.namesOf 的路径名，id 取 agent.id', () => {
+  const ctx = {
+    get: (name: string) =>
+      name === 'subagents' ? { namesOf: () => ({ name: 'lead/dev-t1', creator: 'lead' }) } : undefined,
+  } as unknown as HostContext
+  assert.deepEqual(memberIdentityOf(ctx, { id: 'child-1' }), { id: 'child-1', name: 'dev-t1' })
+
+  // namesOf 抛错 → 退回 agent 自身字段（不臆造）
+  const broken = { get: () => ({ namesOf: () => { throw new Error('no such agent') } }) } as unknown as HostContext
+  assert.deepEqual(memberIdentityOf(broken, { id: 'child-2', name: 'qa-t1' }), { id: 'child-2', name: 'qa-t1' })
 })
 
 test('losslessJson：undefined 键必须被丢掉（宿主拒收 lossy 返回，r12 真机事故）', () => {
@@ -969,4 +1115,201 @@ test('工具 execute 收口过 losslessJson：含 undefined 的 handler 返回�
   const value = await def.execute({}, { agent: { id: 's1' } })
   assert.deepEqual(value, { ok: true, enabled: true, tasks: [{ id: 't1' }] })
   assert.equal(JSON.stringify(value).includes('undefined'), false)
+})
+
+// ---------------------------------------------------------------------------
+// r19：workspaceRegistry 是可选服务（宿主 headless / 旧宿主可能没有）。
+// 四条降级路径必须各自独立成立：缺失 / list 抛错 / 非数组 / 实体字段读不出。
+// ---------------------------------------------------------------------------
+
+function ctxWithRegistry(registry: unknown): HostContext {
+  return {
+    get: (name: string) => (name === 'workspaceRegistry' ? registry : undefined),
+  } as unknown as HostContext
+}
+
+test('readWorkspaces：服务缺失 / 实体没有 list 时返回空数组（不抛、不回退裸读）', () => {
+  assert.deepEqual(readWorkspaces({} as HostContext), [], '没有 get 的旧 ctx')
+  assert.deepEqual(readWorkspaces(ctxWithRegistry(undefined)), [], '宿主未注册 workspaceRegistry')
+  assert.deepEqual(readWorkspaces(ctxWithRegistry({})), [], '实体没有 list 方法')
+})
+
+test('readWorkspaces：list 抛错 / 返回非数组一律返回空数组（绝不抛）', () => {
+  const throwing = {
+    list: () => {
+      throw new Error('storage domain not ready')
+    },
+  }
+  assert.deepEqual(readWorkspaces(ctxWithRegistry(throwing)), [])
+
+  assert.deepEqual(readWorkspaces(ctxWithRegistry({ list: () => undefined })), [])
+  assert.deepEqual(readWorkspaces(ctxWithRegistry({ list: () => ({ items: [] }) })), [], '非数组不猜字段名')
+})
+
+test('readWorkspaces：实体用 getter 暴露字段（宿主真实形状），title 空则不带上', () => {
+  class Entry {
+    private readonly _path: string
+    private readonly _title: string
+    private readonly _sessions: unknown
+    constructor(path: string, title: string, sessions: unknown) {
+      this._path = path
+      this._title = title
+      this._sessions = sessions
+    }
+    get id(): string {
+      return `id:${this._path}`
+    }
+    get path(): string {
+      return this._path
+    }
+    get title(): string {
+      return this._title
+    }
+    get sessionIds(): unknown {
+      return this._sessions
+    }
+  }
+
+  const list = () => [
+    new Entry('/work/nengtan', 'nengtan', ['s1', 's2', 's1', 42, '']),
+    new Entry('/work/unnamed', '   ', ['s3']),
+  ]
+  const entries = readWorkspaces(ctxWithRegistry({ list }))
+
+  assert.deepEqual(entries, [
+    { id: 'id:/work/nengtan', path: '/work/nengtan', title: 'nengtan', sessionIds: ['s1', 's2'] },
+    { id: 'id:/work/unnamed', path: '/work/unnamed', sessionIds: ['s3'] },
+  ])
+})
+
+test('readWorkspaces：缺 path / path 非字符串 / 单个实体读字段抛错 → 跳过该条，其余照常', () => {
+  class BrokenPath {
+    get path(): string {
+      throw new Error('entity disposed')
+    }
+    get sessionIds(): string[] {
+      return ['s-x']
+    }
+  }
+  const list = () => [
+    new BrokenPath(),
+    { path: '', title: 'empty', sessionIds: [] },
+    { title: 'no path', sessionIds: [] },
+    { path: 42, sessionIds: [] },
+    'not-an-entity',
+    { path: '  /work/fine  ', sessionIds: 'not-an-array' },
+  ]
+  const entries = readWorkspaces(ctxWithRegistry({ list }))
+  assert.deepEqual(entries, [{ path: '/work/fine', sessionIds: [] }], '只保留 path 非空的实体')
+})
+
+/* ─────────────── r20：调用次数 = 成员会话自己的 assistant/message 事件数 ─────────────── */
+
+/** 最小会话桩：`inheritedEventCount` 之前的是父会话事件，`snapshotEvents(from)` 只返回自己的。 */
+function callCtx(session: Record<string, unknown> | null): HostContext {
+  return {
+    agents: { get: (id: string) => (session !== null && id === 'm1' ? { id, session } : undefined) },
+  } as unknown as HostContext
+}
+
+test('readSessionCallCount：从 inheritedEventCount 之后数，一条 assistant/message = 一次调用', () => {
+  const events = [
+    { type: 'assistant/message' }, // 父会话（fork 继承）
+    { type: 'assistant/message' }, // 父会话
+    { type: 'assistant/message' }, // 自己的第 1 次
+    { type: 'step/end' },
+    { type: 'assistant/message' }, // 自己的第 2 次
+  ]
+  const seen: unknown[] = []
+  const session = {
+    inheritedEventCount: 2,
+    snapshotEvents: (from: number) => {
+      seen.push(from)
+      return events.slice(from)
+    },
+  }
+  assert.equal(readSessionCallCount(callCtx(session), 'm1'), 2, '父会话的 2 条不许算进来')
+  assert.deepEqual(seen, [2], '必须把 inheritedEventCount 交给 snapshotEvents 当起点')
+})
+
+test('readSessionCallCount：可读但 0 条 = 真实 0（不是「不可得」）；旧宿主退回 log 切片', () => {
+  assert.equal(
+    readSessionCallCount(callCtx({ inheritedEventCount: 0, snapshotEvents: () => [] }), 'm1'),
+    0,
+    '会话可读、没有调用 → 0 是真实计数，不能用 undefined 冒充缺失',
+  )
+
+  // 旧宿主没有 snapshotEvents：按同样的继承语义切 session.log。
+  const legacy = {
+    inheritedEventCount: 1,
+    log: [{ type: 'assistant/message' }, { type: 'assistant/message' }, { type: 'step/end' }],
+  }
+  assert.equal(readSessionCallCount(callCtx(legacy), 'm1'), 1, 'log[0] 是父会话不数；后两条里只有 1 条 assistant/message')
+
+  // 事件条目可以是任意形状：非对象 / 其他类型都不计数。
+  const noisy = { inheritedEventCount: 0, snapshotEvents: () => [null, 42, 'x', { type: 'other' }, { type: 'assistant/message' }] }
+  assert.equal(readSessionCallCount(callCtx(noisy), 'm1'), 1)
+})
+
+test('readSessionCallCount：会话未加载 / 日志不可读 / 空 id → undefined（保留已落盘值，绝不补 0）', () => {
+  assert.equal(readSessionCallCount(callCtx(null), 'm1'), undefined, '会话未加载')
+  assert.equal(readSessionCallCount(callCtx({}), 'm1'), undefined, '既无 snapshotEvents 也无 log')
+  assert.equal(readSessionCallCount(callCtx({ log: 'not-an-array' }), 'm1'), undefined, 'log 不是数组')
+  assert.equal(
+    readSessionCallCount(
+      callCtx({
+        snapshotEvents: () => {
+          throw new Error('session log unreadable')
+        },
+      }),
+      'm1',
+    ),
+    undefined,
+    '日志读抛错必须降级成不可得',
+  )
+  assert.equal(
+    readSessionCallCount(callCtx({ snapshotEvents: () => undefined }), 'm1'),
+    undefined,
+    '读口返回非数组同样是不可得',
+  )
+  assert.equal(readSessionCallCount(callCtx({ inheritedEventCount: 0, snapshotEvents: () => [] }), ''), undefined, '空会话 id')
+  assert.equal(readSessionCallCount(callCtx({ inheritedEventCount: 0, snapshotEvents: () => [] }), 'sess-unknown'), undefined)
+})
+
+/* ─────────── t5：宿主席位耗尽的失败文案 ─────────── */
+
+test('t5：宿主席位耗尽 → 失败文案保留原文并给出 maxMembers 的调法（不再只透一句 member limit）', async () => {
+  const ctx = {
+    agents: { currentInitiator: () => ({ id: 'captain' }) },
+    get: () => undefined,
+    logger: { warn: () => {} },
+    agentTeams: {
+      spawnTeammate: async () => {
+        throw new Error('Team member limit 8 reached')
+      },
+    },
+  } as unknown as HostContext
+
+  const result = await createSpawnPorts(ctx).spawn({ prompt: '去做 t1', name: 'dev-t1', sessionId: 's1', taskId: 't1' })
+
+  assert.equal(result.ok, false)
+  const error = result.ok ? '' : result.error
+  assert.match(error, /Team member limit 8 reached/, '宿主原文必须原样保留：分类错了也不能把真实原因藏掉')
+  assert.match(error, /agent-team 的 maxMembers/, '必须点名要调大哪个配置（用户不知道 member limit 去哪改）')
+  assert.match(error, /profile/, '要提示配置在 profile 里')
+  assert.match(error, /cordis\.patch\.yml/, '最好给到具体文件')
+})
+
+test('t5：并发上限（active child limit）与普通失败各自给出不同文案', () => {
+  const concurrent = spawnFailureText(new Error('active child limit 3 reached'))
+  assert.match(concurrent, /active child limit 3 reached/)
+  assert.match(concurrent, /并发|同时运行/, '并发名额要说明「等一会儿就好」')
+  assert.doesNotMatch(concurrent, /maxMembers/, '并发上限不是终身名额，别把人引去改 maxMembers')
+
+  const plain = spawnFailureText(new Error('no subagent provider registered for "x"'))
+  assert.equal(plain, '创建成员失败：no subagent provider registered for "x"', '非名额错误只加既有前缀，不编造指引')
+
+  const genericLimit = spawnFailureText(new Error('team member quota exceeded'))
+  assert.match(genericLimit, /team member quota exceeded/)
+  assert.match(genericLimit, /maxMembers/, '兜底正则也要把用户引向 maxMembers，不许静默失败')
 })

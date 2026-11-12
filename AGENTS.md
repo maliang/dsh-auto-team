@@ -14,6 +14,7 @@
 | 职责 | 位置 | 说明 |
 |---|---|---|
 | 产品入口 | README.md | 安装/使用/开发命令速览 |
+| 产品入口（英文） | README.en.md | 与 README.md 结构、命令、图片引用一一对应的完整英译（改中文版时同步改） |
 | 任务产物 | docs/teamflow/<yyyyMMdd-rN-slug>/ | 每个需求一个自包含任务夹：PRD/设计/技术方案/QA 报告/验收报告（按日期倒序即迭代史） |
 | 架构总览 | docs/teamflow/architecture/ARCHITECTURE.md | 技术栈权衡、模块契约、目录树、构建/测试/CI、**未完成清单** |
 | 架构参考 | docs/teamflow/architecture/SUPER-AGENT-MAPPING.md | Super-agent（DeepSeek 原型仓）→ 本插件的映射：能搬 / 需改造 / 不搬 + 分期 + 证据索引 |
@@ -52,7 +53,7 @@
 **验证命令（提交前必须全绿）**
 ```bash
 pnpm typecheck   # tsc --noEmit
-pnpm test        # node --test test/*.test.ts（当前 484 例）
+pnpm test        # node --test test/*.test.ts（当前 1167 例）
 pnpm build       # 双产物
 node --input-type=module -e "await import('./lib/index.js')"
 node --input-type=module -e "await import('./lib/client.js')"

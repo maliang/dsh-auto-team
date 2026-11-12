@@ -7,7 +7,7 @@
  *   ② 结构层：`node --test` 不转 JSX，组件只能按源码判据 —— `data-last-open-result`、
  *      逐字 hint、`data-library-surface` 必须真的出现在模板里（不是只写在注释/样式里）。
  *
- * 为什么必须测 watchdog：宿主 `mainArea.open()` 说「开了」但主区没挂载时，
+ * 为什么必须测 watchdog：宿主 `layout.selectPanel()` 说「开了」但主区没挂载时，
  * 没有 watchdog 的版本会返回 main 然后什么都不出现 —— 这正是用户报的「点了没反应」。
  */
 import test from 'node:test'
@@ -91,7 +91,7 @@ function winWithLog(): { window: unknown; events: string[] } {
   }
 }
 
-/* ─────────────────── 假 ctx：mainArea / sidebarRight 两个可选服务 ─────────────────── */
+/* ─────────────────── 假 ctx：layout / sidebarRight 两个可选服务 ─────────────────── */
 
 interface CtxOptions {
   withMain?: boolean
@@ -109,8 +109,8 @@ function fakeCtx(options: CtxOptions = {}): {
   const openTabs: string[] = []
   const scope: Record<string, unknown> = {}
   if (options.withMain !== false) {
-    scope.mainArea = {
-      open(id: string) {
+    scope.layout = {
+      selectPanel(id: string) {
         mainCalls.push(id)
         if (options.openThrows === true) throw new Error('main refused')
         return options.openResult
@@ -243,7 +243,7 @@ test('主区显式拒绝 / 抛错：立即降级 event，不抛未捕获异常',
     withGlobals({ document: docWith({}), window: recorder.window }, () => {
       result = createOpenLibrary(ctx as never)('sess-1')
     })
-    assert.equal(result, 'event', `mainArea.open ${JSON.stringify(options)} 时必须降级`)
+    assert.equal(result, 'event', `layout.selectPanel ${JSON.stringify(options)} 时必须降级`)
     assert.deepEqual(openTabs, [PANEL_TAB_KIND])
     assert.deepEqual(recorder.events, [OPEN_LIBRARY_EVENT])
   }

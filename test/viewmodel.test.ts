@@ -728,7 +728,7 @@ test('进度：状态缺失或未知一律回落 pending，不出现 NaN/空标�
 
 test('计划状态：5 态全映射为中文，无计划走「未启用」', () => {
   const cases: [PlanStatus, string, string][] = [
-    ['draft', '计划就绪', 'ok'],
+    ['draft', '已计划', 'ok'],
     ['dispatching', '派发中', 'ok'],
     ['paused', '已暂停', 'warn'],
     ['terminated', '已终止', 'muted'],
@@ -784,6 +784,7 @@ import {
   memoryRowOf,
   nextListWidth,
   roleChipsOf,
+  roleDurationTitleOf,
   roleTaskRefViewOf,
   roleUsageOf,
   runHeadOf,
@@ -791,6 +792,7 @@ import {
   taskRowOf,
   tokenTextOf,
   tokenTitleOf,
+  usageMetricsOf,
   usageCellOr,
 } from '../src/client/viewmodel.ts'
 import type {
@@ -802,6 +804,7 @@ import type {
   RunDetailView,
   TaskDetailView,
   UsageCell,
+  UsageMetric,
 } from '../src/shared/types.ts'
 import { ROLE_STATE_TEXT } from '../src/shared/role-view.ts'
 
@@ -820,12 +823,12 @@ const durationCell = (text: string, state: DurationCell['state'] = 'done'): Dura
 
 /* ──────────────────── token：三态必须一眼可分 ──────────────────── */
 
-test('token 文本：0 是真数字、缺失是不可得、千分位与宿主逐字一致', () => {
+test('token 文本：0 是真数字、缺失是不可得、动态单位与宿主逐字一致', () => {
   // 「花了 0 token」是真话，不能和「不可得」混为一谈（AC-6 的反面）
   assert.equal(tokenTextOf(providerCell(0)), '0')
   assert.equal(tokenTextOf(providerCell(999)), '999')
-  assert.equal(tokenTextOf(providerCell(1_234_567)), '1,234,567')
-  assert.equal(tokenTextOf(providerCell(12_345, 10_000, 2_345)), '12,345')
+  assert.equal(tokenTextOf(providerCell(1_234_567)), '1.23M')
+  assert.equal(tokenTextOf(providerCell(12_345, 10_000, 2_345)), '12.35K')
   assert.equal(tokenTextOf(unavailableCell()), UNAVAILABLE_TEXT)
   assert.equal(tokenTextOf(undefined), UNAVAILABLE_TEXT)
   // 有来源但没有 total：宁可不给数，也不补 0
@@ -834,18 +837,83 @@ test('token 文本：0 是真数字、缺失是不可得、千分位与宿主逐
 })
 
 test('token title：可得给输入/输出明细，不可得给原因', () => {
-  assert.equal(tokenTitleOf(providerCell(1_000, 700, 300)), '合计 1,000 token · 输入 700 · 输出 300')
+  assert.equal(tokenTitleOf(providerCell(1_000, 700, 300)), '合计 1.00K token · 输入 700 · 输出 300')
   assert.equal(tokenTitleOf(providerCell(42)), '合计 42 token')
   assert.equal(tokenTitleOf(unavailableCell('宿主未上报 usage')), '宿主未上报 usage')
   assert.equal(tokenTitleOf(undefined), '该处没有用量来源')
 })
 
-test('token 紧凑文本：流转节点 128px 内的量级缩写', () => {
+test('token 六项（r17）：title 透传宿主 details，text 优先用宿主文案', () => {
+  const metrics: UsageMetric[] = [
+    { key: 'input', label: '输入未命中', text: '29.23K', available: true },
+    { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
+    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
+    { key: 'output', label: '输出', text: '344', available: true },
+    { key: 'calls', label: '调用次数', text: '1', available: true },
+    { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
+  ]
+  const cell: UsageCell = { source: 'provider', tokens: { total: 60_421 }, text: '60.42K', details: metrics }
+  assert.equal(tokenTextOf(cell), '60.42K', '宿主 text 优先，客户端不再自己分组')
+  assert.equal(
+    tokenTitleOf(cell),
+    '合计 60.42K token · 输入未命中 29.23K · 输入命中 30.85K · 写缓存 不可得 · 输出 344 · 调用次数 1 · 缓存命中率 51.3%',
+  )
+  assert.deepEqual(usageMetricsOf(cell), metrics)
+  assert.deepEqual(usageMetricsOf(unavailableCell()), [], '不可得时没有明细（走原因文案）')
+  assert.deepEqual(usageMetricsOf({ source: 'provider', tokens: { total: 1 } }), [], '旧数据没有 details 时退化为合计')
+})
+
+test('任务详情六项（r17）：provider 时带 usageMetrics，旧数据只显示合计', () => {
+  const metrics: UsageMetric[] = [
+    { key: 'input', label: '输入未命中', text: '4', available: true },
+    { key: 'cacheRead', label: '输入命中', text: '不可得', available: false },
+    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
+    { key: 'output', label: '输出', text: '6', available: true },
+    { key: 'calls', label: '调用次数', text: '1', available: true },
+    { key: 'hitRate', label: '缓存命中率', text: '不可得', available: false },
+  ]
+  const withDetails = buildTaskDetail(taskOf('t1', 'done'), {
+    roleName: 'dev',
+    messageCount: 0,
+    usage: { source: 'provider', tokens: { total: 10 }, details: metrics },
+  })
+  const panel = taskDetailOf(withDetails)
+  assert.deepEqual(panel.usageMetrics, metrics)
+  assert.equal(panel.usageReason, undefined, '有六项明细时不再显示「不可得」原因')
+
+  const legacy = taskDetailOf(
+    buildTaskDetail(taskOf('t2', 'done'), { roleName: 'dev', messageCount: 0, usage: providerCell(10) }),
+  )
+  assert.equal(legacy.usageMetrics, undefined, '旧快照没有 details：不伪造六项')
+  assert.equal(legacy.usageReason, undefined)
+})
+
+test('token 紧凑文本：流转节点 128px 内的量级缩写（r19 与合计同口径）', () => {
   assert.equal(compactTokenTextOf(providerCell(999)), '999')
-  assert.equal(compactTokenTextOf(providerCell(1_234)), '1.2k')
-  assert.equal(compactTokenTextOf(providerCell(12_000)), '12k')
-  assert.equal(compactTokenTextOf(providerCell(1_500_000)), '1.5M')
+  assert.equal(compactTokenTextOf(providerCell(1_234)), '1.23K')
+  assert.equal(compactTokenTextOf(providerCell(12_000)), '12.00K')
+  assert.equal(compactTokenTextOf(providerCell(1_500_000)), '1.50M')
   assert.equal(compactTokenTextOf(unavailableCell()), UNAVAILABLE_TEXT)
+})
+
+test('旧数据兜底（r19）：无 cell.text 时客户端按宿主同一算法补单位', () => {
+  // providerCell 不带 text，走 fullTokenText —— 必须与宿主 formatTokenUnits 同口径
+  assert.equal(tokenTextOf(providerCell(0)), '0', '0 不许写「0K」')
+  assert.equal(tokenTextOf(providerCell(999)), '999')
+  assert.equal(tokenTextOf(providerCell(1_000)), '1.00K')
+  assert.equal(tokenTextOf(providerCell(999_999)), '1.00M', '999.999K 进位成 1.00M')
+  assert.equal(tokenTextOf(providerCell(1_000_000)), '1.00M')
+  assert.equal(tokenTextOf(providerCell(1_000_000_000)), '1.00B')
+  // 两位小数四舍五入
+  assert.equal(tokenTextOf(providerCell(246_910)), '246.91K')
+  assert.equal(tokenTextOf(providerCell(69_459)), '69.46K')
+  // 不出现科学计数法 / 假单位
+  assert.equal(tokenTextOf(providerCell(999_999_999)), '1.00B')
+  assert.equal(/e[+-]?\d/i.test(tokenTextOf(providerCell(1_000_000_000))), false)
+  // unavailable 不带任何单位：只有「不可得」，没有 K/M/B
+  assert.equal(tokenTextOf(unavailableCell()), '不可得')
+  assert.equal(/[KMB]/.test(tokenTextOf(unavailableCell())), false)
+  assert.equal(tokenTextOf({ source: 'provider' }), UNAVAILABLE_TEXT, '有来源没 total：宁可不给数')
 })
 
 test('usageCellOr：缺单元格时保留原因，绝不冒充 0', () => {
@@ -889,7 +957,7 @@ test('任务行：两行式字段齐全，token 与用时同源于同一单元�
 
   const collapsed = taskRowOf(detail, false)
   assert.equal(collapsed.expanded, false)
-  assert.equal(collapsed.tokenText, '12,345')
+  assert.equal(collapsed.tokenText, '12.35K')
   assert.equal(collapsed.durationText, '2 分 03 秒')
   assert.deepEqual(collapsed.badge, statusBadge('running'), '行内 badge 与状态词表同源')
   assert.equal(collapsed.tokenSource, 'provider')
@@ -1073,25 +1141,45 @@ test('flowLayoutOf：空计划 24×24（两侧 padding），没有阶段/箭头/
   assert.equal(Number.isFinite(layout.width) && Number.isFinite(layout.height), true)
 })
 
-test('flowNodeViewOf：token 用宿主原串不压缩（节点 158 内宽容得下），title 带 tN 与角色名', () => {
+test('flowNodeViewOf：token 用宿主文案（动态单位、不压缩），title 带 tN 与角色名', () => {
   const flow = buildFlow([taskOf('t1', 'done')], {
     usage: { t1: providerCell(1_234_567) },
     durations: { t1: durationCell('1 小时 02 分') },
   })
   const view = flowNodeViewOf(flow.nodes[0])
-  // r14 AC-6：不截断数字 —— 1,234,567 共 9 字符，仍在 158px 内宽内（第 3 行最坏 133px）
-  assert.equal(view.tokenText, '1,234,567')
+  // r19：单位化后 1,234,567 → `1.23M`（5 字符），158px 内绰绰有余，不截断数字
+  assert.equal(view.tokenText, '1.23M')
   assert.equal(view.durationText, '1 小时 02 分')
-  assert.equal(view.text, '1,234,567 · 1 小时 02 分')
-  assert.equal(view.title.includes('1,234,567'), true, '全文同样放 title')
+  assert.equal(view.text, '1.23M · 1 小时 02 分')
+  assert.equal(view.title.includes('1.23M'), true, '全文同样放 title')
   // 角色名与任务简述分开给两行（第一行不许再是任务 id；缺角色名时如实说「角色未记录」）
   assert.equal(view.roleText, '角色未记录')
   assert.equal(view.taskTitle, '任务t1')
   // r16：title/aria 都以 tN 开头并带状态中文，角色名只出现在 title 里（不进节点第一行）
-  assert.equal(view.title, 't1 任务t1 · 角色 角色未记录 · token 1,234,567 · 用时 1 小时 02 分')
-  assert.equal(view.label, 't1：任务t1，已通过，token 1,234,567，用时 1 小时 02 分')
+  assert.equal(view.title, 't1 任务t1 · 角色 角色未记录 · token 1.23M · 用时 1 小时 02 分')
+  assert.equal(view.label, 't1：任务t1，已通过，token 1.23M，用时 1 小时 02 分')
   assert.equal(view.statusText, '已通过')
   assert.equal(view.tone, 'success')
+})
+
+test('flowNodeViewOf：token 不可得时 title/label 带上原因（悬停能看出为什么）', () => {
+  const flow = buildFlow([taskOf('t1', 'running')], {
+    usage: { t1: unavailableCell('尚无用量事件') },
+    durations: { t1: durationCell('4 分 05 秒', 'running') },
+  })
+  const view = flowNodeViewOf(flow.nodes[0])
+  assert.equal(view.tokenText, UNAVAILABLE_TEXT)
+  // 第二行仍只放「不可得 · 用时」，原因只进 title/aria，不挤占节点正文
+  assert.equal(view.text, `${UNAVAILABLE_TEXT} · 4 分 05 秒`)
+  assert.equal(view.title.includes(`token ${UNAVAILABLE_TEXT}（尚无用量事件）`), true)
+  assert.equal(view.label.includes(`token ${UNAVAILABLE_TEXT}（尚无用量事件）`), true)
+  // 可得到数字时保持原串，不加原因后缀（避免把正常数字说成异常）
+  const ok = flowNodeViewOf(
+    buildFlow([taskOf('t2', 'done')], { usage: { t2: providerCell(42) }, durations: { t2: durationCell('1 秒') } })
+      .nodes[0],
+  )
+  assert.equal(ok.title.includes('（'), false)
+  assert.equal(ok.title, 't2 任务t2 · 角色 角色未记录 · token 42 · 用时 1 秒')
 })
 
 /* ──────────────────── 角色条：部分缺来源不合计 ──────────────────── */
@@ -1149,7 +1237,7 @@ test('roleUsageOf：只列有任务的角色，全有来源才合计', () => {
   // ops 在任务里没有出现 → 不占位置
   assert.equal(usage.some((row) => row.roleId === 'ops'), false)
   const chips = roleChipsOf(usage)
-  assert.equal(chips[0].usageText, '3,500')
+  assert.equal(chips[0].usageText, '3.50K')
   assert.equal(chips[0].taskCount, 2)
 })
 
@@ -1269,6 +1357,37 @@ test('buildRunDetail：run 用量缺失时聚合任务用量，全部缺失才�
   assert.equal(runHeadOf(missing).downgrade, `token ${UNAVAILABLE_TEXT}（无用量来源）`)
 })
 
+test('buildRunDetail：快照恒带 unavailable runUsage 时仍聚合任务用量（r17 真机回归）', () => {
+  // 真机快照的 runUsage 永远是**一个单元格**（无事件时是 unavailable），不是缺字段；
+  // 旧实现用 `snapshot.runUsage ?? sumUsage(...)`，于是聚合分支永不生效 → 成员合计恒「不可得」。
+  const merged = buildRunDetail({
+    snapshot: runSnapshotOf({
+      runUsage: unavailableCell('尚无用量事件'),
+      taskUsage: { t1: providerCell(100), t2: providerCell(200) },
+      tasks: [taskOf('t1', 'done'), taskOf('t2', 'done')],
+    }),
+  })!
+  assert.equal(merged.usage.source, 'provider')
+  assert.equal(merged.usage.tokens?.total, 300)
+
+  // 部分任务有用量：聚合仍不可得（不给出偏小的数），且原因换成「部分任务缺失」而不是宿主的「尚无事件」
+  const partial = buildRunDetail({
+    snapshot: runSnapshotOf({
+      runUsage: unavailableCell('尚无用量事件'),
+      taskUsage: { t1: providerCell(100) },
+      tasks: [taskOf('t1', 'done'), taskOf('t2', 'done')],
+    }),
+  })!
+  assert.equal(partial.usage.source, 'unavailable')
+  assert.equal(partial.usage.reason, '部分任务没有可用用量事件')
+
+  // 完全没用量的旧快照：保留宿主原因，不被兜底文案覆盖
+  const empty = buildRunDetail({
+    snapshot: runSnapshotOf({ runUsage: unavailableCell('宿主未上报本 run 的用量') }),
+  })!
+  assert.equal(empty.usage.reason, '宿主未上报本 run 的用量')
+})
+
 /* ──────────────────── run 头 / 在途派发 ──────────────────── */
 
 test('runHeadOf：无用量来源时给一行降级说明，可得时不显示', () => {
@@ -1285,7 +1404,7 @@ test('runHeadOf：无用量来源时给一行降级说明，可得时不显示',
     snapshot: runSnapshotOf({ runUsage: providerCell(1_234), runDuration: durationCell('2 分 00 秒') }),
   })!
   const head2 = runHeadOf(withUsage)
-  assert.equal(head2.usageText, '1,234')
+  assert.equal(head2.usageText, '1.23K')
   assert.equal(head2.downgrade, undefined)
   assert.equal(head2.durationText, '2 分 00 秒')
   assert.equal(head2.inflightText, '自动派发已开启')
@@ -1416,3 +1535,38 @@ test('clampListWidth / nextListWidth：夹在 160–360，非数字回 220（AC-
 })
 
 
+
+test('roleDurationTitleOf：四态 + 旧快照都有解释，且原因原样接在说明后面（不吞证据）', () => {
+  assert.equal(
+    roleDurationTitleOf(undefined),
+    '旧快照没有该角色的用时数据',
+    '旧快照没有该字段 ≠ 用时为 0',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'not-started', text: '未开始' }),
+    '该角色名下的任务都还没开始，暂无累计用时',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'unavailable', text: '不可得：任务 t1 缺少开始/结束时刻' }),
+    '该角色名下任务用时合计不可得：任务 t1 缺少开始/结束时刻',
+    '宿主给的原因必须原样出现在 title 里，否则用户不知道缺的是什么',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'unavailable', text: '不可得' }),
+    '该角色名下任务用时合计不可得',
+    '只有「不可得」没有原因时不要拼出一个空冒号',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'done', ms: 100_000, text: '1 分 40 秒' }, 2),
+    '该角色名下任务用时合计：1 分 40 秒（共 2 个任务）',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'running', ms: 100_000, text: '1 分 40 秒' }, 2),
+    '该角色名下任务用时合计：1 分 40 秒（共 2 个任务），进行中的任务按当前时刻计入',
+  )
+  assert.equal(
+    roleDurationTitleOf({ state: 'done', ms: 1_000, text: '1 秒' }),
+    '该角色名下任务用时合计：1 秒',
+    '没有任务数时不要凭空补一个计数',
+  )
+})

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto Team",
+    "description": "Turn the current DSH session into a team lead: split a goal into a dependency-aware task graph, dispatch resumable members in parallel, and gate every completion with executable acceptance checks."
+  }
+}

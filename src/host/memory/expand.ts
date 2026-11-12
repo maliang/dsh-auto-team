@@ -20,6 +20,7 @@ import type { ExpandCode, ExpandPayload, MemoryTrack } from '../../shared/types.
 import { MEMORY_EXPAND_MAX_CHARS, MEMORY_EXPAND_MAX_DEPTH, MEMORY_RELATED_MAX } from '../config.ts'
 import { memoryDirOf, safeMemoryName } from './repo.ts'
 import type { MemoryRoots } from './repo.ts'
+import { entryIdOf, fileStemOf, parseEntryFile, renderEntry } from './entries.ts'
 
 /** ID 前缀：`mem://<track>/<stem>`（TECHNICAL §6.1，不引入 hash，源文件改动不会失联）。 */
 const ID_SCHEME = 'mem://'
@@ -69,7 +70,7 @@ export interface Expander {
 
 /** 解析结果：成功给出归一化后的 `track` + 文件名（已带 `.md`）；失败给出错误码。 */
 export type ParsedMemoryId =
-  | { ok: true; track: MemoryTrack; name: string }
+  | { ok: true; track: MemoryTrack; name: string; file: string; hash?: string }
   | { ok: false; code: ExpandCode }
 
 /**
@@ -91,18 +92,27 @@ export function parseMemoryId(raw: string): ParsedMemoryId {
   if (slash <= 0) return { ok: false, code: 'EXPAND_BAD_ID' }
   const track = rest.slice(0, slash)
   if (track !== 'public' && track !== 'project') return { ok: false, code: 'EXPAND_BAD_ID' }
-  const stem = rest.slice(slash + 1)
+  const rawStem = rest.slice(slash + 1)
+  if (rawStem === '') return { ok: false, code: 'EXPAND_BAD_ID' }
+  // 条目 ID：`mem://<track>/<stem>#<hash12>`；多个 `#`、空 stem、非 12 位十六进制都算形态错。
+  const hashAt = rawStem.indexOf('#')
+  const stem = hashAt < 0 ? rawStem : rawStem.slice(0, hashAt)
+  const hash = hashAt < 0 ? undefined : rawStem.slice(hashAt + 1)
   if (stem === '') return { ok: false, code: 'EXPAND_BAD_ID' }
+  if (hash !== undefined && (!/^[0-9a-f]{12}$/.test(hash) || hash.includes('#'))) {
+    return { ok: false, code: 'EXPAND_BAD_ID' }
+  }
   // stem 只允许单段：再出现分隔符就是多段路径（`mem://project/a/b`），按逃逸处理。
   if (looksLikePath(stem) || stem.includes('/') || stem.includes(':')) {
     return { ok: false, code: 'EXPAND_PATH_ESCAPE' }
   }
-  // 大小写原样保留（与 `inject.memoryIdOf` 同源），否则区分大小写的文件系统上会找不到文件。
+  // 大小写原样保留（与注入期 ID 同源），否则区分大小写的文件系统上会找不到文件。
   if (!STEM_PATTERN.test(stem)) return { ok: false, code: 'EXPAND_BAD_ID' }
   // 第二道门：复用仓库层既有的 safeMemoryName（不在这里另写一套路径守门）。
-  const name = safeMemoryName(stem)
-  if (name === null) return { ok: false, code: 'EXPAND_BAD_ID' }
-  return { ok: true, track, name }
+  const file = safeMemoryName(stem)
+  if (file === null) return { ok: false, code: 'EXPAND_BAD_ID' }
+  const displayName = hash === undefined ? file : `${fileStemOf(file)}#${hash}`
+  return hash === undefined ? { ok: true, track, name: displayName, file } : { ok: true, track, name: displayName, file, hash }
 }
 
 /** sha256 十六进制（AC-9 的逐字节比对基准；单独导出便于测试与集成层共用一份实现）。 */
@@ -128,7 +138,7 @@ export function createExpander(deps: ExpanderDeps): Expander {
         if (hop > MEMORY_EXPAND_MAX_DEPTH) {
           return failure('EXPAND_DEPTH_EXCEEDED', id, hop, parsed)
         }
-        const path = `${memoryDirOf(parsed.track, deps.roots)}/${parsed.name}`
+        const path = `${memoryDirOf(parsed.track, deps.roots)}/${parsed.file}`
         if (!existsSync(path)) return failure('EXPAND_NOT_FOUND', id, hop, parsed)
         let source: string
         try {
@@ -137,13 +147,17 @@ export function createExpander(deps: ExpanderDeps): Expander {
           // 不可读 / 同名目录 / 权限：一律降级成「不存在」，绝不把 EISDIR 抛给工具层。
           return failure('EXPAND_NOT_FOUND', id, hop, parsed)
         }
+        if (parsed.hash !== undefined) {
+          const detail = entryExpansion(deps, parsed.track, parsed.file, parsed.hash, id, hop, hashOf)
+          return detail
+        }
         const truncated = source.length > MEMORY_EXPAND_MAX_CHARS
         const body = truncated ? source.slice(0, MEMORY_EXPAND_MAX_CHARS) : source
         return {
           code: 'OK',
           id,
           track: parsed.track,
-          name: parsed.name,
+          name: parsed.file,
           body,
           chars: body.length,
           truncated,
@@ -159,6 +173,60 @@ export function createExpander(deps: ExpanderDeps): Expander {
         return failure('EXPAND_NOT_FOUND', typeof raw === 'string' ? raw : '', hop, null)
       }
     },
+  }
+}
+
+/**
+ * 条目级展开：找到 hash 前缀匹配的条目（含 tombstone），返回单条渲染结果；
+ * related 同文件其他活动条目的带 hash ID（最多 `MEMORY_RELATED_MAX`）。
+ */
+function entryExpansion(
+  deps: ExpanderDeps,
+  track: MemoryTrack,
+  file: string,
+  hash12: string,
+  id: string,
+  hop: number,
+  hashOf: (text: string) => string,
+): ExpandedMemory {
+  let source: string
+  try {
+    source = readFileSync(`${memoryDirOf(track, deps.roots)}/${file}`, 'utf8')
+  } catch {
+    return failure('EXPAND_NOT_FOUND', id, hop, { track, name: file })
+  }
+  const parsedFile = parseEntryFile(source, {
+    track,
+    file,
+    now: Date.now(),
+    fallbackAt: Date.now(),
+    acceptLegacy: true,
+  })
+  const target = parsedFile.entries.find((entry) => entry.hash.slice(0, 12) === hash12)
+  if (target === undefined) {
+    return {
+      ...failure('EXPAND_NOT_FOUND', id, hop, { track, name: file }),
+      message: `条目已不存在（可能被整理或淘汰）：${id}；请用 list 查看当前条目`,
+    }
+  }
+  const body = renderEntry(target, { superseded: target.superseded })
+  const stem = fileStemOf(file)
+  const related = parsedFile.entries
+    .filter((entry) => entry !== target && !entry.superseded && entry.track === track)
+    .slice(0, MEMORY_RELATED_MAX)
+    .map((entry) => entryIdOf(track, stem, entry.text))
+  return {
+    code: 'OK',
+    id,
+    track,
+    name: `${stem}#${hash12}`,
+    body,
+    chars: body.length,
+    truncated: false,
+    depth: hop,
+    related,
+    message: EXPAND_MESSAGES.OK,
+    hash: safeHash(hashOf, body),
   }
 }
 

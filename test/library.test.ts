@@ -422,7 +422,7 @@ test('恰好 4 条路由，且 /library 带 runId 透传、/memory 透传 worksp
   })) as { error?: string }
   assert.equal(result.error, '未授权的工作区')
   const calls = (routes as unknown as { memoryCalls: unknown[][] }).memoryCalls
-  assert.deepEqual(calls[0], ['project', 'a.md', '/work/old'])
+  assert.deepEqual(calls[0], ['project', 'a.md', '/work/old', 'default'])
 })
 
 test('/library 未注入装配时回落到 bridge.library（同一端口，不留第二条路径）', async () => {
@@ -454,4 +454,41 @@ test('runs 摘要排序与 usage 直方图：不带数字的 run 在项目合计
   assert.equal(project?.usage.tokens?.total, 250)
   const summaries = project?.recentRuns ?? []
   assert.deepEqual(summaries.map((item) => item.runId), ['r-b', 'r-a'])
+})
+
+test('历史回退列表（library.runs）派生 usage 六项；缺用量记「不可得」而不是 0（r17）', () => {
+  const { store } = tempRuns()
+  store.save(
+    stateOf({
+      plan: { runId: 'r-token', createdAt: 2_000 },
+      usage: {
+        attribution: 'per-member',
+        byMember: {},
+        byTask: {},
+        total: { total: 1_234, input: 1_000, output: 234 },
+        updatedAt: 1,
+      },
+    }),
+  )
+  store.save(stateOf({ plan: { runId: 'r-empty', createdAt: 1_000 } }))
+  const runs = buildLibrary(depsFor(store)).runs ?? []
+  assert.deepEqual(runs.map((run) => run.runId), ['r-token', 'r-empty'])
+
+  // snapshot 缺席时历史页退回 library.runs —— 必须与 bridge.historyOf 一样带 text + 六项。
+  const cell = runs[0]?.usage
+  assert.equal(cell?.source, 'provider')
+  assert.equal(cell?.text, '1.23K', 'r19：合计与 details 同一口径（动态单位）')
+  assert.deepEqual(
+    cell?.details?.map((metric) => metric.key),
+    ['input', 'cacheRead', 'cacheWrite', 'output', 'calls', 'hitRate'],
+  )
+  // r18b t6 起 details 里的 token 带单位；r19 起合计 cell.text 同口径。
+  assert.equal(cell?.details?.find((metric) => metric.key === 'input')?.text, '1.00K')
+  // 未上报分项是「不可得」，不补 0。
+  assert.equal(cell?.details?.find((metric) => metric.key === 'cacheRead')?.available, false)
+
+  const empty = runs[1]?.usage
+  assert.equal(empty?.source, 'unavailable')
+  assert.ok((empty?.reason ?? '').length > 0, '不可得必须带原因')
+  assert.equal(empty?.tokens, undefined)
 })

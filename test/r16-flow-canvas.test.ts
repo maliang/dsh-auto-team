@@ -226,13 +226,13 @@ test('AC-13：节点 cell 的 tN/标题/状态/第二行全部来自 flowNodeVie
   assert.equal(cell.taskTitle, '写门禁探针')
   assert.equal(cell.statusText, badge.text)
   assert.equal(cell.tone, badge.tone)
-  assert.match(cell.tokenText, /1,230/, 'token 原串，不四舍五入')
+  assert.match(cell.tokenText, /1\.23K/, 'token 走动态单位（1,230 → 1.23K）')
   assert.equal(cell.durationText, '2 分 14 秒')
   assert.equal(cell.text, `${cell.tokenText} · ${cell.durationText}`)
   // 角色名只进 title/aria（hover 仍知道归属），不进第一行文本
   assert.match(cell.title, /角色 测试/)
   assert.match(cell.label, /^t3：写门禁探针，/)
-  assert.match(cell.label, /token 1,230/)
+  assert.match(cell.label, /token 1\.23K/)
 })
 
 /* ────────────────────────── FlowCanvas 源码钩子 ────────────────────────── */

@@ -11,8 +11,10 @@ import assert from 'node:assert/strict'
 import {
   UNAVAILABLE_TEXT,
   durationCellOf,
+  formatCacheHitRate,
   formatCompactTokens,
   formatDuration,
+  formatTokenUnits,
   formatTokens,
   memoryTokenEstimate,
   usageCellOf,
@@ -48,6 +50,31 @@ test('formatCompactTokens：节点第二行用，千级/百万级各一位小数
   assert.equal(formatCompactTokens(undefined), UNAVAILABLE_TEXT)
 })
 
+test('formatTokenUnits：六个 token 指标带动态单位、两位小数（r18b t6）', () => {
+  // < 1000 原样整数，不补小数
+  assert.equal(formatTokenUnits(0), '0')
+  assert.equal(formatTokenUnits(7), '7')
+  assert.equal(formatTokenUnits(999), '999')
+  // 跨过 1000 就上单位，固定两位小数
+  assert.equal(formatTokenUnits(1_000), '1.00K')
+  assert.equal(formatTokenUnits(1_234), '1.23K')
+  assert.equal(formatTokenUnits(34_930), '34.93K')
+  assert.equal(formatTokenUnits(69_459), '69.46K', '四舍五入到两位：69.459 → 69.46')
+  // 999,999 ≈ 1000.00K：必须进位成 1.00M，界面上不许出现「1000.00K」
+  assert.equal(formatTokenUnits(999_999), '1.00M')
+  assert.equal(formatTokenUnits(1_000_000), '1.00M')
+  assert.equal(formatTokenUnits(1_500_000), '1.50M')
+  assert.equal(formatTokenUnits(2_000_000), '2.00M')
+  // 十亿级同样两位小数；999,999,999 进位成 1.00B
+  assert.equal(formatTokenUnits(1_000_000_000), '1.00B')
+  assert.equal(formatTokenUnits(999_999_999), '1.00B')
+  // 缺失/非法不伪造数值
+  assert.equal(formatTokenUnits(null), UNAVAILABLE_TEXT)
+  assert.equal(formatTokenUnits(undefined), UNAVAILABLE_TEXT)
+  assert.equal(formatTokenUnits(Number.NaN), UNAVAILABLE_TEXT)
+  assert.equal(formatTokenUnits(-1), UNAVAILABLE_TEXT, '负数不是用量')
+})
+
 test('formatDuration：六段边界逐字对应 AC-20', () => {
   assert.equal(formatDuration(null), UNAVAILABLE_TEXT)
   assert.equal(formatDuration(undefined), UNAVAILABLE_TEXT)
@@ -69,14 +96,91 @@ test('formatDuration：六段边界逐字对应 AC-20', () => {
 test('usageCellOf：有数字就是 provider（含 0），没有就 unavailable + 原因', () => {
   assert.deepEqual(usageCellOf(undefined, '宿主未上报'), { source: 'unavailable', reason: '宿主未上报' })
   assert.deepEqual(usageCellOf({ total: Number.NaN }, '坏数据'), { source: 'unavailable', reason: '坏数据' })
-  assert.deepEqual(usageCellOf({ total: 0 }, '不该出现'), { source: 'provider', tokens: { total: 0 } })
-  assert.deepEqual(usageCellOf({ total: 10, input: 4, output: 6 }, '不该出现'), {
-    source: 'provider',
-    tokens: { total: 10, input: 4, output: 6 },
-  })
+  const zero = usageCellOf({ total: 0 }, '不该出现')
+  assert.equal(zero.source, 'provider')
+  assert.deepEqual(zero.tokens, { total: 0 }, '0 token 是真话，不是缺失')
+  assert.equal(zero.text, '0')
+
+  const full = usageCellOf({ total: 10, input: 4, output: 6 }, '不该出现')
+  assert.deepEqual(full.tokens, { total: 10, input: 4, output: 6 })
+  assert.equal(full.text, '10')
+  assert.deepEqual(
+    full.details?.map((metric) => [metric.key, metric.text]),
+    [
+      ['input', '4'],
+      ['cacheRead', UNAVAILABLE_TEXT],
+      ['cacheWrite', UNAVAILABLE_TEXT],
+      ['output', '6'],
+      ['calls', UNAVAILABLE_TEXT],
+      ['hitRate', UNAVAILABLE_TEXT],
+    ],
+    '没给分项就不凭空补 0：缺失项一律「不可得」',
+  )
+
   const partial = usageCellOf({ total: 5, input: 3 }, '不该出现')
   assert.equal(partial.tokens?.input, 3)
   assert.equal(partial.tokens?.output, undefined, '没给分项就不凭空补 0')
+})
+
+test('usageCellOf 六项：真实宿主 usage 的命中率与四项 token 分量（r18b t6 带单位）', () => {
+  const cell = usageCellOf(
+    { total: 60_421, input: 29_229, output: 344, cacheRead: 30_848, cacheWrite: 0, calls: 1 },
+    '不该出现',
+  )
+  assert.deepEqual(cell.tokens, { total: 60_421, input: 29_229, output: 344, cacheRead: 30_848, cacheWrite: 0, calls: 1 })
+  assert.equal(cell.text, '60.42K', 'r19：合计与六项同一口径（动态单位），不再给逗号数字')
+  assert.deepEqual(
+    cell.details?.map((metric) => [metric.key, metric.label, metric.text, metric.available]),
+    [
+      ['input', '输入未命中', '29.23K', true],
+      ['cacheRead', '输入命中', '30.85K', true],
+      ['cacheWrite', '写缓存', '0', true],
+      ['output', '输出', '344', true],
+      ['calls', '调用次数', '1', true],
+      ['hitRate', '缓存命中率', '51.3%', true],
+    ],
+    '四项 token 带单位；calls 仍是次数、hitRate 仍是百分比；命中率 = cacheRead / (input + cacheRead)',
+  )
+})
+
+test('usageCellOf 合计 text 边界（r19）：动态单位与六项同口径，0 仍显示 0', () => {
+  const textOf = (total: number): string => {
+    const text = usageCellOf({ total }, '不该出现').text
+    assert.equal(typeof text, 'string', `${total} 必须给出宿主文本`)
+    return text ?? ''
+  }
+  // < 1000：原样整数，不补小数点（999 token 就写 999）
+  assert.equal(textOf(0), '0', '0 token 是真话，不许变成「不可得」')
+  assert.equal(textOf(1), '1')
+  assert.equal(textOf(999), '999')
+  // 阈值：跨过 1,000 立刻上 K，固定两位小数
+  assert.equal(textOf(1_000), '1.00K')
+  // 999,999 的 999.999K 四舍五入进位成 1.00M（界面永不出现 1000.00K）
+  assert.equal(textOf(999_999), '1.00M')
+  assert.equal(textOf(1_000_000), '1.00M')
+  assert.equal(textOf(1_234_567), '1.23M')
+  // 十亿级：两位小数；999,999,999 同样进位
+  assert.equal(textOf(999_999_999), '1.00B')
+  assert.equal(textOf(1_000_000_000), '1.00B')
+  // 两位小数四舍五入：246.910K → 246.91K；69.459K → 69.46K
+  assert.equal(textOf(246_910), '246.91K')
+  assert.equal(textOf(69_459), '69.46K')
+  assert.equal(textOf(60_421), '60.42K')
+  // 不出现科学计数法 / 小数点位数漂移
+  assert.equal(textOf(12_345), '12.35K')
+  assert.equal(/e[+-]?\d/i.test(textOf(1_000_000_000)), false)
+  // 缺失与负数仍是「不可得」，不是 0、不是 NaN
+  assert.equal(usageCellOf(undefined, '没有用量来源').source, 'unavailable')
+  assert.equal(usageCellOf({ total: Number.NaN }, '坏数据').source, 'unavailable')
+  assert.equal(usageCellOf({ total: -1 }, '负数').source, 'unavailable')
+})
+
+test('usageCellOf 命中率边界：分母为 0 或缺一侧 → 不可得，不用一半数据算比率', () => {
+  assert.equal(formatCacheHitRate({ total: 0, input: 0, cacheRead: 0 }), UNAVAILABLE_TEXT)
+  assert.equal(formatCacheHitRate({ total: 10, input: 10 }), UNAVAILABLE_TEXT)
+  assert.equal(formatCacheHitRate({ total: 10, cacheRead: 10 }), UNAVAILABLE_TEXT)
+  assert.equal(formatCacheHitRate({ total: 20, input: 5, cacheRead: 15 }), '75%', '整数去掉 .0')
+  assert.equal(formatCacheHitRate(undefined), UNAVAILABLE_TEXT)
 })
 
 test('durationCellOf：四态互斥，未开始/不可得都不伪装成 0 秒', () => {

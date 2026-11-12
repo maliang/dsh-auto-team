@@ -39,11 +39,19 @@ import {
   onMemberProgress,
   onSessionEvents,
   readModelCatalog,
+  canReadSessionRoute,
+  readCallerRoute,
+  readSessionCallCount,
+  readSessionRoute,
+  readSessionTokenUsage,
+  readWorkspaces,
   registerAgentCreated,
   registerEffect,
   registerToolGuard,
   resolveConcurrencyLimit,
+  sessionWorkspaceOf,
   type HostContext,
+  type HostWorkspaceEntry,
 } from './adapters.ts'
 import { registerTools, type ToolsDeps } from './tools.ts'
 import { registerCaptainPrompt } from './prompt.ts'
@@ -67,6 +75,7 @@ import { readCaptainModel, captainModelView } from './team/captain.ts'
 import { triggerFromMemberExit } from './team/trigger.ts'
 import { createExpander } from './memory/expand.ts'
 import { listMemoryItems } from './memory/repo.ts'
+import type { MemoryRoots } from './memory/repo.ts'
 // r13 五个新模块里的三个装配点：自动派发 / 项目库缓存 / 用量记录（判定都在纯模块，这里只接线）。
 import { createAutoDispatcher } from './team/auto-dispatch.ts'
 import { createDispatchNotes } from './team/dispatch-notices.ts'
@@ -78,7 +87,7 @@ import {
   usageOfSessionEvent,
   type UsageEventInput,
 } from './team/usage.ts'
-import type { CaptainModelView } from '../shared/types.ts'
+import type { CaptainModelView, ExpandPayload } from '../shared/types.ts'
 
 export const name = 'auto-team'
 
@@ -158,17 +167,13 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   const routePorts = createRoutePorts(ctx)
 
   /**
-   * 记忆展开端口（AC-9）：`createExpander` 需要读盘但不需要宿主 API，所以这里只把两个根目录喂进去。
+   * 记忆展开端口（AC-9 / r22）：`createExpander` 需要读盘但不需要宿主 API。
    *
-   * 初始化失败（目录不可用等）→ `null`：`bridge.expandMemory` 会明确报「不可用」，
-   * 工具调用面不会崩，注入侧的内联索引照常工作（只是展不开）。
+   * **不能**在 apply 时刻用 `memoryRoots` 建一次就固定 —— 那正是「记忆写错项目」的同源缺陷：
+   * 展开会永远读装配目录。这里改成工厂：bridge 每次按会话/run 解析出本次的根，再传进来。
    */
-  let expander: ReturnType<typeof createExpander> | null = null
-  try {
-    expander = createExpander({ roots: memoryRoots })
-  } catch (error) {
-    warn(ctx, `记忆展开端口不可用（内联索引仍会注入，但无法按 ID 展开）：${messageOf(error)}`)
-  }
+  const expander = (id: string, depth: number | undefined, roots: MemoryRoots): ExpandPayload =>
+    createExpander({ roots }).expand(id, depth)
 
   /** 宿主成员名单（做成方法而不是快照：每次对账都取当时的事实，不用缓存的旧名单）。 */
   function listMembers(): ReturnType<typeof listHostMembers> {
@@ -193,13 +198,54 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   }
 
   /**
+   * 会话工作区（门禁 cwd 的唯一解析点）。
+   *
+   * `apply()` 在宿主启动时只跑一次，`options.workspace ?? process.cwd()` 拿到的是宿主 profile
+   * 目录而不是用户打开的仓库；会话根目录只有宿主知道 —— `agents.get(sessionId)` →
+   * `agent.session.header.cwd`（同宿主 `dsh-plugin-teamflow` 的实测用法）。
+   * 任何一步取不到都返回 undefined，由 bridge 回退到装配 workspace（不改变旧行为）。
+   */
+  function sessionWorkspace(sessionId: string): string | undefined {
+    try {
+      return sessionWorkspaceOf(ctx.agents?.get?.(sessionId))
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 宿主工作区注册表（r19）：**每次现读**，不在 apply 时快照。
+   *
+   * 服务可能比本插件晚激活（apply 早期 `ctx.get` 拿不到），也可能根本不存在
+   * （headless / 旧宿主）。惰性读取让「晚激活」自动变正确，「不存在」自然退回旧行为
+   * （`readWorkspaces` 返回 `[]`，左栏按路径 basename 展示）。
+   */
+  const workspaces = (): HostWorkspaceEntry[] => readWorkspaces(ctx)
+
+  /**
+   * r22：记忆落点的会话 → 工作区解析（与 r19 的 run.project 同源）。
+   *
+   * 先取会话 cwd（正常会话），再按 sessionId 反查工作区注册表（agent 已卸载/旧会话）。
+   * 取不到返回 undefined，由 `memoryLocationOf` 明确退化并在快照里给出原因。
+   */
+  function memoryWorkspaceOf(sessionId: string): string | undefined {
+    const own = sessionWorkspace(sessionId)
+    if (own !== undefined) return own
+    try {
+      return workspaces().find((entry) => entry.sessionIds.includes(sessionId))?.path
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * 成员 prompt 的拼装本体已搬到纯模块 `team/member-prompt.ts`（AC-10 的独立探针必须
    * import 到**真实**实现才能证明「技能正文真的进了 spawn prompt」）；装配层只留这一行委托，
    * 旧的拼装片段整段删除，避免同一份文案出现两个来源。
    */
   function buildPrompt(input: PromptInput): string {
     return buildMemberPrompt(input, {
-      memoryFor: (goal: string) => bridge.memoryFor(goal),
+      memoryFor: (goal: string) => bridge.memoryFor(goal, input.plan.sessionId),
       // r10 AC-29：技能正文**读盘**（不是出厂常量）—— 用户改过的内置技能必须真的进成员提示词，
       // 否则「界面上改了、成员还是老一套」是必然结果，而 AC-29 的「重启后读回」也会变成假象。
       skillBodyOf: (skillId: string) => skills.get(skillId)?.body ?? '',
@@ -226,6 +272,14 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       buildPrompt,
       listMembers,
       routePort: routePorts,
+      // r27：复用闸门 + 审计都读会话真实路由；宿主 API 只在这里接线。
+      // 老宿主没有 agents.get（读不到任何会话路由）时不接端口：闸门整体视为不可用，保留复用。
+      ...(canReadSessionRoute(ctx)
+        ? {
+            readSessionRoute: (sessionId: string) => readSessionRoute(ctx, sessionId),
+            readCallerRoute: () => readCallerRoute(ctx),
+          }
+        : {}),
       sendMessage: spawnPorts.sendMessage,
       hostConcurrency,
       now,
@@ -401,6 +455,9 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     projectMemories: (target) => listMemoryItems(projectMemoryDir(target), 'project'),
     roles: () => roles.list().map((role) => ({ id: role.id, name: role.name })),
     runsDir: runsDir(home),
+    // r19：项目名真源（用户命名的工作区标题）+ 老 run 的 sessionId → 工作区反查。
+    // 惰性函数：注册表可能晚于 apply 激活，读的时刻才决定看到什么。
+    workspaces,
   }
   const libraryCache = createLibraryCache(libraryDeps)
 
@@ -408,6 +465,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     store,
     roles,
     memoryRoots,
+    // r22：每次读写记忆都按会话现解析项目工作区，不在 apply 时刻定格（旧缺陷的根因）。
+    workspaceOf: memoryWorkspaceOf,
     dataRoot,
     dispatch,
     resume,
@@ -417,7 +476,7 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     dispatchNotices: dispatchNotes,
     // 门禁超时（AC-13 生效点②）**不在这里传**：缺省时 bridge 取 `settings.gateTimeoutMs`
     // （其缺省正是 GATE_TIMEOUT_MS），设置才能立刻生效；这里硬塞常量会把可配点做废。
-    gate: { cwd: workspace, artifactsDir },
+    gate: { cwd: workspace, artifactsDir, workspaceOf: sessionWorkspace },
     hostConcurrency,
     // r11 F7：快照里 `deviations` 的读取口（最近 50 条）；装配层给不出时面板空数组、不报错。
     deviations,
@@ -425,6 +484,17 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     ...(spawnPorts.interruptMember === undefined ? {} : { interruptMember: spawnPorts.interruptMember }),
     // 停滞阈值同理**不传**：bridge 每次快照按 settings 现算，面板与 watcher 同源同值。
     now,
+    /**
+     * r17：用量改读宿主**会话投影**（`session/event` 在真机从未投递到插件）。
+     * 读口留在 adapters（宿主 API 唯一入口），bridge 每次快照前用它把成员累计用量覆盖进落盘 usage。
+     */
+    readSessionUsage: (sessionId) => readSessionTokenUsage(ctx, sessionId),
+    // r20：调用次数 = 成员会话自己的 assistant/message 事件数（宿主投影没有这个计数器）。
+    readSessionCalls: (sessionId) => readSessionCallCount(ctx, sessionId),
+    onUsagePersistError: (text) => warn(ctx, text),
+    // r24：closeRun 的成员存活判据（宿主名单是唯一事实源）+ 残留计划对账的非致命告警出口。
+    listMembers,
+    onWarn: (text) => warn(ctx, text),
     captainModel: () => captainView,
     settingsRepo,
     // r10：技能仓储 / 系统技能库 / 模型清单缓存（三者都是「宿主能力」投影，缺省各有明确降级）。
@@ -452,7 +522,7 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       libraryCache.invalidate()
       autoDispatcher.kick(sessionId, runId, cause)
     },
-    ...(expander === null ? {} : { expander: (id: string, depth?: number) => expander!.expand(id, depth) }),
+    expander,
   })
 
   try {
@@ -470,7 +540,15 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       now,
       // r14 AC-14：与 libraryDeps.workspace 同一个变量（装配层是唯一能保证同源的地方）——
       // 换成两次 process.cwd() 或任一处拼尾斜杠，同一个工作区就会裂成两个项目桶。
+      // 它只是**兜底**：新的 run 优先写会话自己的 cwd（见下面的 workspaceOf）。
       workspace,
+      /**
+       * r19：run 的 `project` 真源 = 会话 cwd（用户打开的仓库），不是宿主 profile 目录。
+       *
+       * 顺序：会话 header 的 canonical cwd → 注册表按 sessionId 反查 → undefined（工具层再
+       * 退回装配 workspace）。第一条覆盖正常会话；第二条兜住「agent 已卸载但注册表还认识它」。
+       */
+      workspaceOf: (sessionId) => memoryWorkspaceOf(sessionId),
       // r13 AC-8 的前两个触发点（plan 落盘 / add_tasks 追加）直接由工具层通知；
       // 工具只知道「计划变了」，派发语义留在 dispatcher 里（不在工具里长出第二套调度）。
       autoDispatch: (sessionId, runId, cause) => autoDispatcher.kick(sessionId, runId, cause),

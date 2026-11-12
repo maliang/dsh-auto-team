@@ -20,7 +20,7 @@
  */
 import { AUTO_DISPATCH_RETRY_LIMIT } from '../../shared/const.ts'
 import { readyTasks } from '../plan/graph.ts'
-import type { RunState, RunsStore } from '../store.ts'
+import { advancePlanToDispatching, type RunState, type RunsStore } from '../store.ts'
 
 /**
  * 6 个触发点（缺一个 AC-8 的变异用例就会红）。
@@ -209,6 +209,18 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
       const started = result.started ?? []
       const errors = (result.errors ?? []).map(errorLineOf)
       const failed = result.errors?.length ?? 0
+      // r26 ①：自动路径同样在「真的有人起来/被复用」后把 draft 推进到 dispatching。
+      // 派发失败（started 为空）保持 draft，退避重试时仍能被 shouldAutoDispatch 接受；
+      // 推进写盘失败不回滚已派发事实，也不改变本批报告（下一批 tick 会再试）。
+      if (started.length > 0) {
+        try {
+          const latest = deps.store.load(runId)
+          const advanced = latest === null ? null : advancePlanToDispatching(latest)
+          if (advanced !== null) deps.store.save(advanced)
+        } catch {
+          /* 计划态推进是派生记账，失败不阻断派发结果与报告 */
+        }
+      }
       // 「一个都没起来且有错误」才算一次失败：部分成功说明路径是通的，不该累计退避。
       if (started.length === 0 && failed > 0) {
         bumpFailure(runId)

@@ -25,6 +25,7 @@ import {
   deviationRowOf,
   deviationRowsOf,
   deviationWriteCountOf,
+  planStatusView,
   progressOf,
   scopeLockRowOf,
   scopeLockRowsOf,
@@ -32,17 +33,22 @@ import {
   taskActionsOf,
   waitReasonOf,
 } from '../src/client/viewmodel.ts'
+import { projectRunRowOf, runSummaryRowOf } from '../src/client/tabs/rows.ts'
+import { tasksEmptyStateOf } from '../src/client/nav.ts'
 import { TASK_ACTION_ALLOW, TASK_STATUS_LABELS, taskActionDisabledReason } from '../src/shared/task-actions.ts'
 import type {
   AutoTeamSettings,
   PlanStatus,
   PlanTask,
   Role,
+  RunSummary,
   ScopeLockView,
   SkillInfo,
   SkillSource,
   DeviationView,
   TaskStatus,
+  UsageCell,
+  UsageMetric,
 } from '../src/shared/types.ts'
 
 /* ────────────────────────── 夹具 ────────────────────────── */
@@ -100,10 +106,36 @@ test('hook：五个描述层输出都带 data-auto-team-* 唯一前缀（旧 dat
 /** 可供断言的固定状态集（r10 的可见文本恒为「自动团队」，状态语义全在 aria/tone）。 */
 const OPTION_STATES = [
   { name: '未启用', input: { enabled: false, busy: false, done: 0, total: 0 } },
-  { name: '计划就绪', input: { enabled: true, busy: false, planStatus: 'draft' as const, done: 0, total: 3 } },
+  {
+    name: '计划就绪',
+    input: {
+      enabled: true,
+      busy: false,
+      planStatus: 'draft' as const,
+      done: 0,
+      total: 3,
+      running: 0,
+      failed: 0,
+      interrupted: 0,
+      members: 0,
+    },
+  },
   { name: '完成', input: { enabled: true, busy: false, planStatus: 'dispatching' as const, done: 3, total: 3 } },
   { name: '已暂停', input: { enabled: true, busy: false, planStatus: 'paused' as const, done: 1, total: 3 } },
-  { name: '写盘在飞', input: { enabled: true, busy: true, planStatus: 'draft' as const, done: 0, total: 3 } },
+  {
+    name: '写盘在飞',
+    input: {
+      enabled: true,
+      busy: true,
+      planStatus: 'draft' as const,
+      done: 0,
+      total: 3,
+      running: 0,
+      failed: 0,
+      interrupted: 0,
+      members: 0,
+    },
+  },
 ] as const
 
 /* ───────────────────── ② 输入框内胶囊（AC-3 / AC-6） ───────────────────── */
@@ -115,13 +147,29 @@ test('胶囊：可见文本逐字「自动团队」，状态只进 aria 与 stat
   assert.equal(off.pressed, false)
   assert.match(off.ariaLabel, /未启用/, '状态语义必须仍在无障碍名里，否则读屏用户看不到状态')
 
-  const ready = optionView({ enabled: true, busy: false, planStatus: 'draft', done: 0, total: 3 })
+  // r26：只有「planStatus + 全部计数为 0」才命中判定表第 10 条（计划就绪）。
+  const ready = optionView({
+    enabled: true,
+    busy: false,
+    planStatus: 'draft',
+    done: 0,
+    total: 3,
+    running: 0,
+    failed: 0,
+    interrupted: 0,
+    members: 0,
+  })
   assert.equal(ready.label, '自动团队')
   assert.equal(ready.state, 'on')
   assert.equal(ready.pressed, true)
   assert.equal(ready.ariaLabel, '自动团队，已启用，计划就绪 · 3 任务')
   assert.equal(ready.dotTone, 'neutral')
   assert.equal(ready.failure, undefined, '无失败时不许渲染失败说明')
+
+  // 反面：只给 planStatus + total（缺成员/失败计数）不足以断言「就绪」，必须保守回落。
+  // 把规则 10 的 `members === 0` 放宽成 `members === undefined || members === 0`，这里立刻红。
+  const uncounted = optionView({ enabled: true, busy: false, planStatus: 'draft', done: 0, total: 3 })
+  assert.equal(uncounted.ariaLabel, '自动团队，已启用，待派发', '缺计数时绝不能说「计划就绪」')
 
   const done = optionView({ enabled: true, busy: false, planStatus: 'dispatching', done: 3, total: 3 })
   assert.equal(done.label, '自动团队')
@@ -304,6 +352,64 @@ const ALL_TASK_STATUSES: TaskStatus[] = [
   'failed',
   'interrupted',
 ]
+
+/* ───────── ⑤c r18b t7：计划状态徽标（run 行 / 历史行） ───────── */
+
+const ALL_PLAN_STATUSES: PlanStatus[] = ['draft', 'dispatching', 'paused', 'terminated', 'cancelled']
+
+test('计划状态（r26 t1）：原始计划态只做辅助文案，「计划就绪」不得从这里漏出', () => {
+  // r26 t1：计划徽标统一由 runStageOf 判定，「计划就绪」只属于判定表第 10 条；
+  // planStatusView 降级为「原始计划状态」辅助文案，draft 改称「已计划」。
+  assert.deepEqual(planStatusView('draft'), { label: '已计划', tone: 'ok' })
+  assert.deepEqual(planStatusView('dispatching'), { label: '派发中', tone: 'ok' })
+  assert.deepEqual(planStatusView('paused'), { label: '已暂停', tone: 'warn' })
+  assert.deepEqual(planStatusView('terminated'), { label: '已终止', tone: 'muted' })
+  assert.deepEqual(planStatusView('cancelled'), { label: '已取消', tone: 'muted' })
+
+  // 守卫：这是用户可见文案，draft 再也不能被当成「计划就绪」渲染
+  assert.notEqual(planStatusView('draft').label, '计划就绪')
+  assert.equal(planStatusView('draft').label, '已计划')
+
+  for (const status of ALL_PLAN_STATUSES) {
+    const view = planStatusView(status)
+    assert.notEqual(view.label, status, `${status} 不得回显英文原文`)
+    assert.equal(/[A-Za-z]/.test(view.label), false, `${status}：文案不许含英文`)
+  }
+
+  // 无计划 → 「未启用」；未知取值（宿主日后新增）→ 同样保守回落，绝不透传英文
+  assert.deepEqual(planStatusView(undefined), { label: '未启用', tone: 'muted' })
+  assert.deepEqual(planStatusView('dispatched' as unknown as PlanStatus), { label: '未启用', tone: 'muted' })
+})
+
+test('计划行徽标（r18b t7）：runSummaryRowOf 的状态三元组来自计划态，不再显示 ? + 英文', () => {
+  const terminated = runSummaryRowOf(runSummaryOf({ status: 'terminated' }))
+  assert.equal(terminated.statusText, '已终止')
+  assert.equal(terminated.statusIcon, '■')
+  assert.equal(terminated.statusTone, 'neutral')
+  assert.doesNotMatch(`${terminated.statusIcon} ${terminated.statusText}`, /\?|terminated/)
+
+  const running = runSummaryRowOf(runSummaryOf({ status: 'dispatching' }))
+  assert.equal(running.statusText, '派发中 · 2/3', 'r26：阶段判定第 9 条带任务进度')
+  assert.equal(running.statusTone, 'business')
+
+  // 任务 13 态徽标（statusBadge）不变：计划态走新函数，任务态仍走原表
+  assert.equal(statusBadge('done').text, TASK_STATUS_LABELS.done)
+  assert.equal(statusBadge('paused').text, TASK_STATUS_LABELS.paused)
+
+  // 左栏项目页的「最近运行」行（projectRunRowOf）同样走计划态徽标
+  const projectRow = projectRunRowOf({
+    runId: 'run-proj',
+    goal: '项目页最近一次运行',
+    planStatus: 'terminated',
+    tasks: 3,
+    done: 2,
+    usage: { source: 'unavailable', reason: '无用量记录' },
+    duration: { text: '—', state: 'unavailable' },
+  })
+  assert.equal(projectRow.statusText, '已终止')
+  assert.equal(projectRow.statusIcon, '■')
+  assert.equal(projectRow.statusTone, 'neutral')
+})
 
 test('任务行：状态标签唯一来自 progressOf（13 态全覆盖，组件不得自写映射）', () => {
   assert.equal(ALL_TASK_STATUSES.length, 13, 'TaskStatus 必须是 13 值（AC-28）')
@@ -654,7 +760,17 @@ test('胶囊：计划 5 态在 aria 名与 state 上各不相同（可见文本�
 test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → 暂停 → 继续 → 完成 2/2', () => {
   type Step = {
     name: string
-    input: { enabled: boolean; busy: boolean; planStatus?: PlanStatus; done: number; total: number }
+    input: {
+      enabled: boolean
+      busy: boolean
+      planStatus?: PlanStatus
+      done: number
+      total: number
+      running?: number
+      failed?: number
+      interrupted?: number
+      members?: number
+    }
     /** aria 名里必须出现的片段（可见文本恒为「自动团队」，状态语义全在这里）。 */
     aria: RegExp
     state: 'off' | 'on' | 'paused' | 'busy'
@@ -671,7 +787,18 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
     },
     {
       name: '启用后计划就绪',
-      input: { enabled: true, busy: false, planStatus: 'draft', done: 0, total: 2 },
+      // r26：判定表第 10 条要求计数齐全且全为 0；只传 planStatus 会保守回落「待派发」。
+      input: {
+        enabled: true,
+        busy: false,
+        planStatus: 'draft',
+        done: 0,
+        total: 2,
+        running: 0,
+        failed: 0,
+        interrupted: 0,
+        members: 0,
+      },
       aria: /已启用，计划就绪 · 2 任务/,
       state: 'on',
       pause: '暂停任务',
@@ -730,6 +857,121 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
   assert.equal(optionView(paused.input).state, 'paused')
   // 暂停前后完成数一致 —— 「已完成的不要重跑」在描述层可见
   assert.equal(paused.input.done, resumed.input.done)
+})
+
+/* ───────────────── ⑫ r17 历史行：顶部任务名 + 底部 token 六项 ───────────────── */
+
+function runSummaryOf(extra: Partial<RunSummary> = {}): RunSummary {
+  return {
+    runId: 'run-r17-t1',
+    sessionId: 'session-x',
+    createdAt: 1_793_000_000_000,
+    status: 'terminated',
+    tasks: 3,
+    done: 2,
+    project: 'dsh-auto-team',
+    ...extra,
+  }
+}
+
+/** 宿主 `usageCellOf` 的真实输出形状（六项文案由宿主给，客户端不许重算）。 */
+const SIX_METRICS: UsageMetric[] = [
+  // r18b t6 起 details 的四项 token 带单位；r19 起合计 text 同口径（不再有逗号数字）。
+  { key: 'input', label: '输入未命中', text: '29.23K', available: true },
+  { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
+  { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
+  { key: 'output', label: '输出', text: '344', available: true },
+  { key: 'calls', label: '调用次数', text: '1', available: true },
+  { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
+]
+
+const SIX_CELL: UsageCell = {
+  source: 'provider',
+  tokens: { total: 60_421, input: 29_229, cacheRead: 30_848, output: 344, calls: 1 },
+  text: '60.42K',
+  details: SIX_METRICS,
+}
+
+test('历史行（r17）：顶部是任务名（run goal），项目名不再冒充标题', () => {
+  const withGoal = runSummaryRowOf(runSummaryOf({ goal: 'r17 历史行顶部任务名改造' }))
+  assert.equal(withGoal.title, 'r17 历史行顶部任务名改造', '顶部必须是任务名')
+  assert.equal(withGoal.titleSource, 'goal')
+  assert.notEqual(withGoal.title, 'dsh-auto-team', '项目名不许冒充任务名')
+
+  // 旧 run 没有 goal：诚实标注 fallback，不拿项目名/runId 假装是任务名
+  const legacy = runSummaryRowOf(runSummaryOf({ goal: undefined }))
+  assert.match(legacy.title, /^未命名任务 · /)
+  assert.equal(legacy.titleSource, 'fallback')
+
+  // 超长任务名截断在 goalTitleOf 单点做，完整文本仍留在 titleTitle 供悬停
+  const long = runSummaryRowOf(runSummaryOf({ goal: '一'.repeat(40) }))
+  assert.equal(Array.from(long.title).length, 25, '24 字 + 省略号')
+  assert.equal(long.titleTitle, '一'.repeat(40))
+})
+
+test('历史行（r17）：底部六项原样透传宿主 details，客户端零重算', () => {
+  const row = runSummaryRowOf(runSummaryOf({ usage: SIX_CELL }))
+  // deepEqual 而非逐项 includes：顺序（固定六项）与文案（含「不可得」「51.3%」）都不许被客户端改写
+  assert.deepEqual(row.usageMetrics, SIX_METRICS)
+  assert.equal(row.tokenText, '60.42K', '合计文本优先用宿主给的 text（动态单位）')
+  assert.equal(row.tokenSource, 'provider')
+  // title 展开六项：任何人都能从悬停看到「为什么命中率是 51.3%」
+  assert.match(row.tokenTitle, /输入未命中 29\.23K/)
+  assert.match(row.tokenTitle, /写缓存 不可得/)
+  assert.match(row.tokenTitle, /缓存命中率 51\.3%/)
+})
+
+test('历史行（r17）：旧数据只有 usageTotals → 只显示合计，不自己拆六项', () => {
+  const legacy = runSummaryRowOf(runSummaryOf({ usageTotals: { total: 1234, input: 1000, output: 234 } }))
+  assert.equal(legacy.usageMetrics.length, 0, '没有宿主 details 时不许自己拆六项（那会是第二套口径）')
+  assert.equal(legacy.tokenSource, 'provider')
+  assert.equal(legacy.tokenText, '1.23K', '旧数据走客户端 fallback，口径与宿主一致（动态单位）')
+
+  // 连 usageTotals 都没有：三态里的「不可得」，不是 0
+  const none = runSummaryRowOf(runSummaryOf({}))
+  assert.equal(none.tokenSource, 'unavailable')
+  assert.equal(none.tokenText, '不可得')
+  assert.equal(none.usageMetrics.length, 0)
+})
+
+test('历史行（r17）：HistoryTab 真的把六项渲染在标题下方（钩子供样式/探针认元素）', () => {
+  const code = readFileSync(new URL('../src/client/tabs/HistoryTab.tsx', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  assert.match(code, /data-history-line="title"/)
+  // r18b t7 / r26 t1：历史行状态徽标同样来自 RunRowView（阶段徽标由 runStageOf 派生）
+  assert.match(code, /row\.statusIcon/)
+  assert.match(code, /row\.statusText/)
+  assert.match(code, /data-history-line="usage"/, '六项必须有独立的底部行钩子')
+  assert.match(code, /data-history-usage/)
+  assert.match(code, /row\.usageMetrics\.map\(/)
+  assert.match(code, /data-history-metric=\{metric\.key\}/)
+  assert.match(code, /data-usage-metric=\{metric\.key\}/)
+  assert.match(code, /data-available=\{metric\.available \? 'true' : 'false'\}/)
+  // 不可得与真 0 必须能区分：不能把 available 抹平成恒 true
+  assert.match(code, /metric\.text/)
+  // 行仍然是整行可点的 button，六项只是 span（button 内不能塞 ul/dl）
+  assert.equal(/<ul[^>]*data-history-usage/.test(code), false)
+})
+
+test('任务页空态（D3）：历史详情读不到时标题不再说「正在读取」', () => {
+  // 已删除/被清理的 run：state.ts 会把 libraryError 设成可读原因，detail 保持 null。
+  const lost = tasksEmptyStateOf({
+    historicalRunId: 'run-gone',
+    libraryError: '没有找到运行 run-gone 的历史详情（可能已被清理）',
+  })
+  assert.equal(lost.title, '读不到这条历史 run')
+  assert.doesNotMatch(lost.title, /正在读取/, '错误态标题不许再承诺「正在读取」')
+  assert.equal(lost.hint, '没有找到运行 run-gone 的历史详情（可能已被清理）', '原因原样透传，不吞错误')
+  assert.equal(lost.next, '返回当前 run 或换一条历史 run')
+
+  // 真在读取：保持 loading 文案
+  const loading = tasksEmptyStateOf({ historicalRunId: 'run-1', libraryError: null })
+  assert.equal(loading.title, '正在读取历史 run…')
+
+  // 当前 run 没有计划：与历史读取失败无关
+  const noPlan = tasksEmptyStateOf({ historicalRunId: null, libraryError: null })
+  assert.equal(noPlan.title, '尚未生成计划')
 })
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -832,11 +1074,18 @@ test('TaskTable：两行式任务行、token/用时 data-cell、展开详情与�
   assert.match(code, /data-duration-state=/)
   assert.match(code, /aria-expanded=/)
   assert.match(code, /data-task-detail/)
+  // r17：展开区渲染六项用量指标（宿主 details 透传，客户端不重算）
+  assert.match(code, /data-detail-usage/)
+  assert.match(code, /data-usage-metrics/)
+  assert.match(code, /data-usage-metric=/)
+  assert.match(code, /data-usage-metric-label/)
+  assert.match(code, /data-usage-metric-value/)
+  assert.match(code, /panel\.usageMetrics\.map/)
   assert.match(code, /data-gate-evidence/)
   assert.match(code, /data-gate-tail/)
   // 排序/筛选/格式化都归 viewmodel：组件只消费 TaskRowView（AC-7 的单点）
   assert.match(code, /taskRowOf\(/)
-  assert.equal(code.includes('toLocaleString'), false, 'token 千分位只能在 viewmodel.tokenTextOf')
+  assert.equal(code.includes('toLocaleString'), false, 'token 文案只能来自 viewmodel.tokenTextOf（动态单位）')
 })
 
 test('FlowCanvas：可平移视口 + rAF 直写 transform，角色列头 + tN 节点（r16）', () => {
@@ -995,7 +1244,7 @@ test('样式：r13 新块只用宿主 token，关键尺寸来自设计稿', () =
   assert.equal(/font-size:\s*var\(--dsw-font/.test(block), false, '不许写 font-size: var(--dsw-font-*)')
   // 2) 新块不写 16 进制色值（旧块的历史兜底不复制过来）
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(block), false, 'r13 新块不许出现 #hex 色值')
-  // 3) 关键尺寸：任务行 56、表头 24、run 头 64、节点 180×76、画布 300、弹窗 402、
+  // 3) 关键尺寸：任务行 56、表头 24、run 头 64、节点 180×76、画布 600、弹窗 402、
   //    项目列表列宽走 --lib-list-w 变量（AC-13 要能拖动，所以不能再写死 220px）
   for (const snippet of [
     'min-height: 56px',
@@ -1003,7 +1252,7 @@ test('样式：r13 新块只用宿主 token，关键尺寸来自设计稿', () =
     'min-height: 64px',
     'width: 180px',
     'height: 76px',
-    'height: 300px',
+    'height: 600px',
     'width: 402px',
     '--lib-list-w',
     'flex: 0 0 var(--lib-list-w',

@@ -25,10 +25,17 @@ import type {
   LibraryView,
   MemberStatus,
   MemberView,
+  MemoryCurateReport,
+  MemoryEntryView,
+  MemoryFileView,
   MemoryItemView,
+  MemoryLevel,
+  MemoryQuotaView,
+  MemoryTrack,
   PanelAction,
   PanelSnapshot,
   PendingConfirmationView,
+  PlanRevision,
   PlanStatus,
   PlanTask,
   Role,
@@ -41,6 +48,7 @@ import type {
   TaskStatus,
   TokenTotals,
   UsageCell,
+  UsageMetric,
   UsageSource,
 } from '../shared/types.ts'
 
@@ -50,6 +58,8 @@ export type CapsuleTone = 'idle' | 'run' | 'plan' | 'done' | 'fail'
 export interface Capsule {
   tone: CapsuleTone
   text: string
+  /** 悬停说明（阶段判定 detail）；缺省时渲染方回落用 text（r26）。 */
+  title?: string
 }
 
 /** 徽标的语义 tone（styles.ts 的 [data-tone] 选择器据此上色）。 */
@@ -89,9 +99,68 @@ const TASK_BADGES: Record<string, Badge> = {
 const BADGES: Record<string, Badge> = {
   ...TASK_BADGES,
   idle: { icon: '○', text: '空闲', tone: 'neutral' },
+  // r21：宿主新增的两个成员态（`MemberStatus`），任务态表里没有同名词。
+  // 「停止中」= 中断已发出、尚未确认；「已停止」= 已确认停止，都是忠实回显宿主字段。
+  stopping: { icon: '◔', text: '停止中', tone: 'warn' },
+  stopped: { icon: '■', text: '已停止', tone: 'neutral' },
 }
 
 const UNKNOWN_BADGE: Badge = { icon: '?', text: '未知', tone: 'neutral' }
+
+/**
+ * 成员卡专用徽标表（r21）。
+ *
+ * 与任务卡共用 `badge.text` 会冲突：任务 `waiting` 的文案是「等待中」（13 态词表，
+ * 被 test/viewmodel.test.ts 与 test/client-ui.test.ts 钉死），而成员 `waiting` 的语义
+ * 是**等待写域**。任务卡继续用 `statusBadge`，成员卡用本表 —— 两边都只读宿主状态，
+ * 各自的中文在唯一一张表里。
+ */
+const MEMBER_BADGES: Record<string, Badge> = {
+  ...BADGES,
+  waiting: { icon: '⏳', text: '等待写域', tone: 'warn' },
+}
+
+/**
+ * 成员状态 → 徽标（r21）：只给成员卡/成员页用。
+ *
+ * 之前成员卡的 `waiting` 落到任务词表显示「等待中」，看不出成员在等写域；
+ * `stopping`/`stopped` 没有词表条目时更会回显英文原文。
+ */
+export function memberStatusBadge(status: MemberStatus | string): Badge {
+  return MEMBER_BADGES[status] ?? { ...UNKNOWN_BADGE, text: status === '' ? '未知' : status }
+}
+
+/** 成员状态的悬停说明（r21）：只解释宿主已下发的事实，不推断「应该已经停了」。 */
+export function memberStatusTitleOf(status: MemberStatus | string): string | undefined {
+  if (status === 'stopping') return '已发出中断，尚未确认停止'
+  if (status === 'stopped') return '中断已确认，成员已停止'
+  return undefined
+}
+
+/** 需要独立徽标提示的成员态（r21）：这些态在角色卡上会被角色聚合状态盖住。 */
+export const MEMBER_CARD_STATUSES: readonly MemberStatus[] = [
+  'waiting',
+  'stopping',
+  'stopped',
+  'cancelled',
+]
+
+/**
+ * 角色卡上的成员态 chip（r21）：只在「角色状态看不出成员实况」时返回。
+ *
+ * 角色卡的状态来自 `roleStateOf(tasks)`（按任务聚合）；成员被中断/任务作废/等写域时，
+ * 角色卡可能仍显示「待命」。这份 chip 只补成员事实，不替换角色状态。
+ */
+export function memberCardChipOf(member: MemberView | undefined): Badge | undefined {
+  if (member === undefined) return undefined
+  if (!MEMBER_CARD_STATUSES.includes(member.status)) return undefined
+  const badge = memberStatusBadge(member.status)
+  // r21 AC-4：已确认停止的成员把确认时刻一起显示（时间戳由宿主给，客户端零推断）。
+  if (member.status === 'stopped' && typeof member.stoppedAt === 'number' && member.stoppedAt > 0) {
+    return { ...badge, text: `${badge.text} ${formatStamp(member.stoppedAt)}` }
+  }
+  return badge
+}
 
 /**
  * 状态 → 徽标三元组。
@@ -447,6 +516,19 @@ export function capsuleOf(enabled: boolean, snapshot: PanelSnapshot | null | und
   const running = countRunning(tasks)
   const done = tasks.filter((task) => task.status === 'done').length
   const limit = extras.concurrency.limit
+  // r26：胶囊也读同一个阶段判定 —— 但只有「计划就绪」这条规则并入本函数
+  // （其余分支与判定表 5/6/7/9 条同文案，且胶囊额外带并发上限，保持现状不另造一套）。
+  const stage = runStageOf({
+    // 快照没有计划态字段时，只要已经有任务就说明计划存在（旧宿主快照），按 draft 参与判定；
+    // 零任务则保持 undefined → 规则 1「未启用」不会误伤「待派发」的既有文案。
+    planStatus: snapshot.planStatus ?? (tasks.length > 0 ? 'draft' : undefined),
+    total: tasks.length,
+    done,
+    running,
+    failed,
+    interrupted,
+    members: members.length,
+  })
 
   if (snapshot.planStatus === 'cancelled') return { tone: 'idle', text: '已取消' }
   if (snapshot.planStatus === 'terminated') return { tone: 'idle', text: '已终止' }
@@ -457,9 +539,11 @@ export function capsuleOf(enabled: boolean, snapshot: PanelSnapshot | null | und
   if (tasks.length > 0 && done === tasks.length) {
     return { tone: 'done', text: `已完成 · ${tasks.length} 任务` }
   }
-  // AC-30：计划已生成但**一个成员都还没创建** —— 这是「先计划、后派发」的可视证据
-  if (tasks.length > 0 && members.length === 0) {
-    return { tone: 'plan', text: `计划就绪 · ${tasks.length} 任务` }
+  // AC-30：计划已生成但**一个成员都还没创建** —— 这是「先计划、后派发」的可视证据。
+  // r26：必须同时满足判定表第 10 条（零成员 **且** 一个都没完成），draft + 部分完成
+  // 不能再被说成「计划就绪」。
+  if (stage.key === 'ready') {
+    return { tone: 'plan', text: stage.label, ...(stage.detail === undefined ? {} : { title: stage.detail }) }
   }
   if (members.length === 0) return { tone: 'idle', text: '待派发' }
   if (snapshot.planStatus === 'dispatching') {
@@ -693,7 +777,7 @@ export interface PlanStatusView {
  * viewmodel.ts」，而「已暂停」既是任务态也是计划态 —— 分两处写必然被守卫判红，也必然漂移。
  */
 const PLAN_STATUS: Record<PlanStatus, PlanStatusView> = {
-  draft: { label: '计划就绪', tone: 'ok' },
+  draft: { label: '已计划', tone: 'ok' },
   dispatching: { label: '派发中', tone: 'ok' },
   paused: { label: '已暂停', tone: 'warn' },
   terminated: { label: '已终止', tone: 'muted' },
@@ -704,6 +788,366 @@ const PLAN_STATUS: Record<PlanStatus, PlanStatusView> = {
 export function planStatusView(planStatus?: PlanStatus): PlanStatusView {
   if (!planStatus) return { label: '未启用', tone: 'muted' }
   return PLAN_STATUS[planStatus] ?? { label: '未启用', tone: 'muted' }
+}
+
+/** `PlanStatusTone` → `BadgeTone`：计划态没有 run/success/danger，按语义就近对齐。 */
+const PLAN_TONE_BADGE_TONE: Record<PlanStatusTone, BadgeTone> = {
+  ok: 'business',
+  warn: 'warn',
+  bad: 'danger',
+  muted: 'neutral',
+}
+
+/* ───────────── r26：运行阶段（唯一判定，判定表 1..11） ───────────── */
+
+/**
+ * 阶段判定表的 11 个结果，数组顺序即优先级（先命中先返回，见 `runStageOf`）。
+ *
+ * 为什么要单独一个「阶段」而不是继续用 `PlanStatus`：`draft` 既可能是「刚拆好任务、
+ * 一个成员都没有」，也可能是「派发过但成员全挂了」；直接把 `draft` 当「计划就绪」渲染
+ * 正是历史 bug 的来源。阶段把计划态 + 计数 + 收口信息压成一个用户可读的结论，
+ * 是 run 卡 / 历史行 / 页头 chip / run 头 / dock 胶囊的**唯一**文案来源。
+ */
+export type RunStageKey =
+  | 'disabled'
+  | 'cancelled'
+  | 'terminated'
+  | 'paused'
+  | 'failed'
+  | 'interrupted'
+  | 'running'
+  | 'closing'
+  | 'dispatching'
+  | 'ready'
+  | 'pending'
+
+/**
+ * 阶段判定的输入。计数全部可选：旧数据 / 详情投影没有这些数字时**保持 undefined**，
+ * 绝不拿 0 或别的字段反推（反推会把「不知道」说成「没有」）。
+ */
+export interface RunStageInput {
+  planStatus?: PlanStatus
+  total?: number
+  done?: number
+  running?: number
+  failed?: number
+  interrupted?: number
+  members?: number
+  terminationReason?: string
+  finishedAt?: number
+}
+
+export interface RunStageView {
+  key: RunStageKey
+  label: string
+  tone: PlanStatusTone
+  /** 人话解释「为什么是这个阶段」：渲染成 title/tooltip，不占版面。 */
+  detail?: string
+}
+
+/** 阶段图标：只补「形状」一个视觉维度，文案仍只来自 `runStageOf`。 */
+const RUN_STAGE_ICON: Record<RunStageKey, string> = {
+  disabled: '·',
+  cancelled: '⊘',
+  terminated: '■',
+  paused: '⏸',
+  failed: '✕',
+  interrupted: '⚑',
+  running: '▶',
+  closing: '◔',
+  dispatching: '◐',
+  ready: '·',
+  pending: '○',
+}
+
+/** 计数规整：只接受有限非负数；缺失 / NaN / 负数一律 `undefined`（不补 0）。 */
+function stageCountOf(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : undefined
+}
+
+/**
+ * 计划 goal 里的阶段判定表（r26）：**唯一**的阶段判定实现。
+ *
+ * 优先级从高到低，先命中先返回：
+ *  1 无计划 → 未启用；2 已取消；3 已终止（detail 取终止原因）；4 已暂停；
+ *  5 有失败；6 已中断；7 执行中；8 任务全部结束但计划未收口 → 待收口；
+ *  9 派发中；10 计划就绪（total>0 && 零成员 && done===0）；11 待派发。
+ *
+ * 「计划就绪」只允许在规则 10 命中时出现 —— 这是 `draft` 不再直接当徽标的机械保证。
+ */
+export function runStageOf(input: RunStageInput): RunStageView {
+  const planStatus = input.planStatus
+  const total = stageCountOf(input.total)
+  const done = stageCountOf(input.done)
+  const running = stageCountOf(input.running)
+  const failed = stageCountOf(input.failed)
+  const interrupted = stageCountOf(input.interrupted)
+  const members = stageCountOf(input.members)
+  const reason =
+    typeof input.terminationReason === 'string' ? input.terminationReason.trim() : ''
+  const finishedAt = stageCountOf(input.finishedAt)
+  // 「已收口」= 有终止原因且真的有结束时刻；只有半截信息时按未收口处理（更保守）。
+  const closed = reason !== '' && finishedAt !== undefined && finishedAt > 0
+
+  if (planStatus === undefined) {
+    return {
+      key: 'disabled',
+      label: '未启用',
+      tone: 'muted',
+      detail: '还没有计划：给出目标后，宿主会先拆解任务，再派发给成员',
+    }
+  }
+  if (planStatus === 'cancelled') {
+    return {
+      key: 'cancelled',
+      label: '已取消',
+      tone: 'muted',
+      detail: reason !== '' ? reason : '计划已取消，不再派发新任务',
+    }
+  }
+  if (planStatus === 'terminated') {
+    return {
+      key: 'terminated',
+      label: '已终止',
+      tone: 'muted',
+      detail: reason !== '' ? reason : '计划已终止，不再派发新任务',
+    }
+  }
+  if (planStatus === 'paused') {
+    return {
+      key: 'paused',
+      label: '已暂停',
+      tone: 'warn',
+      detail: '计划已暂停，继续后才会派发新任务',
+    }
+  }
+  if (failed !== undefined && failed > 0) {
+    return {
+      key: 'failed',
+      label: `有失败 · ${failed}`,
+      tone: 'bad',
+      detail: `${failed} 个任务失败，需要返工或重跑`,
+    }
+  }
+  if (interrupted !== undefined && interrupted > 0) {
+    return {
+      key: 'interrupted',
+      label: `已中断 · ${interrupted}`,
+      tone: 'bad',
+      detail: `${interrupted} 个成员已中断，可续聊恢复`,
+    }
+  }
+  if (running !== undefined && running > 0) {
+    return {
+      key: 'running',
+      label: total === undefined ? '执行中' : `执行中 · ${done ?? 0}/${total}`,
+      tone: 'ok',
+      detail:
+        total === undefined
+          ? `${running} 个任务正在执行`
+          : `${total} 个任务已完成 ${done ?? 0} 个，${running} 个正在执行`,
+    }
+  }
+  // 规则 8：任务全部结束，但计划没有收口（没有终止原因 / 没有结束时刻）。
+  if (total !== undefined && total > 0 && done === total && !closed) {
+    return {
+      key: 'closing',
+      label: '待收口',
+      tone: 'warn',
+      detail: '任务已全部结束，计划尚未收口',
+    }
+  }
+  if (planStatus === 'dispatching' || (members !== undefined && members > 0)) {
+    return {
+      key: 'dispatching',
+      label: total === undefined ? '派发中' : `派发中 · ${done ?? 0}/${total}`,
+      tone: 'ok',
+      detail:
+        total === undefined
+          ? '计划正在把就绪任务派给成员'
+          : `计划正在派发：${done ?? 0}/${total} 个任务已结束`,
+    }
+  }
+  // 规则 10：唯一合法的「计划就绪」。
+  if (total !== undefined && total > 0 && members === 0 && done === 0) {
+    return {
+      key: 'ready',
+      label: `计划就绪 · ${total} 任务`,
+      tone: 'ok',
+      detail: `${total} 个任务已就绪，还没有派发给成员`,
+    }
+  }
+  return {
+    key: 'pending',
+    label: '待派发',
+    tone: 'muted',
+    detail:
+      total !== undefined && total > 0
+        ? `计划尚未进入派发：${done ?? 0}/${total} 个任务已结束`
+        : '计划还没有可派发的任务',
+  }
+}
+
+/** 阶段 → 徽标三元组（图标本表、文案本函数上游、tone 走计划态映射）。 */
+export function runStageBadge(stage: RunStageView): Badge {
+  return {
+    icon: RUN_STAGE_ICON[stage.key] ?? '?',
+    text: stage.label,
+    tone: PLAN_TONE_BADGE_TONE[stage.tone],
+  }
+}
+
+/**
+ * run 详情（`RunDetailView`，不带计数）→ 阶段。
+ *
+ * 计数**从真实任务列表派生**（精确值，不是猜）；`members` 这类详情里没有的信息
+ * 保持 undefined，让规则 9/10 不被误命中。
+ */
+export function stageOfDetail(
+  detail: RunDetailView,
+  counts: Partial<RunStageInput> = {},
+): RunStageView {
+  const tasks = detail.tasks ?? []
+  const done = tasks.filter((task) => task.status === 'done').length
+  const running = tasks.filter((task) => task.status === 'running' || task.status === 'gate').length
+  const failed = tasks.filter((task) => task.status === 'failed').length
+  return runStageOf({
+    ...counts,
+    planStatus: detail.planStatus,
+    total: counts.total ?? tasks.length,
+    done: counts.done ?? done,
+    running: counts.running ?? running,
+    failed: counts.failed ?? failed,
+    ...(detail.terminationReason !== undefined
+      ? { terminationReason: detail.terminationReason }
+      : {}),
+    ...(detail.finishedAt !== undefined ? { finishedAt: detail.finishedAt } : {}),
+  })
+}
+
+/**
+ * 当前 run 的阶段判定输入：宿主投影 `runCounts` 优先；旧快照没有投影时按
+ * `tasks` / `members` **精确派生**（不是拿 0 冒充缺失：running/failed 由任务态直接数，
+ * interrupted 由成员态直接数，members 就是快照里本 run 的成员数）。
+ *
+ * `planStatus` 保持原样（缺失即 undefined）—— 阶段函数据此走规则 1「未启用」。
+ */
+export function currentRunStageInputOf(snapshot: PanelSnapshot | null | undefined): RunStageInput {
+  const tasks = snapshot?.tasks ?? []
+  const members = snapshot?.members ?? []
+  const counts = snapshot?.runCounts ?? {}
+  const done = tasks.filter((task) => task.status === 'done').length
+  return {
+    planStatus: snapshot?.planStatus,
+    total: tasks.length,
+    done,
+    running:
+      counts.running ?? tasks.filter((task) => task.status === 'running' || task.status === 'gate').length,
+    failed: counts.failed ?? tasks.filter((task) => task.status === 'failed').length,
+    interrupted: counts.interrupted ?? members.filter((member) => member.status === 'interrupted').length,
+    members: counts.members ?? members.length,
+  }
+}
+
+/* ───────────── r24：残留计划（未收口的 run 可见、可终止） ───────────── */
+
+/**
+ * 「还没有收口」的计划态 —— 与宿主 `reconcileStalePlans` 用**同一个集合**。
+ *
+ * 只有这三种态可能出现在「计划还在，进程已经没了」的场景里；终态
+ * （`terminated` / `cancelled`）本身已经收口，不会再被认为是残留。
+ */
+const UNCLOSED_PLAN_STATUSES: readonly PlanStatus[] = ['draft', 'dispatching', 'paused']
+
+/** 残留计划徽标文案（唯一来源；历史行与 run 卡都读它）。 */
+export const RESIDUAL_RUN_BADGE_TEXT = '未收口·可能残留'
+
+/** 徽标悬停解释：说清「凭什么这么判」以及「能做什么」，不做「系统认为」式推断。 */
+export const RESIDUAL_RUN_TITLE =
+  '计划态为草稿/派发中/已暂停，且没有结束时刻：这次运行没有收口，可能残留。确认没有成员在跑后可点「终止计划」'
+
+/** 终止残留计划的按钮文案（破坏性动作：用结果命名，不用「确定」）。 */
+export const CLOSE_RUN_LABEL = '终止计划'
+
+/** 终止成功后的就地提示（宿主返回的新快照会把这一行刷成终态，提示只在刷不到时可见）。 */
+export const CLOSE_RUN_DONE_TEXT = '已终止该残留计划'
+
+/** 终止失败、且宿主没给原因的兜底文案（`hintOf` 已优先透传 `rejected.message`）。 */
+export const CLOSE_RUN_FAILED_TEXT = '终止失败：宿主未说明原因，请稍后重试'
+
+/** 残留计划徽标（warn tone：不是失败，但需要用户处理）。 */
+export const RESIDUAL_RUN_BADGE: Badge = { icon: '⚠', text: RESIDUAL_RUN_BADGE_TEXT, tone: 'warn' }
+
+/** 判定所需的宿主事实（`RunSummary` 的超集兼容：只要这两项）。 */
+export interface ResidualRunFacts {
+  status: PlanStatus
+  finishedAt?: number
+}
+
+/**
+ * 是否残留计划：**只读宿主事实**，不看任务数、不看 `active`。
+ *
+ * `active` 在宿主侧等于 `ongoing > 0`（有未终态任务），无法区分「正在跑」与「进程没了」；
+ * 因此残留判定严格按 r24 口径：计划态 ∈ {draft,dispatching,paused} 且没有 `finishedAt`。
+ * 正在跑的 run 也满足这一条 —— 它同样是「没收口」，徽标文案说的是「可能残留」。
+ */
+export function isResidualRun(run: ResidualRunFacts): boolean {
+  if (!UNCLOSED_PLAN_STATUSES.includes(run.status)) return false
+  return run.finishedAt === undefined || !(run.finishedAt > 0)
+}
+
+/* ───────────── r25：终态 run 绝不显示为「进行中」 ───────────── */
+
+/**
+ * 已收口（终态）的计划态 —— 与宿主 `PLAN_TERMINAL_STATUSES` 用**同一个集合**。
+ *
+ * 这两个态的 run 里可能还留着旧数据（任务没被终结、宿主下发的 `ongoing > 0`），
+ * 客户端必须自己把它们从「进行中」里排除：这是与宿主修正并行的双保险。
+ */
+const TERMINAL_PLAN_STATUSES: readonly PlanStatus[] = ['terminated', 'cancelled']
+
+/** 判定「run 已收口」所需的宿主事实（`RunSummary` 的超集兼容：只要这三项）。 */
+export interface ClosedRunFacts {
+  status: PlanStatus
+  finishedAt?: number
+  terminationReason?: string
+}
+
+/**
+ * run 是否已经收口（终态）。
+ *
+ * 两条判据（与任务卡口径一致）：
+ *  - 计划态就是 `terminated` / `cancelled`：宿主已明确收口，**即使还带着旧任务的 ongoing>0**；
+ *  - 带了终止原因且落了结束时刻：宿主 r21 起终止时才写 `terminationReason`，
+ *    两者同时存在说明这次运行已经结束（防旧宿主把计划态写成非终态）。
+ *
+ * 只读宿主事实，不按 `active` / 任务数反推。
+ */
+export function isClosedRun(run: ClosedRunFacts): boolean {
+  if (TERMINAL_PLAN_STATUSES.includes(run.status)) return true
+  const reason = typeof run.terminationReason === 'string' ? run.terminationReason.trim() : ''
+  return reason !== '' && typeof run.finishedAt === 'number' && run.finishedAt > 0
+}
+
+/**
+ * 「终止计划」的二次确认内容（`PendingConfirmationView` 的唯一构造点）。
+ *
+ * 走既有 `confirmDialogOf` 渲染，因此标题/按钮文案来自 `CONFIRM_VERBS.closeRun`，
+ * 这里只提供**影响范围**：1 次运行、停止派发新任务；有存活成员时宿主会拒绝。
+ */
+export function closeRunPendingOf(runId: string, now: number = Date.now()): PendingConfirmationView {
+  return {
+    id: `close-run-${runId}`,
+    action: 'closeRun',
+    runId,
+    createdAt: now,
+    summary:
+      '影响 1 次运行：标记为已终止，不再派发新任务、不再等待门禁；若仍有存活成员，宿主会拒绝本次终止并说明原因',
+    irreversible: true,
+    waitedText: '刚刚',
+  }
 }
 
 /* ──────── r11：单任务干预 / 写域占用 / 执行痕迹（F4~F7，DESIGN §3.3~§3.6） ──────── */
@@ -866,7 +1310,7 @@ export function deviationWriteCountOf(rows: readonly DeviationRowView[]): number
 export const UNAVAILABLE_TEXT = '不可得'
 export const NOT_STARTED_TEXT = '未开始'
 
-/** 千分位分组：与宿主 `format.ts` 的 `groupDigits` 逐字一致（客户端唯一的数字分组实现）。 */
+/** 千分位分组：与宿主 `format.ts` 的 `groupDigits` 逐字一致（客户端唯一的分组实现）。 */
 function groupDigits(digits: string): string {
   return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 }
@@ -876,45 +1320,94 @@ function usableNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
-function fullTokenText(total: number | undefined): string {
-  if (!usableNumber(total)) return UNAVAILABLE_TEXT
-  return groupDigits(String(Math.round(total)))
-}
+/** 带单位的 token 阶梯（从大到小，先命中先返回）：与宿主 `TOKEN_UNITS` 同表。 */
+const CLIENT_TOKEN_UNITS: ReadonlyArray<{ readonly divisor: number; readonly suffix: string }> = [
+  { divisor: 1_000_000_000, suffix: 'B' },
+  { divisor: 1_000_000, suffix: 'M' },
+  { divisor: 1_000, suffix: 'K' },
+]
 
-function oneDecimal(value: number): string {
-  const text = value.toFixed(1)
-  return text.endsWith('.0') ? text.slice(0, -2) : text
-}
-
-function compactTokenText(total: number | undefined): string {
+/**
+ * 带单位的 token 文本（r19）：与宿主 `src/host/format.ts` 的 `formatTokenUnits` **逐字一致**
+ * （跨端不能互相 import，只能靠两侧测试同表锁定）。
+ *
+ * 规则：`< 1,000` 原样整数；`≥ 1e3 / 1e6 / 1e9` 升到 K / M / B，固定两位小数；
+ * 四舍五入进位跨阈值时顺延上一级（`999,999` → `1.00M`，界面永不出现 `1000.00K`）。
+ *
+ * 只在宿主没给 `cell.text`（旧快照）时兜底；有 `text` 时一律用宿主的，客户端不重算。
+ */
+function tokenUnitsText(total: number | undefined): string {
   if (!usableNumber(total)) return UNAVAILABLE_TEXT
   const value = Math.round(total)
   if (value < 1_000) return String(value)
-  if (value < 1_000_000) return `${oneDecimal(value / 1_000)}k`
-  return `${oneDecimal(value / 1_000_000)}M`
+  for (let index = 0; index < CLIENT_TOKEN_UNITS.length; index += 1) {
+    const unit = CLIENT_TOKEN_UNITS[index]
+    if (value < unit.divisor) continue
+    const text = (value / unit.divisor).toFixed(2)
+    if (Number(text) >= 1_000 && index > 0) {
+      const next = CLIENT_TOKEN_UNITS[index - 1]
+      return `${(value / next.divisor).toFixed(2)}${next.suffix}`
+    }
+    return `${text}${unit.suffix}`
+  }
+  return String(value)
+}
+
+/** 合计文本兜底（旧数据无 `cell.text`）：动态单位，与宿主同口径。 */
+function fullTokenText(total: number | undefined): string {
+  return tokenUnitsText(total)
 }
 
 /**
- * token 单元格文本：`provider` 走千分位，`unavailable` 一律「不可得」。
+ * 紧凑合计（流转节点第二行，128px 宽）。
  *
+ * r19 起改用与合计相同的动态单位：单位文本最长 7 字符（`999.99K`），刚好落在旧的
+ * 7 字符预算内，因此**不再截断数字**（截断等于造假），也不需要第二套「一位小数小写 k」
+ * 的口径。保留独立导出只为兼容既有调用点。
+ */
+function compactTokenText(total: number | undefined): string {
+  return tokenUnitsText(total)
+}
+
+/**
+ * token 单元格文本：`provider` 用宿主文本（带 K/M/B 单位），`unavailable` 一律「不可得」。
+ *
+ * r19：以为单位是唯一展示口径；旧数据没有 `text` 时按同一算法兜底（`fullTokenText`）。
  * 为什么不显示 `-` 或 `0`：`-` 会被读成「还没跑」，`0` 会被读成「跑了但没花 token」，
  * 两者都是假话；「不可得」是唯一诚实的第三种状态（DESIGN §2.2）。
  */
 export function tokenTextOf(cell: UsageCell | null | undefined): string {
   if (!cell || cell.source !== 'provider') return UNAVAILABLE_TEXT
+  // 宿主已经算好的展示文本优先（r17）；旧数据没有 text 时才按数字补一遍。
+  if (typeof cell.text === 'string' && cell.text !== '') return cell.text
   return fullTokenText(cell.tokens?.total)
 }
 
-/** 流转节点第二行用的紧凑 token（宽 128px）；超过 7 字符时由调用方降级到它。 */
+/** 流转节点第二行用的紧凑 token（宽 128px，单位文本最长 7 字符）；口径与合计一致。 */
 export function compactTokenTextOf(cell: UsageCell | null | undefined): string {
   if (!cell || cell.source !== 'provider') return UNAVAILABLE_TEXT
   return compactTokenText(cell.tokens?.total)
 }
 
-/** token 单元格的 `title`：不可得时给原因，可得时给输入/输出明细。 */
+/**
+ * 六项指标明细（r17）：只透传宿主 `details`，客户端不重算命中率、不猜缺失分项。
+ *
+ * 旧数据没有 `details` 时返回空数组，调用方退化为只显示合计。
+ */
+export function usageMetricsOf(cell: UsageCell | null | undefined): UsageMetric[] {
+  if (!cell || cell.source !== 'provider' || !Array.isArray(cell.details)) return []
+  return cell.details
+}
+
+/** token 单元格的 `title`：不可得时给原因；可得时优先展开宿主给的六项明细。 */
 export function tokenTitleOf(cell: UsageCell | null | undefined): string {
   if (!cell || cell.source !== 'provider') return cell?.reason ?? '该处没有用量来源'
   const parts: string[] = [`合计 ${fullTokenText(cell.tokens?.total)} token`]
+  const details = usageMetricsOf(cell)
+  if (details.length > 0) {
+    for (const metric of details) parts.push(`${metric.label} ${metric.text}`)
+    return parts.join(' · ')
+  }
   if (usableNumber(cell.tokens?.input)) parts.push(`输入 ${fullTokenText(cell.tokens?.input)}`)
   if (usableNumber(cell.tokens?.output)) parts.push(`输出 ${fullTokenText(cell.tokens?.output)}`)
   return parts.join(' · ')
@@ -933,11 +1426,46 @@ export function durationTitleOf(cell: DurationCell | null | undefined): string {
       return '任务尚未开始'
     case 'running':
       return '正在计时'
-    case 'unavailable':
-      return '没有开始时间，算不出用时'
+    case 'unavailable': {
+      // r24：宿主会说明「为什么不可得」（例如旧 run 完成于起止记录上线前）。
+      // 有原因就逐字透传；旧快照没有 reason 才退回通用文案（既有断言保持不变）。
+      const reason = (cell.reason ?? '').trim()
+      return reason !== '' ? reason : '没有开始时间，算不出用时'
+    }
     default:
       return `开始 ${formatStamp(cell.startAt)} · 结束 ${formatStamp(cell.endAt)}`
   }
+}
+
+/**
+ * 角色卡「累计用时」的 `title`（r20）—— **不能**走 `durationTitleOf`。
+ *
+ * 角色用时是**聚合值**（`shared/role-view.ts#roleDurationOf` 把该角色名下任务逐个相加），
+ * 聚合区间没有单一「开始/结束时刻」，所以 cell 里刻意不带 `startAt`/`endAt`；
+ * 走通用的 `durationTitleOf` 会拼出「开始 — · 结束 —」这种自相矛盾的解释。
+ *
+ * 四态文案（与卡片上的可见文本分工：卡片只放 `cell.text`，这里解释「这个数怎么来的」）：
+ *  - done / running → 「该角色名下任务用时合计：<text>（N 个任务）」；
+ *  - not-started → 任务都还没开始，暂无累计用时（**不是 0 秒**）；
+ *  - unavailable → 合计不可得 + cell.text 里宿主给的原因（缺开始/结束时刻等）；
+ *  - 旧快照没有 duration 字段 → 说明是旧数据，不补 0。
+ *
+ * 纯函数、零格式化：时长文案一律取自宿主下发的 `cell.text`。
+ */
+export function roleDurationTitleOf(duration: DurationCell | undefined, tasks?: number): string {
+  if (duration === undefined) return '旧快照没有该角色的用时数据'
+  if (duration.state === 'not-started') return '该角色名下的任务都还没开始，暂无累计用时'
+  if (duration.state === 'unavailable') {
+    // 宿主把原因写进 text（`不可得：任务 t1 缺少开始/结束时刻…`）；去掉前缀后接在解释后面。
+    const reason = duration.text.startsWith(UNAVAILABLE_TEXT)
+      ? duration.text.slice(UNAVAILABLE_TEXT.length).replace(/^[：:]\s*/, '')
+      : duration.text
+    return reason === '' ? '该角色名下任务用时合计不可得' : `该角色名下任务用时合计不可得：${reason}`
+  }
+  const count =
+    typeof tasks === 'number' && Number.isFinite(tasks) && tasks > 0 ? `（共 ${Math.round(tasks)} 个任务）` : ''
+  const running = duration.state === 'running' ? '，进行中的任务按当前时刻计入' : ''
+  return `该角色名下任务用时合计：${duration.text}${count}${running}`
 }
 
 /** 缺单元格时的兜底：保留原因，不冒充 0。 */
@@ -972,6 +1500,8 @@ export interface RunHeadView {
   runId: string
   planStatusLabel: string
   planStatusTone: PlanStatusTone
+  /** r26：阶段 detail（人话解释），渲染为 `[data-plan-status]` 的 title。 */
+  planStatusDetail?: string
   plannedAtText: string
   /** 起止时钟（`10:21:03 → 进行中`）；时钟不是时长，允许客户端用 formatClock。 */
   windowText: string
@@ -984,15 +1514,25 @@ export interface RunHeadView {
   inflightState: InflightState
   /** 用量拿不到时的降级说明（有数据但拿不到该量，**不复用空态**）。 */
   downgrade?: string
+  /** r21：宿主记录的收口原因（旧 run 没有该字段 → 缺席，界面不占位、不编原因）。 */
+  terminationReason?: string
 }
 
-export function runHeadOf(detail: RunDetailView, inflight: InflightState = 'idle'): RunHeadView {
+/**
+ * r26：第三参可传入阶段视图；不传时保持旧行为（原始计划状态）。
+ * 任务页会把 `stageOfDetail` 的结果传进来，所以 run 头的徽标与卡片/历史行同源。
+ */
+export function runHeadOf(
+  detail: RunDetailView,
+  inflight: InflightState = 'idle',
+  stage?: RunStageView,
+): RunHeadView {
   const status = planStatusView(detail.planStatus)
   const inflightView = inflightOf(inflight)
   const head: RunHeadView = {
     runId: detail.runId,
-    planStatusLabel: status.label,
-    planStatusTone: status.tone,
+    planStatusLabel: stage === undefined ? status.label : stage.label,
+    planStatusTone: stage === undefined ? status.tone : stage.tone,
     plannedAtText: detail.plannedAt ? `计划于 ${formatStamp(detail.plannedAt)}` : '计划时间未记录',
     windowText: `${detail.plannedAt ? formatClock(detail.plannedAt) : '--:--:--'} → ${
       detail.finishedAt ? formatClock(detail.finishedAt) : '进行中'
@@ -1005,7 +1545,12 @@ export function runHeadOf(detail: RunDetailView, inflight: InflightState = 'idle
     inflightText: inflightView.text,
     inflightState: inflightView.state,
   }
+  if (stage !== undefined && stage.detail !== undefined) head.planStatusDetail = stage.detail
   if (head.usageSource !== 'provider') head.downgrade = `token ${UNAVAILABLE_TEXT}（无用量来源）`
+  // r21：只透传宿主落盘的 reason；没有就缺席（历史列表旧数据不显示「未记录原因」占位）。
+  if (detail.terminationReason !== undefined && detail.terminationReason.trim() !== '') {
+    head.terminationReason = detail.terminationReason.trim()
+  }
   return head
 }
 
@@ -1040,6 +1585,28 @@ export const TASK_TABLE_HEADER = {
   duration: '用时',
 } as const
 
+/**
+ * r21：宿主在**当前 run 快照**的 `PlanTask` 上下发的修订/作废事实位。
+ *
+ * 注意：`shared/types.ts#TaskDetailView`（历史 run 详情的任务投影）还没有这几个字段，
+ * 宿主 `library.taskDetailOf` 也没投影 —— 所以它们在客户端是**可选**的：
+ *  - 当前 run：`snapshot.tasks` 是原始 `PlanTask`，字段直接可见；
+ *  - 历史 run：宿主没下发 → 字段缺席，卡片不显示修订/作废说明（不自行推断）。
+ *
+ * 这是宿主契约缺口，等宿主把字段补进 `TaskDetailView` 后删除本地的可选扩展即可。
+ */
+export interface TaskRevisionFacts {
+  revisedAt?: number
+  revisionNote?: string
+  cancelledAt?: number
+  cancelReason?: string
+  // r25：与 shared/types.ts 的 PlanTask/TaskDetailView 同步扩 'stale'（计划收口连带终结）。
+  cancelledBy?: 'revision' | 'user' | 'stale'
+}
+
+/** 任务卡可消费的来源：`TaskDetailView`（历史）+ 可选修订事实（当前 run 才有）。 */
+export type TaskCardSource = TaskDetailView & TaskRevisionFacts
+
 export interface TaskRowView {
   id: string
   title: string
@@ -1052,10 +1619,41 @@ export interface TaskRowView {
   durationState: DurationState
   durationTitle: string
   expanded: boolean
+  /** r21：被需求修订改写过 → 可见徽标「已修订」（文案唯一出处在这里）。 */
+  revisedText?: string
+  /** r21：修订说明（宿主 `revisionNote`），徽标的 title 与行内说明共用。 */
+  revisionNote?: string
+  /** r21：任务作废原因（宿主 `cancelReason`），只对已取消任务展示。 */
+  cancelReason?: string
+  /**
+   * r21：任务在等写域时的可见标记（`等待写域`）。
+   *
+   * `status='waiting'` 在任务词表里是「等待中」（被单测钉死）；但宿主 r21 的 waiting
+   * 语义就是等写域锁，这里只**追加**一枚标记，不改 badge 文案（否则会与既有断言打架）。
+   */
+  waitScopeText?: string
 }
 
-export function taskRowOf(task: TaskDetailView, expanded: boolean): TaskRowView {
-  return {
+/** 修订徽标文案（r21）：宿主只下发事实位，中文在客户端这一处。 */
+export const TASK_REVISED_TEXT = '已修订'
+
+/**
+ * r25：取消原因的中文兜底 —— **只读 `cancelledBy` 的语义，绝不回显英文枚举**。
+ *
+ * 宿主正常会写 `cancelReason`（如「计划已收口：…」）；旧数据只有 `cancelledBy` 时
+ * 卡片仍要能回答「为什么没了」，因此按来源翻成中文。新增来源必须先在这里补文案。
+ */
+const CANCEL_BY_REASON: Record<'revision' | 'user' | 'stale', string> = {
+  revision: '被需求修订作废',
+  user: '队长取消任务',
+  stale: '计划已收口，任务随计划一起终结',
+}
+
+/** 已取消但宿主既没给原因、也没给来源：如实说明，不伪造理由、不留空白。 */
+export const CANCEL_REASON_UNKNOWN_TEXT = '已取消，宿主未记录原因'
+
+export function taskRowOf(task: TaskCardSource, expanded: boolean): TaskRowView {
+  const row: TaskRowView = {
     id: task.id,
     title: task.title,
     badge: statusBadge(task.status),
@@ -1068,6 +1666,30 @@ export function taskRowOf(task: TaskDetailView, expanded: boolean): TaskRowView 
     durationTitle: durationTitleOf(task.duration),
     expanded,
   }
+  // r21：只在宿主真的写了 `revisedAt` 时标「已修订」，不拿 revisionNote 反推。
+  if (typeof task.revisedAt === 'number' && task.revisedAt > 0) {
+    row.revisedText = TASK_REVISED_TEXT
+    const note = task.revisionNote?.trim()
+    if (note !== undefined && note !== '') row.revisionNote = note
+  }
+  // 取消原因是「为什么没了」的唯一解释；不把原因复制到非取消任务上。
+  // r25：宿主没写 cancelReason 时按 cancelledBy 翻成中文（stale 等枚举绝不上屏）。
+  if (task.status === 'cancelled') {
+    const reason = task.cancelReason?.trim()
+    if (reason !== undefined && reason !== '') row.cancelReason = reason
+    else {
+      const by = task.cancelledBy
+      const fallback = by === undefined ? '' : CANCEL_BY_REASON[by]
+      row.cancelReason = fallback !== '' ? fallback : CANCEL_REASON_UNKNOWN_TEXT
+    }
+  }
+  // 等写域（宿主 r11/r21 语义）：只有任务真的在 waiting 且宿主给了等待原因时才标；
+  // 不拿状态自行推断「应该是在等写域」。
+  if (task.status === 'waiting') {
+    const waitReason = task.waitReason?.trim()
+    if (waitReason !== undefined && waitReason !== '') row.waitScopeText = '等待写域'
+  }
+  return row
 }
 
 export interface GateEvidenceView {
@@ -1087,6 +1709,8 @@ export interface TaskDetailPanelView {
   attemptsText?: string
   waitReason?: string
   usageReason?: string
+  /** provider 时的六项指标（宿主 `details` 透传）；缺失 = 旧数据，只显示合计。 */
+  usageMetrics?: UsageMetric[]
   durationReason?: string
   evidence?: GateEvidenceView
 }
@@ -1102,7 +1726,15 @@ export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
   if (typeof task.attempts === 'number' && task.attempts > 1) panel.attemptsText = `第 ${task.attempts} 次尝试`
   if (task.waitReason) panel.waitReason = task.waitReason
   if (task.usage.source !== 'provider') panel.usageReason = task.usage.reason ?? '该任务没有可用用量事件'
-  if (task.duration.state === 'unavailable') panel.durationReason = '没有开始时间，算不出用时'
+  else {
+    const metrics = usageMetricsOf(task.usage)
+    if (metrics.length > 0) panel.usageMetrics = metrics
+  }
+  if (task.duration.state === 'unavailable') {
+    // r24：展开区与单元格 title 用同一句原因（宿主 `DurationCell.reason`），不再各写一份。
+    const reason = (task.duration.reason ?? '').trim()
+    panel.durationReason = reason !== '' ? reason : '没有开始时间，算不出用时'
+  }
   const evidence = task.evidence
   if (evidence) {
     panel.evidence = {
@@ -1141,11 +1773,19 @@ export interface TaskOverviewView {
 }
 
 /**
- * 任务总览的**唯一**派生点（r14 AC-10 / AC-11）。
+ * 任务总览的**唯一**派生点（r14 AC-10 / AC-11；r18b 恢复全量列表）。
  *
  * 一次调用同时产出环的比例、圆心文本与两个分组 —— 组件不再自己做除法或二次过滤，
  * 所以「改一个任务 running→done」时环与两组必然同一帧一致（AC-11）。
- * 分子只认 `status === 'done'`：`cancelled`/`skipped` 是终态但不是完成（AC-10）。
+ *
+ * 口径（r18b 按用户要求回滚 r18 的过滤）：
+ *  - **环**按**全量**任务算：分子只认 `status === 'done'`，分母是全部任务
+ *    （`cancelled`/`skipped` 计入分母、不计入分子，AC-10）；
+ *  - **列表也是全量**：`groups.open` = 所有非 done 任务（`cancelled`/`skipped` 同样
+ *    留在未完成组，不再被剔除），`groups.done` = 所有 done 任务；两组都保持计划顺序。
+ *
+ * 空组的隐藏不在这里做：由 TaskTable 的 grouped 分支按 `rows.length === 0` 过滤
+ * （全部完成或没有任务时 open 组为空，因此「全部完成时没有『未完成 · 0』组头」仍然成立）。
  */
 export function taskOverviewOf(
   tasks: readonly TaskDetailView[],
@@ -1204,6 +1844,94 @@ export function goalTitleOf(goal: string | undefined, runId: string): GoalTitleV
   return { text: `${chars.slice(0, GOAL_TITLE_MAX).join('')}…`, title: full, source: 'goal' }
 }
 
+/* ───────────── r21：需求修订（同一个 runId 内并入） ───────────── */
+
+/**
+ * 宿主追加段落的标题格式：`## 需求修订（YYYY-MM-DD HH:mm）`。
+ *
+ * 与 `src/host/plan/plan.ts#revisePlan` 的落盘格式**逐字对应**；客户端只做切分，
+ * 不重写标题、不重排时间 —— 用户原文（含换行）原样保留。
+ */
+const REVISION_HEADING = /^## 需求修订（([^）\n]*)）[ \t]*$/gm
+
+export interface PlanGoalSectionView {
+  key: string
+  /** true = 需求修订追加段（不是原目标）。 */
+  revision: boolean
+  heading: string
+  /** 段正文：用户原文，保留换行。 */
+  body: string
+}
+
+/** run 头的「目标 + 追加需求」视图（r21）。 */
+export interface PlanGoalView {
+  sections: PlanGoalSectionView[]
+  /** `本次运行已被修订 N 次`；没有修订史时不出。 */
+  revisionCountText?: string
+  /** `已并入 <runId>`：目标里确实出现了修订段/修订史时才有。 */
+  mergedText?: string
+  /** 最近一次修订的说明（`changeSummary` + 时刻）；只有修订史能给出。 */
+  latestRevisionText?: string
+}
+
+/**
+ * 目标全文 → 分段视图（r21）。
+ *
+ * 输入是宿主下发的 `PanelSnapshot.goal`（原目标 + 逐次追加的「## 需求修订（…）」段）
+ * 与 `PanelSnapshot.revisions`。函数是纯的：
+ *  - 没有目标、也没有修订史 → `null`（run 头整块不渲染，不占位）；
+ *  - `goal` 里没有修订标题 → 只有「原始目标」一段；
+ *  - 修订段与修订史**同一份用户原文**，只切分、不改写、不补时刻。
+ */
+export function planGoalOf(
+  goal: string | undefined,
+  revisions: readonly PlanRevision[] | undefined,
+  runId: string,
+): PlanGoalView | null {
+  const text = (goal ?? '').trim()
+  const history = Array.isArray(revisions) ? revisions : []
+  if (text === '' && history.length === 0) return null
+
+  const headings = [...text.matchAll(REVISION_HEADING)]
+  const sections: PlanGoalSectionView[] = []
+  if (headings.length === 0) {
+    if (text !== '') {
+      sections.push({ key: 'goal-origin', revision: false, heading: '原始目标', body: text })
+    }
+  } else {
+    const firstIndex = headings[0].index ?? 0
+    const origin = text.slice(0, firstIndex).trim()
+    if (origin !== '') {
+      sections.push({ key: 'goal-origin', revision: false, heading: '原始目标', body: origin })
+    }
+    headings.forEach((heading, index) => {
+      const start = (heading.index ?? 0) + heading[0].length
+      const end = index + 1 < headings.length ? (headings[index + 1].index ?? text.length) : text.length
+      const body = text.slice(start, end).trim()
+      sections.push({
+        key: `goal-revision-${index + 1}`,
+        revision: true,
+        heading: `需求修订（${heading[1]}）`,
+        body,
+      })
+    })
+  }
+
+  const view: PlanGoalView = { sections }
+  const hasRevisionSection = sections.some((section) => section.revision)
+  if (history.length > 0) {
+    view.revisionCountText = `本次运行已被修订 ${history.length} 次`
+    const latest = history[history.length - 1]
+    const summary = (latest.changeSummary ?? '').trim()
+    view.latestRevisionText =
+      summary === ''
+        ? `最近一次修订于 ${formatStamp(latest.at)}`
+        : `最近修订 ${formatStamp(latest.at)}：${summary}`
+  }
+  if (history.length > 0 || hasRevisionSection) view.mergedText = `已并入 ${runId}`
+  return view
+}
+
 /* ───────────── 项目库分栏宽度 ───────────── */
 
 /** 项目列表列宽（r14 DESIGN §3）：默认 220，夹在 160–360（再窄放不下项目名，再宽挤掉详情）。 */
@@ -1251,7 +1979,7 @@ export interface FlowNodeCellView {
   roleText: string
   /** 节点第一行的任务简述（给人看的名字，不是任务 id）。 */
   taskTitle: string
-  /** 第二行的整串（`1,203 · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
+  /** 第二行的整串（`1.20K · 3 分 12 秒`），超宽时 CSS 加 ellipsis。 */
   text: string
   title: string
   label: string
@@ -1262,13 +1990,17 @@ export interface FlowNodeCellView {
 }
 
 export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
-  // r14：token 一律给**原串**（宿主已格式化千分位）。r13 在这里超过 7 位就换紧凑写法，
-  // 那是设计师明确否掉的口径 —— 截断/压缩数字等于造假，宁可让 CSS 省略号省略文字。
+  // r19：token 一律给宿主文本（已带 K/M/B 单位、两位小数），客户端不重算、不截断；
+  // r13 曾在这里超过 7 位换紧凑写法，单位化后最长 7 字符（`999.99K`），该分支已无必要。
   const full = tokenTextOf(node.usage)
   const durationText = durationTextOf(node.duration)
   const roleText = (node.roleName ?? '').trim() || FLOW_ROLE_FALLBACK
   // r16：状态词与 tone 只从 statusBadge 取（13 态一张表），组件不再自己映射。
   const status = statusBadge(node.status)
+  // r17：token 不可得时把原因带进 title/label（用户问「这些不可得是怎么回事儿」，
+  // 节点上只写「token 不可得」看不出缘由；RunHeader / RoleCard / TaskTable 三处
+  // 的 title 早已带 reason，这里补齐流程卡片）。可得到数字时保持原串，不加后缀。
+  const tokenNote = node.usage !== undefined && node.usage.source === 'provider' ? '' : `（${tokenTitleOf(node.usage)}）`
   return {
     tokenText: full,
     durationText,
@@ -1277,8 +2009,8 @@ export function flowNodeViewOf(node: FlowNodeView): FlowNodeCellView {
     text: `${full} · ${durationText}`,
     statusText: status.text,
     tone: status.tone,
-    title: `${node.id} ${node.title} · 角色 ${roleText} · token ${full} · 用时 ${durationText}`,
-    label: `${node.id}：${node.title}，${status.text}，token ${full}，用时 ${durationText}`,
+    title: `${node.id} ${node.title} · 角色 ${roleText} · token ${full}${tokenNote} · 用时 ${durationText}`,
+    label: `${node.id}：${node.title}，${status.text}，token ${full}${tokenNote}，用时 ${durationText}`,
   }
 }
 
@@ -1495,6 +2227,309 @@ export function memoryRowOf(item: MemoryItemView): MemoryRowView {
   }
 }
 
+/* ───────────── r23 记忆条目视图（面板记忆页；宿主解析，客户端只排版） ───────────── */
+
+/**
+ * 主题标题：与宿主目录的标题保持一致，仅用于展示。
+ *
+ * 注意：这里**不解析 md、不拼来源/时间/修正次数** —— 那些一律用宿主下发的
+ * `MemoryEntryView.text / sourceText / stamp / revisions`，避免客户端与宿主各写一套格式。
+ */
+const MEMORY_TOPIC_LABELS: Record<string, string> = {
+  conventions: '团队约定',
+  architecture: '架构与契约',
+  commands: '构建与门禁命令',
+  pitfalls: '失败与教训',
+  workflow: '流程与协作',
+  ui: '界面与样式',
+  host: '宿主集成',
+  domain: '业务与项目',
+}
+
+/** 旧快照没有 `quotas` 时的兜底上限：与宿主 `PROJECT_MAX_FILES` / `PUBLIC_MAX_FILES` 同口径。 */
+const MEMORY_DEFAULT_MAX_FILES: Record<MemoryTrack, number> = { project: 8, public: 6 }
+/** 旧快照没有 `maxEntriesPerFile` 时的兜底上限（宿主 `ENTRIES_PER_FILE`）。 */
+const MEMORY_DEFAULT_MAX_ENTRIES = 40
+
+export type MemoryWarningTone = 'info' | 'warn' | 'danger'
+
+export interface MemoryWarningView {
+  key: string
+  tone: MemoryWarningTone
+  text: string
+}
+
+export interface MemoryQuotaRowView {
+  track: MemoryTrack
+  files: number
+  maxFiles: number
+  totalEntries: number
+  maxEntriesPerFile: number
+  /** 顶栏文案，例：`项目记忆 5/8 · 63 条`（中文由客户端拼，数字全部来自宿主）。 */
+  text: string
+  tone: 'ok' | 'warn' | 'danger'
+  warnings: MemoryWarningView[]
+  legacyFileCount: number
+}
+
+/**
+ * 配额行：宿主只给数字，中文提示在这里单点拼。
+ *
+ * `quota` 缺省（旧快照）时用 `files` 的 canonical 计数兜底；**不猜**未下发的上限，
+ * 只退回与宿主常量同口径的默认值，并在提示里明确这是「未下发」而不是真实统计。
+ */
+export function memoryQuotaRowOf(
+  track: MemoryTrack,
+  quota: MemoryQuotaView | undefined,
+  files: readonly MemoryFileView[],
+  legacyFileCount?: number,
+): MemoryQuotaRowView {
+  const canonical = files.filter((file) => file.track === track && file.canonical && !file.legacy)
+  const fallbackFiles = canonical.length
+  const fallbackEntries = canonical.reduce((sum, file) => sum + (usableNumber(file.active) ? file.active : 0), 0)
+  const maxFiles = usableNumber(quota?.maxFiles) && quota.maxFiles > 0
+    ? Math.round(quota.maxFiles)
+    : MEMORY_DEFAULT_MAX_FILES[track]
+  const count = usableNumber(quota?.files) ? Math.round(quota.files) : fallbackFiles
+  const totalEntries = usableNumber(quota?.totalEntries) ? Math.round(quota.totalEntries) : fallbackEntries
+  const maxEntriesPerFile = usableNumber(quota?.maxEntriesPerFile) && quota.maxEntriesPerFile > 0
+    ? Math.round(quota.maxEntriesPerFile)
+    : MEMORY_DEFAULT_MAX_ENTRIES
+  const nearFiles = quota === undefined ? count >= maxFiles - 1 : quota.nearFiles === true
+  const overFiles = quota === undefined ? count > maxFiles : quota.overFiles === true
+  const nearFullFiles = Array.isArray(quota?.nearFullFiles) ? quota.nearFullFiles.filter((name) => typeof name === 'string') : []
+  const fullFiles = Array.isArray(quota?.fullFiles) ? quota.fullFiles.filter((name) => typeof name === 'string') : []
+  const legacy = usableNumber(legacyFileCount) ? Math.round(legacyFileCount) : 0
+
+  const warnings: MemoryWarningView[] = []
+  if (overFiles) {
+    warnings.push({
+      key: 'over-files',
+      tone: 'danger',
+      text: `主题文件数 ${count}/${maxFiles} 已超出上限：请手工删除多余的主题文件`,
+    })
+  } else if (nearFiles) {
+    warnings.push({
+      key: 'near-files',
+      tone: 'warn',
+      text: `主题文件数 ${count}/${maxFiles} 已接近上限：继续沉淀会先淘汰旧条目`,
+    })
+  }
+  if (fullFiles.length > 0) {
+    warnings.push({
+      key: 'full-files',
+      tone: 'warn',
+      text: `${fullFiles.join('、')} 已满 ${maxEntriesPerFile} 条：新写入会先淘汰最旧的 P2`,
+    })
+  }
+  if (nearFullFiles.length > 0) {
+    warnings.push({
+      key: 'near-full-files',
+      tone: 'warn',
+      text: `${nearFullFiles.join('、')} 接近满（${maxEntriesPerFile} 条上限）：建议清理低优先级条目，或把要保留的升为 P0`,
+    })
+  }
+
+  const tone: MemoryQuotaRowView['tone'] = overFiles ? 'danger' : warnings.some((item) => item.tone === 'warn') ? 'warn' : 'ok'
+  return {
+    track,
+    files: count,
+    maxFiles,
+    totalEntries,
+    maxEntriesPerFile,
+    text: `${track === 'public' ? '公共记忆' : '项目记忆'} ${count}/${maxFiles} · ${totalEntries} 条`,
+    tone,
+    warnings,
+    legacyFileCount: legacy,
+  }
+}
+
+export interface MemoryFileRowView {
+  key: string
+  name: string
+  /** 主题标题；不是 canonical 主题（misc/手写文件）时退回文件名。 */
+  title: string
+  distributionText: string
+  distributionTitle: string
+  countText: string
+  metaText: string
+  readOnly: boolean
+  active: number
+  superseded: number
+}
+
+/** 单个记忆文件的行文案：等级分布与条目数全部来自 `file.levels / active / superseded`。 */
+export function memoryFileRowOf(file: MemoryFileView): MemoryFileRowView {
+  const label = file.topic === null ? '' : MEMORY_TOPIC_LABELS[file.topic] ?? ''
+  const active = usableNumber(file.active) ? Math.max(0, Math.round(file.active)) : 0
+  const superseded = usableNumber(file.superseded) ? Math.max(0, Math.round(file.superseded)) : 0
+  const levels = file.levels ?? { P0: 0, P1: 0, P2: 0 }
+  const distributionText = memoryLevelsTextOf(levels)
+  const meta: string[] = [file.name]
+  if (file.readOnly) meta.push('只读（手工维护）')
+  else if (!file.canonical) meta.push('非主题文件')
+  return {
+    key: `${file.track}/${file.name}`,
+    name: file.name,
+    title: label !== '' ? label : file.name,
+    distributionText,
+    distributionTitle: '活动条目的等级分布：P0 铁律 / P1 教训 / P2 常规',
+    countText: superseded > 0 ? `活动 ${active} 条 · 已作废 ${superseded}` : `活动 ${active} 条`,
+    metaText: meta.join(' · '),
+    readOnly: file.readOnly === true,
+    active,
+    superseded,
+  }
+}
+
+function memoryLevelsTextOf(levels: { P0: number; P1: number; P2: number }): string {
+  const parts: string[] = []
+  for (const level of ['P0', 'P1', 'P2'] as const) {
+    const value = levels[level]
+    const count = usableNumber(value) ? Math.max(0, Math.round(value)) : 0
+    if (count > 0) parts.push(`${level} ${count}`)
+  }
+  return parts.length === 0 ? '暂无活动条目' : parts.join(' · ')
+}
+
+export type MemoryEntryTone = 'strong' | 'normal' | 'muted'
+
+export interface MemoryEntryRowView {
+  key: string
+  id: string
+  level: MemoryLevel
+  levelText: string
+  text: string
+  /** 宿主格式化好的 `来源：… · … · 修正 N`；客户端不做二次格式化。 */
+  sourceText: string
+  revisions: number
+  superseded: boolean
+  supersededText: string
+  tone: MemoryEntryTone
+}
+
+export function memoryEntryRowOf(entry: MemoryEntryView): MemoryEntryRowView {
+  const level: MemoryLevel = entry.level === 'P0' || entry.level === 'P1' ? entry.level : 'P2'
+  const text = typeof entry.text === 'string' ? entry.text : ''
+  const sourceText = typeof entry.sourceText === 'string' ? entry.sourceText : ''
+  return {
+    key: typeof entry.id === 'string' && entry.id !== '' ? entry.id : `${entry.file}:${entry.at}:${entry.level}`,
+    id: typeof entry.id === 'string' ? entry.id : '',
+    level,
+    levelText: level,
+    text: text.trim() === '' ? '（空条目）' : text,
+    sourceText: sourceText.trim() === '' ? `来源：${entry.source}` : sourceText,
+    revisions: usableNumber(entry.revisions) ? Math.max(1, Math.round(entry.revisions)) : 1,
+    superseded: entry.superseded === true,
+    supersededText: '已作废',
+    tone: level === 'P0' ? 'strong' : level === 'P1' ? 'normal' : 'muted',
+  }
+}
+
+export interface MemoryEntriesView {
+  active: MemoryEntryRowView[]
+  superseded: MemoryEntryRowView[]
+}
+
+/** 活动/已作废分栏：宿主字段直接过滤，不解析正文。 */
+export function memoryEntriesOf(entries: readonly MemoryEntryView[]): MemoryEntriesView {
+  const active: MemoryEntryRowView[] = []
+  const superseded: MemoryEntryRowView[] = []
+  for (const entry of entries) {
+    const row = memoryEntryRowOf(entry)
+    if (row.superseded) superseded.push(row)
+    else active.push(row)
+  }
+  return { active, superseded }
+}
+
+export interface MemoryCurationReportView {
+  phase: 'preview' | 'done'
+  headline: string
+  counts: string[]
+  warnings: string[]
+  canApply: boolean
+  applyLabel: string
+  closeLabel: string
+}
+
+/** 整理报告：dry-run 只报「将新增 / 已存在 / 已满」，执行完才显示已写入。 */
+export function memoryCurationReportOf(report: MemoryCurateReport): MemoryCurationReportView {
+  const preview = report.dryRun === true
+  const added = usableNumber(report.added) ? Math.max(0, Math.round(report.added)) : 0
+  const extracted = usableNumber(report.extracted) ? Math.max(0, Math.round(report.extracted)) : 0
+  const scanned = usableNumber(report.scannedFiles) ? Math.max(0, Math.round(report.scannedFiles)) : 0
+  const skippedExisting = usableNumber(report.skippedExisting) ? Math.max(0, Math.round(report.skippedExisting)) : 0
+  const skippedFull = usableNumber(report.skippedFull) ? Math.max(0, Math.round(report.skippedFull)) : 0
+  const skippedInvalid = usableNumber(report.skippedInvalid) ? Math.max(0, Math.round(report.skippedInvalid)) : 0
+  const target = report.target
+  const counts = [`扫描旧流水 ${scanned} 个文件`, `提取 ${extracted} 条`, `已存在 ${skippedExisting} 条`, `已满跳过 ${skippedFull} 条`]
+  if (skippedInvalid > 0) counts.push(`无法解析 ${skippedInvalid} 个文件`)
+  if (target !== undefined && typeof target.name === 'string') {
+    counts.push(`目标 ${target.name}：${target.before} → ${target.after} 条`)
+  }
+  const warnings = Array.isArray(report.warnings)
+    ? report.warnings.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+    : []
+  return {
+    phase: preview ? 'preview' : 'done',
+    headline: preview
+      ? `预演完成：将新增 ${added} 条 P1 教训`
+      : added > 0
+        ? `整理完成：新增 ${added} 条 P1 教训`
+        : '整理完成：没有需要新增的条目',
+    counts,
+    warnings,
+    canApply: preview && added > 0,
+    applyLabel: `确认写入 ${added} 条`,
+    closeLabel: preview ? '取消预览' : '关闭报告',
+  }
+}
+
+export interface MemoryCurationOutcome {
+  ok: boolean
+  message?: string
+  report?: MemoryCurateReport
+  notices: string[]
+}
+
+/**
+ * `act({type:'curateMemory'})` 的解包口（`feedbackOf` 的姊妹函数）。
+ *
+ * 为什么要单独一个：整理报告在 `ActResult.curation`，而 `feedbackOf` 会把它丢掉；
+ * 组件里直接 `result.data.curation` 又会让「整包赋值」那一族 bug 复活。
+ */
+export function memoryCurationOutcomeOf(result: unknown): MemoryCurationOutcome {
+  if (result === null || result === undefined) return { ok: true, notices: [] }
+  const box = result as Record<string, unknown>
+  const transportError = str(box.error)
+  if (transportError !== '') return { ok: false, message: transportError, notices: [] }
+
+  const payload = (box.data ?? box) as Record<string, unknown>
+  if (payload === null || typeof payload !== 'object') return { ok: true, notices: [] }
+
+  const notices = Array.isArray(payload.notices)
+    ? payload.notices.filter((item): item is string => typeof item === 'string')
+    : []
+  const rejected = payload.rejected as Record<string, unknown> | undefined
+  if (rejected !== undefined && rejected !== null && typeof rejected === 'object') {
+    const message = str(rejected.message).trim()
+    const code = str(rejected.code).trim()
+    return { ok: false, message: message !== '' ? message : code !== '' ? code : '整理被拒绝', notices }
+  }
+
+  const report = payload.curation
+  if (report === null || report === undefined || typeof report !== 'object') {
+    return { ok: true, notices }
+  }
+  const typed = report as MemoryCurateReport
+  if (typed.ok === false) {
+    const message = Array.isArray(typed.warnings) ? typed.warnings.find((item) => typeof item === 'string') : undefined
+    return { ok: false, message: message ?? '整理失败', report: typed, notices }
+  }
+  return { ok: true, report: typed, notices }
+}
+
 /* ───────────── 确认弹窗 ───────────── */
 
 export interface ConfirmVerb {
@@ -1510,6 +2545,8 @@ const CONFIRM_VERBS: Record<string, ConfirmVerb> = {
   skipTask: { title: '跳过任务', action: '跳过任务', confirm: '跳过任务', object: 'task' },
   updateAcceptance: { title: '重新门禁', action: '重跑门禁', confirm: '重新门禁', object: 'task' },
   forceParallel: { title: '强制并行', action: '强制并行', confirm: '强制并行', object: 'task' },
+  // r24：收口一条残留计划（终态 run 幂等返回 unchanged，有存活成员则被宿主拒绝）。
+  closeRun: { title: '终止残留计划', action: '终止计划', confirm: '终止计划', object: 'run' },
 }
 
 const FALLBACK_VERB: ConfirmVerb = { title: '不可逆操作', action: '执行动作', confirm: '确认执行', object: 'task' }
@@ -1573,8 +2610,8 @@ function fallbackDurationOf(status: TaskStatus): DurationCell {
  * 「client 里出现的 `ctx.<x>` 必须是 inject 过的服务」（test/host-contract.test.ts），
  * 这里只是普通的装配入参，用 `ctx` 会被静态守卫误判成服务访问。
  */
-export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskDetailView {
-  const detail: TaskDetailView = {
+export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskCardSource {
+  const detail: TaskCardSource = {
     id: task.id,
     title: task.title,
     roleId: task.roleId,
@@ -1591,6 +2628,12 @@ export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskD
   if (typeof task.attempts === 'number') detail.attempts = task.attempts
   const waitReason = waitReasonOf(task)
   if (waitReason) detail.waitReason = waitReason
+  // r21：快照任务直接把修订/作废事实位带进卡片视图（历史 `TaskDetailView` 没有这些字段）。
+  if (typeof task.revisedAt === 'number') detail.revisedAt = task.revisedAt
+  if (typeof task.revisionNote === 'string') detail.revisionNote = task.revisionNote
+  if (typeof task.cancelledAt === 'number') detail.cancelledAt = task.cancelledAt
+  if (typeof task.cancelReason === 'string') detail.cancelReason = task.cancelReason
+  if (task.cancelledBy !== undefined) detail.cancelledBy = task.cancelledBy
   return detail
 }
 
@@ -1758,12 +2801,28 @@ export function buildRunDetail(source: RunDetailSource, runId?: string): RunDeta
     }),
   )
   const duration: DurationCell = snapshot.runDuration ?? { state: 'unavailable', text: UNAVAILABLE_TEXT }
+  // 宿主快照**永远**带 `runUsage`（没有用量事件时是 `unavailable` 单元格而不是缺字段），
+  // 所以这里不能用 `??` 判「缺」：r17 真机实测 `runUsage={source:'unavailable'}` 时
+  // `??` 永不回退，`sumUsage` 的聚合分支成了单测里才走得到的死代码 —— 即使任务级用量
+  // 已经打通，面板「成员合计」仍会恒显示「不可得」。优先级：
+  //   ① 宿主 run 合计（provider）= 权威值，直接采用；
+  //   ② 否则若任务级有数据（完整才给数、部分缺失仍不可得，不低估），用聚合值；
+  //   ③ 再否则保留宿主给的 unavailable 原因（如「尚无用量事件」），没有才用兜底文案。
+  const taskUsageCells = taskViews.map((task) => task.usage)
+  const aggregatedUsage = sumUsage(taskUsageCells, '该 run 没有可用用量事件')
+  const hasTaskUsage = taskUsageCells.some((cell) => cell.source === 'provider' && cell.tokens !== undefined)
+  const usage: UsageCell =
+    snapshot.runUsage?.source === 'provider'
+      ? snapshot.runUsage
+      : aggregatedUsage.source === 'provider' || hasTaskUsage
+        ? aggregatedUsage
+        : (snapshot.runUsage ?? aggregatedUsage)
   const detail: RunDetailView = {
     runId: snapshotRunId,
     // 快照不带会话 id（会话是请求维度而非 run 维度）；T7 在需要时由 api 层补齐。
     sessionId: '',
     planStatus: snapshot.planStatus ?? 'draft',
-    usage: snapshot.runUsage ?? sumUsage(taskViews.map((task) => task.usage), '该 run 没有可用用量事件'),
+    usage,
     duration,
     roles: roleUsageOf(taskViews, roles),
     tasks: taskViews,

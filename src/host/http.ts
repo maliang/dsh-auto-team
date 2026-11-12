@@ -70,8 +70,10 @@ export function buildHttpRoutes(deps: HttpDeps): HttpRoute[] {
         if (track === null) return { error: 'track 必须是 public、project 或 skill' }
         // 合法性判定与读写删共用 safeMemoryName（在 bridge.readMemoryFile 内部），这里不重复实现。
         // r13 AC-16：项目记忆要能按项目读，workspace 白名单校验在 bridge 里做（不在路由层重复一份）。
+        // r22：面板不带 workspace 时按 sessionId 解析当前会话的项目根（与列表/注入/写入同一解析）。
         const workspace = query.get('workspace')
-        return deps.bridge.readMemoryFile(track as MemoryTrack, name, workspace)
+        const sessionId = query.get('sessionId') ?? deps.defaultSessionId()
+        return deps.bridge.readMemoryFile(track as MemoryTrack, name, workspace, sessionId)
       },
     },
     {

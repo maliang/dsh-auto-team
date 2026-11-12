@@ -299,6 +299,43 @@ test('面板路径不变：bridge.act(dispatch) 仍同步 await 派发端口并�
   assert.equal(h.store.load(RUN_ID)?.plan.status, 'dispatching')
 })
 
+test('t5 复用：跨 run 复用空闲成员时提示「已复用」而不是「已创建」', async () => {
+  const h = setup({
+    dispatchImpl: async (state) => {
+      h.store.save({
+        ...state,
+        plan: {
+          ...state.plan,
+          status: 'dispatching',
+          tasks: state.plan.tasks.map((task) =>
+            task.status === 'pending' ? { ...task, status: 'running' as const, memberId: 'member-1' } : task,
+          ),
+        },
+        bindings: [
+          ...state.bindings,
+          { taskId: 't1', roleId: 'dev', memberId: 'member-1', name: '开发-1', spawnedAt: NOW + 5 },
+        ],
+      })
+      return { started: ['t1'], skipped: [], errors: [] }
+    },
+  })
+  // 上一轮 run 已收口，它的成员就是本轮的复用来源（正是「跑两轮就把 8 个名额用完」的场景）。
+  h.store.save(
+    stateOf({
+      plan: planOf({ runId: 'run-r14-prev', createdAt: NOW - 1000, status: 'terminated', tasks: [taskOf('t0', { status: 'done' })] }),
+      bindings: [{ taskId: 't0', roleId: 'dev', memberId: 'member-1', name: '开发-1', spawnedAt: NOW - 1000 }],
+      plannedAt: NOW - 1,
+    }),
+  )
+  h.store.save(stateOf())
+  await enable(h.bridge)
+
+  const result = await h.bridge.act(SESSION, { type: 'dispatch', runId: RUN_ID })
+  const notices = (result.notices ?? []).join('\n')
+  assert.match(notices, /已复用 1 个空闲成员/, `复用不能报成新建：${notices}`)
+  assert.doesNotMatch(notices, /已创建/, '复用没有创建成员，面板成员数必须与宿主真实名额一致')
+})
+
 test('AC-3：后台全失败 → 活动流（kind=status）+ auto_team_status.dispatch 段都看得见；成功后清掉旧文案', async () => {
   const h = setup({ dispatchImpl: async () => ({ started: [], skipped: [], errors: [{ taskId: 't1', error: 'spawn 失败' }] }) })
   h.store.save(stateOf())

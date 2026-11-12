@@ -20,7 +20,7 @@
  * 3. 宿主不提供可选服务（或 ctx 没有 `get`）时**降级为 undefined + warn，绝不回退裸读**：
  *    回退就等于把 r6 之前的「真机不激活」缺陷重新种回来（mock 全绿、真机全灭）。
  */
-import type { RejectionCode, Role, RoleModelRoute } from '../shared/types.ts'
+import type { RejectionCode, Role, RoleModelRoute, TokenTotals } from '../shared/types.ts'
 import type { ModelCatalogRaw } from './model-catalog.ts'
 import type { HostMember } from './team/watcher.ts'
 import type { GuardVerdict } from './team/guard.ts'
@@ -42,6 +42,64 @@ export interface HostAgent {
   readonly id: string
 }
 
+/** `subagents.startActivation()` 的返回值（只声明本插件用到的字段；形状由宿主 0.2.2-rc.2 契约给定）。 */
+export interface HostSubagentActivation {
+  /** 子会话 id（= 我们记的 memberId；续聊/直发/中断都用它，不再经名字表）。 */
+  childId: string
+  /** 宿主 catalog 里登记的名字（可能缺失；缺失就不往名字表里补）。 */
+  name?: string
+  /**
+   * 成员的完成结果。**绝不 await**：成员要跑很久，派发必须立刻返回；
+   * 但**必须**挂一个 `.catch(() => {})`，否则失败结果会变成未处理 rejection 打崩宿主日志。
+   */
+  result?: Promise<unknown>
+  dispose?(): Promise<void>
+}
+
+/**
+ * [已核，宿主 0.2.2-rc.2] `subagents` 服务里成员相关的方法。
+ *
+ * 旧宿主的 `agentTeams.spawnTeammate / sendMessage / listMembers / tryMembership / interrupt`
+ * **已全部移除**（宿主注释原文：teammates are subagents, so subagent limits and inbox delivery apply），
+ * 成员能力整体搬到这里。`agentTeams` 只剩 isEnabled/setEnabled/createTask/getTask/listTasks/updateTask，
+ * 因此本文件对它的成员方法只做**旧宿主兼容回退**（逐个 typeof 判断，不再假设存在）。
+ *
+ * 调用都可能抛 `SubagentError`，调用点一律 try/catch 转成人话（见 `spawnFailureText` / `hostError`）。
+ */
+export interface HostSubagents {
+  /** 已注册的 subagent provider 名（本机 `spawn`）。旧读口，保留作兼容。 */
+  list?(): unknown
+  /** 按名字取已注册 provider；新宿主用它确认 `spawn` 是否可用。 */
+  getProvider?(name: string): unknown
+  /** 创建成员（`provider` 是 subagent provider 名，LLM 路由走 `agentOptions`）。 */
+  startActivation?(spec: {
+    provider: string
+    label: string
+    name?: string
+    prompt: HostTextBlock[]
+    parent: HostAgent
+    signal: AbortSignal
+    delivery: 'parent' | 'caller'
+    agentOptions?: Record<string, unknown>
+  }): Promise<HostSubagentActivation | undefined | null>
+  /** 给指定子会话直发消息（target 是 SessionId，不是名字）。 */
+  sendMessage?(
+    sender: unknown,
+    targetId: string,
+    content: HostTextBlock[],
+    options: { signal: AbortSignal },
+  ): Promise<unknown>
+  /** 中断指定子会话；`authority` 声明调用者是祖先 agent（队长）。 */
+  interrupt?(targetSessionId: string, authority: unknown): unknown
+  /** 'lead' / 名字路径 / 或原样当 session id 返回。 */
+  resolveName?(caller: unknown, name: string, signal: AbortSignal): Promise<unknown>
+  /** 模型可见名：从 root 起的斜杠路径（root 是 'lead'）。 */
+  namesOf?(agent: unknown): { name?: unknown; creator?: unknown } | undefined
+  rootOf?(caller: unknown): unknown
+  /** 成员名单：`child` 行 + `diagnostic` 行（后者表示该分支读不出来的原因）。 */
+  listDescendants?(rootSessionId: string, signal?: AbortSignal): Promise<unknown>
+}
+
 /** 宿主 ctx 的最小子集。故意只声明我们会用到的成员。 */
 export interface HostContext {
   /** [已核] `register(definition: ToolDefinition): () => void`。 */
@@ -55,6 +113,14 @@ export interface HostContext {
   agents?: {
     currentInitiator?(): HostAgent | undefined
     requireInitiator?(): HostAgent
+    /**
+     * [已核] 按会话 id 取 Agent（同宿主 `dsh-plugin-teamflow` 的 `runtime.agents.get(sid)` 用法）。
+     *
+     * 门禁必须跑在**会话工作区**而不是宿主进程的启动目录：`apply()` 在进程启动时只执行一次，
+     * 那时拿不到「用户打开了哪个仓库」；真正的事实挂在 `agent.session.header.cwd` 上，
+     * 所以在每次跑门禁时用 sessionId 现取。取不到由调用方回退（不是错误）。
+     */
+    get?(sessionId: string): unknown
   }
   /** [已核] 全部方法第一参是 `caller: Agent`。 */
   agentTeams?: {
@@ -95,9 +161,11 @@ export interface HostContext {
    *
    * r12 真机事故：把 LLM provider 当 subagent provider 传进 spawn 请求 → 宿主
    * `no subagent provider registered for "opencode-go"`，派发全盘失败。两者是两套命名。
+   *
+   * 0.2.2-rc.2 起成员能力（创建/直发/中断/名单/身份）全部搬到这里，见 {@link HostSubagents}。
    */
   /** 可选服务（纪律 §2）：只许经 optionalService(ctx, 'subagents') 读取，不要裸读本字段。 */
-  subagents?: { list?(): unknown; getProvider?(name: string): unknown }
+  subagents?: HostSubagents
   /**
    * [已核] Cordis 的可选服务读取口。可选服务**只能**经本文件的 optionalService() 走这里读；
    * 缺 `get`（旧宿主 / 手搓 fake ctx）时一律按服务缺失降级，不回退裸读。
@@ -135,6 +203,22 @@ export interface HostContext {
 }
 
 /**
+ * 从一个宿主 Agent 上读**会话工作区**（宿主形状的唯一翻译点）。
+ *
+ * 为什么是 `session.header.cwd` 而不是进程 cwd：插件 `apply()` 只在宿主启动时执行一次，
+ * 那时进程 cwd 是宿主 profile 目录（真机 `~/.dsh/profiles/desktop`），与用户当前打开的仓库无关。
+ * 会话自己的根目录挂在 `agent.session.header.cwd` 上（同宿主 `dsh-plugin-teamflow` 的
+ * `workspaceScopeOf(agent)` 实测用法），门禁每次执行时按 sessionId 现取即可。
+ *
+ * 宽容读取：形状没核到就返回 undefined，由调用方回退到装配 workspace（旧行为），不抛错。
+ */
+export function sessionWorkspaceOf(agent: unknown): string | undefined {
+  const session = (agent as { session?: { header?: { cwd?: unknown } } } | null | undefined)?.session
+  const cwd = session?.header?.cwd
+  return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : undefined
+}
+
+/**
  * 可选服务白名单 —— **唯一登记处**（纪律 §2）。
  *
  * 名词定义：可选服务 = 宿主缺它时插件仍要能激活（只是相关功能降级）的服务。
@@ -142,12 +226,37 @@ export interface HostContext {
  * （同时出现会让 cordis 把整条 entry 判为 required，可选语义立刻消失）。
  * 测试 `test/host-contract.test.ts` 会断言 inject ∩ OPTIONAL_SERVICES === ∅。
  */
-export const OPTIONAL_SERVICES = ['webServer', 'llm', 'agentDefaultModel', 'subagents'] as const
+export const OPTIONAL_SERVICES = [
+  'webServer',
+  'llm',
+  'agentDefaultModel',
+  'subagents',
+  'sessionProjections',
+  /**
+   * 宿主工作区注册表（r19）：
+   * `Service.inject=['storageDomain','sessionPersistence']`，插件侧只读；`list()` **同步**返回
+   * 按持久顺序排列的实体数组，实体是带 getter 的对象（`id` / `path` / `title` / `sessionIds`）。
+   * 缺它时（headless / 旧宿主）左栏一律退回「路径 basename」的旧展示，不报错、不拦截。
+   * 见 `readWorkspaces()`。
+   */
+  'workspaceRegistry',
+] as const
 
 /** 可选服务名（从白名单派生，不许另写一份字面量）。 */
 export type OptionalServiceName = (typeof OPTIONAL_SERVICES)[number]
 
 /** 各可选服务的最小形状（[已核] 字段名来自 ARCHITECTURE §7 的实测输出）。 */
+export interface HostSessionProjections {
+  /**
+   * 读某个会话在某个投影 key 下的当前 state。
+   *
+   * 宿主签名 `stateOf(session: Session, key: string): unknown`：key 未注册 → `undefined`；
+   * 否则先 `materializeCells(session)`（**从会话日志回放**，不依赖事件投递）再返回 cell.state。
+   * 该方法在宿主里标了 deprecated（每个 key 首读会打一条 warn），但当前是唯一无副作用的同步读法。
+   */
+  stateOf?(session: unknown, key: string): unknown
+}
+
 export interface OptionalServiceMap {
   webServer: { register(route: unknown): (() => void) | void }
   llm: {
@@ -157,17 +266,106 @@ export interface OptionalServiceMap {
   }
   agentDefaultModel: { currentSelection?(): unknown }
   /**
-   * [已核] subagents 服务（r12 真机事故后补）。
+   * [已核] subagents 服务（r12 真机事故后补；0.2.2-rc.2 起承载全部成员能力，见 {@link HostSubagents}）。
    *
    * `list()` 返回的是**已注册的 subagent provider 名**（本机为 `spawn`），
    * 与 LLM provider（`opencode-go` / `deepseek` 之类）是**两套完全不同的命名**：
    * 把 LLM provider 填进 spawn 请求的 `provider` 字段，宿主会报
    * `no subagent provider registered for "<llm-provider>"` 并直接创建失败。
    */
-  subagents: {
-    list?(): unknown
-    getProvider?(name: string): unknown
+  subagents: HostSubagents
+  /**
+   * [已核] 会话投影注册表（宿主包 `@deepseek-ai/dsh-session-projection`，r17 读源码确认）。
+   *
+   * 为什么需要它：真机 `session/event` 订阅**从未把事件投递给插件**（r13 起的用量账一直是空的，
+   * 见 docs/teamflow/2026-11-05-r17-ui-polish/t6-usage-projection.md 的证据），而宿主的
+   * `tokenUsage` 投影由核心插件 `@deepseek-ai/dsh-token-meter` 注册 —— `stateOf(session, 'tokenUsage')`
+   * 会**从会话日志回放**出累计 token 数，完全不依赖事件投递。
+   */
+  sessionProjections: HostSessionProjections
+  /**
+   * [已核，来自 app.asar] 工作区注册表的最小形状。
+   *
+   * `list()` 同步返回实体数组；实体字段是 **getter**（`get path()` 等），
+   * 所以只能逐项读属性，**不要**对实体做 JSON / 展开拷贝 —— 那会丢掉原型上的 getter。
+   * 只声明 `list`：本插件只读这一条，写入口不在这里。
+   */
+  workspaceRegistry: { list?(): unknown }
+}
+
+/** 一个宿主工作区的最小投影（`readWorkspaces()` 的唯一输出形状）。 */
+export interface HostWorkspaceEntry {
+  /** 宿主实体 id（可能缺失；本插件不依赖它，只作透传）。 */
+  id?: string
+  /** canonical 绝对路径（宿主已归一，不是用户输入的原始串）。 */
+  path: string
+  /** 用户自己起的**工作区标题**（可改名）；空串按「没有」处理。 */
+  title?: string
+  /** 该工作区名下的会话 id（宿主已按会话 header 的 canonical cwd 过滤；去重后）。 */
+  sessionIds: string[]
+}
+
+/**
+ * 读宿主**工作区注册表**（r19：左栏项目名真源的唯一入口）。
+ *
+ * 为什么需要：run 落盘时记录的 `project` 在桌面宿主里可能是 profile 目录
+ * （`~/.dsh/profiles/desktop`），按 basename 展示就是 `desktop`；用户自己的命名
+ * （`nengtan` / `tuoluojiang`）只存在宿主的 workspaceRegistry 里。`sessionIds` 还能把
+ * 老 run（project 写歪的）按会话 id 映射回真实工作区。
+ *
+ * 纪律（与 `readModelCatalog` 同族）：
+ *  1. **绝不抛**：服务缺失 / `list()` 抛错 / 返回非数组 → 返回 `[]`，调用方退回旧行为；
+ *  2. 逐项容错：实体可能是 getter 对象，单个字段读抛出只跳过该字段（even getter may throw）；
+ *  3. 只保留 `path` 非空字符串的条目 —— 没有路径的实体无法分桶，收进去只会制造假项目。
+ *  4. 用 `readServiceQuietly` 而不是 `optionalService`：项目列表（以及记忆白名单）每次装配都会
+ *     读一次，宿主要真没有这个服务，`optionalService` 会按 5s 缓存周期反复刷 warn
+ *     （同 `readSessionTokenUsage` 的理由；wire 回归里「装配不应有告警」就是这条）。
+ */
+export function readWorkspaces(ctx: HostContext): HostWorkspaceEntry[] {
+  const registry = readServiceQuietly(ctx, 'workspaceRegistry')
+  if (registry === undefined || typeof registry.list !== 'function') return []
+  let raw: unknown
+  try {
+    raw = registry.list.call(registry)
+  } catch {
+    return []
   }
+  if (!Array.isArray(raw)) return []
+  const out: HostWorkspaceEntry[] = []
+  for (const item of raw) {
+    if (!isRecord(item)) continue
+    let path: unknown
+    let title: unknown
+    let id: unknown
+    let sessionIds: unknown
+    // 实体的字段是 getter：读取本身也可能抛（服务加载失败等），逐项兜住后跳过这一条。
+    try {
+      path = item.path
+      title = item.title
+      id = item.id
+      sessionIds = item.sessionIds
+    } catch {
+      continue
+    }
+    if (typeof path !== 'string') continue
+    const pathText = path.trim()
+    if (pathText === '') continue
+    const entry: HostWorkspaceEntry = { path: pathText, sessionIds: [] }
+    if (typeof id === 'string' && id.trim() !== '') entry.id = id.trim()
+    if (typeof title === 'string' && title.trim() !== '') entry.title = title.trim()
+    if (Array.isArray(sessionIds)) {
+      const seen = new Set<string>()
+      for (const value of sessionIds) {
+        if (typeof value !== 'string') continue
+        const sessionId = value.trim()
+        if (sessionId === '' || seen.has(sessionId)) continue
+        seen.add(sessionId)
+        entry.sessionIds.push(sessionId)
+      }
+    }
+    out.push(entry)
+  }
+  return out
 }
 
 /**
@@ -219,6 +417,131 @@ function readServiceQuietly<K extends OptionalServiceName>(
   } catch {
     return undefined
   }
+}
+
+/**
+ * 读某个成员会话在宿主**会话投影**里的累计 token 用量（r17）。
+ *
+ * 为什么走投影而不是事件：真机 `session/event` 从未投递到插件（r13 的用量账一直是空的，
+ * 而成员会话日志里 assistant/message 明明带 usage）；宿主核心插件 `dsh-token-meter` 注册的
+ * `tokenUsage` 投影会从会话日志回放，`stateOf(session,'tokenUsage').totals` 就是权威累计值。
+ *
+ * 三条纪律（与 `readModelCatalog` 同族）：
+ *  1. **绝不抛**：服务缺失、会话已卸载、字段缺失、回放异常一律 `undefined`，由调用方保持
+ *     已落盘的历史值；「读不到」不许降级成 0。
+ *  2. **`calls` 不填**：宿主投影没有调用次数计数器，伪造次数比显示「不可得」更糟。
+ *     调用次数由 `readSessionCallCount` 单独提供（成员会话 `assistant/message` 事件计数，
+ *     与 token 用量取自同一批事件；bridge 把两者合成同一个 `TokenTotals`）。
+ *  3. 用 `readServiceQuietly` 而不是 `optionalService`：本函数在每次快照前都会被调用，
+ *     服务真缺失时 `optionalService` 会每 2 秒刷一条 warn，把日志淹掉。
+ */
+export function readSessionTokenUsage(ctx: HostContext, sessionId: string): TokenTotals | undefined {
+  // 投影要从 `session.snapshotEvents()` 回放，必须拿真 Session（agent.session），不能伪造壳。
+  const session = sessionOf(ctx, sessionId)
+  if (session === undefined) return undefined
+  const projections = readServiceQuietly(ctx, 'sessionProjections')
+  if (projections === undefined || typeof projections.stateOf !== 'function') return undefined
+  for (const key of USAGE_PROJECTION_KEYS) {
+    try {
+      const totals = projectionTotalsOf(projections.stateOf.call(projections, session, key))
+      if (totals !== undefined) return totals
+    } catch {
+      // fail-open：投影回放失败只代表「这次读不到」，不动已落盘的值（下一帧会再试）。
+    }
+  }
+  return undefined
+}
+
+/**
+ * 宿主 `Agent` 上挂的真 `Session`（`agent.session`）；拿不到返回 `undefined`。
+ *
+ * 为什么必须是真 Session：token 投影与事件计数都从 `session.snapshotEvents()` 回放，伪造壳
+ * 只能读出空数据 —— 那比「不可得」更糟（看起来像 0）。
+ */
+function sessionOf(ctx: HostContext, sessionId: string): Record<string, unknown> | undefined {
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  let session: unknown
+  try {
+    session = (ctx.agents?.get?.(sessionId) as { session?: unknown } | null | undefined)?.session
+  } catch {
+    return undefined
+  }
+  return isRecord(session) ? session : undefined
+}
+
+/**
+ * 读某个成员会话**自己**的模型调用次数（r20）。
+ *
+ * 口径：一次模型调用 = 一条 `assistant/message` 事件（`docs/teamflow/2026-11-05-token-usage.md`
+ * 的既定定义；r17 的 `countCall` 也是同一口径）。真机会话日志里 `assistant/message` 与
+ * `step/end` 条数在已完成的轮次上相等，但空回复/被取消的 step 只在 `assistant/message` 上
+ * 有落地 —— 面板的「调用次数」与 token 用量必须取自同一批事件，否则两个指标会互相矛盾。
+ *
+ * 三条纪律：
+ *  1. **只数自己的事件**：从 `inheritedEventCount` 之后数，fork/续聊不把父会话的调用算进来；
+ *  2. **绝不抛**：会话未加载、日志不可读 → `undefined`（调用方保留已落盘的历史值）；
+ *  3. 会话可读但一条都没有 → `0` 是**真实计数**，不是补 0。
+ *
+ * 走 `snapshotEvents`（宿主公开读口）而不是 `ownEvents()`（同样标 deprecated 但会自建数组）；
+ * 旧宿主没有该方法时退化为公开的 `session.log` 数组切片（同 `inheritedEventCount` 语义）。
+ */
+export function readSessionCallCount(ctx: HostContext, sessionId: string): number | undefined {
+  const session = sessionOf(ctx, sessionId)
+  if (session === undefined) return undefined
+  const from = nonNegativeNumber(session.inheritedEventCount) ?? 0
+  let events: unknown
+  try {
+    if (typeof session.snapshotEvents === 'function') {
+      events = session.snapshotEvents.call(session, from)
+    } else if (Array.isArray(session.log)) {
+      events = session.log.slice(from)
+    }
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(events)) return undefined
+  let calls = 0
+  for (const event of events) {
+    if (isRecord(event) && event.type === 'assistant/message') calls += 1
+  }
+  return calls
+}
+
+/** 用量投影的读取顺序：宿主核心口径优先，第三方 `dsh-cost-meter` 兜底。 */
+const USAGE_PROJECTION_KEYS = ['tokenUsage', 'costUsage'] as const
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+/**
+ * 把投影 state 的 buckets 收敛成 `TokenTotals`（读法宽松：`totals` / `buckets` / state 本体）。
+ *
+ * `tokenUsage` 的字段名已核（`uncachedInputTokens` / `outputTokens` / `cacheReadTokens` /
+ * `cacheWriteTokens`）；`costUsage` 是第三方插件兜底、真实形状**未核**，所以同时接受短名别名
+ * （`inputTokens` / `input` …）。认不出任何数字就返回 `undefined` —— 宁可「不可得」，不可补 0。
+ *
+ * `total` 口径与 `team/usage.ts` 的 `tokenTotalsOf` 一致：未命中缓存输入 + 命中缓存输入 + 输出。
+ */
+function projectionTotalsOf(state: unknown): TokenTotals | undefined {
+  if (!isRecord(state)) return undefined
+  const buckets = isRecord(state.totals) ? state.totals : isRecord(state.buckets) ? state.buckets : state
+  const input =
+    nonNegativeNumber(buckets.uncachedInputTokens) ??
+    nonNegativeNumber(buckets.inputTokens) ??
+    nonNegativeNumber(buckets.input)
+  const output = nonNegativeNumber(buckets.outputTokens) ?? nonNegativeNumber(buckets.output)
+  const cacheRead = nonNegativeNumber(buckets.cacheReadTokens) ?? nonNegativeNumber(buckets.cacheRead)
+  const cacheWrite = nonNegativeNumber(buckets.cacheWriteTokens) ?? nonNegativeNumber(buckets.cacheWrite)
+  if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) {
+    return undefined
+  }
+  const totals: TokenTotals = { total: (input ?? 0) + (cacheRead ?? 0) + (output ?? 0) }
+  if (input !== undefined) totals.input = input
+  if (output !== undefined) totals.output = output
+  if (cacheRead !== undefined) totals.cacheRead = cacheRead
+  if (cacheWrite !== undefined) totals.cacheWrite = cacheWrite
+  return totals
 }
 
 /**
@@ -604,6 +927,77 @@ export function resolveCaller(ctx: HostContext): HostAgent | undefined {
   return undefined
 }
 
+const REASONING_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high'])
+
+/** 非空字符串才视为有效值：空串/非字符串一律当「没填」，绝不补猜。 */
+function nonEmptyStringOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+function reasoningEffortOf(value: unknown): 'low' | 'medium' | 'high' | undefined {
+  return typeof value === 'string' && REASONING_EFFORTS.has(value)
+    ? (value as 'low' | 'medium' | 'high')
+    : undefined
+}
+
+/**
+ * 读某个会话**当前真实**的模型路由（r27）。
+ *
+ * 会话默认是 per-session 的：队长会话把它写在 `requestHeader.config`
+ * （`agentDefaultModel.currentSelection()` 只是「新建 agent 的全局默认」，不是这个会话的选择）。
+ * 因此路由必须从会话本身读，且只认完整的一对 provider/model：
+ *
+ *  - 读不到（无 session / 无 requestHeader / 非对象 config）→ `undefined`；
+ *  - provider 或 model 任一缺失/为空 → `undefined`（**禁止半截路由**：只带 provider 会让宿主
+ *    拼出「全局 provider + 父会话 model」的混合路由，正是 r27 要修的事故）；
+ *  - `reasoningEffort` 只接受宿主的三个合法枚举值，其余忽略；
+ *  - 全程不抛：任何异常都退化成「这次读不到」，由调用方回退或保持 unverified。
+ */
+/**
+ * 宿主是否具备「按会话读路由」的能力（r27）。
+ *
+ * 老宿主没有 `ctx.agents.get`：此时任何会话都读不到 `requestHeader.config`，复用闸门必须整体
+ * 视为不可用（继续按旧行为复用），而不是把每个成员都判成「路由不一致」后无限新建成员。
+ */
+export function canReadSessionRoute(ctx: HostContext): boolean {
+  return typeof ctx.agents?.get === 'function'
+}
+
+export function readSessionRoute(ctx: HostContext, sessionId: string): RoleModelRoute | undefined {
+  const session = sessionOf(ctx, sessionId)
+  if (session === undefined) return undefined
+
+  let header: unknown
+  try {
+    header =
+      typeof session.requestHeader === 'function'
+        ? (session.requestHeader as () => unknown).call(session)
+        : undefined
+  } catch {
+    return undefined
+  }
+  const config = isRecord(header) && isRecord(header.config) ? header.config : undefined
+  if (config === undefined) return undefined
+
+  const provider = nonEmptyStringOf(config.provider)
+  const model = nonEmptyStringOf(config.model)
+  if (provider === undefined || model === undefined) return undefined
+
+  const reasoningEffort = reasoningEffortOf(config.reasoningEffort)
+  return {
+    provider,
+    model,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+  }
+}
+
+/** 当前活跃队长会话的真实路由（`resolveCaller` → {@link readSessionRoute}）；读不到 undefined。 */
+export function readCallerRoute(ctx: HostContext): RoleModelRoute | undefined {
+  const caller = resolveCaller(ctx)
+  if (caller === undefined) return undefined
+  return readSessionRoute(ctx, caller.id)
+}
+
 const NO_CALLER = '当前没有活跃的队长会话：agentTeams 需要以 Agent 身份调用，请在会话内使用本工具。'
 
 /**
@@ -614,6 +1008,18 @@ const NO_CALLER = '当前没有活跃的队长会话：agentTeams 需要以 Agen
  * 由宿主给出明确报错（r12 事故：这里曾填 LLM provider，派发 100% 失败）。
  */
 const DEFAULT_SUBAGENT_PROVIDER = 'spawn'
+
+/** `subagents.startActivation` 的 `label` 上限（宿主 catalog 短标签，约 64 字符）；超长截断不报错。 */
+const SUBAGENT_LABEL_MAX = 64
+
+/** 组 `label`：优先任务标题描述，其次任务 id，最后成员名；空串跳过，截断到宿主上限。 */
+function subagentLabelOf(input: SpawnPortInput): string {
+  const raw =
+    [input.description, input.taskId, input.name].find(
+      (value): value is string => typeof value === 'string' && value.trim() !== '',
+    ) ?? ''
+  return raw.length > SUBAGENT_LABEL_MAX ? raw.slice(0, SUBAGENT_LABEL_MAX) : raw
+}
 
 /**
  * `interrupt(caller, name)` 的返回形状**未核实**（只核实了宿主有这个方法），所以宽松归一
@@ -638,6 +1044,31 @@ export function normalizeInterruptResult(value: unknown): { ok: boolean; error?:
     if (error !== undefined) return { ok: false, error }
   }
   return { ok: true }
+}
+
+/**
+ * 宿主名额耗尽的失败文案（t5）。
+ *
+ * 两种配额要分开说，因为处置完全不同：
+ * - `Team member limit N reached`：**终身**名额（含已结束/已退休成员），只能调大
+ *   `agent-team` 的 `maxMembers`（或换一个 profile）。旧实现只把宿主原文透出去，
+ *   用户看到「member limit」完全不知道去哪改。
+ * - `active child limit`：并发名额，等正在跑的任务结束就会释放。
+ *
+ * 宿主原文始终保留在前缀里：分类错了也不会把真实原因藏掉。
+ */
+export function spawnFailureText(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error)
+  if (/team member limit/i.test(raw)) {
+    return `创建成员失败：${raw}。宿主 Team 的成员名额（maxMembers）是终身配额（含已结束成员），当前已用完；请在 profile 配置调大 agent-team 的 maxMembers（cordis.patch.yml 里 agent-team 条目的 config.maxMembers），或换一个 profile 后再派发。`
+  }
+  if (/active child limit/i.test(raw)) {
+    return `创建成员失败：${raw}。宿主同时运行的子成员已达上限（active child limit）；等正在跑的任务结束后重试，或调大宿主的并发上限。`
+  }
+  if (/member.*(limit|quota|capacity)|(limit|quota|capacity).*member|名额|成员.*上限/i.test(raw)) {
+    return `创建成员失败：${raw}。这看起来是宿主成员名额/并发上限；名额是终身配额时请在 profile 配置调大 agent-team 的 maxMembers。`
+  }
+  return `创建成员失败：${raw}`
 }
 
 /** `spawn` 端口的入参（与 dispatch 的 `SpawnInput` 分开：这层只关心宿主调用所需字段）。 */
@@ -778,22 +1209,44 @@ export function takePendingActual(names: readonly string[]): RoleModelRoute | nu
 }
 export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnPorts {
   const teams = ctx.agentTeams
-  /** memberId → 成员名：宿主 sendMessage 的 target 是**名字**，不是 id。 */
+  /**
+   * 成员能力读口：**每次调用现读**，不在构造期快照。
+   *
+   * 走 `ctx.get`（`readServiceQuietly`）而不是裸读 `ctx.subagents`：本服务只在
+   * `OPTIONAL_SERVICES` 登记（漏在 `inject` 里也照样能读到），裸读会踩 cordis
+   * 「cannot get property without inject」。
+   */
+  const subagentsOf = (): HostSubagents | undefined => readServiceQuietly(ctx, 'subagents')
+  /** memberId → 成员名：**仅旧宿主**的 sendMessage target 是名字；新宿主按 SessionId 直发。 */
   const names = new Map<string, string>()
 
-  function fallbackProvider(): string {
+  /**
+   * 最后一级兜底：宿主「新建 agent 的全局默认」选择。
+   *
+   * 只在会话路由读不到时使用（r27）。与 {@link readSessionRoute} 同一口径：provider 与 model
+   * **成对**才算有效，缺一个就返回 `undefined`，绝不产出半截路由。
+   */
+  function fallbackRoute(): RoleModelRoute | undefined {
     try {
-      // 可选服务：缺宿主默认模型选择时返回空串（spawn 侧给出明确报错），不回退裸读。
       const selection = optionalService(ctx, 'agentDefaultModel')?.currentSelection?.() as
-        | { provider?: unknown }
+        | Record<string, unknown>
         | undefined
-      if (typeof selection?.provider === 'string' && selection.provider !== '') return selection.provider
+      const provider = nonEmptyStringOf(selection?.provider)
+      const model = nonEmptyStringOf(selection?.model)
+      if (provider === undefined || model === undefined) return undefined
+      const reasoningEffort = reasoningEffortOf(selection?.reasoningEffort)
+      return {
+        provider,
+        model,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      }
     } catch {
-      /* 读不到就用空串，由宿主给出明确报错 */
+      /* 读不到就视为没有默认路由，由宿主给出明确报错 */
     }
-    return ''
+    return undefined
   }
 
+  /** 旧宿主专用：把名单刷进名字表（新宿主按 SessionId 直发，不需要名字）。 */
   function refreshNames(caller: HostAgent): void {
     try {
       const rows = teams?.listMembers?.(caller)
@@ -809,13 +1262,21 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
   /**
    * 组 spawn 请求时要填的 **subagent provider 名**（≠ LLM provider）。
    *
-   * 宿主 `subagents.list()` 给出已注册名字（本机只有 `spawn`）。优先选 `spawn`
-   * （宿主内置的 fresh-context 子会话实现），否则取第一个已注册的；读不到就退回
-   * `DEFAULT_SUBAGENT_PROVIDER`（与 `spawn_teammate` 工具自身用的默认一致）。
+   * 新宿主 `getProvider('spawn')` 能查到就用 `spawn`（宿主内置的 fresh-context 子会话实现）；
+   * 读不到 `getProvider` 的旧宿主 / 测试桩仍沿用 `list()` 的注册表顺序（优先 `spawn`）；
+   * 两者都读不到就退回 `DEFAULT_SUBAGENT_PROVIDER`，由宿主给出明确报错。
    */
   function subagentProviderName(): string {
+    const subagents = subagentsOf()
     try {
-      const rows = readServiceQuietly(ctx, 'subagents')?.list?.()
+      if (typeof subagents?.getProvider === 'function' && subagents.getProvider(DEFAULT_SUBAGENT_PROVIDER)) {
+        return DEFAULT_SUBAGENT_PROVIDER
+      }
+    } catch {
+      /* getProvider 抛错 → 退回注册表顺序 / 默认常量 */
+    }
+    try {
+      const rows = subagents?.list?.()
       const registered = Array.isArray(rows) ? rows.filter((row): row is string => typeof row === 'string' && row !== '') : []
       if (registered.includes(DEFAULT_SUBAGENT_PROVIDER)) return DEFAULT_SUBAGENT_PROVIDER
       if (registered.length > 0) return registered[0] as string
@@ -825,22 +1286,29 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
     return DEFAULT_SUBAGENT_PROVIDER
   }
 
-  /** 角色声明 / 会话默认的 **LLM** 路由；`agentOptions` 与成员路由都用它。 */
+  /**
+   * 角色声明 / 会话默认的 **LLM** 路由；`agentOptions` 与成员路由都用它。
+   *
+   * 优先级（r27）：角色显式声明 > 当前队长会话路由 > 宿主全局默认选择。三者都必须是
+   * 完整的 provider+model 对；读不到就返回 `undefined`（spawn 侧会明确报错），绝不只取 provider。
+   */
   function modelRouteOf(input: SpawnPortInput): RoleModelRoute | undefined {
-    const route = input.route
-    const provider = route?.provider ?? fallbackProvider()
-    if (provider === '' && route?.model === undefined) return undefined
-    return {
-      provider,
-      model: route?.model ?? '',
-      ...(route?.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-    } as RoleModelRoute
+    if (input.route !== undefined) return input.route
+    // 先走 caller（工具执行期可用）；后台派发没有 initiator 时用本次 run 的会话 id 兜底。
+    return readCallerRoute(ctx) ?? readSessionRoute(ctx, input.sessionId) ?? fallbackRoute()
   }
 
   return {
     async spawn(input) {
-      if (!teams?.spawnTeammate) {
-        return { ok: false, error: '宿主未提供 agentTeams.spawnTeammate，无法创建成员（请确认 auto-teams 能力已启用）' }
+      const subagents = subagentsOf()
+      const canStartActivation = typeof subagents?.startActivation === 'function'
+      // 旧宿主兼容分支：新宿主已移除 spawnTeammate，只在方法仍存在时使用。
+      const canSpawnTeammate = typeof teams?.spawnTeammate === 'function'
+      if (!canStartActivation && !canSpawnTeammate) {
+        return {
+          ok: false,
+          error: '宿主未提供 subagents.startActivation（旧宿主也没有 agentTeams.spawnTeammate），无法创建成员',
+        }
       }
       const caller = resolveCaller(ctx)
       if (!caller) return { ok: false, error: NO_CALLER }
@@ -855,20 +1323,54 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
               ...(modelRoute.model === '' ? {} : { model: modelRoute.model }),
               ...(modelRoute.reasoningEffort === undefined ? {} : { reasoningEffort: modelRoute.reasoningEffort }),
             }
-      // 必须先登记再 spawn：agent/created 在 spawnTeammate 内部同步触发（见 pendingRoutes 说明）。
+      const prompt = [{ type: 'text', text: input.prompt }] satisfies HostTextBlock[]
+      const abort = signal ?? new AbortController().signal
+      // 必须先登记再 spawn：`agent/created` 在创建事务内同步触发（见 pendingRoutes 说明）。
       trackPendingRoute(input.name, input.route)
       // 同上：清掉可能残留的旧观测，保证 take 到的只可能是**本次**创建观测到的路由。
       settlePendingActual([input.name])
       try {
-        const created = (await teams.spawnTeammate(caller, {
+        if (canStartActivation && subagents?.startActivation) {
+          const activation = await subagents.startActivation({
+            provider,
+            // label 只是 catalog 里的短标签（宿主限制 ~64 字符），不是任务正文。
+            label: subagentLabelOf(input),
+            name: input.name,
+            prompt,
+            parent: caller,
+            signal: abort,
+            // 完成时通知父会话模型（队长）；成员不是宿主队友，通知靠这条投递。
+            delivery: 'parent',
+            // 角色声明的 LLM 模型：`agentOptions` 是宿主官方下发通道。
+            ...(agentOptions === undefined ? {} : { agentOptions }),
+          })
+          if (activation === undefined || activation === null) {
+            return { ok: false, error: 'subagents.startActivation 未返回 activation：宿主返回值形状与预期不符' }
+          }
+          if (typeof activation.childId !== 'string' || activation.childId === '') {
+            return { ok: false, error: 'subagents.startActivation 未返回 childId：宿主返回值形状与预期不符' }
+          }
+          // 成员在后台跑很久：**绝不 await** 结果（派发必须立刻返回）；但必须就地吞掉失败，
+          // 否则未处理的 rejection 会打崩宿主日志。
+          const result = activation.result
+          if (result !== undefined && typeof (result as { catch?: unknown }).catch === 'function') {
+            void (result as Promise<unknown>).catch(() => {})
+          }
+          // 事件在 startActivation 内部就触发完了，此刻观测值已经在表里；取到即删。
+          const actualName = typeof activation.name === 'string' ? activation.name : ''
+          const actual = takePendingActual([input.name, activation.childId, actualName])
+          return { ok: true, memberId: activation.childId, ...(actual === undefined ? {} : { actual }) }
+        }
+        // ── 旧宿主回退路径（agentTeams.spawnTeammate）────────────────────────────
+        const created = (await teams!.spawnTeammate!(caller, {
           name: input.name,
           description: input.description ?? `任务 ${input.taskId}`,
-          prompt: [{ type: 'text', text: input.prompt }] satisfies HostTextBlock[],
+          prompt,
           context: 'fresh',
           provider,
           // 角色声明的 LLM 模型：宿主 `SubagentStartRequest.agentOptions` 是官方下发通道。
           ...(agentOptions === undefined ? {} : { agentOptions }),
-          signal: signal ?? new AbortController().signal,
+          signal: abort,
         })) as { member?: { id?: unknown; name?: unknown } } | undefined
         const member = created?.member
         if (typeof member?.id !== 'string' || member.id === '') {
@@ -879,7 +1381,7 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
         const actual = takePendingActual([input.name, member.id, typeof member.name === 'string' ? member.name : ''])
         return { ok: true, memberId: member.id, ...(actual === undefined ? {} : { actual }) }
       } catch (error) {
-        return { ok: false, error: `创建成员失败：${error instanceof Error ? error.message : String(error)}` }
+        return { ok: false, error: spawnFailureText(error) }
       } finally {
         // 装路由是「取走即删」，这里只清理没被取走的（失败/宿主未触发 agent/created）。
         settlePendingRoute(input.name)
@@ -888,17 +1390,26 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
     },
 
     async sendMessage(memberId, text) {
-      if (!teams?.sendMessage) return { ok: false, error: '宿主未提供 agentTeams.sendMessage' }
+      const subagents = subagentsOf()
+      const canNewSend = typeof subagents?.sendMessage === 'function'
+      // 旧宿主兼容分支：新宿主已移除 agentTeams.sendMessage。
+      const canOldSend = typeof teams?.sendMessage === 'function'
+      if (!canNewSend && !canOldSend) {
+        return { ok: false, error: '宿主未提供 subagents.sendMessage（旧宿主也没有 agentTeams.sendMessage）' }
+      }
       const caller = resolveCaller(ctx)
       if (!caller) return { ok: false, error: NO_CALLER }
-      if (!names.has(memberId)) refreshNames(caller)
-      const target = names.get(memberId) ?? memberId
+      const content = [{ type: 'text', text }] satisfies HostTextBlock[]
+      const abort = signal ?? new AbortController().signal
       try {
-        await teams.sendMessage(caller, {
-          target,
-          content: [{ type: 'text', text }] satisfies HostTextBlock[],
-          signal: signal ?? new AbortController().signal,
-        })
+        if (canNewSend && subagents?.sendMessage) {
+          // 新 API 用 SessionId 直发，不需要名字表（refreshNames 只在旧分支用）。
+          await subagents.sendMessage(caller, memberId, content, { signal: abort })
+          return { ok: true }
+        }
+        if (!names.has(memberId)) refreshNames(caller)
+        const target = names.get(memberId) ?? memberId
+        await teams!.sendMessage!(caller, { target, content, signal: abort })
         return { ok: true }
       } catch (error) {
         return { ok: false, error: `直达消息失败：${error instanceof Error ? error.message : String(error)}` }
@@ -908,18 +1419,30 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
     /**
      * 尽力中断（r11 AC-26）：只被「取消一个 running 任务」调用。
      *
+     * 新宿主：名字 → SessionId（`resolveName`）→ `interrupt(id, { kind: 'ancestor', agent })`。
+     * 旧宿主：仍走 `agentTeams.interrupt(caller, name)`。
+     *
      * 失败**不是**动作失败：bridge 把 `error` 折进一条 notice，任务状态照常落 `cancelled`
      * —— 否则用户点一次「取消」会得到红字而状态没变，比不中断更糟。
      */
     async interruptMember(name) {
-      const interrupt = teams?.interrupt
-      if (typeof interrupt !== 'function') {
+      const subagents = subagentsOf()
+      const canNewInterrupt = typeof subagents?.interrupt === 'function' && typeof subagents?.resolveName === 'function'
+      const oldInterrupt = teams?.interrupt
+      if (!canNewInterrupt && typeof oldInterrupt !== 'function') {
         return { ok: false, error: '宿主未提供 interrupt 能力（成员不会被中断，任务状态照常取消）' }
       }
       const caller = resolveCaller(ctx)
       if (!caller) return { ok: false, error: NO_CALLER }
       try {
-        return normalizeInterruptResult(await interrupt.call(teams, caller, name))
+        if (canNewInterrupt && subagents?.interrupt && subagents.resolveName) {
+          const id = await subagents.resolveName(caller, name, signal ?? new AbortController().signal)
+          if (typeof id !== 'string' || id === '') {
+            return { ok: false, error: `中断成员失败：无法把成员 ${name} 解析成会话 id` }
+          }
+          return normalizeInterruptResult(subagents.interrupt(id, { kind: 'ancestor', agent: caller }))
+        }
+        return normalizeInterruptResult(await oldInterrupt!.call(teams, caller, name))
       } catch (error) {
         return { ok: false, error: `中断成员失败：${error instanceof Error ? error.message : String(error)}` }
       }
@@ -1002,19 +1525,61 @@ function hostError(message: string, code: RejectionCode): HostError {
 }
 
 /**
- * 成员名单：`agentTeams.listMembers(caller)`，返回宿主行。
+ * 成员名单（双通道）。
+ *
+ * 新宿主（0.2.2-rc.2）：`subagents.listDescendants(rootOf(caller).id)`——成员就是 subagent，
+ * 名单是 root 会话的子树；`activity` 只有 running/inactive 两态，`diagnostic` 行表示
+ * 该分支读不出来的原因，跳过（它不是成员）。
+ * 旧宿主：`agentTeams.listMembers(caller)`，方法已移除的宿主上只作兼容回退。
+ *
  * 拿不到名单时 **抛错**（而不是返回空数组）——空数组在 watcher 眼里等于「成员全死了」，
  * 会把所有任务误标 interrupted；抛错则本轮跳过，宁可漏报一轮也不误杀。
  */
 export async function listHostMembers(ctx: HostContext): Promise<HostMember[]> {
+  const subagents = readServiceQuietly(ctx, 'subagents')
   const teams = ctx.agentTeams
-  if (!teams?.listMembers) {
-    throw hostError('宿主未提供 agentTeams.listMembers：无法核对成员存活状态。', 'NOT_FOUND')
-  }
   const caller = resolveCaller(ctx)
   if (!caller) throw hostError(NO_CALLER, 'NO_CALLER')
-  const rows = await teams.listMembers(caller)
-  return normalizeMemberRows(rows)
+  if (typeof subagents?.listDescendants === 'function') {
+    const root = subagents.rootOf?.(caller) as { id?: unknown } | string | undefined
+    const rootId = typeof root === 'string' ? root : root?.id
+    if (typeof rootId !== 'string' || rootId === '') {
+      throw hostError('宿主 subagents.rootOf 未返回 root 会话 id：无法核对成员存活状态。', 'NOT_FOUND')
+    }
+    return normalizeDescendantRows(await subagents.listDescendants(rootId))
+  }
+  if (typeof teams?.listMembers === 'function') {
+    return normalizeMemberRows(await teams.listMembers(caller))
+  }
+  throw hostError(
+    '宿主未提供 subagents.listDescendants（旧宿主也没有 agentTeams.listMembers）：无法核对成员存活状态。',
+    'NOT_FOUND',
+  )
+}
+
+/**
+ * 归一 `subagents.listDescendants` 的行。
+ *
+ * 只认 `kind === 'child'` 的成员行；`diagnostic` 是「这条分支为什么读不出来」的说明，不是成员。
+ * `status` 原样透传宿主 activity（running/inactive），由 watcher 的 `normalizeHostStatus` 判定死活。
+ * 返回值不是数组 = 宿主契约不符 → 抛错（绝不能拿空数组冒充「没有成员」）。
+ */
+export function normalizeDescendantRows(rows: unknown): HostMember[] {
+  if (!Array.isArray(rows)) {
+    throw hostError('subagents.listDescendants 返回值不是数组：无法核对成员存活状态。', 'NOT_FOUND')
+  }
+  const members: HostMember[] = []
+  for (const item of rows) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as { kind?: unknown; id?: unknown; activity?: unknown; path?: unknown }
+    if (row.kind !== undefined && row.kind !== 'child') continue
+    if (typeof row.id !== 'string' || row.id === '') continue
+    // 模型可见名是斜杠路径（root='lead'）；面板/消息里只展示最后一段。
+    const path = typeof row.path === 'string' ? row.path : ''
+    const name = path === '' ? '' : (path.split('/').pop() ?? '')
+    members.push({ id: row.id, name, status: row.activity === 'running' ? 'running' : 'inactive' })
+  }
+  return members
 }
 
 /** 宿主返回可能是数组、也可能是 `{ members: [...] }`；两种都吃，其余一律当空。 */
@@ -1281,20 +1846,37 @@ export function installMemberRoute(agent: unknown, route: RoleModelRoute): (() =
   }
 }
 
-/** 成员身份：名字只认宿主 `agentTeams.tryMembership`（消息/对账都按名字），拿不到再退回 agent 自身字段。 */
+/**
+ * 成员身份（双通道）：名字用于消息展示与对账，id 用于续聊/中断。
+ *
+ * 新宿主（0.2.2-rc.2）：`subagents.namesOf(agent)` 给出模型可见名（从 root 起的斜杠路径，
+ * root 是 `'lead'`），取最后一段当名字；id 直接用 `agent.id`（就是 SessionId）。
+ * 旧宿主：`agentTeams.tryMembership(agent)` 已移除，仅在方法仍在时作兜底。
+ * 两者都拿不到 → 退回 agent 自身字段；绝不臆造名字（名字是消息路由与恢复重绑的键）。
+ */
 export function memberIdentityOf(ctx: HostContext, agent: unknown): { id: string; name: string } {
   let id = ''
   let name = ''
-  try {
-    const membership = ctx.agentTeams?.tryMembership?.(agent) as { id?: unknown; name?: unknown } | undefined
-    if (membership && typeof membership === 'object') {
-      if (typeof membership.id === 'string') id = membership.id
-      if (typeof membership.name === 'string') name = membership.name
-    }
-  } catch {
-    /* 非 Team 子 agent 会返回 undefined；抛错同样视为拿不到 */
-  }
   const own = agent as { id?: unknown; name?: unknown } | null | undefined
+  try {
+    const named = readServiceQuietly(ctx, 'subagents')?.namesOf?.(agent)
+    const path = typeof named?.name === 'string' ? named.name : ''
+    if (path !== '') name = path.split('/').pop() ?? ''
+    if (typeof own?.id === 'string') id = own.id
+  } catch {
+    /* namesOf 抛错 → 继续走旧通道 / 自身字段 */
+  }
+  if (id === '' || name === '') {
+    try {
+      const membership = ctx.agentTeams?.tryMembership?.(agent) as { id?: unknown; name?: unknown } | undefined
+      if (membership && typeof membership === 'object') {
+        if (id === '' && typeof membership.id === 'string') id = membership.id
+        if (name === '' && typeof membership.name === 'string') name = membership.name
+      }
+    } catch {
+      /* 非 Team 子 agent 会返回 undefined；抛错同样视为拿不到 */
+    }
+  }
   if (id === '' && typeof own?.id === 'string') id = own.id
   if (name === '' && typeof own?.name === 'string') name = own.name
   return { id, name }

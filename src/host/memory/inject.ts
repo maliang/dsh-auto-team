@@ -1,92 +1,46 @@
 /**
- * 纯函数：有界记忆注入 —— **内联索引**（AC-7 / AC-8 / AC-11）。
+ * 纯函数：条目级有界记忆注入（r23）。
  *
- * 规则：
- *  1. 总预算默认 4000 字符（MEMORY_INJECT_BUDGET），**永不超**；
- *  2. 选取顺序 = 项目记忆优先于公共记忆 → 标题/文件名命中关键词数（标题权重独立成一档，
- *     所以「标题里命中 1 次」一定排在「只在正文里多次命中」之前）→ 正文相关度
- *     → 更新时间新者优先 → 名字升序（稳定序，便于测试与复现）；
- *  3. **不再整段塞正文**：每条候选压成一行内联索引，形态为
- *     `mem://<track>/<stem> · <轨道> · <标题> — <首句摘要> ⇄ <关联 ID…>`，
- *     单条 ≤ `MEMORY_INLINE_ITEM_MAX`(200) 字符（AC-7）；全文由 `expand.ts` 按 ID 取回；
- *  4. 放不进预算的条目进 `omitted`（**不丢信息**：仍可按 ID 展开），文本尾部给一行
- *     「另有 N 条未内联（可按 ID 展开）：mem://…」——因此 `truncated` 的语义是
- *     「有未内联条目」，旧的整段截断与截断标注（`TRUNCATION_MARK` / `tailLine`）已整体删除（AC-8/AC-11）。
+ * 与旧的文件级实现不同：候选是**条目**（`parseEntryFile` 的产物），注入索引只挑条目，
+ * 旧流水 `run-*.md` / `lessons-*.md` 不参与（由 `bridge` 在读盘时排除）。
  *
- * 不 import 本地非纯模块（只 import 类型与常量），故可被 `node --test` 直接跑。
+ * 规则（DESIGN §9）：
+ *  1. 丢弃已作废条目；同一 `(track, hash)` 只留一条（canonical > misc → revisions 大 →
+ *     at 新 → 文件名字典序小）；
+ *  2. 排序：`levelRank` 降序（P0 永不因相关性被淹没）→ relevance 降序 → 项目轨优先 →
+ *     at 降序 → topic 字典序 → hash 字典序；
+ *  3. 每条压成一行（≤ `MEMORY_INLINE_ITEM_MAX`），总长（头 + 行 + 尾）**永不超预算**；
+ *  4. 放不下的条目进 `omitted`，尾部给一行「另有 N 条未内联（可按 ID 展开）」。
+ *
+ * 不 import 本地非纯模块（只 import 类型、常量与 entries 的纯函数），可被 `node --test` 直接跑。
  */
 
-import type { MemoryTrack } from '../../shared/types.ts'
+import type { MemoryInlineEntry, MemoryTrack, MemoryTopicId } from '../../shared/types.ts'
 import { MEMORY_INLINE_ITEM_MAX, MEMORY_RELATED_MAX } from '../config.ts'
+import { entryIdOf, formatEntryStamp, fileStemOf, levelRankOf, topicSpecOf, type ParsedEntry } from './entries.ts'
 
-export interface MemoryCandidate {
-  track: MemoryTrack
-  name: string
-  body: string
-  /** 可选：文件名 mtime（排序末位 tie-break，新者优先）。 */
-  updatedAt?: number
-}
+/** 单条内联项里的标题上限。 */
+const TITLE_MAX = 40
+/** 单条内联项里的摘要上限。 */
+const SUMMARY_MAX = 60
+/** 尾行预留（含分隔用两个换行）。 */
+const TAIL_RESERVE = 160
+/** 尾行最多列几个 ID。 */
+const TAIL_MAX_IDS = 3
+/** 索引块的说明行（只在有条目时出现）。 */
+const ENTRIES_HEADER = '团队记忆索引（按 ID 用 auto_team_memory expand 展开全文）：'
 
-/** 一条内联索引（与 `shared/types.ts` 的 `MemoryInlineEntry` 同形，避免 host 侧再写一份）。 */
-export interface InlineEntry {
-  /** `mem://<track>/<stem>`（由 `memoryIdOf` 单点生成，展开期由 `parseMemoryId` 单点解析）。 */
-  id: string
-  track: MemoryTrack
-  name: string
-  title: string
-  /** 首句摘要（不是全文；全文走 expand）。 */
-  summary: string
-  /** ≥1 个关联 id（同轨相邻优先），供模型顺着展开下一层。 */
-  related: string[]
-  /** 该条内联文本长度（≤ `itemMax`）。 */
-  chars: number
-}
+const TRACK_LABEL: Record<MemoryTrack, string> = { project: '项目记忆', public: '公共记忆' }
 
 export interface MemoryIndex {
   text: string
-  entries: InlineEntry[]
-  /** 未内联但可按 ID 展开的条目（AC-8：`truncated` 的判据）。 */
-  omitted: InlineEntry[]
+  entries: MemoryInlineEntry[]
+  /** 未内联但可按 ID 展开的条目（`truncated` 的判据）。 */
+  omitted: MemoryInlineEntry[]
   chars: number
   budget: number
   truncated: boolean
 }
-
-/**
- * 兼容壳（既有名字与主要字段保留，`bridge.memoryFor` / `snapshot` 两处调用点不动）。
- *
- * 语义升级：`text` 与 `memoryIndexOf(...).text` **同源**；`omitted` 从「省略的行数」改成
- * 「未内联的条目数」，`included` 仍是内联条目的文件名列表。
- */
-export interface MemorySelection {
-  text: string
-  truncated: boolean
-  included: string[]
-  chars: number
-  /** 未内联的条目数（旧语义是省略行数，已随内联索引改写）。 */
-  omitted: number
-  /** 内联条目明细（面板 `memory.inline` 与测试直接消费）。 */
-  entries: InlineEntry[]
-  /** 未内联条目明细（面板 `memory.omitted`）。 */
-  notInlined: InlineEntry[]
-}
-
-/* ---------------------------------------------------------------- 预算与形态常量 */
-
-/** 单条内联项里的标题上限。 */
-const TITLE_MAX = 40
-/** 单条内联项里的摘要上限（AC-7 字段预算表：摘要 ≤60）。 */
-const SUMMARY_MAX = 60
-/** 摘要被关联 ID 挤到低于此长度时，先把关联砍到 1 个（AC-7 只要求 ≥1）。 */
-const MIN_SUMMARY = 12
-/** 尾行预留（含分隔用两个换行）：先留出它再排正文，避免尾行把预算撑爆。 */
-const TAIL_RESERVE = 160
-/** 尾行最多列几个 ID（再多就只给数量，不牺牲正文）。 */
-const TAIL_MAX_IDS = 3
-/** 索引块的说明行（只在有条目时出现，模型才知道 `mem://` ID 怎么用）。 */
-const ENTRIES_HEADER = '团队记忆索引（按 ID 用 auto_team_memory expand 展开全文）：'
-
-const TRACK_LABEL: Record<MemoryTrack, string> = { project: '项目记忆', public: '公共记忆' }
 
 /* ---------------------------------------------------------------- 关键词与排序 */
 
@@ -114,65 +68,7 @@ function countOccurrences(haystack: string, needle: string): number {
   }
 }
 
-/** 标题：优先首个 markdown 标题行，否则退回文件名（去掉 .md）。 */
-export function titleOf(candidate: MemoryCandidate): string {
-  const heading = (candidate.body ?? '')
-    .split('\n')
-    .find((line) => /^\s*#{1,6}\s+\S/.test(line))
-  if (heading) return heading.replace(/^\s*#{1,6}\s+/, '').trim()
-  return (candidate.name ?? '').replace(/\.md$/i, '')
-}
-
-/** 标题权重的可核验数值：目标关键词在标题/文件名里命中多少次。 */
-export function titleHits(goal: string, candidate: MemoryCandidate): number {
-  const words = keywords(goal)
-  if (words.length === 0) return 0
-  const title = titleOf(candidate).toLowerCase()
-  return words.reduce((sum, word) => sum + countOccurrences(title, word), 0)
-}
-
-/** 正文相关度（纯函数，供排序与测试）。 */
-export function relevance(goal: string, candidate: MemoryCandidate): number {
-  const words = keywords(goal)
-  if (words.length === 0) return 0
-  const haystack = `${candidate.name}\n${candidate.body}`.toLowerCase()
-  return words.reduce((sum, word) => sum + countOccurrences(haystack, word), 0)
-}
-
-interface Ranked {
-  candidate: MemoryCandidate
-  body: string
-  priority: number
-  title: number
-  score: number
-  updatedAt: number
-}
-
-/** 排序：项目轨 → 标题命中 → 正文相关度 → 更新时间 → 名字（稳定）。 */
-function rank(goal: string, candidates: MemoryCandidate[]): Ranked[] {
-  return candidates
-    .map((candidate) => ({ candidate, body: (candidate.body ?? '').trim() }))
-    .filter((item) => item.body !== '')
-    .map((item) => ({
-      ...item,
-      priority: item.candidate.track === 'project' ? 1 : 0,
-      title: titleHits(goal, item.candidate),
-      score: relevance(goal, item.candidate),
-      updatedAt: typeof item.candidate.updatedAt === 'number' ? item.candidate.updatedAt : -1,
-    }))
-    .sort(
-      (a, b) =>
-        b.priority - a.priority ||
-        b.title - a.title ||
-        b.score - a.score ||
-        b.updatedAt - a.updatedAt ||
-        a.candidate.name.localeCompare(b.candidate.name),
-    )
-}
-
-/* ---------------------------------------------------------------- 内联索引构造 */
-
-/** 单行收敛：折叠空白 + 超长截断加省略号（摘要/标题共用）。 */
+/** 单行收敛：折叠空白 + 超长截断加省略号。 */
 function clip(text: string, max: number): string {
   const one = (text ?? '').replace(/\s+/g, ' ').trim()
   if (max <= 0) return ''
@@ -180,60 +76,111 @@ function clip(text: string, max: number): string {
   return `${one.slice(0, Math.max(0, max - 1))}…`
 }
 
-/**
- * `mem://<track>/<stem>`（**ID 拼装的唯一出处**，展开期只允许 `parseMemoryId` 解析）。
- *
- * `stem` 保留文件名原始大小写（去掉 `.md`）：这样 `safeMemoryName(stem)` 能逐字还原成
- * 磁盘上的文件名，不会因小写化而「注入期给出一个展开期找不到的 ID」。
- */
-export function memoryIdOf(track: MemoryTrack, name: string): string {
-  const stem = (name ?? '').trim().replace(/\.md$/i, '')
-  return `mem://${track}/${stem}`
+function topicTitleOf(topic: MemoryTopicId | null): string {
+  if (topic === null) return ''
+  return topicSpecOf(topic)?.title ?? ''
 }
 
-/** 首句摘要：首个非标题行 → 去掉列表符号 → 取第一句 → 收敛到 max 字符。 */
-export function summaryOf(candidate: MemoryCandidate, max: number = SUMMARY_MAX): string {
-  const body = (candidate.body ?? '')
-    .split('\n')
-    .find((line) => line.trim() !== '' && !/^\s*#{1,6}\s+/.test(line))
-  const clean = (body ?? '').replace(/^\s*[-*+]\s+/, '').trim()
-  if (clean === '') return ''
-  const sentence = /^(.*?[。！？!?.;；])/.exec(clean)?.[1] ?? clean
-  return clip(sentence, max)
+/** 相关度：goal 关键词在「主题标题 + 条目正文」里的命中次数。 */
+export function entryRelevance(goal: string, entry: Pick<ParsedEntry, 'text' | 'topic'>): number {
+  const words = keywords(goal)
+  if (words.length === 0) return 0
+  const haystack = `${topicTitleOf(entry.topic)}\n${entry.text}`.toLowerCase()
+  return words.reduce((sum, word) => sum + countOccurrences(haystack, word), 0)
 }
 
-/** 关联 ID：同轨按 rank 相邻优先，不足则跨轨补；不含自身，最多 relatedMax 个。 */
-function relatedOf(ranked: Ranked[], index: number, relatedMax: number): string[] {
+function dedupe(candidates: readonly ParsedEntry[]): ParsedEntry[] {
+  const best = new Map<string, ParsedEntry>()
+  for (const entry of candidates) {
+    if (entry.superseded) continue
+    const key = `${entry.track}\u0000${entry.hash}`
+    const current = best.get(key)
+    if (current === undefined || preferEntry(entry, current)) best.set(key, entry)
+  }
+  return [...best.values()]
+}
+
+/** 同 (track,hash) 的两条谁留下：canonical > revisions 大 > at 新 > 文件名字典序小。 */
+function preferEntry(a: ParsedEntry, b: ParsedEntry): boolean {
+  if (a.canonical !== b.canonical) return a.canonical
+  if (a.revisions !== b.revisions) return a.revisions > b.revisions
+  if (a.at !== b.at) return a.at > b.at
+  return a.file.localeCompare(b.file) < 0
+}
+
+interface Ranked {
+  entry: ParsedEntry
+  relevance: number
+}
+
+/** 排序（§9.2 硬规则）。 */
+function rank(goal: string, candidates: readonly ParsedEntry[]): Ranked[] {
+  return dedupe(candidates)
+    .map((entry) => ({ entry, relevance: entryRelevance(goal, entry) }))
+    .sort(
+      (a, b) =>
+        levelRankOf(b.entry.level) - levelRankOf(a.entry.level) ||
+        b.relevance - a.relevance ||
+        trackRank(a.entry.track) - trackRank(b.entry.track) ||
+        b.entry.at - a.entry.at ||
+        (a.entry.topic ?? '').localeCompare(b.entry.topic ?? '') ||
+        a.entry.hash.localeCompare(b.entry.hash),
+    )
+}
+
+function trackRank(track: MemoryTrack): number {
+  return track === 'project' ? 0 : 1
+}
+
+/* ---------------------------------------------------------------- 内联索引构造 */
+
+function inlineNameOf(entry: ParsedEntry): string {
+  return `${fileStemOf(entry.file)}#${entry.hash.slice(0, 12)}`
+}
+
+function idOf(entry: ParsedEntry): string {
+  return entryIdOf(entry.track, fileStemOf(entry.file), entry.text)
+}
+
+/** 同 track 其他活动条目 ID（按已排序列表顺序，最多 relatedMax 个；不含自己）。 */
+function relatedOf(ranked: readonly Ranked[], index: number, relatedMax: number): string[] {
   if (relatedMax <= 0) return []
-  const self = ranked[index].candidate
-  const others = [...ranked.slice(0, index), ...ranked.slice(index + 1)].map((item) => item.candidate)
-  const ordered = [
-    ...others.filter((candidate) => candidate.track === self.track),
-    ...others.filter((candidate) => candidate.track !== self.track),
-  ]
-  return ordered.slice(0, relatedMax).map((candidate) => memoryIdOf(candidate.track, candidate.name))
+  const self = ranked[index].entry
+  const out: string[] = []
+  for (let cursor = 0; cursor < ranked.length && out.length < relatedMax; cursor += 1) {
+    if (cursor === index) continue
+    const other = ranked[cursor].entry
+    if (other.track !== self.track) continue
+    out.push(idOf(other))
+  }
+  return out
+}
+
+function summaryOf(entry: ParsedEntry): string {
+  return clip(`来源：${entry.source} · ${formatEntryStamp(entry.at)} · 修正 ${entry.revisions}`, SUMMARY_MAX)
 }
 
 interface Packed {
-  entry: InlineEntry
+  entry: MemoryInlineEntry
   line: string
 }
 
-/** 把一条候选压成一行内联索引（保证 `line.length <= itemMax`）。 */
-function packOne(ranked: Ranked[], index: number, itemMax: number, relatedMax: number): Packed {
-  const candidate = ranked[index].candidate
-  const id = memoryIdOf(candidate.track, candidate.name)
-  const title = clip(titleOf(candidate), TITLE_MAX)
-  const summary = summaryOf(candidate)
+/** 把一条条目压成一行内联索引（保证 `line.length <= itemMax`）。 */
+function packOne(ranked: readonly Ranked[], index: number, itemMax: number, relatedMax: number): Packed {
+  const entry = ranked[index].entry
+  const id = idOf(entry)
+  const name = inlineNameOf(entry)
+  const title = clip(`${entry.level} ${entry.text}`, TITLE_MAX)
+  const summary = summaryOf(entry)
   let related = relatedOf(ranked, index, relatedMax)
 
   const build = (summaryText: string, relatedIds: string[]): string => {
-    const head = summaryText === '' ? `${id} · ${TRACK_LABEL[candidate.track]} · ${title}` : `${id} · ${TRACK_LABEL[candidate.track]} · ${title} — ${summaryText}`
+    const head = summaryText === '' ? `${id} · ${TRACK_LABEL[entry.track]} · ${title}` : `${id} · ${TRACK_LABEL[entry.track]} · ${title} — ${summaryText}`
     return relatedIds.length === 0 ? head : `${head} ⇄ ${relatedIds.join(', ')}`
   }
 
   let line = build(summary, related)
-  // 关联 ID 挤占摘要时先砍关联（AC-7 只要求 ≥1 个），保住「值不值得展开」的判断信息。
+  // 关联 ID 挤占摘要时先砍关联（只保留 1 个），保住「值不值得展开」的判断信息。
   if (line.length > itemMax && related.length > 1) {
     related = related.slice(0, 1)
     line = build(summary, related)
@@ -244,27 +191,39 @@ function packOne(ranked: Ranked[], index: number, itemMax: number, relatedMax: n
     const fitted = clip(summary, Math.min(SUMMARY_MAX, Math.max(0, room)))
     line = build(fitted, related)
   }
-  // 兜底：极端长 ID 也绝不越界（宁可这条被硬截断，也不让总预算被单条撑破）。
+  // 兜底：极端长 ID 也绝不越界。
   if (line.length > itemMax) line = `${line.slice(0, Math.max(0, itemMax - 1))}…`
 
   return {
-    entry: { id, track: candidate.track, name: candidate.name, title, summary, related, chars: line.length },
+    entry: {
+      id,
+      track: entry.track,
+      name,
+      title,
+      summary,
+      related,
+      chars: line.length,
+      level: entry.level,
+      revisions: entry.revisions,
+      source: entry.source,
+      at: entry.at,
+    },
     line,
   }
 }
 
 interface Composed {
   text: string
-  entries: InlineEntry[]
-  omitted: InlineEntry[]
+  entries: MemoryInlineEntry[]
+  omitted: MemoryInlineEntry[]
 }
 
 /** 在 limit 字符内拼装索引块（不含尾行）。 */
-function compose(ranked: Ranked[], limit: number, itemMax: number, relatedMax: number): Composed {
+function compose(ranked: readonly Ranked[], limit: number, itemMax: number, relatedMax: number): Composed {
   const all = ranked.map((_, index) => packOne(ranked, index, itemMax, relatedMax))
   const lines: string[] = []
-  const entries: InlineEntry[] = []
-  const omitted: InlineEntry[] = []
+  const entries: MemoryInlineEntry[] = []
+  const omitted: MemoryInlineEntry[] = []
   let used = 0
 
   for (const item of all) {
@@ -275,7 +234,7 @@ function compose(ranked: Ranked[], limit: number, itemMax: number, relatedMax: n
       entries.push(item.entry)
       continue
     }
-    // 放不下的不丢弃：进 omitted，仍可按 ID 展开（AC-8）。
+    // 放不下的不丢弃：进 omitted，仍可按 ID 展开。
     omitted.push(item.entry)
   }
 
@@ -283,37 +242,30 @@ function compose(ranked: Ranked[], limit: number, itemMax: number, relatedMax: n
   return { text: `${ENTRIES_HEADER}\n${lines.join('\n')}`, entries, omitted }
 }
 
-/** 尾行：「另有 N 条未内联（可按 ID 展开）：id1, id2…」；放不下就逐个减 ID，最后只给数量。 */
-function tailOf(omitted: InlineEntry[], used: number, budget: number): string {
+/** 尾行：「另有 N 条未内联（可按 ID 展开）：id1, id2, id3」；放不下就只给数量。 */
+function tailOf(omitted: readonly MemoryInlineEntry[], used: number, budget: number): string {
   if (omitted.length === 0) return ''
   const count = `另有 ${omitted.length} 条未内联（可按 ID 展开）`
   const ids = omitted.map((entry) => entry.id)
   for (let take = Math.min(TAIL_MAX_IDS, ids.length); take >= 1; take -= 1) {
-    const rest = omitted.length > take ? `，等 ${omitted.length} 条` : ''
-    const line = `${count}：${ids.slice(0, take).join(', ')}${rest}`
+    const line = `${count}：${ids.slice(0, take).join(', ')}`
     if (used + 2 + line.length <= budget) return line
   }
   return used + 2 + count.length <= budget ? count : ''
 }
 
 /**
- * 内联索引主入口：按 `rank()` 顺序逐条内联，放不下的进 `omitted`，尾部给一行可展开提示。
- *
- * 输出形如：
- *   团队记忆索引（按 ID 用 auto_team_memory expand 展开全文）：
- *   mem://project/conventions · 项目记忆 · 团队约定 — 提交前必须跑 pnpm build ⇄ mem://public/git
- *   另有 3 条未内联（可按 ID 展开）：mem://project/a, mem://project/b
+ * 条目级内联索引主入口。
  *
  * budget<=0 或候选全空时返回空文本且 truncated=false；任何输入下 `chars === text.length ≤ budget`。
  */
-export function memoryIndexOf(
+export function selectMemoryEntries(
   goal: string,
-  candidates: MemoryCandidate[],
+  candidates: readonly ParsedEntry[],
   budget: number,
-  opts?: { itemMax?: number; relatedMax?: number },
 ): MemoryIndex {
-  const itemMax = Math.max(1, opts?.itemMax ?? MEMORY_INLINE_ITEM_MAX)
-  const relatedMax = Math.max(0, opts?.relatedMax ?? MEMORY_RELATED_MAX)
+  const itemMax = Math.max(1, MEMORY_INLINE_ITEM_MAX)
+  const relatedMax = Math.max(0, MEMORY_RELATED_MAX)
   const safeBudget = Math.max(0, budget)
   const ranked = rank(goal, candidates)
 
@@ -346,26 +298,5 @@ export function memoryIndexOf(
     chars: text.length,
     budget: safeBudget,
     truncated: chosen.omitted.length > 0,
-  }
-}
-
-/**
- * 兼容壳：既有调用点（`bridge.snapshot` / `bridge.memoryFor`）零改动。
- * `text` 与 `memoryIndexOf` 同源，绝不各自拼一份（历史 bug 族：两处各拼一份）。
- */
-export function selectMemory(
-  goal: string,
-  candidates: MemoryCandidate[],
-  budget: number,
-): MemorySelection {
-  const index = memoryIndexOf(goal, candidates, budget)
-  return {
-    text: index.text,
-    truncated: index.truncated,
-    included: index.entries.map((entry) => entry.name),
-    chars: index.chars,
-    omitted: index.omitted.length,
-    entries: index.entries,
-    notInlined: index.omitted,
   }
 }

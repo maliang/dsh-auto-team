@@ -8,9 +8,13 @@
  *
  * 布局（DESIGN §2.3）：`[环 64px][gap 12][列表 220px]`，环列 sticky 顶部（滚列表时环不动）。
  * 列表列必须 `min-width: 0`，否则 220px 的列会被内容撑破（grid 的默认 min-width:auto）。
+ *
+ * r18b：环与列表都按**全量**任务算（`groups.open` 含所有非 done 状态，
+ * `groups.done` 含所有 done），r18 的「只列进行中 / 只留最近完成一个」已按用户要求回滚。
+ * 组件不二次筛选；空组由 TaskTable 的 grouped 分支隐藏。
  */
 import * as React from 'react'
-import type { TaskDetailView } from '../../shared/types.ts'
+import type { MemberView, TaskDetailView } from '../../shared/types.ts'
 import { PROGRESS_RING_SIZE, taskOverviewOf } from '../viewmodel.ts'
 import { ProgressRing } from './ProgressRing.tsx'
 import { TaskTable } from './TaskTable.tsx'
@@ -19,10 +23,13 @@ export interface TaskOverviewProps {
   tasks: TaskDetailView[]
   expandedTaskId?: string
   onToggleTask: (taskId: string) => void
+  /** r17：任务行 → 子智能体（历史 run 不传）。 */
+  members?: MemberView[]
+  onOpenMember?: (member: MemberView, taskId: string) => void
 }
 
 export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask } = props
+  const { tasks, expandedTaskId, onToggleTask, members, onOpenMember } = props
   const overview = taskOverviewOf(tasks, expandedTaskId)
   return (
     <section data-task-overview aria-label="任务总览">
@@ -39,6 +46,8 @@ export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
           tasks={tasks}
           expandedTaskId={expandedTaskId}
           onToggleTask={onToggleTask}
+          members={members}
+          onOpenMember={onOpenMember}
           grouped
         />
       </div>

@@ -12,7 +12,7 @@
  */
 import * as React from 'react'
 import type { RunDetailView } from '../../shared/types.ts'
-import type { InflightState } from '../viewmodel.ts'
+import type { InflightState, PlanGoalView, RunStageView } from '../viewmodel.ts'
 import { runHeadOf } from '../viewmodel.ts'
 
 export interface RunHeaderProps {
@@ -20,18 +20,28 @@ export interface RunHeaderProps {
   paused?: boolean
   inflight: InflightState
   onTogglePause?: () => void
+  /**
+   * r21：当前 run 的「目标 + 追加需求」视图（`planGoalOf` 的结果）。
+   * 历史 run 没有修订史 → 上游传 `null`，本组件整块不渲染。
+   */
+  plan?: PlanGoalView | null
+  /**
+   * r26：阶段判定结果（`stageOfDetail`）。传入后计划状态徽标与 run 卡 / 历史行同源；
+   * 不传则退回原始计划状态（兼容直接调用 `runHeadOf` 的既有测试）。
+   */
+  stage?: RunStageView
 }
 
 export function RunHeader(props: RunHeaderProps): React.ReactElement {
-  const { detail, paused, inflight, onTogglePause } = props
-  const head = runHeadOf(detail, inflight)
+  const { detail, paused, inflight, onTogglePause, plan, stage } = props
+  const head = runHeadOf(detail, inflight, stage)
   return (
     <header data-region="run-head" data-paused={paused === true ? 'true' : 'false'}>
       <div data-run-line="identity">
         <code data-run-id title={head.plannedAtText}>
           {head.runId}
         </code>
-        <span data-plan-status data-tone={head.planStatusTone}>
+        <span data-plan-status data-tone={head.planStatusTone} title={head.planStatusDetail}>
           {head.planStatusLabel}
         </span>
         {onTogglePause ? (
@@ -72,6 +82,46 @@ export function RunHeader(props: RunHeaderProps): React.ReactElement {
         <p data-run-downgrade title={head.usageTitle}>
           {head.downgrade}
         </p>
+      ) : null}
+      {head.terminationReason ? (
+        <p data-run-termination title={head.terminationReason}>
+          终止原因：{head.terminationReason}
+        </p>
+      ) : null}
+      {plan !== null && plan !== undefined ? (
+        <section data-run-plan aria-label="本次运行的目标与需求修订">
+          <div data-plan-block-head>
+            {plan.revisionCountText ? (
+              <span data-run-revisions>{plan.revisionCountText}</span>
+            ) : null}
+            {plan.mergedText ? (
+              <span data-run-merged title={`本次运行已并入 ${head.runId}（复用同一个 runId）`}>
+                {plan.mergedText}
+              </span>
+            ) : null}
+          </div>
+          {plan.sections.length > 0 ? (
+            <div data-run-goal-sections>
+              {plan.sections.map((section) => (
+                <div
+                  key={section.key}
+                  data-goal-section={section.revision ? 'revision' : 'original'}
+                >
+                  <span data-goal-heading>
+                    {section.revision ? <span data-goal-tag>追加需求</span> : null}
+                    {section.heading}
+                  </span>
+                  <p data-goal-body>{section.body}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {plan.latestRevisionText ? (
+            <p data-run-latest-revision title={plan.latestRevisionText}>
+              {plan.latestRevisionText}
+            </p>
+          ) : null}
+        </section>
       ) : null}
     </header>
   )

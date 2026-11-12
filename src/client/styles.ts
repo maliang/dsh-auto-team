@@ -1164,6 +1164,14 @@ export const AUTO_TEAM_CSS = `
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+[data-auto-team-memory] [data-memory-degraded] {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-state-warning-primary, #b8860b);
+  border-radius: 6px;
+  color: var(--dsw-alias-state-warning-primary, #b8860b);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
 [data-auto-team-memory] [data-memory-chars] {
   flex: 0 0 auto;
   color: var(--dsw-alias-label-tertiary, inherit);
@@ -2627,6 +2635,39 @@ export const AUTO_TEAM_CSS = `
   color: var(--dsw-alias-state-error-primary, currentColor);
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
 }
+/* r17：六项用量指标（2 列 × 3 行，标签与数字同宽容器；不可得项用三级色区分） */
+[data-task-detail] [data-usage-metrics] {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+[data-task-detail] [data-usage-metric] {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-task-detail] [data-usage-metric-label] {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+[data-task-detail] [data-usage-metric-value] {
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary, inherit);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-task-detail] [data-usage-metric][data-available="false"] [data-usage-metric-value] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font-weight: 400;
+}
 [data-task-detail] [data-gate-artifacts],
 [data-task-detail] [data-gate-at] {
   display: block;
@@ -2635,7 +2676,7 @@ export const AUTO_TEAM_CSS = `
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
 }
 
-/* ── 流转图：148×56 节点、188/72 步进、画布 300px 双层滚动 ───────────────── */
+/* ── 流转图：148×56 节点、188/72 步进、画布 600px 双层滚动 ───────────────── */
 [data-region="task-flow"] {
   padding: 8px 12px 10px;
   border-top: 1px solid var(--dsw-alias-border-l1, currentColor);
@@ -2645,7 +2686,7 @@ export const AUTO_TEAM_CSS = `
   /* r14 D4：viewport 与「重置视图」都是 position:absolute，画布本身必须成为它们的定位上下文，
      否则会锚到宿主 pane 上、浮出画布框并遮挡面板标题与页签（真机截图一眼可见的 P1）。 */
   position: relative;
-  height: 300px;
+  height: 600px;
   overflow: hidden;
   border: 1px solid var(--dsw-alias-border-l1, currentColor);
   border-radius: var(--dsw-radius-sm, 8px);
@@ -3154,8 +3195,25 @@ export const AUTO_TEAM_CSS = `
 [data-auto-team-panellist] [data-library-shell] {
   container-type: inline-size;
 }
+/* r17 ④：main 槽位整页必须撑满宿主主内容区。
+ * 宿主给主区的是确定高度，这里不显式 100% 时项目库只有内容高度：详情列不滚动、
+ * 绝对定位在 shell 里的抽屉也只能拿到「内容高度」，于是出现「主界面没 100%、抽屉高度不对」。
+ * width/box-sizing/min-* 一并写死，避免宿主主区的 padding 或窄宽把内容撑出横向滚动。
+ * 注意只认 data-library-surface="main"：右栏内联（panel）与侧栏图标（panellist）不在此列。 */
+[data-auto-team-library][data-library-surface="main"] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-library-head] {
   display: flex;
+  flex: 0 0 44px;
   align-items: center;
   gap: 8px;
   box-sizing: border-box;
@@ -3170,8 +3228,10 @@ export const AUTO_TEAM_CSS = `
    避免 T5 的页面与既有左栏各写一份 flex 规则。 */
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-project-split] {
   display: flex;
+  flex: 1 1 auto;
   align-items: stretch;
   min-height: 0;
+  overflow: hidden;
 }
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-region="project-list"] {
   flex: 0 0 220px;
@@ -3218,6 +3278,8 @@ export const AUTO_TEAM_CSS = `
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-region="project-detail"] {
   flex: 1 1 auto;
   min-width: 0;
+  /* 容器查询折叠成上下两段后，详情列必须能在剩余高度里内滚，不把整页撑高。 */
+  min-height: 0;
   padding: 12px 14px;
   overflow: auto;
 }
@@ -3390,6 +3452,282 @@ export const AUTO_TEAM_CSS = `
 }
 [data-region="memory-tab"] [data-memory-budget][data-truncated="true"] {
   color: var(--dsw-alias-state-warn-primary, inherit);
+}
+
+/* ── r23 记忆策展：配额提示 / 文件级等级分布 / 条目视图 / 整理旧流水 ───────── */
+[data-region="memory-tab"] [data-memory-stat] {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+[data-region="memory-tab"] [data-memory-quota][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, inherit);
+}
+[data-region="memory-tab"] [data-memory-quota][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, inherit);
+}
+[data-region="memory-tab"] [data-memory-warnings] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 6px 12px;
+  list-style: none;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="memory-tab"] [data-memory-warning] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-warning][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, inherit);
+}
+[data-region="memory-tab"] [data-memory-warning][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, inherit);
+}
+[data-region="memory-tab"] [data-memory-warning][data-tone="info"] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+
+/* 整理旧流水：先预演、再确认写入；失败态留重试入口 */
+[data-region="memory-tab"] [data-memory-curation] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="memory-tab"] [data-memory-curation-bar] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 8px;
+}
+[data-region="memory-tab"] [data-memory-legacy] {
+  flex: 1 1 180px;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curate] {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 0 10px;
+  white-space: nowrap;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curate][data-busy="true"] {
+  cursor: progress;
+}
+[data-region="memory-tab"] [data-memory-curation-report] {
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+[data-region="memory-tab"] [data-memory-curation-report][data-phase="preview"] {
+  border-color: var(--dsw-alias-state-business-primary, currentColor);
+}
+[data-region="memory-tab"] [data-memory-curation-headline] {
+  margin: 0 0 4px;
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curation-counts] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curation-count] {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+[data-region="memory-tab"] [data-memory-curation-warnings] {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  color: var(--dsw-alias-state-warn-primary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curation-actions] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+[data-region="memory-tab"] [data-memory-curation-actions] button {
+  min-height: 26px;
+  padding: 0 10px;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-curation-error] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+[data-region="memory-tab"] [data-memory-curation-error] [data-error] {
+  flex: 1 1 180px;
+  margin: 0;
+}
+[data-region="memory-tab"] [data-memory-curation-error] button {
+  min-height: 24px;
+  padding: 0 8px;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+
+/* 文件行：主题标题 + 条目数；第二行等级分布；第三行文件名/只读标记 */
+[data-memory-list][data-memory-mode="files"] [data-auto-team-memory-item] {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  align-items: start;
+  min-height: 52px;
+  padding: 8px 12px;
+}
+[data-memory-list][data-memory-mode="files"] [data-memory-title] {
+  grid-column: 1;
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+  font-weight: 600;
+}
+[data-memory-list][data-memory-mode="files"] [data-memory-file-count] {
+  grid-column: 2;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-variant-numeric: tabular-nums;
+}
+[data-memory-list][data-memory-mode="files"] [data-memory-distribution],
+[data-memory-list][data-memory-mode="files"] [data-memory-file-meta] {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-memory-list][data-memory-mode="files"] [data-memory-distribution] {
+  color: var(--dsw-alias-label-secondary, inherit);
+}
+[data-memory-list][data-memory-mode="files"] [data-memory-file-meta] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+
+/* 展开后的条目视图：宿主已格式化来源/时间/修正次数，这里只排版 */
+[data-memory-detail] {
+  padding-bottom: 8px;
+}
+[data-memory-entries] {
+  max-height: 360px;
+  margin: 0 12px 8px;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+[data-memory-entry] {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+}
+[data-memory-entry]:last-child {
+  border-bottom: 0;
+}
+[data-memory-entry][data-level="P0"] {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 8%, transparent);
+}
+[data-memory-entry-head] {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: start;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+[data-memory-entry-level] {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-weight: 600;
+}
+[data-memory-entry-level][data-tone="strong"] {
+  border-color: var(--dsw-alias-label-primary, currentColor);
+  background: var(--dsw-alias-label-primary, currentColor);
+  color: var(--dsw-alias-bg-layer-1, inherit);
+}
+[data-memory-entry-level][data-tone="muted"] {
+  border-color: var(--dsw-alias-border-l1, currentColor);
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+[data-memory-entry-flag] {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border: 1px dashed var(--dsw-alias-border-l3, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-memory-entry-text] {
+  grid-column: 2;
+  grid-row: 1;
+  color: var(--dsw-alias-label-primary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-memory-entry-source] {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-memory-entry][data-superseded="true"] [data-memory-entry-text] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  text-decoration: line-through;
+}
+[data-memory-superseded] {
+  margin: 0 12px 8px;
+}
+[data-memory-superseded] > summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-memory-superseded] > summary:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+[data-memory-superseded] [data-memory-entries] {
+  margin: 4px 0 0;
+}
+[data-memory-empty-detail] {
+  margin: 0 12px 8px;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-region="memory-tab"] [data-memory-retry] {
+  min-height: 24px;
+  margin: 0 12px 8px;
+  padding: 0 10px;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
 }
 
 /* ── 确认弹窗：402px、默认焦点在「取消」、按钮用动词短语 ────────────────── */
@@ -3670,6 +4008,8 @@ export const AUTO_TEAM_CSS = `
   color: var(--dsw-alias-label-secondary, inherit);
   letter-spacing: 0.02em;
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  /* r18b：「未完成 · N」/「已完成 · N」的计数是同一位置的两个数字，等宽才不会跳动 */
+  font-variant-numeric: tabular-nums;
 }
 [data-region="task-list"] [data-task-group="done"] [data-group-head] {
   color: var(--dsw-alias-label-secondary, inherit);
@@ -3983,9 +4323,17 @@ export const AUTO_TEAM_CSS = `
 
 /* ── ③ 项目库：分栏（CSS 变量）、run 行、历史桶、右侧抽屉（T5 复用这些钩子） ── */
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-library-shell] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
   position: relative;
   box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
+  /* 抽屉（absolute inset）以 shell 为包含块：shell 必须是整块主区高度，
+   * 否则抽屉的 top/bottom 只能量到内容高度。overflow 留给子级各自内滚。 */
+  overflow: hidden;
 }
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-library-body],
 :is([data-auto-team-library], [data-auto-team-panellist]) [data-project-split] {
@@ -4158,7 +4506,12 @@ export const AUTO_TEAM_CSS = `
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
+  /* r17 ④：抽屉铺满 shell 的整条高度；max-height 兜住「宿主没给确定高度」的降级路径，
+   * 内部再由 drawer-body 内滚，绝不让内容把抽屉顶出可视区。 */
   width: min(520px, 100%);
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
   border-left: 1px solid var(--dsw-alias-border-l2, currentColor);
   border-radius: var(--dsw-radius-md, 12px) 0 0 var(--dsw-radius-md, 12px);
   background: var(--dsw-alias-bg-layer-2, transparent);
@@ -4167,6 +4520,7 @@ export const AUTO_TEAM_CSS = `
 }
 [data-run-drawer] [data-drawer-head] {
   display: flex;
+  flex: 0 0 44px;
   align-items: center;
   gap: 8px;
   box-sizing: border-box;
@@ -4233,6 +4587,982 @@ export const AUTO_TEAM_CSS = `
   to { opacity: 1; }
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * r17 / r18b：run 行 / 子智能体主界面 / 历史六项 / 可点角色卡
+ *
+ * 四项都是 r17 新交互的「可见身份」，样式只长在本文件（owner）里：
+ *  ① run 卡：r18b t8 起是「横向滑动卡，六项在卡内 3 列 × 2 行」，一 run 一卡、整卡一个 button；
+ *     r18b t10 把六项每格改回 label 上 / value 下（同行版在真机被省略号截断）；
+ *     当前 run（左侧竖条）与正在查看的 run（淡底 + 内描边）是两个独立状态位；
+ *  ② 子智能体主界面：外壳接住剩余高度，页面自己滚；列表固定最大高度内滚；
+ *  ③ 历史六项：3 列 × 2 行；标签 11/三级色，数字 12/600 tabular，不可得项虚线；
+ *  ④ 可点角色卡：常驻 business 描边 + 右下 chevron —— 只靠 hover 变化等于没暗示。
+ * 纪律：字号只用 font 简写；颜色只用宿主 token；选择器都对应组件真实 DOM 钩子。
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 任务页顶部 run 卡（r18b t10：零截断，六项回到格内上下两行） ──────────
+ * 一 run 一卡、卡宽固定 216px；卡多时容器横向滚动并吸附到卡左缘。
+ * button 只能装 phrasing content，所以卡内只用 span/b；单列 grid 放三行：
+ *   ① header span：标题（flex:1 单行省略）+ 状态徽标（右对齐、nowrap）
+ *   ② meta 单行省略（title 保留全文）
+ *   ③ 六项 3 列 × 2 行，每格「label 上 / value 下」两行（t9 的同行版在真机被
+ *      ellipsis 截成「输入未命中 246.…」「缓存命中率 7」，故 t10 回退为竖排）
+ * 两个状态位保持正交：
+ *   当前 run = 左侧 3px 业务色竖条；正在查看 = 10% 淡底 + 1px 内描边（可同现）。
+ *
+ * 高度账（min-height 96px，不写死 height，内容多时自然长高）：
+ *   边框 1+1 + 上下内边距 6+6 = 14；L1 18（标题 13px/18px，徽标 18 胶囊同高）；
+ *   L2 13（11px/13px）；L3 = 上边框 1 + padding-top 2 + 两行(12+13) + 格子行距 2 = 55；
+ *   三块之间的 gap 3×2 = 6 → 14+18+13+55+6 = 106（落在 96–108 的紧凑区间）。
+ *
+ * 「零截断」是怎么保证的（t9 的真机证据见 t10-card-fit.md）：
+ *   每格标签最长 5 个汉字（「输入未命中」= 5×11px = 55px），值最长约 7 字符
+ *   （「246.91K」≈ 42px），两行各自 nowrap 且**不写 ellipsis / overflow: hidden**；
+ *   列宽 63.3px > 55px，所以标签与值都按原样完整显示。
+ *
+ * 320px 面板算术：卡 216 + 卡间距 8 = 224，容器 320 内第二张露出约 88px（>1/3 卡宽），
+ * 一眼能看出「右边还有卡」；卡内 216 - 左竖条 3 - 右边框 1 - 内边距 16 = 196，
+ * 六项 3 列、列间距 3×2 → 每列 (196-6)/3 ≈ 63.3px ≥ 55px（最长标签）。
+ * 列距收到 3px：宿主没有 10px 字号 token（标签用 11px），这 3px 是列宽的余量。
+ *
+ * 容器用 padding: 4px 而不用负 margin 补偿：焦点环是 outline-offset: -2px（画在卡内），
+ * 不会被滚动容器裁掉；负 margin 会让容器比 [data-panel-body]（overflow:auto）宽 8px，
+ * 反而在 320px 面板里多出一条横向滚动条。 */
+[data-region="run-switcher"] {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+/* 横滑容器：卡不换行（flex 默认 nowrap），超出就横向滚动；snap 吸附到卡左缘。 */
+[data-region="run-switcher"] [data-active-run-cards] {
+  display: flex;
+  gap: 8px;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x proximity;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dsw-alias-border-l1, currentColor) transparent;
+}
+/* 一张卡 = 单列三行：①header(标题|徽标)  ②meta  ③六项（3 列 × 2 行）。
+ * 固定 216px 三连写（width/min/max）—— flex 项默认会被压缩，只写 width 在卡多时会被挤扁。
+ * 左内边距与右边一致：3px 竖条用常驻透明边框占位，切换卡时标题不位移。
+ * 只给 min-height（96px）：内容（长 meta / 六项换行）多时可自然长高，不裁字。 */
+[data-region="run-switcher"] [data-active-run] {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 3px;
+  box-sizing: border-box;
+  width: 216px;
+  min-width: 216px;
+  max-width: 216px;
+  min-height: 96px;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-left: 3px solid transparent;
+  border-radius: var(--dsw-radius-md, 8px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+  text-align: left;
+  cursor: pointer;
+  scroll-snap-align: start;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+/* hover/active 只描在「未选中」的卡上：选中卡已有淡底，再叠一层会让两种状态糊在一起。
+ * 竖条颜色不参与 hover，所以当前 run 的身份不会被悬停抹掉。 */
+[data-region="run-switcher"] [data-active-run]:hover:not(:disabled):not([data-selected="true"]) {
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
+}
+[data-region="run-switcher"] [data-active-run]:active:not(:disabled):not([data-selected="true"]) {
+  background: var(--dsw-alias-interactive-bg-active, transparent);
+}
+/* outline 内缩 2px：滚动容器会裁掉外扩描边，且卡在 320px 面板里左右没有余量 */
+[data-region="run-switcher"] [data-active-run]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: -2px;
+}
+/* disabled（历史详情读取中）：压暗但仍保留可读对比（0.6 而非 0.5），并明确 not-allowed */
+[data-region="run-switcher"] [data-active-run]:disabled {
+  color: var(--dsw-alias-label-secondary, inherit);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+/* data-fallback="true"（没有进行中的 run，这一条是「最后一个 run」兜底）刻意不加任何
+ * 警示色/描边：它不是异常，只是列表里恰好只有一张卡；状态仍由卡内徽标与 meta 说明。 */
+/* 当前 run：左侧业务色竖条（常驻宽度，切卡时文字不位移） */
+[data-region="run-switcher"] [data-active-run][data-current="true"] {
+  border-left-color: var(--dsw-alias-state-business-primary, currentColor);
+}
+/* 正在查看的 run：10% 淡底 + 1px 内描边 —— 与「当前」是两个维度，看历史/其它 run 时
+ * 当前卡仍只有竖条、查看卡才有底色，两者可以同时出现，也可以各自单独出现。 */
+[data-region="run-switcher"] [data-active-run][data-selected="true"] {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 32%, transparent);
+}
+/* L1 header：标题与状态徽标同一行。标题 flex:1 吃掉剩余宽度，徽标不参与压缩
+ * （nowrap + flex:0 0 auto），所以「标题先省略、徽标始终完整」。 */
+[data-region="run-switcher"] [data-active-run-head] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+[data-region="run-switcher"] [data-active-run-title] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+  /* token 自带 20px 行高；t10 把标题行收到 18px（与 18px 徽标同高），
+     这样卡高才能压进 96–108 而不用省略任何辅助信息。 */
+  line-height: 18px;
+  font-weight: 600;
+}
+/* 状态徽标：与任务行 [data-badge] 同一套几何（18px 胶囊），颜色只由 tone 映射；
+ * max-width 96px —— 卡只有 216 宽，徽标再宽标题就只剩两三个字。 */
+[data-region="run-switcher"] [data-active-run-status] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  box-sizing: border-box;
+  max-width: 96px;
+  height: 18px;
+  padding: 0 6px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="run-switcher"] [data-active-run-status][data-tone="success"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, currentColor) 45%, transparent);
+  color: var(--dsw-alias-state-success-primary, currentColor);
+}
+[data-region="run-switcher"] [data-active-run-status][data-tone="warn"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 45%, transparent);
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+}
+[data-region="run-switcher"] [data-active-run-status][data-tone="danger"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
+  color: var(--dsw-alias-state-error-primary, currentColor);
+}
+[data-region="run-switcher"] [data-active-run-status][data-tone="business"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 45%, transparent);
+  color: var(--dsw-alias-state-business-primary, currentColor);
+}
+/* meta（开始时间 · 任务数）：单行省略，数字等宽（卡宽固定，宁可省略也不换行；
+ * 组件把全文放进 title，悬停可看全）。 */
+[data-region="run-switcher"] [data-active-run-meta] {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  /* 与六项同档行高（13px），省下的 3px 用于格内第二行 */
+  line-height: 13px;
+  font-variant-numeric: tabular-nums;
+}
+/* 六项：3 列 × 2 行（用户口径「六项在卡内两行」），虚线分隔（与历史行同一套视觉语言）。
+ * t10：每格回到「label 上 / value 下」两行——同行版在 63px 列宽里必然触发 ellipsis，
+ * 用户明确要求「其他辅助信息要显示全」，所以宁可让每格占两个行盒（12+13），
+ * 靠行高、padding-top 与块间距（而不是裁字）把整卡控制在 96–108px。 */
+[data-region="run-switcher"] [data-active-run-usage] {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px 3px;
+  padding-top: 2px;
+  border-top: 1px dashed var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="run-switcher"] [data-active-run-metric] {
+  display: flex;
+  /* 竖排：label 在上、value 在下（t9 的 row 版在真机被截断，见 t10-card-fit.md） */
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+/* 标签：2–5 个汉字，单行但不省略——最长的「输入未命中」55px < 列宽 63.3px。
+ * 刻意不写 overflow: hidden / text-overflow: ellipsis：那正是 t9 真机截断的元凶。 */
+[data-region="run-switcher"] [data-active-run-metric-label] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/12px sans-serif);
+  line-height: 12px;
+}
+/* 值：11px/600 tabular，同样整段显示（「246.91K」约 42px < 63.3px）。
+ * 全文仍由格子 title 兜底（复制/读屏用），但视觉上不再出现省略号。 */
+[data-region="run-switcher"] [data-active-run-metric-value] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-primary, inherit);
+  white-space: nowrap;
+  /* 注意：font 简写会重置 line-height，所以 13px 行高必须写在 font 之后。 */
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  line-height: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* 不可得 ≠ 0：三级色 + 虚线下划线（数字本身一字不改，与历史六项同一套区分） */
+[data-region="run-switcher"] [data-active-run-metric][data-available="false"] [data-active-run-metric-value] {
+  border-bottom: 1px dashed var(--dsw-alias-border-l2, currentColor);
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font-weight: 400;
+  cursor: help;
+}
+
+/* ── r24：残留计划（未收口）徽标 + 「终止计划」入口（历史行 / 顶部 run 卡共用） ──
+ * 只在 RunCloseAction 上挂 data-run-close；徽标与按钮成对出现，不占位。
+ * 320px 是最坏基准：容器可换行、错误原因可断词，任何一段长文本都不横向撑破面板。 */
+[data-run-close] {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+/* 徽标：与历史行状态徽标同一套胶囊几何，但允许换行（「未收口·可能残留」8 个字
+ * 在 216px 卡里与按钮同行会挤爆，宁可让它占满一行）。 */
+[data-run-close] [data-residual-run][data-badge] {
+  flex: 0 1 auto;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  height: auto;
+  min-height: 18px;
+  padding: 1px 6px;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 45%, transparent);
+  border-radius: 999px;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+/* 终止按钮：破坏性动作用错误色描边（不是填充红底，避免整行看起来已经出事）；
+ * 命中区做到 24px（窄面板里也不难点中），hover/active/focus/disabled 四态齐全。 */
+[data-run-close] [data-close-run] {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
+  border-radius: var(--dsw-radius-sm, 4px);
+  background: transparent;
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  cursor: pointer;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+[data-run-close] [data-close-run]:hover {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 10%, transparent);
+}
+[data-run-close] [data-close-run]:active {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 18%, transparent);
+}
+[data-run-close] [data-close-run]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-error-primary, currentColor);
+  outline-offset: 2px;
+}
+[data-run-close] [data-close-run][disabled] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  border-color: var(--dsw-alias-border-l1, currentColor);
+  cursor: progress;
+  opacity: 0.7;
+}
+/* 已终止成功、等宿主快照追上：按钮留在 DOM 里只为焦点回归，不再可点。 */
+[data-run-close][data-done="true"] [data-close-run] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  border-color: var(--dsw-alias-border-l1, currentColor);
+  cursor: default;
+  opacity: 0.55;
+}
+[data-run-close][data-done="true"] [data-close-run]:hover,
+[data-run-close][data-done="true"] [data-close-run]:active {
+  background: transparent;
+}
+/* 失败原因/成功提示：各占一整行（flex-basis 100%），长文案断词不截断。 */
+[data-run-close] [data-run-close-error] {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-run-close] [data-run-close-notice] {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+/* 历史行：终止入口在打开按钮**外面**（一行不能嵌套两个 button），缩进与行内一致。 */
+[data-region="history-list"] [data-history-line="residual"] {
+  flex-wrap: wrap;
+  padding: 0 12px 8px;
+}
+/* 顶部 run 卡：残留 run 卡外多一层包装（卡是 button，终止按钮只能是兄弟节点）。
+ * 包装保持 216px 卡宽与横滑吸附，卡本身拉满包装宽度。 */
+[data-region="run-switcher"] [data-active-run-item] {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 2px;
+  box-sizing: border-box;
+  width: 216px;
+  min-width: 0;
+  scroll-snap-align: start;
+}
+[data-region="run-switcher"] [data-active-run-item] [data-active-run] {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+[data-region="run-switcher"] [data-active-run-item] [data-run-close] {
+  padding: 0 2px;
+}
+[data-region="run-switcher"] [data-active-run-item] [data-residual-run] {
+  flex: 1 1 100%;
+}
+[data-region="run-switcher"] [data-active-run-item] [data-close-run] {
+  flex: 1 1 auto;
+}
+
+/* ── ② 子智能体主界面（主区 / 右栏内联共用一套） ────────────────────────── */
+:is([data-auto-team-library], [data-auto-team-panellist]) [data-library-shell] [data-member-surface] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+[data-member-page] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+/* 返回条 sticky：页面内滚时「回项目库」始终可点（320px 下也不被内容顶走） */
+[data-member-page] [data-member-bar] {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex: 0 0 32px;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+[data-member-page] [data-member-back] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  cursor: pointer;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+[data-member-page] [data-member-back]:hover {
+  border-color: var(--dsw-alias-border-l3, currentColor);
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+}
+[data-member-page] [data-member-back]:active {
+  background: var(--dsw-alias-interactive-bg-active, transparent);
+}
+[data-member-page] [data-member-back]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+[data-member-page] [data-member-crumb] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-head] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 10px 12px 6px;
+}
+[data-member-page] [data-member-name] {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-sm-14, 14px/20px sans-serif);
+  font-weight: 600;
+}
+[data-member-page] [data-member-status] {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-status][data-tone="business"] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-status][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-status][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-status][data-tone="success"] {
+  color: var(--dsw-alias-state-success-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-role] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-model] {
+  flex: 1 0 100%;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+}
+[data-member-page] [data-member-facts],
+[data-member-page] [data-member-task-facts] {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 8px;
+  margin: 0;
+}
+[data-member-page] [data-member-facts] {
+  padding: 0 12px 8px;
+}
+[data-member-page] [data-member-task-facts] {
+  padding: 0;
+}
+[data-member-page] [data-member-facts] dt,
+[data-member-page] [data-member-task-facts] dt {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-facts] dd,
+[data-member-page] [data-member-task-facts] dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+/* 停滞是「有事实的异常」：琥珀只做竖条与 8% 底，文字保持可读的 label-secondary */
+[data-member-page] [data-member-stalled][data-stalled="true"] {
+  padding-left: 6px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, currentColor);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 8%, transparent);
+}
+[data-member-page] [data-member-route-audit] {
+  margin: 0 12px 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-left: 2px solid var(--dsw-alias-border-l3, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-route-audit][data-tone="danger"] {
+  border-left-color: var(--dsw-alias-state-error-primary, currentColor);
+}
+[data-member-page] [data-member-route-audit][data-tone="warn"] {
+  border-left-color: var(--dsw-alias-state-warn-primary, currentColor);
+}
+[data-member-page] [data-member-route-audit][data-tone="success"] {
+  border-left-color: var(--dsw-alias-state-success-primary, currentColor);
+}
+[data-member-page] [data-member-task],
+[data-member-page] [data-region="member-messages"] {
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+[data-member-page] [data-member-section-title] {
+  margin: 0 0 6px;
+  color: var(--dsw-alias-label-primary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+  font-weight: 600;
+}
+[data-member-page] [data-member-task-empty],
+[data-member-page] [data-member-messages-empty] {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-member-page] [data-member-task-head] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+}
+[data-member-page] [data-member-task-id] {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-width: 24px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  text-align: center;
+  font: 600 11px/18px var(--ds-font-family-code, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+}
+[data-member-page] [data-member-task-title] {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xs-13, 13px/20px sans-serif);
+  font-weight: 600;
+}
+[data-member-page] [data-member-task-status] {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-task-status][data-tone="business"] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-task-status][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-task-status][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-task-status][data-tone="success"] {
+  color: var(--dsw-alias-state-success-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, currentColor) 40%, transparent);
+}
+[data-member-page] [data-member-task-cells] {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  margin: 2px 0 6px;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-variant-numeric: tabular-nums;
+}
+[data-member-page] [data-member-cell-sep] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+[data-member-page] [data-member-task-cells] [data-cell="token"][data-usage-source="unavailable"],
+[data-member-page] [data-member-task-cells] [data-cell="duration"][data-duration-state="unavailable"],
+[data-member-page] [data-member-task-cells] [data-cell="duration"][data-duration-state="not-started"] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  text-decoration: underline dotted;
+  cursor: help;
+}
+[data-member-page] [data-region="member-messages"] [data-member-message-list] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+[data-member-page] [data-member-message] {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+[data-member-page] [data-member-message-head] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  min-width: 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-message-from] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-primary, inherit);
+  font-weight: 600;
+}
+[data-member-page] [data-member-message-arrow] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+}
+[data-member-page] [data-member-message-to] {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-member-page] [data-member-message-at] {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+[data-member-page] [data-member-message-body] {
+  margin: 4px 0 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-member-page] [data-member-message-fold] summary {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  cursor: pointer;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-member-page] [data-member-message-fold] summary:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+[data-member-page] [data-member-message-fold] [data-member-message-body] {
+  max-height: 216px;
+  overflow: auto;
+}
+
+/* ── ③ 历史行底部 token 六项（3 列 × 2 行） ─────────────────────────────── */
+[data-region="history-list"] [data-history-line="usage"] {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px 8px;
+  margin-top: 2px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="history-list"] [data-history-usage] [data-history-metric] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="history-list"] [data-history-usage] [data-usage-metric-label] {
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-region="history-list"] [data-history-usage] [data-usage-metric-value] {
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxs-12, 12px/16px sans-serif);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* 不可得 ≠ 0：三级色 + 虚线，和真 0 在视觉上分得开（数字本身一字不改） */
+[data-region="history-list"] [data-history-usage] [data-available="false"] [data-usage-metric-value] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  border-bottom: 1px dashed var(--dsw-alias-border-l2, currentColor);
+  font-weight: 400;
+  cursor: help;
+}
+
+/* ── ④ 可点角色卡：常驻描边 + 右下 chevron，hover/active/focus 三态齐全 ─── */
+[data-role-grid] [data-role-card][data-role-card-open="true"] {
+  position: relative;
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 28%, transparent);
+  cursor: pointer;
+}
+[data-role-grid] [data-role-card][data-role-card-open="true"]:hover {
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 55%, transparent);
+}
+[data-role-grid] [data-role-card][data-role-card-open="true"]:active {
+  background: var(--dsw-alias-interactive-bg-active, transparent);
+}
+[data-role-grid] [data-role-card][data-role-card-open="true"]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+/* chevron 占 10px，meta 行让位，避免盖住用时数字 */
+[data-role-grid] [data-role-card][data-role-card-open="true"] [data-role-line="meta"] {
+  padding-right: 10px;
+}
+[data-role-grid] [data-role-card][data-role-card-open="true"]::after {
+  content: "›";
+  position: absolute;
+  right: 6px;
+  bottom: 3px;
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  pointer-events: none;
+  font: var(--dsw-font-xs-13, 13px/16px sans-serif);
+}
+
+/* ───────────────── r21：需求修订 / 终止原因 / 成员停止态 ───────────────── */
+
+/* run 头的终止原因（只在宿主下发了 terminationReason 时渲染；没有就不占位）。 */
+[data-region="run-head"] [data-run-termination] {
+  margin: 0;
+  padding: 2px 6px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 10%, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="run-head"] [data-run-plan] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="run-head"] [data-plan-block-head] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+[data-region="run-head"] [data-run-revisions],
+[data-region="run-head"] [data-run-merged] {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: 100%;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: 999px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="run-head"] [data-run-revisions] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 55%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 12%, transparent);
+}
+[data-region="run-head"] [data-run-merged] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 45%, transparent);
+}
+/* 目标全文可能在 320px 里很长：固定最大高度内滚，不把 run 头撑到整屏。 */
+[data-region="run-head"] [data-run-goal-sections] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 132px;
+  overflow-y: auto;
+  min-width: 0;
+}
+[data-region="run-head"] [data-goal-section] {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding-left: 6px;
+  border-left: 2px solid var(--dsw-alias-border-l1, currentColor);
+}
+[data-region="run-head"] [data-goal-section="revision"] {
+  border-left-color: var(--dsw-alias-state-warn-primary, currentColor);
+}
+[data-region="run-head"] [data-goal-heading] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="run-head"] [data-goal-tag] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 16%, transparent);
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  font: var(--dsw-font-xxxs-11, 11px/14px sans-serif);
+}
+[data-region="run-head"] [data-goal-body] {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary, inherit);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-region="run-head"] [data-run-latest-revision] {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+
+/* 任务卡的「已修订」徽标 + 修订/作废说明（只在宿主字段存在时渲染）。 */
+/* 窄于 320px（右栏任务总览约 220px）时，标题与徽标允许换行：宁可多一行，也不让标题被挤成 0 宽。 */
+[data-region="task-list"] [data-task-line="title"] {
+  flex-wrap: wrap;
+}
+[data-region="task-list"] [data-task-title] {
+  flex: 1 1 96px;
+}
+[data-region="task-list"] [data-task-wait-scope] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 55%, transparent);
+  border-radius: 999px;
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="task-list"] [data-task-revised] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px dashed color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 55%, transparent);
+  border-radius: 999px;
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-region="task-list"] [data-task-line="note"] {
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+
+/* 角色卡上的成员实况 chip（角色聚合状态看不出的停止/等待写域）。 */
+[data-role-grid] [data-role-member-status] {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  box-sizing: border-box;
+  height: 18px;
+  max-width: 100%;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-border-l1, currentColor);
+  border-radius: 999px;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+[data-role-grid] [data-role-member-status][data-tone="warn"] {
+  color: var(--dsw-alias-state-warn-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 55%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 12%, transparent);
+}
+[data-role-grid] [data-role-member-status][data-tone="danger"] {
+  color: var(--dsw-alias-state-error-primary, currentColor);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
+}
+
+/* 历史列表的终止原因行。 */
+[data-history-row] [data-history-termination] {
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+
 @media (prefers-reduced-motion: reduce) {
   [data-progress-ring] [data-ring-arc],
   [data-region="task-flow"] [data-flow-canvas][data-resetting="true"] [data-flow-viewport],
@@ -4242,7 +5572,10 @@ export const AUTO_TEAM_CSS = `
   [data-auto-team-panellist][data-panellist-glyph],
   [data-auto-team-panel] [data-panel-library-inline],
   [data-auto-team-panel] [data-library-inline-back],
-  [data-role-grid] [data-role-card] {
+  [data-role-grid] [data-role-card],
+  [data-region="run-switcher"] [data-active-run-cards],
+  [data-region="run-switcher"] [data-active-run],
+  [data-member-page] [data-member-back] {
     transition: none;
     animation: none;
   }

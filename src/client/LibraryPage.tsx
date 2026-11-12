@@ -20,8 +20,10 @@
 import * as React from 'react'
 import type { LibraryView, MemoryItemView, MemoryTrack, ProjectView } from '../shared/types.ts'
 import { panelApi } from './api.ts'
+import { isStaleMemberNav, mainNavView, memberPageOf, openLibraryNav, resolveMemberSessionId, subscribeMainNav } from './nav.ts'
 import { OPEN_LIBRARY_EVENT, visibleLibrarySurface } from './slots.ts'
 import type { LibraryOpenResult } from './slots.ts'
+import { visibleProjectsOf } from './project-filter.ts'
 import { sessionIdOf, usePanelState } from './state.ts'
 import {
   LIB_LIST_DEFAULT,
@@ -37,6 +39,7 @@ import {
 } from './viewmodel.ts'
 import { EmptyState } from './views/EmptyState.tsx'
 import { FlowCanvas } from './views/FlowCanvas.tsx'
+import { MemberPage } from './views/MemberPage.tsx'
 import { MemoryList } from './views/MemoryList.tsx'
 import { RoleGrid } from './views/RoleCard.tsx'
 import { RunDrawer } from './views/RunDrawer.tsx'
@@ -78,7 +81,16 @@ interface SplitDrag {
 
 /** 左栏与面板内联两处共用的内容体（只差外面那层 root 钩子）。 */
 function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist' }): React.ReactElement {
-  const sessionId = sessionIdOf(props)
+  // r17：主界面视图（项目库 / 某个子智能体）。导航状态是模块级单例，
+  // 右栏任务页点角色卡/任务行/流程图节点时由 `navigateToMember` 切换。
+  const nav = React.useSyncExternalStore(subscribeMainNav, mainNavView, mainNavView)
+  // 宿给 `main` 槽位的 props 没有 sessionId（`sessionIdOf` 会退回 `'current'`），
+  // 而 `'current'` 的快照里没有这个成员 —— 成员页优先用导航记下的来源会话。
+  const propsSessionId = sessionIdOf(props)
+  // 右栏在会话 A 里打开了会话 B 的成员页：不渲染成员页，回落到项目库（否则永远「找不到」）。
+  const staleMemberNav = isStaleMemberNav(propsSessionId, nav)
+  // 陈旧回落时项目库必须用**当前槽位**的真实会话；沿用导航会话会显示另一个会话的项目库。
+  const sessionId = staleMemberNav ? propsSessionId : resolveMemberSessionId(propsSessionId, nav)
   const view = usePanelState(sessionId)
   const loadLibrary = view.loadLibrary
   const library: LibraryView | null = view.library
@@ -112,17 +124,30 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
     [sessionId],
   )
 
-  /** 「全局」固定在最上；已知项目按宿主给的最近活跃顺序；历史桶固定末位（PRD §11 默认值）。 */
+  /**
+   * r18 t3：只列「用过自动团队」的项目（runs > 0），0 次运行的整项隐藏。
+   * 过滤收在纯函数 `visibleProjectsOf` 里（单一事实源），本页只做既有分桶：
+   * 「全局」固定在最上；已知项目按宿主给的最近活跃顺序；历史桶固定末位（PRD §11 默认值）。
+   */
   const projects = React.useMemo<ProjectView[]>(() => {
-    const list = library?.projects ?? []
-    const known = list.filter((project) => project.unknown !== true)
-    const unknown = list.filter((project) => project.unknown === true)
+    const visible = visibleProjectsOf(library?.projects ?? [])
+    const known = visible.filter((project) => project.unknown !== true)
+    const unknown = visible.filter((project) => project.unknown === true)
     return [...known, ...unknown]
   }, [library])
   const knownProjects = React.useMemo(() => projects.filter((project) => project.unknown !== true), [projects])
   const historyProjects = React.useMemo(() => projects.filter((project) => project.unknown === true), [projects])
 
-  const selectedId = picked !== '' ? picked : (library?.currentProject ?? 'global')
+  /**
+   * r18 t3：选中项可能正好被过滤掉（0 run 项目 / 被隐藏的历史桶）——
+   * 不能留一块空白详情：回落到仍可见的第一个项目；一个项目都不剩才回到「全局」。
+   * `global` 是固定行，不参与过滤，永远可选。
+   */
+  const storedId = picked !== '' ? picked : (library?.currentProject ?? 'global')
+  const selectedId =
+    storedId === 'global' || projects.some((project) => project.id === storedId)
+      ? storedId
+      : (projects[0]?.id ?? 'global')
   const selectedProject = projects.find((project) => project.id === selectedId)
   const globalItems = library?.global.memories ?? []
   const projectItems = selectedProject?.memories ?? []
@@ -161,6 +186,29 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
     () => (detailView === null ? [] : detailView.tasks.map((task) => task.id)),
     [detailView],
   )
+
+  // r17 成员页：成员、角色与任务都从**当前 run** 的快照装配；历史 run 没有成员，导航也不提供入口。
+  const memberId = nav.kind === 'member' ? nav.memberId : ''
+  const memberTaskId = nav.kind === 'member' ? nav.taskId : undefined
+  const currentRunDetail = React.useMemo(
+    () => buildRunDetail({ snapshot: view.snapshot }),
+    [view.snapshot],
+  )
+  const memberView = React.useMemo(() => {
+    if (memberId === '') return null
+    const member = view.snapshot?.members.find((item) => item.memberId === memberId)
+    if (member === undefined) return null
+    const tasks = currentRunDetail === null ? [] : currentRunDetail.tasks
+    const task = tasks.find((item) => item.id === (memberTaskId ?? member.taskId)) ?? null
+    return memberPageOf({
+      member,
+      role: currentRunDetail === null ? null : (currentRunDetail.roles.find((role) => role.roleId === member.roleId) ?? null),
+      roleDefinition: view.snapshot?.roles.find((role) => role.id === member.roleId) ?? null,
+      task,
+      messages: view.snapshot?.messages ?? [],
+      audits: view.snapshot?.routeAudits ?? [],
+    })
+  }, [memberId, memberTaskId, view.snapshot, currentRunDetail])
 
   async function openMemoryItem(track: MemoryTrack, item: MemoryItemView, workspace?: string): Promise<void> {
     if (openMemory !== undefined && openMemory.name === item.name && openMemory.track === track) {
@@ -294,7 +342,7 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
   const splitStyle: SplitStyle = { '--lib-list-w': `${listWidth}px` }
 
   return (
-    <div data-library-shell data-library-page={props.root}>
+    <div data-library-shell data-library-page={props.root} data-library-view={nav.kind} data-member-id={memberId === '' ? undefined : memberId}>
       <div data-library-head>
         <strong data-library-title>自动团队</strong>
         <span data-library-sub data-project-count={projects.length}>
@@ -310,6 +358,17 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
         </button>
       </div>
 
+      {nav.kind === 'member' && !staleMemberNav ? (
+        <div data-member-surface style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+          <MemberPage
+            view={memberView}
+            memberId={memberId}
+            onBack={openLibraryNav}
+            surface={props.inline === true ? 'panel' : 'main'}
+          />
+        </div>
+      ) : (
+        <>
       {/* r14 AC-13：PRD 指定的分栏锚点必须真的渲染出来（QA D1：此前只写在 styles.ts 的死选择器里） */}
       <div data-library-body data-project-split style={splitStyle}>
         <div data-region="project-list" aria-label="项目">
@@ -473,6 +532,8 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
           </>
         )}
       </RunDrawer>
+        </>
+      )}
     </div>
   )
 }

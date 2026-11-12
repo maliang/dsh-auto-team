@@ -46,7 +46,15 @@ export function RunRow(props: RunRowProps): React.ReactElement {
           <span data-run-sep aria-hidden="true">
             {' · '}
           </span>
-          <span data-run-status data-tone={row.statusTone}>
+          <span
+            data-run-status
+            data-tone={row.statusTone}
+            title={
+              row.statusTitle === undefined
+                ? `状态：${row.statusText}`
+                : `状态：${row.statusText} · ${row.statusTitle}`
+            }
+          >
             <span aria-hidden="true">{row.statusIcon}</span> {row.statusText}
           </span>
           <span data-run-sep aria-hidden="true">

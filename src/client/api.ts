@@ -20,6 +20,8 @@
 import type {
   ActResult,
   LibraryView,
+  MemoryEntryView,
+  MemoryFileView,
   MemoryTrack,
   PanelAction,
   PanelSnapshot,
@@ -34,6 +36,10 @@ export interface MemoryBodyPayload {
   name: string
   body: string
   chars: number
+  /** r23：宿主解析后的文件视图；旧宿主缺省，面板退回整文件正文。 */
+  file?: MemoryFileView
+  /** r23：宿主解析后的条目视图（面板禁止自己解析 md）。 */
+  entries?: MemoryEntryView[]
 }
 
 /**

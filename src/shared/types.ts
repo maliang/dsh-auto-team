@@ -63,6 +63,17 @@ export type MemberStatus =
   | 'done'
   | 'failed'
   | 'interrupted'
+  /**
+   * r21 AC-4：任务被取消后，成员的实际状态必须可见（以前 cancelled 任务映射成 idle，
+   * 面板看起来「什么都没发生」）。cancelled = 成员上下文还在但任务已作废。
+   */
+  | 'cancelled'
+  /** r21 AC-4：成员确实已经停下（任务 interrupted，或停止动作已成功）。 */
+  | 'stopped'
+  /** r21 AC-4：正在等成员停下（interrupt 已发出、尚未确认）——不能提前显示「已停止」。 */
+  | 'stopping'
+  /** r21 AC-4：任务在等写域（waiting），成员尚未真正开跑。 */
+  | 'waiting'
 
 /**
  * 逐角色模型路由（AC-22）。provider/model 是**原样透传**的字面值，不做别名归一：
@@ -106,6 +117,40 @@ export interface PlanTask {
   waitingOn?: string[]
   /** r11 AC-14：等待原因（中文，**宿主生成**，面板原样渲染：「等待 t2 释放 src/host/bridge.ts」）。 */
   waitReason?: string
+  /**
+   * r21 AC-2：最近一次「需求修订」改动本任务的时刻。
+   * 面板据此在任务卡上标「已修订」并展示 `revisionNote`；缺省 = 从未被修订。
+   */
+  revisedAt?: number
+  /** r21 AC-2：本次修订对**本任务**的说明（哪几点变了；宿主写入，面板原样渲染）。 */
+  revisionNote?: string
+  /** r21 AC-3：任务被「需求修订」作废的时刻（与 `status='cancelled'` 同时写）。 */
+  cancelledAt?: number
+  /** r21 AC-3：作废原因（宿主生成或队长填写，面板原样展示，绝不写空话）。 */
+  cancelReason?: string
+  /** r21 AC-3 / r25：作废来源 —— revision = 被需求修订作废；user = 用户手动取消；stale = 计划收口时连带终结。 */
+  cancelledBy?: 'revision' | 'user' | 'stale'
+}
+
+/**
+ * r21 AC-2：一次「需求修订」的结构化留痕。
+ *
+ * 目标原文不覆盖：修订段落追加在 `Plan.goal` 末尾，这里保留修订时刻与新需求正文，
+ * 面板据此渲染「已并入 run <runId>」与修订清单；`updatedTaskIds` 为空 = 只追加任务。
+ */
+export interface PlanRevision {
+  /** 修订提交时刻（毫秒）。 */
+  at: number
+  /** 队长提交的新需求原文（**保留全文**，不截断）。 */
+  text: string
+  /** 队长说明的「哪几点变了」（原文发给在跑成员；缺省 = 只发新需求正文）。 */
+  changeSummary?: string
+  /** 被本次修订更新的既有任务 id（顺序 = 提交顺序）。 */
+  updatedTaskIds: string[]
+  /** 本次修订新增的任务 id。 */
+  addedTaskIds: string[]
+  /** 本次修订作废的任务 id。 */
+  cancelledTaskIds: string[]
 }
 
 /** 写域占用里的一条等待者（r11 AC-19/AC-20；`reason` 同样由宿主生成，客户端零拼装）。 */
@@ -159,6 +204,8 @@ export interface Plan {
   goal?: string
   tasks: PlanTask[]
   maxConcurrent: number
+  /** r21 AC-2：历次需求修订（只增不删；旧 run 没有此字段 = 从未修订过）。 */
+  revisions?: PlanRevision[]
 }
 
 /** 角色（内置 + 用户自建，持久化在 roles.json）。 */
@@ -283,6 +330,16 @@ export interface MemberView {
   /** 该成员正在执行的任务（无绑定任务的成员没有此字段）。 */
   taskId?: string
   status: MemberStatus
+  /**
+   * 宿主已发出中断、但还没确认停下（r21 AC-4）。**只从 binding 透传**，客户端不自行推断：
+   * `status === 'stopping'` 是同一次判定的展示结果，两者一起看才不会被旧快照误导。
+   */
+  stopping?: boolean
+  /**
+   * 确认停止的时刻（r21 AC-4）：宿主在中断成功并落下 `retired + stoppedAt` 后才写入。
+   * 缺席 = 没有停止事实（运行中 / 中断失败 / 旧快照），客户端不得补 0。
+   */
+  stoppedAt?: number
   /** 最近一次活动时间（消息 / 证据 / 派发时间取最大），用于「多久没动静」。 */
   lastEventAt: number
   /**
@@ -320,6 +377,81 @@ export interface ProgressRecord {
 
 /** 记忆双轨（AC-24）：公共轨跨会话共享，项目轨跟随当前工作目录。 */
 export type MemoryTrack = 'public' | 'project'
+
+/** r23 记忆等级：P0 铁律（永不淘汰）/ P1 教训 / P2 常规（最先淘汰）。 */
+export type MemoryLevel = 'P0' | 'P1' | 'P2'
+
+/** r23 主题目录（项目 8 个；公共轨缺 `ui`/`domain`，自动路由时降级，见 entries.ts）。 */
+export type MemoryTopicId =
+  | 'conventions'
+  | 'architecture'
+  | 'commands'
+  | 'pitfalls'
+  | 'workflow'
+  | 'ui'
+  | 'host'
+  | 'domain'
+
+/** r23 条目视图（宿主解析后的结构化条目；客户端禁止自己解析 md）。 */
+export interface MemoryEntryView {
+  id: string
+  track: MemoryTrack
+  file: string
+  topic: MemoryTopicId | null
+  level: MemoryLevel
+  text: string
+  source: string
+  at: number
+  /** 宿主格式化好的 `MM-DD HH:mm`；客户端不要自己 new Date 拼。 */
+  stamp: string
+  /** 宿主格式化好的 `来源：<source> · <stamp> · 修正 <n>`；客户端直接展示。 */
+  sourceText: string
+  revisions: number
+  superseded: boolean
+}
+
+/** r23 记忆文件视图：canonical / misc / legacy 三类共用；legacy 不参与注入与配额。 */
+export interface MemoryFileView extends MemoryFileInfo {
+  topic: MemoryTopicId | null
+  canonical: boolean
+  readOnly: boolean
+  legacy: boolean
+  /** 解析出的总条目（含 tombstone）。 */
+  entries: number
+  active: number
+  superseded: number
+  levels: { P0: number; P1: number; P2: number }
+}
+
+/** r23 配额视图（只给数字，中文由客户端拼）。 */
+export interface MemoryQuotaView {
+  track: MemoryTrack
+  files: number
+  maxFiles: number
+  totalEntries: number
+  maxEntriesPerFile: number
+  nearFiles: boolean
+  overFiles: boolean
+  nearFullFiles: string[]
+  fullFiles: string[]
+}
+
+/** r23 「整理旧流水」报告（工具 `curate` / 面板 `curateMemory` / CLI 共用唯一形状）。 */
+export interface MemoryCurateReport {
+  ok: boolean
+  track: MemoryTrack
+  dryRun: boolean
+  at: number
+  scannedFiles: number
+  legacyFiles: string[]
+  extracted: number
+  added: number
+  skippedExisting: number
+  skippedFull: number
+  skippedInvalid: number
+  target: { name: string; before: number; after: number }
+  warnings: string[]
+}
 
 /** 记忆文件条目（面板记忆页列表用）。 */
 export interface MemoryFileInfo {
@@ -389,6 +521,20 @@ export interface MemberBinding {
   spawnedAt: number
   /** 成员已退出（被 interrupted / done 后释放），绑定保留以便续聊与审计。 */
   retired?: boolean
+  /**
+   * r21 AC-4：停止动作进行中（interrupt 已发出、尚未确认）。
+   *
+   * 只由宿主写：真实还在跑的成员绝不显示「已停止」；interrupt 失败时保持 true
+   * （面板显示「停止中」并带失败说明），只有确认停下才清掉并置 `retired`。
+   */
+  stopping?: boolean
+  /**
+   * r21 AC-4：成员确认停止的时刻（`retired` 为 true 时才有意义）。
+   *
+   * 与 `stopping` 一起构成三态：`stopping=true` → 停止中；`stoppedAt` 有值 → 已停止；
+   * 两者都无且 `retired` 无 → 在跑。面板据此显示「已停止」而不是让成员悄悄消失。
+   */
+  stoppedAt?: number
 }
 
 /**
@@ -439,6 +585,28 @@ export interface TokenTotals {
   input?: number
   output?: number
   total: number
+  /** 输入命中缓存的 token（宿主 `cacheReadTokens`）。 */
+  cacheRead?: number
+  /** 写入缓存的 token（宿主 `cacheWriteTokens`；当前宿主不上报，通常缺省）。 */
+  cacheWrite?: number
+  /** 调用次数（一条 assistant 消息算一次）。 */
+  calls?: number
+}
+
+/** 六项用量指标：输入未命中 / 输入命中 / 写缓存 / 输出 / 调用次数 / 缓存命中率。 */
+export type UsageMetricKey = 'input' | 'cacheRead' | 'cacheWrite' | 'output' | 'calls' | 'hitRate'
+
+/**
+ * 一项用量指标（r17）：`text` 由宿主 `format.ts` 生成，客户端只渲染。
+ *
+ * `available:false` 表示来源没有上报这一项（文案通常是「不可得」）—— 项目纪律：
+ * 缺失就写「不可得」，绝不补 0 或用其它分项拼一个数出来。
+ */
+export interface UsageMetric {
+  key: UsageMetricKey
+  label: string
+  text: string
+  available: boolean
 }
 
 /** 用量来源（AC-19 三态归一后的两种可交付形态）：`provider` 有值，`unavailable` 无值。 */
@@ -461,6 +629,8 @@ export interface UsageCell {
   reason?: string
   /** 宿主生成的展示文本（`1,234` / `不可得`）；缺省表示旧数据，客户端自行降级。 */
   text?: string
+  /** 六项指标明细（顺序固定）；缺省表示旧数据，客户端退化为只显示合计。 */
+  details?: UsageMetric[]
 }
 
 /** 用时状态（AC-20）：未开始 / 进行中 / 已结束 / 不可得，四态互斥。 */
@@ -473,6 +643,13 @@ export interface DurationCell {
   ms?: number
   text: string
   state: DurationState
+  /**
+   * r24：`state==='unavailable'` 时为什么不可得（人话，面板/tooltip 直接展示）。
+   *
+   * 旧 run 早于任务起止记录上线，任务已 done/skipped/cancelled 却没有 `taskTimes`：
+   * 这时必须说「记录缺失」，不能与「还没开始」混成同一种 `not-started`。
+   */
+  reason?: string
 }
 
 /** r16：角色卡上的任务编号与状态（只读投影，顺序 = 计划顺序）。 */
@@ -519,6 +696,19 @@ export interface TaskDetailView {
   attempts?: number
   /** 写域等待原因（宿主生成的人话；缺省 = 没在等）。 */
   waitReason?: string
+  /**
+   * r21 修订事实：需求修订并入本任务后，宿主把任务退回 ready 并记下修订时刻。
+   * 与 cancelledAt 系字段一样是「发生过才存在」——旧快照/未修订任务缺席，客户端不得补 0。
+   */
+  revisedAt?: number
+  /** 修订要点（成员直达消息里的变更摘要；缺省 = 未修订 / 旧快照没记录）。 */
+  revisionNote?: string
+  /** 任务被新需求作废的时刻（r21）；缺席 = 没被作废。 */
+  cancelledAt?: number
+  /** 作废原因（用户修改需求时填写；缺省 = 旧快照没记录）。 */
+  cancelReason?: string
+  /** 作废来源：需求修订连带 / 用户直接取消 / 计划收口连带（r25）。 */
+  cancelledBy?: 'revision' | 'user' | 'stale'
   /** 该任务名下的直达消息条数（面板「消息」徽标用）。 */
   messageCount: number
 }
@@ -576,6 +766,8 @@ export interface RunDetailView {
   planStatus: PlanStatus
   plannedAt?: number
   finishedAt?: number
+  /** r21：收口原因（与 `finishedAt` 同时落盘；缺省 = 旧 run 没记录，界面不补猜）。 */
+  terminationReason?: string
   usage: UsageCell
   duration: DurationCell
   roles: RoleUsageView[]
@@ -635,12 +827,29 @@ export interface LibraryView {
 }
 
 /**
+ * r26：run 阶段判定所需的计数（当前 run 与历史 run 共用的同一组输入）。
+ *
+ * 全部可选：旧数据 / 旧快照没有这些投影时**缺席**，客户端按「不可得」处理，
+ * 不许拿 0 或其它字段反推（`ongoing` 只表示非终态任务数，不能拆出失败/中断）。
+ */
+export interface RunStageCounts {
+  /** `running` + `gate` 任务数（正在占并发名额的任务）。 */
+  running?: number
+  /** `failed` 任务数。 */
+  failed?: number
+  /** `interrupted` 任务数（每个中断任务对应一个可续聊的中断成员）。 */
+  interrupted?: number
+  /** 非 retired 的成员绑定数。 */
+  members?: number
+}
+
+/**
  * 运行列表的一行（面板/恢复入口/左栏历史用，不含消息账本等大字段）。
  *
  * 放 shared 而不是 store：`LibraryView.runs` 是共享契约，而 client 不允许 import host。
  * store.ts 只做 `export type { RunSummary }`，定义单点仍在 shared。
  */
-export interface RunSummary {
+export interface RunSummary extends RunStageCounts {
   runId: string
   sessionId: string
   createdAt: number
@@ -655,10 +864,31 @@ export interface RunSummary {
   plannedAt?: number
   /** r13：进入终态的时间；进行中缺省。 */
   finishedAt?: number
+  /** r21：收口原因（与 `finishedAt` 同时落盘，历史列表直接展示；缺省 = 旧 run 没记录）。 */
+  terminationReason?: string
   /** r13：run 合计用量（`aggregation` 三态见 UsageCell）。 */
   usageTotals?: TokenTotals
+  /**
+   * r17：run 合计用量的宿主单元格（`text` + 六项 `details`），历史行据此渲染六项指标。
+   *
+   * 由宿主装配（`bridge.ts#historyOf` 用 `usageCellOf` 统一生成），**不落盘** ——
+   * 落盘的是原始 `usageTotals`，`usage` 是每次读取时派生的视图字段。
+   * 旧数据/旧快照缺省时客户端退化为按 `usageTotals` 只显示合计（不自己拆六项）。
+   */
+  usage?: UsageCell
   /** r13：是否还有非终态任务（左栏「活跃」标记）。 */
   active?: boolean
+  /**
+   * r18b：**进行中任务数** = 非终态任务个数（`active` 的计数版）。
+   *
+   * 终态沿用仓库既有判定：`host/store.ts` 的 `SUMMARY_TERMINAL_STATUSES`
+   * （done / failed / cancelled / skipped / interrupted，与 `team/dispatch.ts` 的
+   * `isTerminalTaskStatus` 同一套语义）。客户端据此决定面板顶部只显示还有进行中任务的 run，
+   * **不要在 client 侧另写一份终态集合** —— 那会让两条链路的「还剩几个」分叉。
+   *
+   * 可选：旧快照 / 旧文件缺省时客户端按 `active` 或 0 降级（不补猜）。
+   */
+  ongoing?: number
 }
 
 /* ─────────────────────────────── 面板快照（HTTP / 工具共用） ─────────────────────────────── */
@@ -673,6 +903,14 @@ export interface PanelSnapshot {
   plannedAt?: number
   tasks: PlanTask[]
   members: MemberView[]
+  /**
+   * r26：当前 run 的阶段判定计数 —— 与 {@link RunSummary} 的四个同名字段同构，
+   * 让「当前 run」与「历史 run」喂给同一套判定函数时输入形状一致。
+   *
+   * 缺省 = 还没有 run / 旧宿主未投影；客户端按不可得处理，不补猜。
+   * 注意与上面的 `members: MemberView[]` 区分：这里是计数投影，不是成员列表。
+   */
+  runCounts?: RunStageCounts
   /** 直达消息账本（AC-16），最多 200 条。 */
   messages: MessageRecord[]
   /** 逐角色模型审计（AC-22），按时间升序。 */
@@ -683,7 +921,12 @@ export interface PanelSnapshot {
     injectedChars: number
     budget: number
     truncated: boolean
-    files: MemoryFileInfo[]
+    /** r23：canonical + misc（不含旧流水 `run-*.md`/`lessons-*.md`）。 */
+    files: MemoryFileView[]
+    /** r23：双轨配额统计（缺省 = 旧快照，客户端按 0/空处理）。 */
+    quotas?: { project: MemoryQuotaView; public: MemoryQuotaView }
+    /** r23：两轨旧流水文件数（只展示，不注入、不计配额）。 */
+    legacyFileCount?: number
     /**
      * 内联进上下文的记忆索引（AC-7）：每条带 `mem://<track>/<stem>` ID + 标题 + 首句。
      *
@@ -694,6 +937,23 @@ export interface PanelSnapshot {
     inline?: MemoryInlineEntry[]
     /** 未内联但可按 ID 展开的条目（AC-8：`truncated` 的语义 = 本数组非空）。 */
     omitted?: MemoryInlineEntry[]
+    /**
+     * r22：项目记忆**实际落点**（绝对路径）。
+     *
+     * 用于回答「记忆到底写到哪儿了」——旧实现把落点定在 apply 时刻的装配 workspace，
+     * 面板上看得到文件、项目自己的 `.auto-team/memory` 却永远为空。
+     */
+    projectDir?: string
+    /** r22：解析成功的项目工作区（缺省 = 退化）。 */
+    workspace?: string
+    /**
+     * r22：未能解析项目工作区、项目记忆已退化到装配目录时为 true。
+     *
+     * 必须与 `degradeReason` 成对出现：面板显示原因，不允许静默写错位置。
+     */
+    degraded?: boolean
+    /** r22：退化原因（可读中文，含实际落点）。 */
+    degradeReason?: string
   }
   roles: Role[]
   activity: ActivityEvent[]
@@ -750,6 +1010,13 @@ export interface PanelSnapshot {
   taskDurations?: Record<string, DurationCell>
   /** r13 AC-21：历史 run 列表（`HISTORY_PAGE_SIZE` 条，createdAt 倒序）。 */
   runs?: RunSummary[]
+  /**
+   * r21 AC-2：本轮目标全文（含历次「需求修订」段落，原文不覆盖）。
+   * 缺省 = 旧 run / 尚无计划，面板不补猜。
+   */
+  goal?: string
+  /** r21 AC-2：需求修订留痕（空 = 从未修订；面板据此显示「已并入 run <runId>」标记）。 */
+  revisions?: PlanRevision[]
 }
 
 /** 活动流事件（面板「活动」区；上限由 host 侧 ACTIVITY_LIMIT 控制）。 */
@@ -843,17 +1110,25 @@ export interface TriggerRecord {
 
 /** 内联索引条目（AC-7）：面板与测试都能看到「内联了哪几条、各自多长」。 */
 export interface MemoryInlineEntry {
-  /** `mem://<track>/<stem>`（由 `memoryIdOf` 单点生成）。 */
+  /** `mem://<track>/<stem>#<hash12>`（r23 条目 ID）。 */
   id: string
   track: MemoryTrack
   name: string
   title: string
-  /** 首句摘要（不是全文；全文走 expand）。 */
+  /** 来源 · 时间 · 修正次数（r23 起不再是正文首句）。 */
   summary: string
-  /** ≥1 个关联 id（同轨相邻条目），供模型顺着展开下一层。 */
+  /** 同轨相邻条目 id（最多 3 个），供模型顺着展开下一层。 */
   related: string[]
   /** 该条内联文本长度（≤ `MEMORY_INLINE_ITEM_MAX`）。 */
   chars: number
+  /** r23：等级（新实现恒有；旧快照可能缺省）。 */
+  level?: MemoryLevel
+  /** r23：修正次数（新实现恒有）。 */
+  revisions?: number
+  /** r23：来源（新实现恒有）。 */
+  source?: string
+  /** r23：条目时间戳（新实现恒有）。 */
+  at?: number
 }
 
 /** 记忆展开结果码（AC-9/AC-10）：失败一律降级成码，**不抛异常**（工具调用面不能崩）。 */
@@ -884,7 +1159,7 @@ export interface ExpandPayload {
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
 
 /**
- * 面板动作全集（18 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 面板动作全集（20 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
  * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
  */
 export type PanelAction =
@@ -909,6 +1184,11 @@ export type PanelAction =
   | { type: 'receipt'; taskId: string; note?: string }
   | { type: 'saveMemory'; track: MemoryTrack; name: string; body: string }
   | { type: 'deleteMemory'; track: MemoryTrack; name: string }
+  /**
+   * r23：把旧流水（`run-*.md` / `lessons-*.md`）的失败证据整理进 `pitfalls.md`（只追加、幂等）。
+   * `dryRun=true` 只出报告、零写入；失败用 `BAD_REQUEST` + 可读 message（不新增拒绝码）。
+   */
+  | { type: 'curateMemory'; track: MemoryTrack; dryRun: boolean }
   /**
    * r10 AC-19：`role` 与 `skills` 至少给一个 —— 技能变更随角色保存一起上送，
    * 所以动作数仍是 15 条（不新开 `saveSkills`），客户端只有一条写路径。
@@ -946,6 +1226,13 @@ export type PanelAction =
    * 复用同一任务的写域闸不再弹窗（`RunState.forceParallel`）。
    */
   | { type: 'forceParallel'; taskId: string }
+  /**
+   * r24：收口一条**残留计划**（进程重启后遗留的 draft/dispatching/paused）。
+   *
+   * 目标 run 必须非终态且本进程没有存活成员；终态 run 返回 `unchanged`（幂等、不报错），
+   * 有存活成员则 `BAD_REQUEST`（先停成员，不能凭空把还在跑的计划判死）。
+   */
+  | { type: 'closeRun'; runId: string }
 
 /**
  * 拒绝码（12 个）。每条都必须能落到一句「用户下一步该做什么」的文案（见 bridge.reasonText），
@@ -993,6 +1280,13 @@ export interface ActResult {
   rejected?: { code: RejectionCode; message: string }
   /** r13 AC-13：`rejected.code === 'CONFIRM_REQUIRED'` 时指向刚挂起的待确认记录。 */
   pendingId?: string
+  /**
+   * r24：动作幂等命中「不需要改动」时为 true（例如 `closeRun` 打到一条已终态的 run）。
+   * 这不是失败：面板据此提示「已是终态」而不是红字。
+   */
+  unchanged?: boolean
+  /** r23：`curateMemory` 动作的报告（成功执行与 dry-run 都带）。 */
+  curation?: MemoryCurateReport
 }
 
 /* ───────────────────────────────── 通用返回包装 ───────────────────────────────── */

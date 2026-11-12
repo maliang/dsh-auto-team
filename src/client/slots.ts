@@ -96,7 +96,13 @@ export interface SlotMeta {
   key?: string
   order?: number
   label?: string
-  inject?: (sessionId: string) => Record<string, unknown>
+  /**
+   * 宿主调用形状（asar `runInject` 实核）：
+   *  - root 作用域座位（`sidebar.panellist` / `main`）**不传参**；
+   *  - session 作用域的 keyed 座位传 `binding.key`。
+   * 所以参数不能声明成必填 sessionId —— 这里按 unknown 收，再只认「非本插件 key 的字符串」。
+   */
+  inject?: (binding?: unknown, actions?: unknown) => Record<string, unknown>
 }
 
 /** 宿主 `sidebarRightTabs.register` 的定义形状（只声明本插件写入的字段）。 */
@@ -146,8 +152,8 @@ export interface SidebarRightFace {
 export interface ServiceScope {
   sidebarRightTabs?: TabsFace
   sidebarRight?: SidebarRightFace
-  /** r13：主区页面服务（**未验证**，形状只按 `open(id)` 猜测，失败即事件降级）。 */
-  mainArea?: MainAreaFace
+  /** 宿主布局服务：`selectPanel(id)` 是选中 main 面板的**唯一**官方入口。 */
+  layout?: LayoutFace
   effect?(fn: () => unknown, label?: string): unknown
 }
 
@@ -333,6 +339,11 @@ export function sessionIdBag(
   return { sessionId, ...extras }
 }
 
+/** 宿主 `runInject` 对 root 座位不传参，对 session 座位传 `binding.key`；统一成字符串会话 id。 */
+function sessionIdArg(binding: unknown): string {
+  return typeof binding === 'string' && binding !== '' ? binding : 'current'
+}
+
 /**
  * 注册全部挂载点。`deps` 只为让测试注入桩组件；生产由 `index.ts` 传真组件。
  * 挂载点不存在时 `slots.inject` 是 inert 的（回调不会被调），因此注册它零副作用。
@@ -345,7 +356,8 @@ export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
   const closePanel = deps.closePanel ?? ((sessionId: string) => commands.close(sessionId))
   const isPanelOpen = deps.isPanelOpen ?? ((sessionId: string) => commands.isOpen(sessionId))
 
-  const injectOf = (sessionId: string): Record<string, unknown> => sessionIdBag(sessionId)
+  // root 座位宿主不传参（asar `runInject`），session 座位传 binding.key；统一兜底 'current'。
+  const injectOf = (binding?: unknown): Record<string, unknown> => sessionIdBag(sessionIdArg(binding))
 
   // E1 输入框左侧胶囊选项：非 keyed → name/id/order/inject，**不带 key**。
   // 点击语义只有「开关」，所以不把面板命令下发给它。
@@ -360,12 +372,14 @@ export function registerSlots(ctx: SlotsContext, deps: SlotComponents): void {
         name: HEADER_ACTIONS_SLOT,
         id: HEADER_ID,
         order: 0,
-        inject: (sessionId: string) =>
-          sessionIdBag(sessionId, {
+        inject: (binding?: unknown) => {
+          const sessionId = sessionIdArg(binding)
+          return sessionIdBag(sessionId, {
             openPanel,
             closePanel: () => closePanel(sessionId),
             isPanelOpen: () => isPanelOpen(sessionId),
-          }),
+          })
+        },
       },
       deps.HeaderButton,
     )
@@ -457,7 +471,7 @@ export const PANELLIST_LABEL = '自动团队'
 /**
  * 「左栏项目库」的窗口事件名（降级通道）。
  *
- * 正常路径是 `mainArea.open(PANELLIST_ID)`；拿不到主区服务时退化成这个事件，
+ * 正常路径是 `layout.selectPanel(PANELLIST_ID)`；主区不可用时退化成这个事件，
  * 由 `Panel.tsx` 监听后在右栏内联渲染同一份项目库（同一套组件、同一份 `LibraryView`）。
  * 常量放这里而不是组件文件：`slots.ts` 不 import 任何 `.tsx`，
  * 组件与测试都能引它，且不会形成 `slots ↔ LibraryPage` 的运行时环。
@@ -534,6 +548,30 @@ export function resetLibraryOpenRequest(): void {
   libraryOpenRequestAt = null
 }
 
+/**
+ * 组件侧「打开项目库主区」的 opener：由 `registerPanellist` 在注册时挂上。
+ *
+ * 组件（角色卡 / 任务行 / 流程图节点）拿不到 ctx，但点击后必须能像左栏 glyph 一样
+ * 打开主区并走 500ms watchdog 降级；`navigateToMember` 因此只依赖这个薄入口。
+ */
+let librarySurfaceOpener: ((sessionId?: string) => LibraryOpenResult) | null = null
+
+/** 组件侧打开项目库主区；`null` = 还没注册过 opener（单测 / 非浏览器宿主）。 */
+export function requestLibrarySurface(sessionId?: string): LibraryOpenResult | null {
+  if (librarySurfaceOpener === null) return null
+  try {
+    return librarySurfaceOpener(sessionId)
+  } catch {
+    // opener 内部已经各自兜底；真漏出来的异常也不许打断点击链。
+    return 'error'
+  }
+}
+
+/** 测试隔离用：清掉 opener（不在生产过程调用）。 */
+export function resetLibrarySurfaceOpener(): void {
+  librarySurfaceOpener = null
+}
+
 /** 派发降级事件；没有 window（node 测试 / 非浏览器宿主）时安全返回 false。 */
 function dispatchOpenLibraryEvent(): boolean {
   if (typeof window === 'undefined' || window === null) return false
@@ -542,9 +580,15 @@ function dispatchOpenLibraryEvent(): boolean {
   return true
 }
 
-/** 主区服务的只声明用到的成员（形状未验证，故整段 try/catch）。 */
-export interface MainAreaFace {
-  open?(id: string): unknown
+/**
+ * 宿主 `layout` 服务的只声明用到的成员。
+ *
+ * 2026-11-05 对照 asar 核实：宿主全量检索 **没有 `mainArea` 服务**；全局面板由
+ * `ctx.layout.selectPanel(id)` 选中（`main` keyed slot 的 key 即面板 id，`null` 回会话）。
+ * `selectPanel` 在目标 main 未注册时会抛错且不改当前选中态 —— 必须 catch 后降级。
+ */
+export interface LayoutFace {
+  selectPanel?(panelId: string | null): unknown
 }
 
 export interface PanellistComponents {
@@ -564,22 +608,22 @@ function warnSlot(name: string, error: unknown): void {
 /**
  * 生成「打开左栏项目库」动作（AC-8 / AC-9 的唯一入口）。
  *
- * additive 语义：先试主区 `mainArea.open(PANELLIST_ID)`；主区缺失 / 显式拒绝 / 500ms 内
+ * additive 语义：先试 `layout.selectPanel(PANELLIST_ID)`；布局服务缺失 / 显式拒绝 / 500ms 内
  * 没有出现可见的 `[data-library-surface="main"]` 时，降级到右栏内联（打开面板页签 + 派发
  * `OPEN_LIBRARY_EVENT`）。返回 `'main' | 'event' | 'error'` —— 调用方（glyph）据此显示
  * `data-last-open-result`，**任何分支都不静默**。
  */
 export function createOpenLibrary(ctx: SlotsContext): (sessionId?: string) => LibraryOpenResult {
-  let face: MainAreaFace | undefined
+  let layout: LayoutFace | undefined
   if (typeof ctx.inject === 'function') {
     try {
-      ctx.inject(['mainArea'], (scope) => {
-        const service = scope.mainArea
-        if (service !== undefined) face = service
+      ctx.inject(['layout'], (scope) => {
+        const service = scope.layout
+        if (service !== undefined) layout = service
       })
     } catch {
       // 服务不存在时 cordis 会一直 pending；这里只是少一条快路径，事件降级仍然可用。
-      face = undefined
+      layout = undefined
     }
   }
   const panel = createPanelCommands(ctx)
@@ -606,12 +650,13 @@ export function createOpenLibrary(ctx: SlotsContext): (sessionId?: string) => Li
   }
 
   return (sessionId?: string): LibraryOpenResult => {
-    if (face !== undefined && typeof face.open === 'function') {
+    if (layout !== undefined && typeof layout.selectPanel === 'function') {
       let accepted = true
       try {
         // 只有**显式 false** 才算主区拒绝：真实宿主多半返回 void，
         // 那种情况交给 watchdog 用 DOM 事实判定，否则会误判成失败并双开。
-        accepted = face.open(PANELLIST_ID) !== false
+        // main 未注册时宿主 selectPanel 会抛错（且不改选中态）→ 这里 catch 后走降级。
+        accepted = layout.selectPanel(PANELLIST_ID) !== false
       } catch {
         accepted = false
       }
@@ -643,10 +688,17 @@ export function registerPanellist(
   if (ctx === undefined || ctx === null || ctx.slots === undefined) return result
 
   const openLibrary = createOpenLibrary(ctx)
+  // 组件侧（角色卡 / 任务行 / 流程图节点）没有 ctx，通过这个模块级入口打开主区。
+  librarySurfaceOpener = openLibrary
   // 组件侧零参（`PanellistEntryProps.openLibrary`）；sessionId 在这一层绑定，
   // 免得每个组件各自记住「点左栏时要带会话 id」。
-  const injectOf = (sessionId: string): Record<string, unknown> =>
-    sessionIdBag(sessionId, { openLibrary: () => openLibrary(sessionId) })
+  const injectOf = (binding?: unknown): Record<string, unknown> => {
+    // root 座位没有 binding → 'current'（宿主默认会话，与 host DEFAULT_SESSION 同值）；
+    // session 座位拿到的是 key，只有不是本插件面板 id 的字符串才当会话 id。
+    const sessionId =
+      typeof binding === 'string' && binding !== '' && binding !== PANELLIST_ID ? binding : 'current'
+    return sessionIdBag(sessionId, { openLibrary: () => openLibrary(sessionId) })
+  }
 
   // 左栏栏目：非 keyed → name/id/order/label/inject（不带 key）。
   try {
@@ -661,18 +713,33 @@ export function registerPanellist(
     warnSlot(PANELLIST_SLOT, error)
   }
 
-  // 主区页面：先按 keyed 注册（蓝图形状 { name, key, inject }）；宿主若说「这不是 keyed 槽位」，
+  // 主区页面：先按 keyed 注册（宿主契约 { name, key, inject }）；宿主若说「这不是 keyed 槽位」，
   // 就退一步按非 keyed 再试一次。两条都失败 = 能力不存在，降级为面板内联项目库。
+  //
+  // **必须走 slots.inject，不能直接 register**：`main` 由 AppFrame 在下拉布局里声明，
+  // 插件 apply 时它可能还没提交；此时直接 register 会抛
+  // `slot "main" is not declared`，被 catch 后永不重试 → main 永久缺失 →
+  // 宿主侧栏行 onClick 的 `layout.selectPanel(id)` 抛错、界面保持原样（用户报的「点了没反应」）。
+  // slots.inject 的语义是「声明存在就同步跑，不存在就等声明提交后再跑」，且随声明生命周期重建。
+  let mainFailed = false
   try {
-    ctx.slots.register({ name: MAIN_SLOT, key: PANELLIST_ID, inject: injectOf }, deps.LibraryPage)
-    result.main = true
+    ctx.slots.inject(MAIN_SLOT, () => {
+      try {
+        ctx.slots.register({ name: MAIN_SLOT, key: PANELLIST_ID, inject: injectOf }, deps.LibraryPage)
+      } catch (error) {
+        // 极旧/不同实现的宿主若把 main 声明成非 keyed，再退一步；再失败就只降级。
+        try {
+          ctx.slots.register({ name: MAIN_SLOT, inject: injectOf }, deps.LibraryPage)
+        } catch (inner) {
+          mainFailed = true
+          warnSlot(MAIN_SLOT, inner)
+        }
+      }
+    })
+    // 同步声明已提交时这里能如实反映成败；声明尚未提交时表示「已接管，等声明」。
+    result.main = !mainFailed
   } catch (error) {
-    try {
-      ctx.slots.register({ name: MAIN_SLOT, inject: injectOf }, deps.LibraryPage)
-      result.main = true
-    } catch (inner) {
-      warnSlot(MAIN_SLOT, inner)
-    }
+    warnSlot(MAIN_SLOT, error)
   }
 
   return result

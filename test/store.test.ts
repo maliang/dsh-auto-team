@@ -12,6 +12,7 @@ import {
   RUN_STATE_VERSION,
   RunsStore,
   STALL_ALERTS_LIMIT,
+  finishedAtOf,
   makeRunId,
   uniqueRunId,
   wrapLegacy,
@@ -540,4 +541,72 @@ test('r14 AC-18：没有 goal 的旧 run 形状不变 —— 可选字段不出�
     assert.equal('goal' in store.list()[0], false, '旧夹具投影后不得多出 goal: undefined/空串')
     assert.equal(store.load('run-legacy')?.plan.goal, undefined)
   })
+})
+
+/* ─────────── r20：run 结束时刻 = 落盘值优先，历史终态按可核实事实回退 ─────────── */
+
+function stateWith(
+  over: {
+    status?: 'dispatching' | 'cancelled' | 'terminated'
+    finishedAt?: number
+    taskTimes?: Record<string, { startedAt?: number; endedAt?: number }>
+    messages?: Array<{ at: number }>
+  } = {},
+) {
+  const state = wrapLegacy({
+    version: RUN_STATE_VERSION,
+    plan: legacyPlan({ runId: 'r-finished', status: over.status ?? 'terminated' }),
+    plannedAt: now,
+    ...(over.finishedAt !== undefined ? { finishedAt: over.finishedAt } : {}),
+    ...(over.taskTimes !== undefined ? { taskTimes: over.taskTimes } : {}),
+    messages: (over.messages ?? []).map((message, index) => ({
+      at: message.at,
+      from: 'captain',
+      to: 'dev-t1',
+      body: `msg-${index}`,
+    })),
+  })
+  assert.ok(state)
+  return state
+}
+
+test('finishedAtOf：真实落盘值优先（哪怕历史事实推出更晚的时刻）', () => {
+  const state = stateWith({
+    status: 'terminated',
+    finishedAt: now + 500,
+    taskTimes: { t1: { startedAt: now, endedAt: now + 900 } },
+    messages: [{ at: now + 800 }],
+  })
+  assert.equal(finishedAtOf(state), now + 500, '落盘值是真实收口证据，不能被回退口径覆盖')
+})
+
+test('finishedAtOf：历史终态缺落盘值时，取 max(任务 endedAt) 与最后消息 at 的较大值', () => {
+  const fromTaskTimes = stateWith({
+    status: 'terminated',
+    taskTimes: {
+      t1: { startedAt: now, endedAt: now + 100 },
+      t2: { startedAt: now + 50, endedAt: now + 400 },
+      t3: { startedAt: now + 60, endedAt: Number.NaN },
+    },
+  })
+  assert.equal(finishedAtOf(fromTaskTimes), now + 400, '取任务结束时刻最大值；NaN 不得参与比较')
+
+  const fromMessage = stateWith({
+    status: 'cancelled',
+    taskTimes: { t1: { startedAt: now, endedAt: now + 100 } },
+    messages: [{ at: now + 200 }, { at: now + 300 }],
+  })
+  assert.equal(finishedAtOf(fromMessage), now + 300, '最后一条消息晚于所有任务结束时刻 → 取消息时间')
+
+  const cancelledOnlyMessage = stateWith({ status: 'cancelled', messages: [{ at: now + 700 }] })
+  assert.equal(finishedAtOf(cancelledOnlyMessage), now + 700, '派发前取消的旧 run 只剩消息时间可核')
+})
+
+test('finishedAtOf：都拿不到 / 进行中 → undefined，绝不拿 now 冒充', () => {
+  assert.equal(finishedAtOf(stateWith({ status: 'terminated' })), undefined, '终态但无任何可核事实')
+  assert.equal(
+    finishedAtOf(stateWith({ status: 'dispatching', taskTimes: { t1: { endedAt: now + 100 } }, finishedAt: undefined })),
+    undefined,
+    '进行中的 run 没有结束时刻，不做回退',
+  )
 })

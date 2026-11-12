@@ -60,6 +60,17 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
     ...(handoffs.length > 0
       ? ['## 上游交接', '以下内容由上游任务的门禁证据直接投递，不需要再问队长：', ...handoffs, '']
       : []),
+    // r28：成员侧的省 token 纪律。位置在验收判定之前 —— 成员先知道「怎么干活最省」，
+    // 再读验收命令；同时必须常驻（技能正文可能被成员跳过，纪律不行）。
+    // 正文刻意压到 1000 字符以内：这段每次 spawn 都会进上下文，膨胀了就是反向省 token。
+    '## 工作纪律（省 token，硬要求）',
+    '- 先按任务卡里的「关键文件 / 符号」定位：用 `grep -n` 找符号，`read` 带 offset/limit 切片；不要整文件通读，不要 `cat`。',
+    '- 一条消息里并行发多个互不依赖的工具调用（read/grep/bash 一起发），不要一步一条命令。',
+    '- 长输出必须收窄：`| tail -30`、`pnpm test 2>&1 | grep -E "^(not ok|ℹ (pass|fail|tests))"`、`grep ... | head -20`；不要把逐条 ✔ 与整段日志塞进上下文。',
+    '- 全量门禁只在收尾跑一次；过程中用定向测试（只跑相关 test 文件）。',
+    '- 探索结果/日志用完后立即 `compress` 折叠，不要囤在上下文里。',
+    '- reasoning 只写决策与下一步，不复述计划、不复述代码全文。',
+    '',
     '## 验收判定（必须实际执行并回报退出码）',
     input.task.acceptance === '' ? '（未声明；视为需要人工确认，不得自称完成）' : `\`${input.task.acceptance}\``,
     '',

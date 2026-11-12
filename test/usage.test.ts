@@ -26,6 +26,7 @@ import {
   memberIdOf,
   runUsageOf,
   taskUsageOf,
+  tokenTotalsOf,
   usageOfSessionEvent,
 } from '../src/host/team/usage.ts'
 
@@ -72,14 +73,14 @@ test('usageOfSessionEvent：三种包裹形状都能取到数字与身份', () =
     agentId: 'm1',
     usage: { totalTokens: 120 },
   })
-  assert.deepEqual(flat, { usage: { total: 120 }, sessionId: 'm1', eventKey: 'm1:?' })
+  assert.deepEqual(flat, { usage: { total: 120, calls: 1 }, sessionId: 'm1', eventKey: 'm1:?' })
 
   const nested = usageOfSessionEvent({
     type: 'assistant/message',
     event: { agent: { id: 'm2' }, seq: 7, taskId: 't1', usage: { inputTokens: 3, outputTokens: 4 } },
   })
   assert.deepEqual(nested, {
-    usage: { total: 7, input: 3, output: 4 },
+    usage: { total: 7, input: 3, output: 4, calls: 1 },
     sessionId: 'm2',
     taskId: 't1',
     eventKey: 'm2:7',
@@ -162,6 +163,61 @@ test('runUsageOf / taskUsageOf：三态下各自的原因文案必须可读', ()
   assert.match(taskUsageOf(aggregate, 't1').reason ?? '', /未按成员归属/)
 })
 
+test('端到端：真实宿主事件 → applyUsage → 落盘 → 读回，六项指标一项不少', () => {
+  const session = { id: '3f1c2b0a-member' }
+  const event = {
+    type: 'assistant/message',
+    seq: 12,
+    data: {
+      usage: { inputTokens: 29_229, outputTokens: 344, totalTokens: 60_421, cacheReadTokens: 30_848 },
+    },
+  }
+  const parsed = usageOfSessionEvent([session, event])
+  assert.ok(parsed)
+  assert.equal(parsed.sessionId, '3f1c2b0a-member')
+  assert.equal(memberIdOf([bindingOf('3f1c2b0a-member')], parsed.sessionId), '3f1c2b0a-member')
+
+  const record = applyUsage(undefined, { ...parsed, memberId: '3f1c2b0a-member', taskId: 't1' }, NOW)
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-r17-'))
+  const store = new RunsStore(join(dir, 'runs'))
+  store.save(stateOf({ usage: record }))
+  const loaded = store.load('run-1')
+  assert.ok(loaded?.usage, '落盘再读回后 usage 仍在')
+
+  const cell = runUsageOf(loaded.usage)
+  assert.equal(cell.source, 'provider')
+  assert.equal(cell.text, '60.42K', 'r19：合计与六项同一口径（动态单位）')
+  assert.deepEqual(
+    cell.details?.map((metric) => [metric.key, metric.text]),
+    [
+      ['input', '29.23K'],
+      ['cacheRead', '30.85K'],
+      ['cacheWrite', '不可得'],
+      ['output', '344'],
+      ['calls', '1'],
+      ['hitRate', '51.3%'],
+    ],
+    '面板六项：输入未命中 / 输入命中 / 写缓存 / 输出 / 调用次数 / 缓存命中率',
+  )
+  // 任务级走 byTask，六项与 run 级同源（同一份累加结果，不会两套口径）
+  assert.deepEqual(taskUsageOf(loaded.usage, 't1').details, cell.details)
+})
+
+test('tokenTotalsOf 别名：cacheRead/cacheWrite/calls 多种宿主字段名都能取到', () => {
+  assert.deepEqual(tokenTotalsOf({ promptCacheReadTokens: 5, cacheCreationTokens: 2, requestCount: 4 }), {
+    total: 5,
+    cacheRead: 5,
+    cacheWrite: 2,
+    calls: 4,
+  })
+  assert.deepEqual(tokenTotalsOf({ input: 10, cacheRead: 90, output: 0, total: undefined }), {
+    total: 100,
+    input: 10,
+    cacheRead: 90,
+    output: 0,
+  }, '没有 totalTokens 时 total 必须含命中缓存的部分')
+})
+
 test('createUsageDeduper：重复事件只算一次，且不落盘、有上限', () => {
   const dedupe = createUsageDeduper(3)
   assert.equal(dedupe.seen('run-1', 'evt-1'), false)
@@ -197,6 +253,10 @@ test('normalizeUsage：丢坏数字、按 input+output 补 total、全坏则整�
 
   const inferred = normalizeUsage({ byMember: { m1: { total: 2 } } })
   assert.equal(inferred?.attribution, 'per-member', 'attribution 缺失时按内容推断')
+
+  // r17：cacheRead/cacheWrite/calls 必须落盘可读回，否则重启后六项指标少三项
+  const six = normalizeUsage({ attribution: 'per-member', total: { input: 10, cacheRead: 40, cacheWrite: 5, output: 2, calls: 3 } })
+  assert.deepEqual(six?.total, { total: 52, input: 10, cacheRead: 40, cacheWrite: 5, output: 2, calls: 3 }, 'total 缺失时含命中缓存的部分')
 })
 
 test('normalizeTaskTimes：毫秒整数、时间倒流整条丢弃', () => {
@@ -323,10 +383,10 @@ test('usageOfSessionEvent：真实宿主两参形状（session, event）能取�
       usage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500, cacheReadTokens: 900 },
     },
   }
-  // ① 监听器收到的参数数组
+  // ① 监听器收到的参数数组（r17：cacheReadTokens 是「输入命中」，一条消息算一次调用）
   const tuple = usageOfSessionEvent([session, event])
   assert.deepEqual(tuple, {
-    usage: { total: 1500, input: 1200, output: 300 },
+    usage: { total: 1500, input: 1200, output: 300, cacheRead: 900, calls: 1 },
     sessionId: '3f1c2b0a-member',
     eventKey: '3f1c2b0a-member:12',
   })
@@ -334,7 +394,7 @@ test('usageOfSessionEvent：真实宿主两参形状（session, event）能取�
   assert.deepEqual(usageOfSessionEvent({ session, event }), tuple)
   // ③ 只给事件本身（拿不到身份 → 只能进 aggregate-only）
   assert.deepEqual(usageOfSessionEvent(event), {
-    usage: { total: 1500, input: 1200, output: 300 },
+    usage: { total: 1500, input: 1200, output: 300, cacheRead: 900, calls: 1 },
   }, '无 session 时不给身份，但用量要取到')
 })
 

@@ -1,0 +1,113 @@
+{
+  "__fixture": "从真实 run 冻结的未收口形态（2026-11-12 15:01 前现场），仅用于回归；不得随宿主现场变化更新。",
+  "version": 3,
+  "plan": {
+    "runId": "run-mwa9n8xf-1c61",
+    "sessionId": "session-b6814f6b-61ad-432e-bdb3-5c83a1b76003",
+    "createdAt": 1794289507827,
+    "status": "draft",
+    "tasks": [
+      {
+        "id": "t1",
+        "title": "前端：表计数据抽屉改两页签，「原始读数记录」默认在首屏",
+        "roleId": "frontend",
+        "dependsOn": [],
+        "acceptance": "cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && grep -RIn \"el-tab-pane\" src/components/MeterDataDrawer.vue >/dev/null && npx vite build",
+        "status": "running",
+        "writeScopes": [
+          "client-web/src/components/MeterDataDrawer.vue",
+          "client-web/src/components/MeterRawReadings.vue"
+        ],
+        "memberId": "3b488da8-9df4-43ff-8d84-a3616f4f599b",
+        "attempts": 0
+      },
+      {
+        "id": "t2",
+        "title": "QA：抽屉首屏可见性验收（不滚动就要看到六列表头/数据/分页）",
+        "roleId": "qa",
+        "dependsOn": [
+          "t1"
+        ],
+        "acceptance": "cd /Users/maliang/Documents/develop/guangdahehui/nengtan && test -f .screenshots/verify-drawer-order.cjs && node .screenshots/verify-drawer-order.cjs",
+        "status": "pending",
+        "writeScopes": [
+          ".screenshots"
+        ]
+      }
+    ],
+    "maxConcurrent": 2,
+    "goal": "修「表计数据抽屉里看不到原始表计值/尖峰平谷总」：现场实测代码与接口都是新的（live bundle 已含新列、API 已返回 raw_value），问题是「原始读数记录」区块排在聚合图表之后、落在抽屉首屏以下约 420px 处，用户不滚动就看不到。改为抽屉内两页签，默认落在「原始读数记录」，并让 QA 在首屏不滚动的前提下验收。"
+  },
+  "plannedAt": 1794289507827,
+  "messages": [
+    {
+      "at": 1794289508191,
+      "from": "captain",
+      "to": "frontend-t1-r9vi3s",
+      "body": "任务「前端：表计数据抽屉改两页签，「原始读数记录」默认在首屏」已派发给你（角色 前端工程师）。验收判定：cd client-web && grep -RIn --fixed-strings \"原始读数记录\" src/components/MeterDataDrawer.vue >/dev/null && grep -RIn \"el-tab-pane\" src/components/MeterDataDrawer.vue >/dev/null && npx vite build",
+      "messageId": "msg-1794289508191-21",
+      "toMemberId": "3b488da8-9df4-43ff-8d84-a3616f4f599b",
+      "taskId": "t1"
+    }
+  ],
+  "bindings": [
+    {
+      "taskId": "t1",
+      "roleId": "frontend",
+      "memberId": "3b488da8-9df4-43ff-8d84-a3616f4f599b",
+      "name": "frontend-t1-r9vi3s",
+      "spawnedAt": 1794289508191
+    }
+  ],
+  "routeAudits": [
+    {
+      "taskId": "t1",
+      "roleId": "frontend",
+      "declared": null,
+      "actual": null,
+      "at": 1794289846341,
+      "verdict": "unverified"
+    }
+  ],
+  "progress": {},
+  "stallAlerts": [],
+  "triggers": [],
+  "project": "/Users/maliang/Documents/develop/guangdahehui/nengtan",
+  "usage": {
+    "attribution": "per-member",
+    "byMember": {
+      "3b488da8-9df4-43ff-8d84-a3616f4f599b": {
+        "total": 4143108,
+        "input": 105589,
+        "output": 40463,
+        "cacheRead": 3997056,
+        "cacheWrite": 0,
+        "calls": 62
+      }
+    },
+    "byTask": {
+      "t1": {
+        "total": 4143108,
+        "input": 105589,
+        "output": 40463,
+        "cacheRead": 3997056,
+        "cacheWrite": 0,
+        "calls": 62
+      }
+    },
+    "updatedAt": 1794289859603,
+    "total": {
+      "total": 4143108,
+      "input": 105589,
+      "output": 40463,
+      "cacheRead": 3997056,
+      "cacheWrite": 0,
+      "calls": 62
+    }
+  },
+  "taskTimes": {
+    "t1": {
+      "startedAt": 1794289508191
+    }
+  }
+}

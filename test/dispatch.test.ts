@@ -20,8 +20,10 @@ import {
   dispatchReady,
   memberNameFor,
   resumeRun,
+  routeReusable,
   runningCount,
   shortIdentityHash,
+  taskCardText,
   withNameSuffix,
   type DispatchDeps,
   type PromptInput,
@@ -1353,3 +1355,318 @@ test('dispatch：并发满的早退分支也必须落盘（否则这一轮的等
 })
 
 
+/* ─────────── r20：run 终态结束时刻（finishedAt）由回执收口时落盘 ─────────── */
+
+test('applyReceipt：最后一个任务收口时写 finishedAt + terminated，重放不刷新', () => {
+  const tasks = [
+    makeTask('t1', { status: 'running', memberId: 'm-dev-t1' }),
+    makeTask('t2', { status: 'running', memberId: 'm-dev-t2' }),
+  ]
+  let state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1'), bindingOf('t2', 'dev-t2')] })
+
+  state = applyReceipt(state, 't1', { verdict: 'done' }, now + 100)
+  assert.equal(state.finishedAt, undefined, '还有任务在跑就不能写结束时刻')
+  assert.equal(state.plan.status, 'dispatching')
+
+  state = applyReceipt(state, 't2', { verdict: 'done' }, now + 200)
+  assert.equal(state.finishedAt, now + 200, '收口时刻 = 本次回执的 at')
+  assert.equal(state.plan.status, 'terminated')
+
+  const replay = applyReceipt(state, 't2', { verdict: 'done' }, now + 900)
+  assert.equal(replay.finishedAt, now + 200, '重放同一回执不得把结束时刻往后推')
+  assert.equal(replay.plan.status, 'terminated')
+})
+
+test('applyReceipt：failed 也算收口（全部任务终态 → finishedAt + terminated）', () => {
+  const tasks = [makeTask('t1', { status: 'running', memberId: 'm-dev-t1' })]
+  const state = makeState(tasks, { bindings: [bindingOf('t1', 'dev-t1')] })
+
+  const next = applyReceipt(state, 't1', { verdict: 'failed', note: '门禁连续失败' }, now + 300)
+  assert.equal(next.plan.tasks[0]?.status, 'failed')
+  assert.equal(next.finishedAt, now + 300, '失败收口同样要有结束时刻')
+  assert.equal(next.plan.status, 'terminated')
+})
+
+/* ─────────── t5：按角色复用成员（宿主席位是终身配额） ─────────── */
+
+/** t5 用例的发送桩：记录 (memberId, text)，默认成功。 */
+function makeSendStub(verdict: { ok: boolean; error?: string } = { ok: true }) {
+  const sent: Array<{ memberId: string; text: string }> = []
+  const send = async (memberId: string, text: string) => {
+    sent.push({ memberId, text })
+    return verdict
+  }
+  return { sent, send }
+}
+
+test('t5：同 run 同角色复用空闲成员——不新建成员，新任务卡直发该成员', async () => {
+  const { store, dir, cleanup } = makeStore()
+  try {
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2')]
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'inactive' }
+    const state = makeState(tasks, { bindings: [bindingOf('t1', member.name, member.id)] })
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { sent, send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(spawned.length, 0, '同角色有空闲成员时必须复用，绝不再建一个（名额泄漏的直接判据）')
+    assert.equal(sent.length, 1, '复用必须真的把任务卡发出去（只改 binding 不派活等于静默丢任务）')
+    assert.equal(sent[0]?.memberId, 'm-dev-t1')
+    assert.match(sent[0]?.text ?? '', /## 新任务（t2）/, '发的是可执行的任务卡，不是随便一句「继续」')
+    assert.match(sent[0]?.text ?? '', /pnpm typecheck/, '任务卡必须带上本任务的验收命令')
+    const binding = result.state.bindings.find((item) => item.taskId === 't2')
+    assert.equal(binding?.memberId, 'm-dev-t1', '新任务按 taskId 记自己的 binding，但指向同一个成员')
+    assert.equal(binding?.roleId, 'dev')
+    assert.equal(statusOf(result.state, 't2'), 'running')
+    assert.ok(
+      result.state.bindings.some((item) => item.taskId === 't1' && item.retired !== true),
+      '复用不清旧 binding：面板仍要能查到 t1 是谁做的',
+    )
+    assert.ok(
+      result.state.messages.some((message) => message.taskId === 't2' && message.toMemberId === 'm-dev-t1'),
+      '派活必须落一条直达消息（AC-16 的证据链对复用同样成立）',
+    )
+    assert.equal(
+      new RunsStore(dir).load('run-1')?.plan.tasks.find((task) => task.id === 't2')?.status,
+      'running',
+      '复用路径也必须落盘',
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：跨 run 复用——上一轮 run 收口后的成员仍可接新 run 的任务（「跑两轮就满」的根因场景）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-old', name: 'dev-old-abc123', status: 'inactive' }
+    const previousTasks = [makeTask('old', { status: 'done' })]
+    store.save(
+      makeState(previousTasks, {
+        plan: makePlan(previousTasks, { runId: 'run-0', status: 'terminated' }),
+        bindings: [bindingOf('old', member.name, member.id)],
+      }),
+    )
+
+    const tasks = [makeTask('t1')]
+    const state = makeState(tasks)
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { sent, send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+
+    assert.deepEqual(result.started, ['t1'])
+    assert.equal(spawned.length, 0, '跨 run 也必须复用：每轮 run 的 bindings 从空开始，只扫本 run 等于没修')
+    assert.equal(sent[0]?.memberId, member.id)
+    assert.equal(result.state.bindings.find((item) => item.taskId === 't1')?.memberId, member.id)
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：没在跑的 run（dispatching/paused）里的成员不被抢——两条 run 不能共用一个上下文', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-busy', name: 'dev-busy-abc123', status: 'inactive' }
+    const previousTasks = [makeTask('old', { status: 'done' })]
+    store.save(
+      makeState(previousTasks, {
+        plan: makePlan(previousTasks, { runId: 'run-0', status: 'paused' }),
+        bindings: [bindingOf('old', member.name, member.id)],
+      }),
+    )
+
+    const tasks = [makeTask('t1')]
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(makeState(tasks), deps)
+    assert.deepEqual(result.started, ['t1'])
+    assert.equal(spawned.length, 1, '暂停中的 run 恢复后还要用自己的成员，不能被新 run 抢走')
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：成员正被另一个未收口任务占着 → 不算空闲（同一成员不许同时背两张任务卡）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const tasks = [
+      makeTask('t1', { status: 'done' }),
+      makeTask('t9', { status: 'running', memberId: 'm-dev-t1' }),
+      makeTask('t2'),
+    ]
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'running' }
+    const state = makeState(tasks, {
+      bindings: [bindingOf('t1', member.name, member.id), bindingOf('t9', member.name, member.id)],
+    })
+    const { deps, spawned } = makeDeps(store, { members: [member], hostLimit: 8 })
+    const { sent, send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(sent.length, 0, '忙成员不许接第二张卡（会串任务、还会让两个任务的 binding 抢同一上下文）')
+    assert.equal(spawned.length, 1, '没有别的空闲成员时照常新建，绝不因为「看起来能复用」而不派')
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：retired / stopping 的 binding 不复用，成员名单里 failed 的也不复用', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'failed' }
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2')]
+    const state = makeState(tasks, {
+      bindings: [{ ...bindingOf('t1', member.name, member.id), retired: true }],
+    })
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(spawned.length, 1, '已退休/已失败的成员都不能接新任务')
+    assert.equal(result.state.bindings.find((item) => item.taskId === 't2')?.memberId, `m-${spawned[0]?.name}`)
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：路由漂移过的成员不复用（AC-22 不能被复用绕过）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const role = makeRole('dev', { provider: 'deepseek', model: 'deepseek-chat' })
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'inactive' }
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2')]
+    const state = makeState(tasks, {
+      bindings: [bindingOf('t1', member.name, member.id)],
+      routeAudits: [
+        {
+          taskId: 't1',
+          roleId: 'dev',
+          declared: { provider: 'deepseek', model: 'deepseek-chat' },
+          actual: { provider: 'other', model: 'other-model' },
+          at: now,
+          verdict: 'drift',
+        },
+      ],
+    })
+    const { deps, spawned } = makeDeps(store, { roles: [role], members: [member] })
+    const { send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(spawned.length, 1, '上个任务的实际模型与声明不符 → 宁可新建成员，也不复用漂移上下文')
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：发送失败落回新建成员（复用是名额优化，绝不能变成静默不派）', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'inactive' }
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2')]
+    const state = makeState(tasks, { bindings: [bindingOf('t1', member.name, member.id)] })
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { sent, send } = makeSendStub({ ok: false, error: '成员已终止' })
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'], '发送失败也必须把任务派出去（新建成员）')
+    assert.equal(sent.length, 1, '必须先试过复用')
+    assert.equal(spawned.length, 1, '发送失败 → 落回 spawn')
+    assert.notEqual(result.state.bindings.find((item) => item.taskId === 't2')?.memberId, member.id)
+    assert.equal(statusOf(result.state, 't2'), 'running')
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：一个空闲成员只接一张卡——同批第二个同角色任务照常新建', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'inactive' }
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2'), makeTask('t3')]
+    const state = makeState(tasks, { bindings: [bindingOf('t1', member.name, member.id)] })
+    const { deps, spawned } = makeDeps(store, { members: [member] })
+    const { sent, send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2', 't3'])
+    assert.equal(sent.length, 1, '同一成员本轮只复用一次')
+    assert.equal(spawned.length, 1, '第二个任务新建成员，绝不把两张卡塞给同一个成员')
+    assert.equal(result.state.bindings.find((item) => item.taskId === 't3')?.memberId, `m-${spawned[0]?.name}`)
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：成员名单不可得（listMembers 抛错）→ 一律不复用，宁可新建', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const member = { id: 'm-dev-t1', name: 'dev-t1-abc123', status: 'inactive' }
+    const tasks = [makeTask('t1', { status: 'done' }), makeTask('t2')]
+    const state = makeState(tasks, { bindings: [bindingOf('t1', member.name, member.id)] })
+    const { deps, spawned } = makeDeps(store)
+    deps.listMembers = async () => {
+      throw new Error('宿主名单不可得')
+    }
+    const { send } = makeSendStub()
+    deps.sendMessage = send
+
+    const result = await dispatchReady(state, deps)
+    assert.deepEqual(result.started, ['t2'])
+    assert.equal(spawned.length, 1, '名单不可得时无法确认成员活着 → 不猜，直接新建')
+  } finally {
+    cleanup()
+  }
+})
+
+test('t5：routeReusable / taskCardText 的口径（纯函数直测）', () => {
+  const role = makeRole('dev', { provider: 'deepseek', model: 'deepseek-chat' })
+  assert.equal(routeReusable(role, null), false, '上个任务没声明模型、本次声明了 → 不认为同路由')
+  assert.equal(routeReusable(role, { declared: null, actual: null }), false)
+  assert.equal(
+    routeReusable(role, { declared: { provider: 'deepseek', model: 'deepseek-chat' }, actual: null }),
+    true,
+    '声明一致、实际未测到 → 可以复用（沿用原上下文，绑定记 unverified）',
+  )
+  assert.equal(
+    routeReusable(role, {
+      declared: { provider: 'deepseek', model: 'deepseek-chat' },
+      actual: { provider: 'deepseek', model: 'deepseek-chat' },
+    }),
+    true,
+  )
+  assert.equal(
+    routeReusable(role, {
+      declared: { provider: 'deepseek', model: 'deepseek-chat' },
+      actual: { provider: 'other', model: 'other' },
+    }),
+    false,
+    '实际漂移 → 不复用',
+  )
+  assert.equal(routeReusable(makeRole('dev'), null), true, '都不声明模型 = 都走会话默认，可以复用')
+
+  const card = taskCardText(
+    makeTask('t9', { dependsOn: ['t8'], acceptance: 'pnpm test' }),
+    role,
+    ['上游结论 A'],
+  )
+  assert.match(card, /## 新任务（t9）：任务t9/)
+  assert.match(card, /前置任务（已完成）：t8/)
+  assert.match(card, /## 上游交接[\s\S]*上游结论 A/)
+  assert.match(card, /## 验收判定（必须实际执行并回报退出码）[\s\S]*`pnpm test`/)
+  assert.match(card, /taskId = t9/)
+  assert.doesNotMatch(card, /## 技能/, '任务卡不重复角色/技能：成员上下文里已经有了')
+})

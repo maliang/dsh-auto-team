@@ -11,8 +11,18 @@
  *    `buildPlan` / `extendPlan` 保持宽容（既有样本直接构造 `acceptance:''`），
  *    因为只有工具入口能在 `store.save` **之前**整批拒绝、做到「一条都不落盘」。
  */
-import type { ActResult, PanelSnapshot, Plan, PlanTask, RejectionCode, Result } from '../shared/types.ts'
+import type {
+  ActResult,
+  MemoryLevel,
+  MemoryTopicId,
+  PanelSnapshot,
+  Plan,
+  PlanTask,
+  RejectionCode,
+  Result,
+} from '../shared/types.ts'
 import { MEMORY_LINES_PER_TASK, TOOL_PREFIX } from './config.ts'
+import { parseEntryFile, topicCatalogOf, type EntryDraft } from './memory/entries.ts'
 import { blockedTasks, readyTasks } from './plan/graph.ts'
 import {
   ACCEPTANCE_TEMPLATES,
@@ -50,13 +60,25 @@ export interface ToolsDeps {
    */
   autoDispatch?: (sessionId: string, runId: string | undefined, cause: AutoDispatchCause) => void
   /**
-   * 本 run 的工作区名（r14 AC-14/AC-15）：`auto_team_plan` 落盘时写进 `RunState.project`。
+   * 兜底工作区（r14 AC-14/AC-15）：`workspaceOf` 取不到时才写进 `RunState.project`。
    *
    * **必须与 `LibraryDeps.workspace` 是同一个字符串**（装配层注入，`host/index.ts` 一处取值）：
    * 两个字符串只要差一个字符，同一个工作区就会在左栏裂成两个项目桶。
    * 缺省（单测桩）= 不写 project，旧 run 归入「历史运行（未记录工作区）」——不猜、不迁移。
    */
   workspace?: string
+  /**
+   * 本次 run 的工作区（r19）：按 sessionId 取**会话自己的 cwd**，`auto_team_plan` 落盘时
+   * 写进 `RunState.project`。
+   *
+   * 为什么必须按会话取：`apply()` 只在宿主启动时跑一次，装配时的 `process.cwd()` 在桌面宿主里
+   * 是 profile 目录（`~/.dsh/profiles/desktop`），写进 project 就让左栏把 13 次运行都归到 `desktop`
+   * 名下。装配层（`host/index.ts`）先读 `agent.session.header.cwd`，再按注册表反查，都取不到
+   * 才返回 undefined（工具层回退到 `workspace`）。
+   *
+   * 缺省（单测桩）= 只用 `workspace`（旧行为，全部保持通过）。
+   */
+  workspaceOf?: (sessionId: string) => string | undefined
   /**
    * 派发报告（r14 AC-3）：`auto_team_status` 的 `dispatch` 段，来源 `autoDispatcher.reportsOf`。
    *
@@ -90,6 +112,38 @@ const DISPATCH_SYNC_NOTE = '派发端口未装配（宿主未接自动派发）�
  */
 export const DISPATCH_ALREADY_TEXT = '此前已自动派发：成员已在运行，本次未重复起人'
 
+/**
+ * `auto_team_status` 的消息投影（r28）：默认精简，别让 200 条历史消息撑爆队长上下文。
+ *
+ * 账本本身仍然保留全量（`RunState.messages` 上限 200），这里只决定「回给模型看多少」：
+ *  - 默认最近 8 条、单条正文截断 400 字，并给 `messagesTotal` 让队长知道「还有多少没看到」；
+ *  - 需要全文时显式传 `detail:'full'`（最近 20 条、正文不截断，等价于精简化之前的返回值）。
+ */
+const STATUS_MESSAGES_COMPACT_LIMIT = 8
+const STATUS_MESSAGES_FULL_LIMIT = 20
+const STATUS_MESSAGE_BODY_MAX = 400
+
+/** 一条消息的投影：正文超长时截断并标 `truncated`+`bodyChars`，其余字段原样保留。 */
+function messageBrief(
+  message: PanelSnapshot['messages'][number],
+  maxBody: number | null,
+): Record<string, unknown> {
+  const body = typeof message.body === 'string' ? message.body : ''
+  // 按 code point 截断：直接 `slice` 可能把 emoji 劈成孤立代理项，宿主会拒收这种返回值。
+  const codePoints = Array.from(body)
+  const truncated = maxBody !== null && codePoints.length > maxBody
+  return {
+    at: message.at,
+    from: message.from,
+    to: message.to,
+    ...(message.taskId === undefined ? {} : { taskId: message.taskId }),
+    ...(message.toMemberId === undefined ? {} : { toMemberId: message.toMemberId }),
+    ...(message.messageId === undefined ? {} : { messageId: message.messageId }),
+    body: truncated ? `${codePoints.slice(0, maxBody).join('')}…` : body,
+    ...(truncated ? { truncated: true, bodyChars: codePoints.length } : {}),
+  }
+}
+
 /** 成员投影（dispatch 与 status 工具共用的那一份，避免两处字段慢慢分叉）。 */
 function memberBrief(member: PanelSnapshot['members'][number]): Record<string, unknown> {
   return {
@@ -121,6 +175,26 @@ export function sessionOf(meta: unknown): string {
   return value?.agent?.id ?? value?.sessionId ?? value?.session?.id ?? 'current'
 }
 
+/**
+ * 本次 run 最终写进 `RunState.project` 的工作区（r19）。
+ *
+ * 顺序：`deps.workspaceOf(sessionId)`（会话 cwd / 注册表反查）→ 装配层兜底 `deps.workspace`。
+ * `workspaceOf` 是装配层注入的外部回调：它抛错只代表「这次取不到」，回退到兜底即可，
+ * 绝不能让一次计划落盘因为宿主读不到工作区而失败（fail-open 到旧行为）。
+ */
+function workspaceFor(deps: ToolsDeps, sessionId: string): string | undefined {
+  let own: string | undefined
+  try {
+    const value = deps.workspaceOf?.(sessionId)
+    own = typeof value === 'string' ? value.trim() : undefined
+  } catch {
+    own = undefined
+  }
+  if (own !== undefined && own !== '') return own
+  const fallback = (deps.workspace ?? '').trim()
+  return fallback === '' ? undefined : fallback
+}
+
 function taskBrief(task: PlanTask): Record<string, unknown> {
   return {
     id: task.id,
@@ -148,7 +222,11 @@ const TASK_ITEM_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
     id: { type: 'string', description: '任务 id，缺省按 t1/t2… 生成（追加时不得与既有 id 重复）' },
-    title: { type: 'string' },
+    title: {
+      type: 'string',
+      description:
+        '写清要实现什么 + 关键文件与符号（成员据此定位；不要写「看一下相关代码」）；一行结论在前，细节在后',
+    },
     roleId: { type: 'string', description: '执行该任务的角色 id' },
     dependsOn: {
       type: 'array',
@@ -157,7 +235,8 @@ const TASK_ITEM_SCHEMA: Record<string, unknown> = {
     },
     acceptance: {
       type: 'string',
-      description: '验收命令（门禁据此产出证据）；不能是空白字符串，空验收会整批拒绝',
+      description:
+        '验收命令（门禁据此产出证据）；不能是空白字符串，空验收会整批拒绝。输出会进上下文，长输出请自行收窄（如 | tail -20）',
     },
     writeScopes: {
       type: 'array',
@@ -262,13 +341,25 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       parameters: {
         type: 'object',
         properties: {
-          goal: { type: 'string', description: '要达成的目标' },
+          goal: { type: 'string', description: '要达成的目标（revise=true 时是「本次修订的新要求」，会作为「需求修订」段落追加，不覆盖原目标）' },
           maxConcurrent: { type: 'integer', description: '并发上限，默认 3，硬上限 8' },
           tasks: {
             type: 'array',
-            description: '任务列表（依赖必须指向同一列表里的 id；1 条也合法）',
+            description: '任务列表（依赖必须指向同一列表里的 id；1 条也合法）。revise=true 时：id 命中既有任务=更新其目标/验收，无 id 或新 id=追加任务',
             items: TASK_ITEM_SCHEMA,
           },
+          revise: {
+            type: 'boolean',
+            description: '显式声明「这是对在跑需求的修改」。只有队长判断本次输入是同一需求的修订时才传 true；不传时一律新建 run（不相关的新需求不并入旧计划）',
+          },
+          runId: { type: 'string', description: 'revise=true 时要并入的 runId；缺省取当前会话最近的非终态 run' },
+          changeSummary: { type: 'string', description: 'revise=true 时的变更要点（会原样写进给在跑成员的直达消息与任务卡修订说明）' },
+          cancelledTaskIds: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'revise=true 时被新需求作废的任务 id（转 cancelled，面板可见作废原因）',
+          },
+          cancelReason: { type: 'string', description: 'revise=true 时作废任务的统一原因；缺省由修订说明生成' },
         },
         required: ['goal', 'tasks'],
       },
@@ -282,11 +373,97 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         if (!scoped.ok) return { ok: false, code: 'BAD_REQUEST', error: scoped.error }
 
         const at = deps.now()
+        const goal = typeof args.goal === 'string' ? args.goal : ''
+        const maxConcurrent = typeof args.maxConcurrent === 'number' ? args.maxConcurrent : undefined
+        const revise = args.revise === true
+        const requestedRunId = typeof args.runId === 'string' ? args.runId.trim() : ''
+
+        // 会话里所有非终态 run（新建提示与 revise 目标解析共用一份，避免两处口径分叉）。
+        const openRuns = deps.store
+          .list()
+          .filter(
+            (summary) =>
+              summary.sessionId === sessionId &&
+              summary.status !== 'cancelled' &&
+              summary.status !== 'terminated',
+          )
+          .sort((left, right) => right.createdAt - left.createdAt)
+
+        // r21：需求修订走**显式**通道。判定权在队长（`revise: true`），这里只解析目标 run，
+        // 绝不自动并入 —— 不相关的新需求必须仍然新建 run（这是 r21 口径修正的核心）。
+        if (revise) {
+          // 不带 runId 时取**最新的非终态 run**（不是 latestForSession：最后一条可能已收口）。
+          const target = requestedRunId === ''
+            ? (openRuns[0] === undefined ? null : deps.store.load(openRuns[0].runId))
+            : deps.store.load(requestedRunId)
+          if (target === null) {
+            if (requestedRunId !== '') {
+              return { ok: false, code: 'NOT_FOUND', error: `找不到要修订的 run：${requestedRunId}` }
+            }
+            // 没有可并入的 run（会话从未跑过）：退化成新建，并在 note 里说清楚。
+          } else if (target.plan.sessionId !== sessionId) {
+            return {
+              ok: false,
+              code: 'NOT_FOUND',
+              error: `run ${target.plan.runId} 不属于当前会话，拒绝并入（请确认 runId）`,
+            }
+          } else if (target.plan.status === 'cancelled' || target.plan.status === 'terminated') {
+            // 显式 runId 指向终态：拒绝，绝不复活旧计划（不带 runId 时上面已不会解析到终态 run）。
+            const label = target.plan.status === 'cancelled' ? '已取消' : '已终止'
+            return {
+              ok: false,
+              code: 'BAD_REQUEST',
+              error: `run ${target.plan.runId} ${label}，不能再并入需求修订；请去掉 revise 或换一个在跑的 runId 开新计划`,
+            }
+          } else {
+            const outcome = await deps.bridge.revise(sessionId, target.plan.runId, {
+              goal,
+              changeSummary: typeof args.changeSummary === 'string' ? args.changeSummary : undefined,
+              cancelledTaskIds: Array.isArray(args.cancelledTaskIds)
+                ? (args.cancelledTaskIds as unknown[]).map((id) => String(id ?? ''))
+                : undefined,
+              cancelReason: typeof args.cancelReason === 'string' ? args.cancelReason : undefined,
+              tasks: scoped.tasks,
+              maxConcurrent,
+            })
+            if (!outcome.ok) return { ok: false, code: outcome.code, error: outcome.reason }
+            // 追加出来的 pending 任务走同一条自动派发；更新/作废的任务不动它们的成员（停止由桥负责）。
+            deps.autoDispatch?.(sessionId, outcome.plan.runId, 'plan-saved')
+            return {
+              ok: true,
+              mode: outcome.mode,
+              runId: outcome.plan.runId,
+              plannedAt: target.plannedAt,
+              maxConcurrent: outcome.plan.maxConcurrent,
+              tasks: outcome.plan.tasks.map(taskBrief),
+              ready: readyTasks(outcome.plan.tasks),
+              blocked: blockedTasks(outcome.plan.tasks),
+              members: deps.bridge.snapshot(sessionId).members.length,
+              added: outcome.added.map(taskBrief),
+              updated: outcome.updated.map(taskBrief),
+              cancelled: outcome.cancelled.map(taskBrief),
+              skipped: outcome.skipped,
+              stopped: outcome.stopped,
+              stopFailed: outcome.stopFailed,
+              notified: outcome.notified,
+              notifyFailed: outcome.notifyFailed,
+              goal: outcome.plan.goal,
+              revisions: outcome.plan.revisions ?? [],
+              note:
+                `已并入需求修订（mode=${outcome.mode}）：更新 ${outcome.updated.length}、追加 ${outcome.added.length}、`
+                + `作废 ${outcome.cancelled.length}；在跑成员已按新需求通知 ${outcome.notified.length} 人。`,
+            }
+          }
+        }
+
+        // 新建 run 前先看一眼：会话里还有在跑的 run 时给队长提示（不自动并入！）。
+        const activeOther = openRuns[0]?.runId
+
         const draft = buildPlan(
           {
             sessionId,
-            goal: typeof args.goal === 'string' ? args.goal : '',
-            maxConcurrent: typeof args.maxConcurrent === 'number' ? args.maxConcurrent : undefined,
+            goal,
+            maxConcurrent,
             tasks: scoped.tasks,
           },
           uniqueRunId(deps.store, sessionId, at),
@@ -299,6 +476,7 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         const emptyAcceptance = emptyAcceptanceOf(draft.plan.tasks, deps.scripts)
         if (emptyAcceptance !== null) return { ok: false, code: 'BAD_REQUEST', error: emptyAcceptance }
 
+        const workspace = workspaceFor(deps, sessionId)
         const state: RunState = {
           version: RUN_STATE_VERSION,
           plan: draft.plan,
@@ -307,8 +485,10 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           bindings: [],
           routeAudits: [],
           // r14 AC-14：r13 早就有这个字段与投影，只是从没被写过 —— 左栏因此把每次新 run
-          // 都归进历史桶（「历史运行（未记录工作区）」）。写入点只在这里（读的是装配层那个与 library 完全同源的字符串）。
-          ...(deps.workspace === undefined ? {} : { project: deps.workspace }),
+          // 都归进历史桶（「历史运行（未记录工作区）」）。写入点只在这里。
+          // r19：来源改为**会话 cwd**（`workspaceOf`），装配 workspace 只做兜底 ——
+          // 宿主 profile 目录（desktop）不再冒充用户工作区。
+          ...(workspace === undefined ? {} : { project: workspace }),
         }
         deps.store.save(state)
         // r13 AC-8：计划落盘后**零点击**自动派发（notice 文案同步改成「已自动派发」，不再要求用户手动确认）。
@@ -316,6 +496,7 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
 
         return {
           ok: true,
+          mode: 'created' as const,
           runId: draft.plan.runId,
           plannedAt: state.plannedAt,
           maxConcurrent: draft.plan.maxConcurrent,
@@ -323,7 +504,13 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           ready: readyTasks(draft.plan.tasks),
           blocked: blockedTasks(draft.plan.tasks),
           members: 0,
-          note: '计划已保存；符合依赖与并发条件的任务会自动派发，无需再手动调用 dispatch。',
+          // 不相关的新需求允许新建 run；但必须让队长看见「另有一个在跑的 run」，避免误以为自己改了旧计划。
+          ...(activeOther === undefined ? {} : { activeRunId: activeOther }),
+          note:
+            `计划已保存；符合依赖与并发条件的任务会自动派发，无需再手动调用 dispatch。`
+            + (activeOther === undefined
+              ? ''
+              : `当前会话还有在跑的 run ${activeOther}；若这次是对它的需求修订，请传 revise=true 与 runId=${activeOther}`),
         }
       },
     },
@@ -418,12 +605,30 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       name: `${TOOL_PREFIX}status`,
       description:
         '读取当前会话的执行计划、成员状态、门禁证据、消息账本、记忆注入预算与角色列表。'
+        + `默认精简：messages 只留最近 ${STATUS_MESSAGES_COMPACT_LIMIT} 条、单条正文截断 ${STATUS_MESSAGE_BODY_MAX} 字，`
+        + '并给 messagesTotal 总数（要看全文就传 detail:\'full\'）。'
         + '**只读**：先查 `enabled`，确认开关打开后才决定是否 plan/dispatch；未启用时不要创建成员或计划。',
-      parameters: { type: 'object', properties: {}, required: [] },
-      async handler(_args, meta) {
+      parameters: {
+        type: 'object',
+        properties: {
+          detail: {
+            type: 'string',
+            enum: ['compact', 'full'],
+            description:
+              `compact（默认）：消息只留最近 ${STATUS_MESSAGES_COMPACT_LIMIT} 条、正文截断 ${STATUS_MESSAGE_BODY_MAX} 字；`
+              + `full：最近 ${STATUS_MESSAGES_FULL_LIMIT} 条、正文不截断`,
+          },
+        },
+        required: [],
+      },
+      async handler(args, meta) {
         const sessionId = sessionOf(meta)
         if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
         const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId)
+        // 默认精简：不传即 compact；只有显式 full 才回正文全文（默认值写死在实现里，schema 只是提示）。
+        const detail = args?.detail === 'full' ? 'full' : 'compact'
+        const limit = detail === 'full' ? STATUS_MESSAGES_FULL_LIMIT : STATUS_MESSAGES_COMPACT_LIMIT
+        const messages = snapshot.messages.slice(-limit)
         return {
           ok: true,
           enabled: snapshot.enabled,
@@ -439,7 +644,11 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
               : undefined,
           })),
           members: snapshot.members,
-          messages: snapshot.messages.slice(-20),
+          detail,
+          messages: messages.map((message) => messageBrief(message, detail === 'full' ? null : STATUS_MESSAGE_BODY_MAX)),
+          messagesTotal: snapshot.messages.length,
+          messagesShown: messages.length,
+          messagesTruncated: snapshot.messages.length > messages.length,
           routeAudits: snapshot.routeAudits,
           // r14 AC-3：「后台派发到底发生了什么」——受理制之后这是唯一能解释「已接受派发但没人起来」的窗口。
           // 只报最近 ≤5 条（内存态，进程重启即空）：它不是账本，而是「刚才那几次」。
@@ -540,18 +749,25 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
     {
       name: `${TOOL_PREFIX}memory`,
       description:
-        '读写团队记忆（双轨 md）：track=public 为跨项目公共记忆，track=project 为当前项目记忆。写入自动限制行数并落来源标注。'
-        + 'action=expand 按内联索引里的 ID（mem://<track>/<stem>）取回原文——上下文里只内联了 ID+标题+首句，'
-        + '要读完整内容必须显式展开，不要凭标题猜正文。',
+        '读写团队记忆（双轨 md）：track=public 为跨项目公共记忆，track=project 为当前项目记忆。'
+        + 'write 支持 importance（P0 铁律 / P1 教训 / P2 默认）与 topic；正文按主题文件合并、自动判重并受每文件 40 条配额约束。'
+        + 'action=expand 按内联索引里的 ID（mem://<track>/<stem>#<hash12>）取回原文——上下文里只内联了 ID+标题+首句，'
+        + '要读完整内容必须显式展开，不要凭标题猜正文。'
+        + 'action=curate 把旧 run-*.md / lessons-*.md 的失败证据提炼进 pitfalls.md，dryRun 缺省 true：先预览，再 dryRun:false 执行。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'read', 'write', 'expand'] },
+          action: { type: 'string', enum: ['list', 'read', 'write', 'expand', 'curate'] },
           track: { type: 'string', enum: ['public', 'project'] },
-          name: { type: 'string', description: '文件名（单段，自动补 .md）' },
-          body: { type: 'string' },
-          id: { type: 'string', description: 'action=expand 的记忆 ID（mem://<track>/<stem>，来自内联索引）' },
+          name: { type: 'string', description: 'write 时的主题/文件名（如 pitfalls 或 pitfalls.md）；read 时是文件名' },
+          body: { type: 'string', description: '兼容旧写入（与 text 二选一）' },
+          text: { type: 'string', description: '新写入；单条，或多行（每行一条）' },
+          importance: { type: 'string', enum: ['P0', 'P1', 'P2'], description: '缺省 P2' },
+          topic: { type: 'string', description: '显式主题 id；缺省按正文路由' },
+          supersedes: { type: 'string', description: '要取代的旧正文（只能配一条正文）' },
+          id: { type: 'string', description: 'action=expand 的记忆 ID（mem://<track>/<stem>#<hash12>，来自内联索引）' },
           depth: { type: 'number', description: 'action=expand 顺着关联 ID 继续展开的跳数（1~2，缺省 1）' },
+          dryRun: { type: 'boolean', description: 'action=curate 的预演开关，缺省 true（不写盘）' },
         },
         // expand 只需要 id（track/name 由 ID 自带）：把它俩设成 required 会逼模型为展开动作编一个 track。
         // read/write 缺 name 的情况下面按业务拒绝，原因文案反而更可读。
@@ -572,8 +788,16 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             injectedChars: snapshot.memory.injectedChars,
             truncated: snapshot.memory.truncated,
             files: snapshot.memory.files,
+            quotas: snapshot.memory.quotas,
+            legacyFileCount: snapshot.memory.legacyFileCount,
             inline: snapshot.memory.inline ?? [],
             omitted: snapshot.memory.omitted ?? [],
+            // r22：落点与退化原因随 list 一起给出（「记忆写在哪个项目」必须可见）。
+            projectDir: snapshot.memory.projectDir,
+            ...(snapshot.memory.workspace === undefined ? {} : { workspace: snapshot.memory.workspace }),
+            ...(snapshot.memory.degraded === true
+              ? { degraded: true, degradeReason: snapshot.memory.degradeReason }
+              : {}),
           }
         }
 
@@ -583,11 +807,25 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             return { ok: false, code: 'EXPAND_BAD_ID', error: 'expand 需要 id（形如 mem://project/<文件名>）' }
           }
           const depth = typeof args.depth === 'number' ? args.depth : undefined
-          const expanded = deps.bridge.expandMemory(id, depth)
+          const expanded = deps.bridge.expandMemory(id, depth, sessionId)
           if (expanded.error !== undefined) return { ok: false, error: expanded.error }
           // 失败码原样透出（AC-11）：模型要能区分「ID 写错 / 越权 / 不存在 / 跳数超限」，
           // 压成一句「展开失败」它只会盲试。
           const payload = expanded.data
+          // 条目级 ID：正文就是一条 renderEntry 结果，顺手把它解析成结构化字段给模型看
+          // （整文件展开时 body 是多行文件内容，解析不出单条，就不额外加字段）。
+          const single =
+            payload.code === 'OK' && payload.track !== null && payload.name !== null
+              ? parseEntryFile(payload.body, {
+                  track: payload.track,
+                  file: payload.name,
+                  now: deps.now(),
+                  fallbackAt: deps.now(),
+                }).entries
+              : []
+          // 行首形态：活动条目 `- [P1] …`；tombstone `- ~~[P1] …~~`。`[P012]` 是字符类，
+          // 只能匹配单个字符 P/0/1/2，认不出字面 `[P1]`（D2），必须写成 `P[012]`。
+          const entry = single.length === 1 && /^- (?:\[P[012]\]|~~\[P[012]\])/.test(payload.body.trim()) ? single[0] : undefined
           return {
             ok: payload.code === 'OK',
             code: payload.code,
@@ -600,33 +838,123 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             truncated: payload.truncated,
             depth: payload.depth,
             related: payload.related,
+            ...(entry === undefined
+              ? {}
+              : {
+                  level: entry.level,
+                  revisions: entry.revisions,
+                  source: entry.source,
+                  at: entry.at,
+                }),
           }
         }
 
-        if (name === '') return { ok: false, error: 'name 不能为空' }
+        if (args.action === 'curate') {
+          // 工具不能默认改盘：dryRun 缺省 true。失败时 act 仍算过快照（面板列表不被清空）。
+          const dryRun = args.dryRun !== false
+          const acted = await deps.bridge.act(sessionId, { type: 'curateMemory', track, dryRun })
+          const rejected = rejectedOf(acted)
+          if (rejected) return rejected
+          return { ok: true, report: acted.curation, notices: acted.notices }
+        }
 
         if (args.action === 'read') {
-          const read: Result<{ track: string; name: string; body: string; chars: number }> =
-            await deps.bridge.readMemoryFile(track, name)
+          if (name === '') return { ok: false, error: 'name 不能为空' }
+          const read = await deps.bridge.readMemoryFile(track, name, undefined, sessionId)
           if (read.error !== undefined) return { ok: false, error: read.error }
           return { ok: true, ...read.data }
         }
 
-        const body = typeof args.body === 'string' ? args.body : ''
-        if (body.trim() === '') return { ok: false, error: 'body 不能为空' }
-        const lines = body.split('\n')
-        const clipped = lines.slice(0, MEMORY_LINES_PER_TASK).join('\n')
+        // ---- write：条目级 upsert/supersede ----
+        const text = typeof args.text === 'string' ? args.text : undefined
+        const body = typeof args.body === 'string' ? args.body : undefined
+        if (text !== undefined && body !== undefined && text !== body) {
+          return { ok: false, code: 'BAD_REQUEST', error: 'text 与 body 只能给一个' }
+        }
+        const raw = text ?? body ?? ''
 
-        const result = await deps.bridge.act(sessionId, { type: 'saveMemory', track, name, body: clipped })
-        const rejected = rejectedOf(result)
-        if (rejected) return rejected
+        const topicCatalog = topicCatalogOf(track)
+        const allowed = topicCatalog.map((spec) => spec.id)
+        let topic: MemoryTopicId | undefined
+        if (name !== '') {
+          const bare = name.replace(/\.md$/i, '')
+          if (!allowed.includes(bare as MemoryTopicId)) {
+            return {
+              ok: false,
+              code: 'BAD_TOPIC',
+              error: `主题「${name}」不在${track === 'project' ? '项目' : '公共'}轨的允许列表里；允许：${allowed.join('、')}`,
+            }
+          }
+          topic = bare as MemoryTopicId
+        }
+        if (args.topic !== undefined) {
+          const rawTopic = String(args.topic).trim().replace(/\.md$/i, '')
+          if (!allowed.includes(rawTopic as MemoryTopicId)) {
+            return {
+              ok: false,
+              code: 'BAD_TOPIC',
+              error: `主题「${rawTopic}」不在${track === 'project' ? '项目' : '公共'}轨的允许列表里；允许：${allowed.join('、')}`,
+            }
+          }
+          if (topic !== undefined && topic !== rawTopic) {
+            return {
+              ok: false,
+              code: 'BAD_TOPIC',
+              error: `name 与 topic 指向不同主题：${topic} / ${rawTopic}（只给一个即可）`,
+            }
+          }
+          topic = rawTopic as MemoryTopicId
+        }
+
+        const level: MemoryLevel =
+          args.importance === 'P0' || args.importance === 'P1' || args.importance === 'P2'
+            ? args.importance
+            : 'P2'
+        if (args.importance !== undefined && args.importance !== 'P0' && args.importance !== 'P1' && args.importance !== 'P2') {
+          return { ok: false, code: 'BAD_REQUEST', error: `importance 只能是 P0/P1/P2（收到「${String(args.importance)}」）` }
+        }
+
+        // 多行 = 多条；跳过空行/标题/围栏/分隔线，最多 20 条（兼容旧上限）。
+        const lines = raw
+          .split('\n')
+          .map((line) => line.trim())
+          .filter(
+            (line) =>
+              line !== '' &&
+              !/^#{1,6}\s/.test(line) &&
+              !/^(?:```|~~~)/.test(line) &&
+              !/^(?:-{3,}|\*{3,}|_{3,})$/.test(line),
+          )
+        if (lines.length === 0) return { ok: false, code: 'BAD_TEXT', error: '正文不能为空' }
+        const supersedes = typeof args.supersedes === 'string' ? args.supersedes.trim() : ''
+        if (supersedes !== '' && lines.length !== 1) {
+          return { ok: false, code: 'BAD_REQUEST', error: 'supersedes 只能配一条正文' }
+        }
+        const at = deps.now()
+        const drafts: EntryDraft[] = lines.slice(0, MEMORY_LINES_PER_TASK).map((line) => ({
+          track,
+          text: line,
+          level,
+          source: '队长',
+          at,
+          ...(topic === undefined ? {} : { topic }),
+          ...(supersedes === '' ? {} : { supersedes }),
+        }))
+        const mutated = deps.bridge.mutateMemory(track, drafts, sessionId)
+        if (!mutated.ok) return { ok: false, code: mutated.code, error: mutated.message }
         return {
           ok: true,
           track,
-          name,
-          lines: Math.min(lines.length, MEMORY_LINES_PER_TASK),
+          written: drafts.length,
+          added: mutated.added,
+          updated: mutated.updated,
+          revived: mutated.revived,
+          superseded: mutated.superseded,
+          topics: mutated.topics,
+          entries: mutated.entries,
+          evicted: mutated.evicted,
+          notices: mutated.notices,
           truncated: lines.length > MEMORY_LINES_PER_TASK,
-          notices: result.notices,
         }
       },
     },

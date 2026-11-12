@@ -725,7 +725,7 @@ test('r13 左栏栏目 + 主区页面：两个槽位各注册一次，main 带 k
   assert.deepEqual(result, { panellist: true, main: true }, '两个槽位都注册上时必须如实返回 true')
 
   // 槽名是 AC-24 的判据，逐字锁死（文档 UI-SLOTS.md 同值）
-  assert.deepEqual(injected, [PANELLIST_SLOT], '栏目必须经 slots.inject 注册（inject 的 name 与 register 的 name 同值）')
+  assert.deepEqual(injected, [PANELLIST_SLOT, MAIN_SLOT], '栏目与主区都必须经 slots.inject 注册（等声明提交后再 register）')
   assert.equal(PANELLIST_SLOT, 'sidebar.panellist')
   assert.equal(MAIN_SLOT, 'main')
   assert.equal(PANELLIST_ID, `${PLUGIN_ID}-panellist`)
@@ -780,6 +780,56 @@ test('r13 左栏栏目 + 主区页面：两个槽位各注册一次，main 带 k
   }
   const failed = registerPanellist(broken as never, deps as never)
   assert.deepEqual(failed, { panellist: false, main: false }, '槽位不可用必须降级而不是拖死整条 entry')
+})
+
+test('main 槽位晚于插件声明时：经 slots.inject 等声明提交后再注册（点击无反应的根因）', () => {
+  // 真机机制（2026-11-05 复核 asar）：AppFrame 声明 `main` 可能晚于插件 apply；
+  // 直接 register 会抛 `slot "main" is not declared`，旧实现 catch 后**永不重试**，
+  // main 永久缺失 → 宿主侧栏行 onClick 的 layout.selectPanel(id) 抛错 → 界面保持原样。
+  let mainDeclared = false
+  let pendingMain: (() => void) | undefined
+  const injected: string[] = []
+  const metas: Array<Record<string, unknown>> = []
+  const ctx = {
+    slots: {
+      inject(name: string, run: () => void) {
+        injected.push(name)
+        // 宿主语义：声明未提交时回调先挂起，提交后由声明方调用。
+        if (name === MAIN_SLOT && !mainDeclared) {
+          pendingMain = run
+          return
+        }
+        run()
+      },
+      register(meta: Record<string, unknown>) {
+        if (meta.name === MAIN_SLOT && !mainDeclared) {
+          throw new Error('slot "main" is not declared (a parent entry\'s children table must declare it)')
+        }
+        metas.push(meta)
+      },
+    },
+  }
+  const deps = { PanellistEntry: 'panellist-stub', LibraryPage: 'library-stub' }
+  const result = registerPanellist(ctx as never, deps as never)
+  assert.equal(result.panellist, true, '侧栏座位照常挂上')
+  assert.equal(result.main, true, 'main 必须进入「等声明提交」的状态（不是失败后放弃）')
+  assert.deepEqual(injected, [PANELLIST_SLOT, MAIN_SLOT], 'main 也必须走 slots.inject，不许裸 register')
+  assert.equal(metas.some((meta) => meta.name === MAIN_SLOT), false, '声明提交前不许硬注册')
+
+  // 声明提交：宿主调用挂起的回调，此时 keyed 注册必须成功。
+  mainDeclared = true
+  assert.equal(typeof pendingMain, 'function', '声明未提交时必须真的挂了一个等待回调')
+  pendingMain?.()
+  const main = metas.find((meta) => meta.name === MAIN_SLOT)
+  assert.ok(main, '声明提交后 main 必须被注册')
+  assert.equal(main.key, PANELLIST_ID, 'main 仍是 keyed 座位，key 与栏目 id 同值')
+})
+
+test('主区打开只认宿主 layout.selectPanel，不许再引用不存在的 mainArea 服务', () => {
+  const code = codeOnlyOf('src/client/slots.ts')
+  assert.equal(code.includes('mainArea'), false, '宿主没有 mainArea 服务（asar 全量检索 0 命中）')
+  assert.equal(code.includes("ctx.inject(['layout']"), true, '必须经 ctx.inject([\'layout\']) 捕获宿主布局服务')
+  assert.equal(code.includes('layout.selectPanel(PANELLIST_ID)'), true, '必须调宿主官方入口 selectPanel')
 })
 
 test('r13 项目库按需加载：refresh 不碰 library，同 key 单飞 + 5s 缓存（AC-23）', () => {
@@ -929,8 +979,8 @@ test('r16 左栏 glyph：注入的 openLibrary 零参且只返回三值，座位
   try {
     assert.deepEqual(registerPanellist(ctx as never, deps as never), { panellist: true, main: true })
 
-    // 计数不变：一个侧栏 inject + 两次 register（栏目 + 主区），r16 不新增座位
-    assert.deepEqual(injected, [PANELLIST_SLOT], 'r16 不许新增 slots.inject 座位')
+    // 座位数不变：栏目 + 主区各一次 slots.inject，各一次 register（main 现在等声明提交后注册）
+    assert.deepEqual(injected, [PANELLIST_SLOT, MAIN_SLOT], '侧栏与主区各一次 slots.inject（main 不许裸 register）')
     assert.equal(metas.length, 2, 'r16 不许新增 slots.register 次数')
 
     const bag = bagOf({ injected, metas, components }, PANELLIST_SLOT)
