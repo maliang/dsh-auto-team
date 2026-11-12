@@ -13,6 +13,7 @@
  */
 import type {
   ActResult,
+  MemberBinding,
   MemoryLevel,
   MemoryTopicId,
   PanelSnapshot,
@@ -173,6 +174,85 @@ export function sessionOf(meta: unknown): string {
     | { sessionId?: string; session?: { id?: string }; agent?: { id?: string } }
     | undefined
   return value?.agent?.id ?? value?.sessionId ?? value?.session?.id ?? 'current'
+}
+
+/**
+ * 宿主 `exec.agent.id`（成员的 SessionId）；取不到返回 undefined。
+ *
+ * 与 `sessionOf` 的区别：这里**不做** `'current'` 兜底 —— 成员判定必须拿到真实 id，
+ * 否则一个没有 agent 的调用就可能撞上某个 memberId 为 `'current'` 的脏数据。
+ */
+function agentIdOf(meta: unknown): string | undefined {
+  const value = meta as { agent?: { id?: string } } | undefined
+  const id = value?.agent?.id
+  return typeof id === 'string' && id.trim() !== '' ? id : undefined
+}
+
+/** 成员会话的身份：命中的绑定 + 它被派发的那个任务 + 所属 run。 */
+export interface MemberIdentityView {
+  runId: string
+  /** run 的队长会话 id（`bridge.act`/`snapshot` 认的是它，不是成员的 agent id）。 */
+  sessionId: string
+  binding: MemberBinding
+  task: PlanTask
+}
+
+/**
+ * 反查「本次工具调用是不是某个成员发起的」。
+ *
+ * 判据只有一条：`exec.agent.id` 与某个 run 的 `bindings[].memberId` 相同且 `!retired`
+ * （`apply` 时宿主给成员的 SessionId 就是 binding 里记下的 memberId）。多个 run 命中时
+ * 取 `plannedAt` 最大的那份（计划越新越相关），同一时刻再用 `createdAt`、`runId` 兜底，
+ * 保证结果确定而不是依赖目录遍历顺序。
+ *
+ * **只判身份，不判开关**：这里刻意不看 `settings.enabled`——身份解析与准入是两件事。
+ * 成员自助（status/receipt）的准入必须再叠一层 `memberSelfServiceOf`：开关关闭时
+ * 两个工具都要回 tools.ts 的 `NOT_ENABLED` 原文案，不能一个放行一个被桥拦。
+ */
+export function memberIdentityOf(deps: ToolsDeps, meta: unknown): MemberIdentityView | null {
+  const agentId = agentIdOf(meta)
+  if (agentId === undefined) return null
+  let best: { state: RunState; binding: MemberBinding; task: PlanTask } | null = null
+  for (const summary of deps.store.list()) {
+    const state = deps.store.load(summary.runId)
+    if (state === null) continue
+    const binding = state.bindings.find((item) => item.memberId === agentId && item.retired !== true)
+    if (binding === undefined) continue
+    const task = state.plan.tasks.find((item) => item.id === binding.taskId)
+    if (task === undefined) continue
+    if (best === null || newerBinding(state, best.state)) {
+      best = { state, binding, task }
+    }
+  }
+  if (best === null) return null
+  return {
+    runId: best.state.plan.runId,
+    sessionId: best.state.plan.sessionId,
+    binding: best.binding,
+    task: best.task,
+  }
+}
+
+/**
+ * 成员自助的唯一准入谓词（r30 边界修正）：身份命中 **且** run 所属队长会话的开关仍开着。
+ *
+ * 为什么必须叠这一层：开关是「团队停用」的总闸，成员自助只是同一团队里的受限视图，
+ * 不能因为调用者恰好有绑定就绕过闸门。修正前 status 在开关关闭时照样回成员视图，
+ * receipt 却被 `bridge.act` 的 `preflightGate` 拦下并回桥层文案（多两个字「先」、无句号）——
+ * 「一个放行一个拒绝 + 两处文案」对用户是纯噪音。现在两个工具共用这一个谓词，
+ * 关闭时都回本文件的 `NOT_ENABLED` 原文案；开启时都放行，receipt 仍走 `bridge.act` 同一道门禁。
+ */
+function memberSelfServiceOf(deps: ToolsDeps, meta: unknown): MemberIdentityView | null {
+  const member = memberIdentityOf(deps, meta)
+  if (member === null) return null
+  return deps.bridge.enabled(member.sessionId) ? member : null
+}
+
+/** 两条命中的优先级：plannedAt 大的胜；再按 createdAt；最后按 runId 字典序（确定性）。 */
+function newerBinding(next: RunState, prev: RunState): boolean {
+  if (next.plannedAt !== prev.plannedAt) return next.plannedAt > prev.plannedAt
+  if (next.plan.createdAt !== prev.plan.createdAt) return next.plan.createdAt > prev.plan.createdAt
+  return next.plan.runId > prev.plan.runId
 }
 
 /**
@@ -623,7 +703,28 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
-        if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
+        // 队长路径完全不变：开关打开时先走原分支。成员的「查看自己任务」只在 run 所属队长会话
+        // 的开关仍开着时成立（memberSelfServiceOf 身份 + 开关一次判定）；关闭时与其它工具同回旧文案。
+        if (!deps.bridge.enabled(sessionId)) {
+          const member = memberSelfServiceOf(deps, meta)
+          if (member === null) return { ok: false, error: NOT_ENABLED }
+          // 成员视图**只**回自己的任务：不回 members / memory / roles / 其它任务 / plan 全量。
+          const evidence = member.task.evidence
+          return {
+            ok: true,
+            view: 'member',
+            runId: member.runId,
+            task: {
+              id: member.task.id,
+              title: member.task.title,
+              status: member.task.status,
+              acceptance: member.task.acceptance,
+              dependsOn: member.task.dependsOn,
+              ...(evidence === undefined ? {} : { evidence }),
+            },
+            notice: '成员视角：只显示你自己被派发的任务；完成后用 auto_team_receipt 提交回执（门禁由宿主执行）。其它工具在成员会话不可用。',
+          }
+        }
         const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId)
         // 默认精简：不传即 compact；只有显式 full 才回正文全文（默认值写死在实现里，schema 只是提示）。
         const detail = args?.detail === 'full' ? 'full' : 'compact'
@@ -719,13 +820,27 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
-        if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
+        // 队长路径完全不变；未启用时才尝试成员身份 —— 且开关关闭的 run 里成员也不放行
+        // （memberSelfServiceOf 与 status 同一谓词）。放行后仍由 bridge.act 走同一道门禁。
+        const leaderMode = deps.bridge.enabled(sessionId)
+        const member = leaderMode ? null : memberSelfServiceOf(deps, meta)
+        if (!leaderMode && member === null) return { ok: false, error: NOT_ENABLED }
 
         const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
         if (taskId === '') return { ok: false, error: 'taskId 不能为空' }
+        // 成员只能提交自己被派发任务的回执：传别人的任务一律 FORBIDDEN（不跑门禁、不碰账本）。
+        if (member !== null && taskId !== member.binding.taskId) {
+          return {
+            ok: false,
+            code: 'FORBIDDEN',
+            error: `只能提交自己被派发任务（${member.binding.taskId}）的回执，${taskId} 不是你被派发的任务`,
+          }
+        }
         const note = typeof args.note === 'string' && args.note.trim() !== '' ? args.note : undefined
 
-        const result = await deps.bridge.act(sessionId, { type: 'receipt', taskId, note })
+        // 成员的门禁必须落在 run 所属会话上：成员的 agent id 不是任何一份 run 的 sessionId。
+        const targetSessionId = member === null ? sessionId : member.sessionId
+        const result = await deps.bridge.act(targetSessionId, { type: 'receipt', taskId, note })
         const rejected = rejectedOf(result)
         if (rejected) return rejected
 

@@ -6,7 +6,7 @@
 
 ![自动团队：左侧会话 + 右栏面板](docs/images/panel-overview.png)
 
-- 包名 / 版本：`dsh-auto-team@0.2.0`（`package.json`）
+- 包名 / 版本：`dsh-auto-team@0.2.1`（`package.json`）
 - 运行时约束：Node `>=22.18`；DSH `>=0.2.1-alpha.2 <0.3.0`（`package.json` 的 `engines`）
 - 本文件所有命令默认在仓库内执行，先复制这一行（在仓库任意子目录都成立，执行后 `$REPO` 就是仓库根）：
 
@@ -71,14 +71,14 @@ export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO"
 
 ![输入框左下角的自动团队开关](docs/images/entry.png)
 
-输入框左下角的「自动团队」胶囊是**按会话**的总开关（关闭时所有工具回「未启用」，不会偷偷起人）；左栏「自动团队」是跨 run 的项目库入口。
+输入框左下角的「自动团队」胶囊是**按会话**的总开关（关闭时所有工具回「未启用」，不会偷偷起人；**成员自助也受开关约束**：成员视角查询与回执提交同样以 run 所属队长会话的开关为前置）；左栏「自动团队」是跨 run 的项目库入口。
 
 ## 30 秒看懂
 
 1. 输入框**左侧**点开「自动团队」胶囊开关。默认关；开关按会话记在 `~/.dsh/auto-team/sessions.json`，只改开关不会起人。
 2. 把目标直接说给队长。队长先调 `auto_team_plan` 落一份任务图，每条任务必须带 `roleId` 与**可执行的** `acceptance`（空验收整批拒绝、一条不落盘）。
 3. 计划落盘后**自动派发**，不需要你点「派发」：并发上限、依赖门禁、写域冲突、暂停四道闸都在同一处（`src/host/team/dispatch.ts` 的 `dispatchReady`）判定，超出并发的任务排队。
-4. 成员交付并向队长回报后，**由开着开关的队长会话**提交回执 → `auto_team_receipt` 执行该任务的 `acceptance`，**exit 0 才算 done**；失败转返工（rework），下游保持 blocked，失败证据回发原成员。成员子会话自己提交会一律回「未启用」（开关状态只记在点开胶囊的那个会话上，见「已知限制」）。
+4. 成员交付并向队长回报后，由**开着开关的队长会话或该任务的成员自己**提交回执 → `auto_team_receipt` 执行该任务的 `acceptance`，**exit 0 才算 done**；失败转返工（rework），下游保持 blocked，失败证据回发原成员。成员子会话可用 `auto_team_status` 自查自己那条任务（字段白名单，看不到成员/记忆/角色/其它任务），并用 `auto_team_receipt` 提交**自己任务**的回执（传别人的 taskId 返回 `FORBIDDEN`；其它工具仍回「未启用」）。**成员自助也受开关约束**：run 所属队长会话的开关关闭时，这两个工具对成员同样回「未启用」原文案（不会一个放行、一个拒绝）。
 5. 需求要改：对队长说清楚改什么，队长用 `revise: true` **并回同一个 run**（见「同一需求的修订」）；不相关的新需求照旧新建 run。
 
 ## 能力与入口
@@ -153,9 +153,9 @@ grep -c '"dsh-auto-team"' package.json    # 期望 0
 | `auto_team_plan` | 落一份执行计划，返回 `runId` | 空 `acceptance` / 非法写域整批拒绝，一条不落盘；带 `revise: true` 时改为并入既有 run（见上一节） |
 | `auto_team_add_tasks` | 往**同一个** run 追加任务 | 必须带 `runId`；内容指纹幂等；整批原子；已终止的 run 拒绝 |
 | `auto_team_dispatch` | 手动派发就绪任务 | **必须带 plan 返回的 `runId`**，缺了直接拒绝（保证计划早于成员） |
-| `auto_team_status` | 读计划、成员、门禁证据、消息账本 | 只读；无计划时返回空字段而不是报错 |
+| `auto_team_status` | 读计划、成员、门禁证据、消息账本 | 只读；无计划时返回空字段而不是报错；成员会话只回自己那条任务（字段白名单），且要求 run 所属队长会话的开关开着 |
 | `auto_team_message` | 直达成员（按 taskId 或成员名定位） | 可续聊；中断后用同一 `memberId` 继续，不要新建同名成员 |
-| `auto_team_receipt` | 提交回执并跑门禁 | 任务 `running → done` 的**唯一**入口；成员口头说完成不算。**只能由开着开关的队长会话提交**：handler 先用调用者会话（`exec.agent.id`）查开关，成员子会话没有开关记录，必回「未启用」（`src/host/tools.ts:408-409`） |
+| `auto_team_receipt` | 提交回执并跑门禁 | 任务 `running → done` 的**唯一**入口；成员口头说完成不算。**开着开关的队长会话或该任务的成员自己**可提交（成员自助也受开关约束：run 所属队长会话的开关关闭时与 status 同回「未启用」）；成员传别人的 `taskId` 返回 `FORBIDDEN`，门禁仍由宿主执行（`src/host/tools.ts` 的 `memberIdentityOf` 与 receipt 分支） |
 | `auto_team_memory` | 读写双轨记忆（`list/read/write/expand/curate`） | `write` 支持 `importance`（P0/P1/P2）、`topic`、`supersedes`；按归一化正文判重并累计「修正次数」；`read/list` 返回条目结构化视图（id/level/text/source/revisions/superseded）；`expand` 按 `mem://` ID 取全文；`curate` 整理旧流水（`dryRun` 缺省 true）；返回里带 `projectDir/workspace/degraded/degradeReason` |
 | `auto_team_role` | 角色读写（`list/save/remove`） | 内置角色可改不可删 |
 
@@ -253,10 +253,10 @@ export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" \
 ```
 
 - `pnpm typecheck` → exit 0
-- `pnpm test` → **1167 通过 / 0 失败 / 0 skipped**，exit 0（约 7.4s；含 `test/r29-packaging.test.ts` 的 6 条打包/文档回归）
+- `pnpm test` → **1179 通过 / 0 失败 / 0 skipped**，exit 0（约 7.4s；含 `test/r29-packaging.test.ts` 的 6 条打包/文档回归）
 - `pnpm build` → exit 0，`lib/index.js` **613.65 kB**、`lib/client.js` **587.57 kB**
 - 两条 `import` 自检 → exit 0
-- `npm pack --dry-run` → **8 个文件 / 381.0 kB**（`package.json`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`）
+- `npm pack --dry-run` → **8 个文件 / 384.5 kB**（`package.json`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`）
 
 数字会随实现漂移：要拿当前数就重跑上面这组命令，不要拿本表去比对 CI 产物；包体积也随 README 自身大小变化（这次 pack 时 README 为 37.9 kB）。
 
@@ -278,10 +278,10 @@ export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" \
 
 每条按「现象 → 原因 → 规避」写。
 
-- **`auto_team_receipt` 只能由队长会话提交**
-  - 现象：成员子会话自己提交回执，一律返回「自动团队未启用」。
-  - 原因：handler 先用调用者会话查开关（`exec.agent.id` → `src/host/tools.ts:408-409`），而开关只在点胶囊 toggle 时写入（`src/host/bridge.ts:1125-1126`，`setEnabled` 在 :1814-1816）；成员是独立会话，没有这条记录。
-  - 规避：成员把结果回报给队长，由开着开关的队长会话代跑 `auto_team_receipt`。
+- **成员会话只能看到/提交自己的任务（且成员自助也受开关约束）**
+  - 现象：成员会话里 `auto_team_status` 只回自己那条任务，`auto_team_receipt` 只受理自己的 `taskId`，其余工具一律回「未启用」；**run 所属队长会话的开关关闭时，这两个工具对成员也回同一句「未启用」**。
+  - 原因：成员身份靠 `exec.agent.id` 反查 `bindings[].memberId`（`src/host/tools.ts` 的 `memberIdentityOf`），只对 status/receipt 开了成员分支；成员分支的准入还要再叠一层开关校验（`memberSelfServiceOf`：身份命中 + run 所属队长会话 `enabled`），所以开关关闭时两工具同态拒绝，不会一个放行一个被桥拦；没有绑定也不放行，也不暴露计划全量。
+  - 规避：需要成员自查/交回执时让队长会话保持开着开关；需要看全量计划、成员名单或记忆时，回到开着开关的队长会话操作；需要委派/协调也由队长发起。
 - **设置里的并发可能被宿主上限夹小**
   - 现象：设置填 6，实际只并行 3。
   - 原因：`src/host/index.ts:177-192` 的 `hostConcurrency()` 以宿主上限为天花板（设置是上限请求，不是替代宿主约束）。
@@ -323,6 +323,13 @@ export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" \
 - 团队协作守则与文档索引：`AGENTS.md`
 
 ## 变更记录
+
+### 2026-11-13 — 成员自助：自查自己的任务、自己提交回执（v0.2.1）
+
+- 改了什么：`auto_team_status` / `auto_team_receipt` 在成员子会话里不再一律回「未启用」。宿主用 `exec.agent.id` 反查 `run.bindings` 中 `memberId` 相同且未退休的绑定（多个命中取 `plannedAt` 最大），命中即视为该成员：`status` 只返回 `{view:member, runId, task:{id,title,status,acceptance,dependsOn,evidence}, notice}`，不返回 members / 记忆 / 角色 / 其它任务 / plan 全量；`receipt` 只放行绑定里那个 taskId，传别人的任务回 `FORBIDDEN` 且不跑门禁、不写账本。门禁仍由宿主执行同一条路径（`bridge.act` + `preflightGate`），未新增旁路。
+- 开关语义（补漏）：成员自助**也受**「自动团队」总闸约束——开关关闭时 status 与 receipt 同回「自动团队未启用…」，不会出现「能查状态、交不了回执」；开启时两者都放行。
+- 为什么：此前成员拿不到自己的门禁结果，「完成必须过门禁」只能由队长代跑；成员写错一步也无法自查，等于把链断在成员侧。
+- 怎么验：`pnpm test` 1179 通过（含 `test/r30-member-self-service.test.ts` 12 条：身份解析、字段白名单、他人任务 → FORBIDDEN、门禁失败 → 返工并回发证据、开关关闭时两工具同态拒绝、端到端提交 → done），突变反证 M1–M7；`test/r29-packaging.test.ts` 继续守住打包与文档对等。
 
 ### 2026-11-13 — 打包清单回归测试 + 实测基线刷新
 

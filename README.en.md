@@ -6,7 +6,7 @@ Turns the current DeepSeek Harness session into a **lead**: it splits a goal int
 
 ![Auto Team: session on the left, panel on the right](docs/images/panel-overview.png)
 
-- Package / version: `dsh-auto-team@0.2.0` (`package.json`)
+- Package / version: `dsh-auto-team@0.2.1` (`package.json`)
 - Runtime constraints: Node `>=22.18`; DSH `>=0.2.1-alpha.2 <0.3.0` (`engines` in `package.json`)
 - Every command in this file is run inside the repository. Copy this line first (it works from any subdirectory; afterwards `$REPO` is the repo root):
 
@@ -71,14 +71,14 @@ Solid edge = completed, dashed = unfinished; task cards carry tokens and duratio
 
 ![The Auto Team toggle at the bottom-left of the input box](docs/images/entry.png)
 
-The "自动团队" capsule at the bottom-left of the input box is the **per-session** master switch (while off, every tool answers "not enabled" and no member is ever started silently); "自动团队" in the left sidebar is the cross-run project library entry point.
+The "自动团队" capsule at the bottom-left of the input box is the **per-session** master switch (while off, every tool answers "not enabled" and no member is ever started silently; **member self-service is gated by the switch too**: the member's own status query and receipt submission both require the run's lead session to have the switch on); "自动团队" in the left sidebar is the cross-run project library entry point.
 
 ## 30-second tour
 
 1. Click the "自动团队" capsule on the **left** of the input box. It is off by default; the switch is recorded per session in `~/.dsh/auto-team/sessions.json`, and toggling it alone never starts a member.
 2. State the goal to the lead directly. The lead first calls `auto_team_plan` to lay down a task graph; every task must carry a `roleId` and an **executable** `acceptance` (an empty acceptance rejects the whole batch and nothing is persisted).
 3. Once the plan is persisted it is **dispatched automatically** — no "dispatch" button needed: concurrency limit, dependency gating, write-scope conflicts, and pause are all decided in one place (`dispatchReady` in `src/host/team/dispatch.ts`); tasks beyond the concurrency limit queue up.
-4. After a member delivers and reports back, **the lead session with the switch on** submits the receipt → `auto_team_receipt` runs that task's `acceptance`, and **only `exit 0` means done**; a failure turns the task to rework, keeps downstream blocked, and sends the failure evidence back to the original member. If a member sub-session submits by itself, it always gets "not enabled" (the switch is recorded only in the session where the capsule was clicked — see "Known limitations").
+4. After a member delivers and reports back, the receipt is submitted by **the lead session with the switch on or by that task's own member** → `auto_team_receipt` runs that task's `acceptance`, and **only `exit 0` means done**; a failure turns the task to rework, keeps downstream blocked, and sends the failure evidence back to the original member. A member sub-session can call `auto_team_status` to inspect only its own task (a field whitelist: no members, memory, roles, or other tasks) and call `auto_team_receipt` for **its own task** (another task's `taskId` returns `FORBIDDEN`; every other tool still answers "not enabled"). **Member self-service is gated by the switch too**: when the run's lead session has the switch off, both tools answer "not enabled" with the same wording for the member as well (never one allowed and the other rejected).
 5. When the requirement changes: tell the lead what to change, and the lead passes `revise: true` to **merge the change back into the same run** (see "Revising the same requirement"); unrelated new requirements still open a new run.
 
 ## Capabilities and entry points
@@ -153,9 +153,9 @@ While disabled, all of them return the same Chinese error: `自动团队未启�
 | `auto_team_plan` | Persist an execution plan and return a `runId` | Empty `acceptance` / illegal write scope rejects the whole batch and persists nothing; with `revise: true` it merges into an existing run instead (see the previous section) |
 | `auto_team_add_tasks` | Append tasks to **the same** run | `runId` is mandatory; content fingerprint is idempotent; atomic batch; terminal runs are refused |
 | `auto_team_dispatch` | Manually dispatch ready tasks | **Must carry the `runId` returned by plan**; missing it is rejected outright (the mechanical guarantee that the plan precedes the members) |
-| `auto_team_status` | Read plan, members, gate evidence, message ledger | Read-only; with no plan it returns empty fields instead of an error |
+| `auto_team_status` | Read plan, members, gate evidence, message ledger | Read-only; with no plan it returns empty fields instead of an error; a member session only sees its own task (whitelisted fields), and only while the run's lead session has the switch on |
 | `auto_team_message` | Reach a member directly (by taskId or member name) | Resumable; after an interruption continue with the same `memberId` instead of creating a same-named member |
-| `auto_team_receipt` | Submit a receipt and run the gate | The **only** entry from `running → done`; a member saying "finished" does not count. **Only the lead session with the switch on may submit it**: the handler checks the switch on the caller session (`exec.agent.id`), and a member sub-session has no switch record, so it always gets "not enabled" (`src/host/tools.ts:408-409`) |
+| `auto_team_receipt` | Submit a receipt and run the gate | The **only** entry from `running → done`; a member saying "finished" does not count. **The lead session with the switch on, or that task's own member, may submit it** (member self-service is gated by the switch too: when the run's lead session has it off, receipt answers "not enabled" exactly like status); a member passing another task's `taskId` gets `FORBIDDEN`, and the gate is still executed by the host (`memberIdentityOf` and the receipt branch in `src/host/tools.ts`) |
 | `auto_team_memory` | Read/write the two-track memory (`list/read/write/expand/curate`) | `write` supports `importance` (P0/P1/P2), `topic`, `supersedes`; dedupes on normalized text and counts "revision count"; `read/list` return a structured entry view (id/level/text/source/revisions/superseded); `expand` fetches the full text by `mem://` id; `curate` tidies old logs (`dryRun` defaults to true); the response carries `projectDir/workspace/degraded/degradeReason` |
 | `auto_team_role` | Role read/write (`list/save/remove`) | Built-in roles can be edited but not deleted |
 
@@ -253,10 +253,10 @@ export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" \
 ```
 
 - `pnpm typecheck` → exit 0
-- `pnpm test` → **1167 passed / 0 failed / 0 skipped**, exit 0 (about 7.4s; includes the 6 packaging/documentation regression cases in `test/r29-packaging.test.ts`)
+- `pnpm test` → **1179 passed / 0 failed / 0 skipped**, exit 0 (about 7.4s; includes the 6 packaging/documentation regression cases in `test/r29-packaging.test.ts`)
 - `pnpm build` → exit 0, `lib/index.js` **613.65 kB**, `lib/client.js` **587.57 kB**
 - both `import` self-checks → exit 0
-- `npm pack --dry-run` → **8 files / 381.0 kB** (`package.json`, both READMEs, `cordis.patch.yml`, both `lib/` artifacts, `locale/en.json`, `locale/zh.json`)
+- `npm pack --dry-run` → **8 files / 384.5 kB** (`package.json`, both READMEs, `cordis.patch.yml`, both `lib/` artifacts, `locale/en.json`, `locale/zh.json`)
 
 The numbers drift with the implementation: rerun the group above for current values instead of comparing them against CI output; package size also changes with the size of this README (37.9 kB at that pack).
 
@@ -278,10 +278,10 @@ Do not bypass these: `lib/` must be committed (it is the `pnpm add file:` instal
 
 Each item is written as symptom → cause → workaround.
 
-- **`auto_team_receipt` can only be submitted by the lead session**
-  - Symptom: when a member sub-session submits a receipt itself, it always returns "not enabled".
-  - Cause: the handler checks the switch on the caller session first (`exec.agent.id` → `src/host/tools.ts:408-409`), and the switch is written only when the capsule is toggled (`src/host/bridge.ts:1125-1126`; `setEnabled` at :1814-1816); a member is a separate session with no such record.
-  - Workaround: the member reports back to the lead, and the lead session (switch on) runs `auto_team_receipt` on its behalf.
+- **A member session can only see/submit its own task (and member self-service is gated by the switch too)**
+  - Symptom: in a member session `auto_team_status` returns only that member's task, `auto_team_receipt` accepts only its own `taskId`, and every other tool answers "not enabled"; **when the run's lead session has the switch off, both tools also answer "not enabled" for the member**.
+  - Cause: member identity is resolved by looking up `exec.agent.id` in `bindings[].memberId` (`memberIdentityOf` in `src/host/tools.ts`); only status/receipt have a member branch, and that branch's admission adds a switch check on top (memberSelfServiceOf: identity hit + the run's lead session `enabled`), so with the switch off both tools reject alike instead of one being allowed and the other blocked by the bridge; no binding means no access, with no full plan exposed.
+  - Workaround: keep the lead session's switch on while a member needs to self-check or submit a receipt; to see the full plan, the member list, or memory, operate from the lead session with the switch on; delegation and coordination also start from the lead.
 - **The concurrency setting may be clamped down by the host limit**
   - Symptom: you set 6 but only 3 run in parallel.
   - Cause: `hostConcurrency()` in `src/host/index.ts:177-192` treats the host limit as a ceiling (the setting is a request, not a replacement for host constraints).
@@ -323,6 +323,13 @@ Each item is written as symptom → cause → workaround.
 - Team collaboration rules and document index: `AGENTS.md`
 
 ## Changelog
+
+### 2026-11-13 — Members can inspect their own task and submit their own receipt (v0.2.1)
+
+- What changed: `auto_team_status` / `auto_team_receipt` no longer always answer "not enabled" inside a member sub-session. The host resolves `exec.agent.id` against `run.bindings` (same `memberId`, not retired; the latest `plannedAt` wins on multiple hits). A hit is treated as that member: `status` returns only `{view:member, runId, task:{id,title,status,acceptance,dependsOn,evidence}, notice}` — never members / memory / roles / other tasks / the full plan; `receipt` accepts only the bound taskId, returns `FORBIDDEN` for anyone else's task without running the gate or touching the ledger. The gate still runs through the same host path (`bridge.act` + `preflightGate`); no bypass was added.
+- Switch semantics (gap fixed): member self-service is **also** subject to the Auto Team master switch — when it is off, status and receipt both answer "Auto Team is not enabled…", so there is no state where a member can read its status but cannot submit a receipt. When it is on, both are allowed.
+- Why: members could not see their own gate result, so "done" always required the lead to run the gate on their behalf, and a member could not self-correct after a mistake — the chain broke on the member side.
+- How to verify: `pnpm test` passes 1179 cases (including 12 in `test/r30-member-self-service.test.ts`: identity resolution, field whitelist, another task → FORBIDDEN, gate failure → rework with evidence sent back, both tools refusing identically when the switch is off, end-to-end submit → done), mutation checks M1–M7; `test/r29-packaging.test.ts` keeps guarding packaging and README parity.
 
 ### 2026-11-13 — Packaging-manifest regression tests + refreshed measured baseline
 
