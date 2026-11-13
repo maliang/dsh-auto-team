@@ -100,6 +100,15 @@ export interface PlanTask {
   memberId?: string
   /** 最近一次门禁证据（AC-19：命令、退出码、输出尾部、全量日志路径）。 */
   evidence?: GateEvidence
+  /**
+   * r33：**观察事实** —— 成员已结束本轮，却没有提交回执（任务仍卡在 `running`）。
+   *
+   * 由宿主在两路信号下写入：事件路径（`subagent/end` / `agent/error`）与轮询对账
+   * （宿主把成员归一为 dead/inactive）。只用于提示队长「没人干了、也没门禁证据」，
+   * **不代表完成、不参与任何完成度计算**；不自动写 done、不自动 rework、不自动 resume、
+   * 也不替成员执行门禁。任务离开 `running`（receipt / rework / cancel / 计划收口）时清除。
+   */
+  silentFinish?: { at: number; memberId: string }
   /** 已返工次数（AC-19）：达到 MAX_ATTEMPTS 后转 failed 并需人工处理。 */
   attempts?: number
   /** 上一次 resume 的时间（AC-17 幂等去抖，见 RESUME_DEBOUNCE_MS）。 */
@@ -729,6 +738,11 @@ export interface TaskDetailView {
   cancelReason?: string
   /** 作废来源：需求修订连带 / 用户直接取消 / 计划收口连带（r25）。 */
   cancelledBy?: 'revision' | 'user' | 'stale'
+  /**
+   * r33：成员已结束本轮但未交回执（宿主算好的布尔，**客户端不要自己推**）。
+   * 只在任务仍 `running` 且无门禁证据时可能为 true。
+   */
+  awaitingReceipt?: boolean
   /** 该任务名下的直达消息条数（面板「消息」徽标用）。 */
   messageCount: number
 }
@@ -909,9 +923,31 @@ export interface RunSummary extends RunStageCounts {
    * 可选：旧快照 / 旧文件缺省时客户端按 `active` 或 0 降级（不补猜）。
    */
   ongoing?: number
+  /**
+   * r34：该 run 此刻**存活成员数** = 未退休 binding 中宿主状态归一为 `alive` 的个数
+   * （判定与 `closeRun` 共用 `bridge.ts#liveMemberNamesOf` 的同一套归一，不另写一份）。
+   *
+   * 用来把「未收口·可能残留」收敛到真正没人跑的时候：正在推进的 run 也有存活成员，
+   * 客户端据此不把它当残留。
+   *
+   * 缺省 = **宿主读不到**（无成员名单读口 / 读失败 / 该 run 文件读不出来），
+   * 不要当成 0：0 是「确实没有存活成员」的事实，缺省是「不知道」，两者的界面语义不同。
+   * 不落盘，每次读取现算。
+   */
+  liveMembers?: number
 }
 
 /* ─────────────────────────────── 面板快照（HTTP / 工具共用） ─────────────────────────────── */
+
+/**
+ * 快照里的任务行 = 落盘任务 + 宿主算好的展示事实。
+ *
+ * `awaitingReceipt` 只有宿主知道（要结合绑定与成员存活状态），客户端不得自己推。
+ * 类型上可缺席是为了兼容旧宿主快照，读取一律 `=== true` 判定，绝不补猜。
+ */
+export interface PanelTaskView extends PlanTask {
+  awaitingReceipt?: boolean
+}
 
 /** 面板快照：`GET {BRIDGE_ROUTE}/snapshot` 的载荷，也是每个动作返回的同一份形状。 */
 export interface PanelSnapshot {
@@ -921,7 +957,7 @@ export interface PanelSnapshot {
   planStatus?: PlanStatus
   /** 计划条目写入时间（AC-30 证据）：必须早于首个成员的 spawnedAt。 */
   plannedAt?: number
-  tasks: PlanTask[]
+  tasks: PanelTaskView[]
   members: MemberView[]
   /**
    * r26：当前 run 的阶段判定计数 —— 与 {@link RunSummary} 的四个同名字段同构，

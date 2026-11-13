@@ -2474,6 +2474,36 @@ export const AUTO_TEAM_CSS = `
   outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
   outline-offset: -2px;
 }
+/* r33：任务行里的「子智能体」入口（与展开按钮是兄弟节点，互不干扰）。
+   无成员时仍是可点按钮 —— 点一下由任务页给一行原因，而不是「点了没反应」。 */
+[data-region="task-list"] [data-task-open-member] {
+  display: block;
+  box-sizing: border-box;
+  min-height: 24px;
+  margin: 0 12px 8px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-state-business-primary, inherit);
+  text-align: left;
+  cursor: pointer;
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+}
+[data-region="task-list"] [data-task-open-member]:hover {
+  text-decoration: underline;
+}
+[data-region="task-list"] [data-task-open-member]:active {
+  color: var(--dsw-alias-state-business-primary, inherit);
+  text-decoration: underline;
+}
+[data-region="task-list"] [data-task-open-member]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+[data-region="task-list"] [data-task-open-member][data-member-jump="unavailable"] {
+  color: var(--dsw-alias-label-tertiary, inherit);
+  cursor: help;
+}
 [data-region="task-list"] [data-task-line="title"] {
   display: flex;
   align-items: center;
@@ -2636,6 +2666,10 @@ export const AUTO_TEAM_CSS = `
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
 }
 /* r17：六项用量指标（2 列 × 3 行，标签与数字同宽容器；不可得项用三级色区分） */
+/* 展开区里的「回执」行：与门禁证据分开一行，读起来是「缺什么」而不是「结果如何」。 */
+[data-task-detail] [data-awaiting-receipt] {
+  color: var(--dsw-alias-state-business-primary, currentColor);
+}
 [data-task-detail] [data-usage-metrics] {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5105,6 +5139,24 @@ export const AUTO_TEAM_CSS = `
   overflow-wrap: anywhere;
   font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
 }
+/* r33「待回执」：蓝色 pill，与下面停滞的琥珀竖条是两种事实（人停了 vs 人还活着却没产出）。 */
+[data-member-page] [data-awaiting-receipt] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 18px;
+  max-width: 100%;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 55%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 8%, transparent);
+  overflow: hidden;
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
 /* 停滞是「有事实的异常」：琥珀只做竖条与 8% 底，文字保持可读的 label-secondary */
 [data-member-page] [data-member-stalled][data-stalled="true"] {
   padding-left: 6px;
@@ -5368,6 +5420,34 @@ export const AUTO_TEAM_CSS = `
   pointer-events: none;
   font: var(--dsw-font-xs-13, 13px/16px sans-serif);
 }
+/* r33：没有可跳成员时卡片仍可点（点一下给原因），箭头换成问号，和「能跳」区分开。 */
+[data-role-grid] [data-role-card][data-member-jump="unavailable"] {
+  cursor: help;
+}
+[data-role-grid] [data-role-card][data-member-jump="unavailable"]::after {
+  content: "?";
+  color: var(--dsw-alias-label-tertiary, currentColor);
+}
+/* 跳转失败的一行原因：贴在任务页顶部（sticky），点了底部的流程图节点也看得见。
+   空态折叠为零高 —— 常驻只为让读屏能播报新文案，不占版面。 */
+[data-region="tasks-tab"] [data-member-jump-notice] {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0;
+  padding: 4px 12px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, currentColor);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+  overflow-wrap: anywhere;
+}
+[data-region="tasks-tab"] [data-member-jump-notice][data-empty="true"] {
+  max-height: 0;
+  padding: 0;
+  border-left-width: 0;
+  overflow: hidden;
+}
 
 /* ───────────────── r21：需求修订 / 终止原因 / 成员停止态 ───────────────── */
 
@@ -5514,6 +5594,21 @@ export const AUTO_TEAM_CSS = `
   white-space: nowrap;
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
 }
+/* r33「待回执」：与停滞（琥珀）、失败（红）刻意不同色 —— 蓝色只表示「还差一份回执」，不是异常。 */
+[data-region="task-list"] [data-task-line="title"] [data-awaiting-receipt] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 55%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 8%, transparent);
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  white-space: nowrap;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
 [data-region="task-list"] [data-task-line="note"] {
   display: block;
   min-width: 0;
@@ -5549,6 +5644,37 @@ export const AUTO_TEAM_CSS = `
 [data-role-grid] [data-role-member-status][data-tone="danger"] {
   color: var(--dsw-alias-state-error-primary, currentColor);
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
+}
+
+/* 任务页顶部的聚合提示：回答「有几个任务在等回执」，细节仍由每行自己的标记回答。 */
+[data-region="tasks-tab"] [data-awaiting-receipt-summary] {
+  margin: 0 12px 8px;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 45%, transparent);
+  border-left: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  border-radius: var(--dsw-radius-xs, 4px);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 8%, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
+
+/* 角色卡上的「本轮已结束 · 待回执」：蓝色描边，和琥珀色的停滞 chip / 红色失败 chip 一眼可分。 */
+[data-role-grid] [data-awaiting-receipt] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  box-sizing: border-box;
+  height: 18px;
+  max-width: 100%;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 55%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, currentColor) 8%, transparent);
+  overflow: hidden;
+  color: var(--dsw-alias-state-business-primary, currentColor);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
 }
 
 /* 历史列表的终止原因行。 */

@@ -64,7 +64,7 @@ import {
   type PromptInput,
   type SpawnPort,
 } from './team/dispatch.ts'
-import { createMemberWatcher } from './team/watcher.ts'
+import { createMemberWatcher, recordSilentFinish } from './team/watcher.ts'
 import { createDeviationRecorder } from './team/deviation.ts'
 import { touchProgress } from './team/stall.ts'
 import { auditRoute } from './team/route.ts'
@@ -74,6 +74,7 @@ import { guardOf } from './team/guard.ts'
 import { createTriggerBus, type TriggerBus } from './team/trigger-bus.ts'
 import { readCaptainModel, captainModelView } from './team/captain.ts'
 import { triggerFromMemberExit } from './team/trigger.ts'
+import { isSilentFinish } from './team/silent-finish.ts'
 import { createExpander } from './memory/expand.ts'
 import { listMemoryItems } from './memory/repo.ts'
 import type { MemoryRoots } from './memory/repo.ts'
@@ -738,14 +739,34 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
         for (const summary of store.list()) {
           const state = store.load(summary.runId)
           if (!state) continue
+          let next = state
           for (const binding of state.bindings) {
             if (binding.retired === true) continue
             if (!ids.has(binding.memberId) && !ids.has(binding.name)) continue
+            // r33「待回执」：事件本身就证明该成员已结束本轮。任务仍 running 且无门禁证据
+            // ⇒ 落一条观察事实 + 通知队长（幂等）；不写 done / 不返工 / 不续聊。
+            const task = next.plan.tasks.find((item) => item.id === binding.taskId)
+            if (task !== undefined && isSilentFinish({ task, binding, memberStopped: true })) {
+              next = recordSilentFinish(next, {
+                taskId: task.id,
+                memberId: binding.memberId,
+                memberName: binding.name,
+                at,
+              })
+            }
             const trigger = triggerFromMemberExit(state.plan.runId, binding.memberId, eventName, at)
             void bus.push(trigger).catch((error: unknown) => warn(ctx, `成员退出推进失败：${messageOf(error)}`))
             // r13 AC-8 第四个触发点：成员退出会空出一个并发位，立刻让下一条就绪任务补上。
             // 与总线推进并存：这里只「叫一次 dispatcher」，能不能派仍由 dispatchReady 的四道闸决定。
             autoDispatcher.kick(state.plan.sessionId, state.plan.runId, 'member-exit')
+          }
+          if (next !== state) {
+            try {
+              store.save(next)
+            } catch (error) {
+              // 观察事实落盘失败不能连累既有推进链：退回轮询路径下一轮照样会判出来。
+              warn(ctx, `待回执落盘失败：${messageOf(error)}`)
+            }
           }
         }
       } catch (error) {

@@ -148,10 +148,17 @@ export interface SidebarRightFace {
   tabDomain?: TabDomainFace
 }
 
+/** 宿主 `uiWorkspace` 的最小面（只声明本插件用到的成员，避免 mock 与真机漂移）。 */
+export interface UiWorkspaceFace {
+  /** r33：切到某个会话。成员 id 与 session id 同源；同步、返回 void、失败抛错。 */
+  openSession?(target: string): void
+}
+
 /** 可选服务作用域（cordis `ctx.inject(deps, cb)` 的回调入参）。 */
 export interface ServiceScope {
   sidebarRightTabs?: TabsFace
   sidebarRight?: SidebarRightFace
+  uiWorkspace?: UiWorkspaceFace
   /** 宿主布局服务：`selectPanel(id)` 是选中 main 面板的**唯一**官方入口。 */
   layout?: LayoutFace
   effect?(fn: () => unknown, label?: string): unknown

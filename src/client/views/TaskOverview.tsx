@@ -16,6 +16,7 @@
 import * as React from 'react'
 import type { MemberView, TaskDetailView } from '../../shared/types.ts'
 import { PROGRESS_RING_SIZE, taskOverviewOf } from '../viewmodel.ts'
+import type { MemberJumpView } from '../viewmodel.ts'
 import { ProgressRing } from './ProgressRing.tsx'
 import { TaskTable } from './TaskTable.tsx'
 
@@ -23,13 +24,13 @@ export interface TaskOverviewProps {
   tasks: TaskDetailView[]
   expandedTaskId?: string
   onToggleTask: (taskId: string) => void
-  /** r17：任务行 → 子智能体（历史 run 不传）。 */
+  /** r17/r33：任务行 → 子智能体会话（历史 run 不传）。 */
   members?: MemberView[]
-  onOpenMember?: (member: MemberView, taskId: string) => void
+  onJump?: (jump: MemberJumpView) => void
 }
 
 export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, members, onOpenMember } = props
+  const { tasks, expandedTaskId, onToggleTask, members, onJump } = props
   const overview = taskOverviewOf(tasks, expandedTaskId)
   return (
     <section data-task-overview aria-label="任务总览">
@@ -47,7 +48,7 @@ export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
           expandedTaskId={expandedTaskId}
           onToggleTask={onToggleTask}
           members={members}
-          onOpenMember={onOpenMember}
+          onJump={onJump}
           grouped
         />
       </div>

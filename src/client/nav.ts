@@ -26,8 +26,11 @@ import type {
   RunSummary,
   TaskDetailView,
 } from '../shared/types.ts'
-import type { BadgeTone } from './viewmodel.ts'
+import type { AwaitingReceiptView, BadgeTone, TaskCardSource } from './viewmodel.ts'
 import {
+  AWAITING_RECEIPT_MEMBER_TEXT,
+  awaitingReceiptOf,
+  awaitingReceiptTitleOf,
   durationTextOf,
   durationTitleOf,
   formatClock,
@@ -181,36 +184,11 @@ export function isStaleMemberNav(propsSessionId: string, nav: MainNavView): bool
 
 /* ───────────────────────── 任务行/角色卡 → 成员 ───────────────────────── */
 
-function latestOf(list: readonly MemberView[]): MemberView {
-  let best = list[0]
-  for (const member of list) {
-    if (member.lastEventAt > best.lastEventAt) best = member
-    else if (member.lastEventAt === best.lastEventAt && member.memberId < best.memberId) best = member
-  }
-  return best
-}
-
 /**
- * 给一个计划任务找执行它的成员。
- *
- * 优先级：**明确绑定了该 taskId 的成员** > 正在跑的成员 > 最近活跃的成员。
- * 角色可能先后有多个成员（返工/续聊会新建），所以不能按 roleId 取第一个。
+ * r33：找成员的实现移到 `viewmodel.ts` —— 三个入口（角色卡 / 任务行 / 流程图节点）
+ * 共用 `memberJumpOf`，判定只能有一处。这里保留同名导出，历史 import 与单测不用改。
  */
-export function memberForRole(
-  members: readonly MemberView[] | null | undefined,
-  roleId: string,
-  taskId?: string,
-): MemberView | undefined {
-  const list = Array.isArray(members) ? members.filter((member) => member.roleId === roleId) : []
-  if (list.length === 0) return undefined
-  if (typeof taskId === 'string' && taskId !== '') {
-    const bound = list.filter((member) => member.taskId === taskId)
-    if (bound.length > 0) return latestOf(bound)
-  }
-  const running = list.filter((member) => member.status === 'running')
-  if (running.length > 0) return latestOf(running)
-  return latestOf(list)
-}
+export { memberForRole } from './viewmodel.ts'
 
 /* ───────────────────────── 任务页 run 行（r18b t2） ───────────────────────── */
 
@@ -366,8 +344,11 @@ export function activeRunRowsOf(source: ActiveRunsSource): ActiveRunsView | null
 
   const rows: ActiveRunRow[] = picked.map((run) => {
     const hasOngoing = ongoingCountOf(run) > 0
+    // 用户 2026-11-13：残留判定要「确认没有存活成员」。快照成员只属于当前 run，
+    // 故仅当前 run 传快照 members（宿主已给 liveMembers 时它仍是兜底，不会覆盖宿主字段）。
+    const members = snapshot !== null && run.runId === snapshot.runId ? snapshot.members : undefined
     return {
-      ...runSummaryRowOf(run),
+      ...runSummaryRowOf(run, Date.now(), members),
       cardMetaText: cardMetaTextOf(run),
       current: run.runId === currentRunId,
       selected: run.runId === selectedRunId,
@@ -474,6 +455,11 @@ export interface MemberPageView {
   canResume: boolean
   resumeText: string
   taskText: string
+  /**
+   * r33：宿主判定「本轮已结束但未提交回执」时才出现。
+   * 与停滞（执行中、还活着）是**互斥事实**，文案/颜色都必须能一眼区分。
+   */
+  awaitingReceipt?: AwaitingReceiptView
   task?: MemberTaskView
   messages: MemberMessageView[]
   messageCount: number
@@ -487,7 +473,7 @@ export interface MemberPageSource {
   /** 角色定义（职责 / 技能），来自 `snapshot.roles`。 */
   roleDefinition?: Role | null
   /** 该成员执行的任务；缺省 = 未绑定任务或任务不在当前 run 里。 */
-  task?: TaskDetailView | null
+  task?: TaskCardSource | null
   messages?: readonly MessageRecord[] | null
   audits?: readonly RouteAudit[] | null
   now?: number
@@ -628,6 +614,10 @@ export function memberPageOf(source: MemberPageSource): MemberPageView {
       member.taskId === undefined
         ? '该成员还没有直接消息。'
         : '还没有与该成员/任务相关的直接消息。',
+  }
+  // r33：待回执是「人停了、只差回执」，标题带宿主记录的结束时刻；与停滞黄条不同色不同文案。
+  if (awaitingReceiptOf(task)) {
+    view.awaitingReceipt = { text: AWAITING_RECEIPT_MEMBER_TEXT, title: awaitingReceiptTitleOf(task) }
   }
   const statusTitle = memberStatusTitleOf(member.status)
   if (statusTitle !== undefined) view.statusTitle = statusTitle

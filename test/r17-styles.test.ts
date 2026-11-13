@@ -470,8 +470,9 @@ test('r17 ⑥ 钩子一致性：样式选择器与四个组件的真实 DOM 对�
   }
 
   assert.match(ROLE_CARD, /data-role-card-open/, 'RoleCard 缺少 data-role-card-open')
-  assert.match(ROLE_CARD, /role=\{onOpen === undefined \? undefined : 'button'\}/, '可点角色卡缺 button 语义')
-  assert.match(ROLE_CARD, /tabIndex=\{onOpen === undefined \? undefined : 0\}/, '可点角色卡缺键盘焦点')
+  // r33：可点态由 onJump 驱动（入口统一走 memberJumpOf），语义/焦点不变量不变。
+  assert.match(ROLE_CARD, /role=\{onJump === undefined \? undefined : 'button'\}/, '可点角色卡缺 button 语义')
+  assert.match(ROLE_CARD, /tabIndex=\{onJump === undefined \? undefined : 0\}/, '可点角色卡缺键盘焦点')
 })
 
 test('r17 ⑥ 样式纪律：新块只用宿主 token、字号走 font 简写、花括号配对', () => {

@@ -31,6 +31,7 @@ import { handoffBodiesFor, handoffMessages } from './handoff.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { auditRoute, describeRouteOf, preflightRoutes, routeDrift, type RoutePort } from './route.ts'
 import { applyScopeWaits, releaseScopes, waitFor } from './scope-locks.ts'
+import { withoutSilentFinish } from './silent-finish.ts'
 
 /** 创建成员的入参：名字是确定性的，路由是角色声明的（宿主可能不支持 model，见 L1）。 */
 export interface SpawnInput {
@@ -1092,6 +1093,15 @@ export function applyReceipt(
     body = giveUp
       ? `返工已达上限（${nextAttempts}/${limit} 次）：任务 ${task.id}「${taskLabelOf(task)}」已转人工，下游保持阻塞。${receipt.note ?? ''}`.trim()
       : `返工第 ${nextAttempts}/${limit} 次：任务 ${task.id}「${taskLabelOf(task)}」未通过门禁，请按证据修改后再次回报。${receipt.note ?? ''}`.trim()
+  }
+
+  // r33：回执一落，任务就离开 running（done / rework / failed 三条都算）⇒「待回执」观察事实失效。
+  next = {
+    ...next,
+    plan: {
+      ...next.plan,
+      tasks: next.plan.tasks.map((item) => (item.id === taskId ? withoutSilentFinish(item) : item)),
+    },
   }
 
   next = appendMessage(

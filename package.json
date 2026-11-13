@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-team",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "自动团队：把当前 DSH 会话变成队长，创建可续聊成员、按依赖并行执行任务、门禁把关，并带角色/模型/双轨记忆与输入框下开关",
   "type": "module",
   "main": "./lib/index.js",

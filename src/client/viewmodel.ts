@@ -1061,12 +1061,18 @@ export function currentRunStageInputOf(snapshot: PanelSnapshot | null | undefine
  */
 const UNCLOSED_PLAN_STATUSES: readonly PlanStatus[] = ['draft', 'dispatching', 'paused']
 
-/** 残留计划徽标文案（唯一来源；历史行与 run 卡都读它）。 */
+/**
+ * 残留计划徽标文案（唯一来源；历史行与 run 卡都读它）。
+ *
+ * 用户 2026-11-13 口径：**确认没有存活成员才提示**。计划态与结束时刻只能说明
+ * 「没收口」，正在跑的 run 同样满足；必须再拿到宿主「存活成员数 = 0」才算残留，
+ * 读不到存活成员数（`undefined`）一律不提示 —— 无法确认 ≠ 确认没有。
+ */
 export const RESIDUAL_RUN_BADGE_TEXT = '未收口·可能残留'
 
 /** 徽标悬停解释：说清「凭什么这么判」以及「能做什么」，不做「系统认为」式推断。 */
 export const RESIDUAL_RUN_TITLE =
-  '计划态为草稿/派发中/已暂停，且没有结束时刻：这次运行没有收口，可能残留。确认没有成员在跑后可点「终止计划」'
+  '计划态为草稿/派发中/已暂停、没有结束时刻，且确认没有存活成员：这次运行没有收口，可能残留。可点「终止计划」收口'
 
 /** 终止残留计划的按钮文案（破坏性动作：用结果命名，不用「确定」）。 */
 export const CLOSE_RUN_LABEL = '终止计划'
@@ -1080,22 +1086,34 @@ export const CLOSE_RUN_FAILED_TEXT = '终止失败：宿主未说明原因，请
 /** 残留计划徽标（warn tone：不是失败，但需要用户处理）。 */
 export const RESIDUAL_RUN_BADGE: Badge = { icon: '⚠', text: RESIDUAL_RUN_BADGE_TEXT, tone: 'warn' }
 
-/** 判定所需的宿主事实（`RunSummary` 的超集兼容：只要这两项）。 */
+/** 判定所需的宿主事实（`RunSummary` 的超集兼容：只要这三项）。 */
 export interface ResidualRunFacts {
   status: PlanStatus
   finishedAt?: number
+  /**
+   * 该 run 的存活成员数（宿主 `RunSummary.liveMembers` 原样透传）。
+   * `undefined` = 宿主读不到 / 旧快照：**无法确认没有存活成员**，按「不提示」处理。
+   */
+  liveMembers?: number
 }
 
 /**
  * 是否残留计划：**只读宿主事实**，不看任务数、不看 `active`。
  *
  * `active` 在宿主侧等于 `ongoing > 0`（有未终态任务），无法区分「正在跑」与「进程没了」；
- * 因此残留判定严格按 r24 口径：计划态 ∈ {draft,dispatching,paused} 且没有 `finishedAt`。
- * 正在跑的 run 也满足这一条 —— 它同样是「没收口」，徽标文案说的是「可能残留」。
+ * 因此残留判定严格按 r24 口径再加一条用户 2026-11-13 的收紧项：
+ *  - 计划态 ∈ {draft,dispatching,paused}；
+ *  - 没有 `finishedAt`；
+ *  - **确认没有存活成员**（`liveMembers === 0`）。
+ *
+ * 后两条缺一不可：正在跑的 run 也满足前两条（没有结束时刻），但它的 `liveMembers > 0`，
+ * 不能再被当成残留挂「终止计划」；宿主读不到存活成员数（`undefined`）时同样不提示 ——
+ * 「无法确认没有存活成员」不等于「确认没有」，宁可少提示也不制造噪音。
  */
 export function isResidualRun(run: ResidualRunFacts): boolean {
   if (!UNCLOSED_PLAN_STATUSES.includes(run.status)) return false
-  return run.finishedAt === undefined || !(run.finishedAt > 0)
+  if (run.finishedAt !== undefined && run.finishedAt > 0) return false
+  return run.liveMembers === 0
 }
 
 /* ───────────── r25：终态 run 绝不显示为「进行中」 ───────────── */
@@ -1602,6 +1620,87 @@ export interface TaskRevisionFacts {
   cancelReason?: string
   // r25：与 shared/types.ts 的 PlanTask/TaskDetailView 同步扩 'stale'（计划收口连带终结）。
   cancelledBy?: 'revision' | 'user' | 'stale'
+  /**
+   * r33：宿主算好的「待回执」布尔（当前快照的 `PanelTaskView.awaitingReceipt`）。
+   * 旧快照没有这个键时，`awaitingReceiptOf()` 会退回看 `silentFinish` 是否存在。
+   */
+  awaitingReceipt?: boolean
+  /** r33：观察事实（成员结束本轮的成员与时刻）；只用于 title 里的时间，不参与整页布局。 */
+  silentFinish?: { at: number; memberId: string }
+}
+
+/* ─────────────────── r33：「待回执」（成员结束本轮却没交回执） ─────────────────── */
+
+/** 任务行 / 任务详情里的标记文案（成员页与角色卡用下面那句，避免两种语义混用）。 */
+export const AWAITING_RECEIPT_TEXT = '待回执'
+
+/** 成员页 / 角色卡的文案：先回答「人停了」，再回答「缺回执」。 */
+export const AWAITING_RECEIPT_MEMBER_TEXT = '本轮已结束 · 待回执'
+
+/** title 的前半句；时间由 `awaitingReceiptTitleOf` 从 `silentFinish.at` 拼（客户端零推断）。 */
+export const AWAITING_RECEIPT_TITLE_LEAD = '成员已结束本轮但未提交回执'
+
+/** title 的后半句：两条出路（与宿主通知正文同口径）。 */
+export const AWAITING_RECEIPT_TITLE_TAIL =
+  '可用 auto_team_receipt 代跑门禁，或 auto_team_message 让它继续。'
+
+/** 「待回执」判定只看宿主事实：优先 `awaitingReceipt`，旧快照退回 `silentFinish` 是否存在。 */
+export interface AwaitingReceiptFact {
+  awaitingReceipt?: boolean
+  silentFinish?: { at: number; memberId: string }
+}
+
+/**
+ * 任务是否处于「待回执」。
+ *
+ * **宿主优先**：`awaitingReceipt` 是布尔时以它为准（`false` 就是 false，不再拿
+ * `silentFinish` 反推 —— 两处口径分叉时听宿主的）；只有旧快照没有该键时才看
+ * `silentFinish` 是否存在。两者都拿不到 → false，不猜。
+ */
+export function awaitingReceiptOf(task: AwaitingReceiptFact | null | undefined): boolean {
+  if (task === null || task === undefined) return false
+  if (task.awaitingReceipt === true) return true
+  if (task.awaitingReceipt === false) return false
+  return task.silentFinish !== undefined
+}
+
+/** title 里括号中的时间；宿主没给时刻时如实写「时间未记录」，不拿当前时间补。 */
+export function awaitingReceiptAtTextOf(task: AwaitingReceiptFact | null | undefined): string {
+  const at = task?.silentFinish?.at
+  return typeof at === 'number' && Number.isFinite(at) && at > 0 ? formatStamp(at) : '时间未记录'
+}
+
+/** 标记的悬停说明（完整一句话）：谁停了 + 两条出路。 */
+export function awaitingReceiptTitleOf(task: AwaitingReceiptFact | null | undefined): string {
+  return `${AWAITING_RECEIPT_TITLE_LEAD}（${awaitingReceiptAtTextOf(task)}）。${AWAITING_RECEIPT_TITLE_TAIL}`
+}
+
+/** 标记的渲染形状：文案与 title 一起下发，组件不再拼中文。 */
+export interface AwaitingReceiptView {
+  text: string
+  title: string
+}
+
+export interface AwaitingReceiptSummaryView {
+  count: number
+  text: string
+  title: string
+}
+
+/**
+ * 任务页顶部的聚合提示（只做「有几件事」的概览，具体是哪几行由行内标记回答）。
+ * 没有待回执任务时返回 `null`（不渲染、不占位）。
+ */
+export function awaitingReceiptSummaryOf(
+  tasks: readonly AwaitingReceiptFact[],
+): AwaitingReceiptSummaryView | null {
+  const hit = tasks.filter((task) => awaitingReceiptOf(task))
+  if (hit.length === 0) return null
+  return {
+    count: hit.length,
+    text: `${AWAITING_RECEIPT_TEXT} · ${hit.length} 个任务`,
+    title: `${AWAITING_RECEIPT_TITLE_LEAD}（共 ${hit.length} 个任务）。${AWAITING_RECEIPT_TITLE_TAIL}`,
+  }
 }
 
 /** 任务卡可消费的来源：`TaskDetailView`（历史）+ 可选修订事实（当前 run 才有）。 */
@@ -1632,6 +1731,8 @@ export interface TaskRowView {
    * 语义就是等写域锁，这里只**追加**一枚标记，不改 badge 文案（否则会与既有断言打架）。
    */
   waitScopeText?: string
+  /** r33：附加标记「待回执」—— 状态徽标仍是任务状态，两者并存，不互相改写。 */
+  awaitingReceipt?: AwaitingReceiptView
 }
 
 /** 修订徽标文案（r21）：宿主只下发事实位，中文在客户端这一处。 */
@@ -1689,6 +1790,10 @@ export function taskRowOf(task: TaskCardSource, expanded: boolean): TaskRowView 
     const waitReason = task.waitReason?.trim()
     if (waitReason !== undefined && waitReason !== '') row.waitScopeText = '等待写域'
   }
+  // r33：待回执是**附加**事实，不改 badge（任务仍是执行中）。
+  if (awaitingReceiptOf(task)) {
+    row.awaitingReceipt = { text: AWAITING_RECEIPT_TEXT, title: awaitingReceiptTitleOf(task) }
+  }
   return row
 }
 
@@ -1713,10 +1818,12 @@ export interface TaskDetailPanelView {
   usageMetrics?: UsageMetric[]
   durationReason?: string
   evidence?: GateEvidenceView
+  /** r33：展开区里的回执行 —— 只有宿主判定待回执时才出现。 */
+  awaitingReceipt?: AwaitingReceiptView
 }
 
 /** 展开区的内容（键值行）。没有的东西给「未声明 / 无」，不留空行。 */
-export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
+export function taskDetailOf(task: TaskCardSource): TaskDetailPanelView {
   const panel: TaskDetailPanelView = {
     acceptance: task.acceptance?.trim() || '（未声明验收命令）',
     dependsText: task.dependsOn.length > 0 ? task.dependsOn.join(' / ') : '无前置任务',
@@ -1745,6 +1852,10 @@ export function taskDetailOf(task: TaskDetailView): TaskDetailPanelView {
       artifacts: evidence.artifacts ?? [],
       atText: formatStamp(evidence.at),
     }
+  }
+  // r33：回执行放在门禁之后（先看有没有证据，再看人是不是已经停了）。
+  if (awaitingReceiptOf(task)) {
+    panel.awaitingReceipt = { text: AWAITING_RECEIPT_TEXT, title: awaitingReceiptTitleOf(task) }
   }
   return panel
 }
@@ -2634,6 +2745,11 @@ export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskC
   if (typeof task.cancelledAt === 'number') detail.cancelledAt = task.cancelledAt
   if (typeof task.cancelReason === 'string') detail.cancelReason = task.cancelReason
   if (task.cancelledBy !== undefined) detail.cancelledBy = task.cancelledBy
+  // r33：宿主算好的待回执布尔与观察事实原样带入卡片（客户端不重推「谁停了」）。
+  // `PlanTask` 本身没有 `awaitingReceipt`（它在快照行的 `PanelTaskView` 上），按事实位读取。
+  const facts = task as PlanTask & AwaitingReceiptFact
+  if (facts.awaitingReceipt !== undefined) detail.awaitingReceipt = facts.awaitingReceipt
+  if (facts.silentFinish !== undefined) detail.silentFinish = { ...facts.silentFinish }
   return detail
 }
 
@@ -2833,4 +2949,140 @@ export function buildRunDetail(source: RunDetailSource, runId?: string): RunDeta
   if (duration.endAt) detail.finishedAt = duration.endAt
   if (snapshot.pendingConfirmation) detail.pendingConfirmation = snapshot.pendingConfirmation
   return detail
+}
+
+/* ─────────── r33：角色卡 / 任务行 / 流程图节点 → 成员会话（唯一判定点） ─────────── */
+
+/** 三个入口的入参形状：组件只负责把自家数据塞成这个形状，判定一律走 `memberJumpOf`。 */
+export type MemberJumpSource =
+  | { kind: 'role'; roleId: string; taskId?: string }
+  | { kind: 'task'; roleId: string; taskId: string }
+  | { kind: 'node'; roleId?: string; taskId: string }
+
+/** 跳转判定结果：`available` 决定跳不跳，其余字段全是给界面直接贴的文案。 */
+export interface MemberJumpView {
+  available: boolean
+  /** 可跳转时的成员 id（与宿主会话 id 同源，直接交给会话服务）。 */
+  memberId?: string
+  /** 不可跳转的原因（人话）：未派发 / 已回收 / 节点没记录角色。 */
+  reason?: string
+  /** 命中的成员（可跳转时才有）：角色卡的成员态 chip 直接用它，避免第二次查找。 */
+  member?: MemberView
+  /** 任务行按钮上的可见文案（角色卡与流程图节点不渲染这句，只取 title/label）。 */
+  actionText: string
+  /** 悬停提示：可跳转 = 打开哪个成员；不可跳转 = 为什么点不动。 */
+  title: string
+  /** aria-label：入口自己的语义 + 跳转结果（传了 `base` 时合并）。 */
+  label: string
+}
+
+/** 入口原有的 title / aria-label（流程图节点的摘要），与跳转文案合并而不是互相覆盖。 */
+export interface MemberJumpBase {
+  title?: string
+  label?: string
+}
+
+/** 入口前缀（组件只传数据，中文拼装留在本文件，见文件头「文案集中」纪律）。 */
+export function roleJumpLabelOf(roleName: string): string {
+  return `角色：${roleName}`
+}
+
+export function taskJumpLabelOf(taskId: string): string {
+  return `任务 ${taskId}`
+}
+
+function latestMemberOf(list: readonly MemberView[]): MemberView {
+  let best = list[0]
+  for (const member of list) {
+    if (member.lastEventAt > best.lastEventAt) best = member
+    else if (member.lastEventAt === best.lastEventAt && member.memberId < best.memberId) best = member
+  }
+  return best
+}
+
+/**
+ * 给一个计划任务找执行它的成员（三入口共用；原在 `nav.ts`，r33 移到纯投影层）。
+ *
+ * 优先级：**明确绑定了该 taskId 的成员** > 正在跑的成员 > 最近活跃的成员。
+ * 角色可能先后有多个成员（返工/续聊会新建），所以不能按 roleId 取第一个。
+ */
+export function memberForRole(
+  members: readonly MemberView[] | null | undefined,
+  roleId: string,
+  taskId?: string,
+): MemberView | undefined {
+  const list = Array.isArray(members) ? members.filter((member) => member.roleId === roleId) : []
+  if (list.length === 0) return undefined
+  if (typeof taskId === 'string' && taskId !== '') {
+    const bound = list.filter((member) => member.taskId === taskId)
+    if (bound.length > 0) return latestMemberOf(bound)
+  }
+  const running = list.filter((member) => member.status === 'running')
+  if (running.length > 0) return latestMemberOf(running)
+  return latestMemberOf(list)
+}
+
+/* 跳转相关的可见文案（组件里禁止再拼一份，见文件头纪律 1）。 */
+export const MEMBER_JUMP_NO_MEMBER_TEXT = '子智能体 · 未派发'
+export const MEMBER_JUMP_NO_ROLE_REASON = '该节点没有记录角色，无法定位成员'
+export const MEMBER_JUMP_NO_MEMBER_REASON = '该任务还没有可跳转的成员：可能尚未派发，或成员已回收'
+export const MEMBER_JUMP_NO_MEMBER_ROLE_REASON = '该角色还没有可跳转的成员：任务可能尚未派发，或成员已回收'
+export const MEMBER_JUMP_SERVICE_MISSING_TEXT = '没有跳转：宿主未提供会话导航服务，无法打开成员会话'
+export const MEMBER_JUMP_REJECTED_TEXT = '没有跳转：宿主拒绝了这次会话切换，请再点一次'
+export const MEMBER_JUMP_NOT_READY_TEXT = '没有跳转：会话导航尚未就绪，请稍后重试'
+
+/**
+ * 三入口的**唯一**跳转判定：有成员 → 可跳转并给 memberId；没成员 → 不可跳转并给人话原因。
+ * 组件只调它，不许各处各写一套「找成员 + 拼原因」。
+ */
+export function memberJumpOf(
+  source: MemberJumpSource,
+  members: readonly MemberView[] | null | undefined,
+  base: MemberJumpBase = {},
+): MemberJumpView {
+  const member =
+    source.kind === 'node'
+      ? source.roleId === undefined
+        ? undefined
+        : memberForRole(members, source.roleId, source.taskId)
+      : memberForRole(members, source.roleId, source.taskId)
+  if (member === undefined) {
+    const reason =
+      source.kind === 'role'
+        ? MEMBER_JUMP_NO_MEMBER_ROLE_REASON
+        : source.kind === 'node' && source.roleId === undefined
+          ? MEMBER_JUMP_NO_ROLE_REASON
+          : MEMBER_JUMP_NO_MEMBER_REASON
+    return {
+      available: false,
+      reason,
+      actionText: MEMBER_JUMP_NO_MEMBER_TEXT,
+      title: base.title === undefined ? reason : `${base.title} · ${reason}`,
+      label: base.label === undefined ? reason : `${base.label}，${reason}`,
+    }
+  }
+  const open = `打开子智能体会话：${member.name}`
+  return {
+    available: true,
+    memberId: member.memberId,
+    member,
+    actionText: `子智能体 · ${member.name} →`,
+    title: base.title === undefined ? open : `${base.title} · ${open}`,
+    label: base.label === undefined ? open : `${base.label}，${open}`,
+  }
+}
+
+/** 会话打开结局：`no-member` 只在 memberId 为空时出现（正常路径由 `memberJumpOf` 先挡住）。 */
+export type MemberSessionOutcome = 'opened' | 'unavailable' | 'rejected' | 'no-member'
+
+/** 结局 → 一行提示；`undefined` = 成功，调用方清掉提示，不渲染空行。 */
+export function memberJumpNoticeOf(
+  outcome: MemberSessionOutcome | null,
+  jump: MemberJumpView,
+): string | undefined {
+  if (outcome === 'opened') return undefined
+  if (outcome === null) return MEMBER_JUMP_NOT_READY_TEXT
+  if (outcome === 'unavailable') return MEMBER_JUMP_SERVICE_MISSING_TEXT
+  if (outcome === 'rejected') return MEMBER_JUMP_REJECTED_TEXT
+  return jump.reason ?? MEMBER_JUMP_NO_MEMBER_REASON
 }

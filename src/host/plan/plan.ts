@@ -424,6 +424,7 @@ export function revisePlan(plan: Plan, input: RevisionInput, now: number): Revis
     }
     delete patched.waitingOn
     delete patched.waitReason
+    delete patched.silentFinish
     nextById.set(id, patched)
     const at = nextTasks.findIndex((item) => item.id === id)
     nextTasks[at] = patched

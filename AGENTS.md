@@ -53,7 +53,7 @@
 **验证命令（提交前必须全绿）**
 ```bash
 pnpm typecheck   # tsc --noEmit
-pnpm test        # node --test test/*.test.ts（当前 1179 例）
+pnpm test        # node --test test/*.test.ts（当前 1257 例）
 pnpm build       # 双产物
 node --input-type=module -e "await import('./lib/index.js')"
 node --input-type=module -e "await import('./lib/client.js')"

@@ -23,9 +23,15 @@
  */
 import * as React from 'react'
 import type { MemberView, TaskDetailView } from '../../shared/types.ts'
-import type { TaskRowView } from '../viewmodel.ts'
-import { memberForRole } from '../nav.ts'
-import { TASK_TABLE_HEADER, taskDetailOf, taskOverviewOf, taskRowOf } from '../viewmodel.ts'
+import type { MemberJumpView, TaskRowView } from '../viewmodel.ts'
+import {
+  TASK_TABLE_HEADER,
+  memberJumpOf,
+  taskDetailOf,
+  taskJumpLabelOf,
+  taskOverviewOf,
+  taskRowOf,
+} from '../viewmodel.ts'
 import { EmptyState } from './EmptyState.tsx'
 
 export interface TaskTableProps {
@@ -36,7 +42,8 @@ export interface TaskTableProps {
   grouped?: boolean
   /** r17：当前 run 的成员，用于「任务行 → 子智能体」；历史 run 不传。 */
   members?: MemberView[]
-  onOpenMember?: (member: MemberView, taskId: string) => void
+  /** r33：点任务行里的「子智能体」按钮 = 跳到该成员的宿主会话（判定来自 memberJumpOf）。 */
+  onJump?: (jump: MemberJumpView) => void
 }
 
 /**
@@ -53,10 +60,10 @@ function TaskRow(props: {
   task: TaskDetailView
   done: boolean
   onToggleTask: (taskId: string) => void
-  member?: MemberView
-  onOpenMember?: (member: MemberView, taskId: string) => void
+  jump: MemberJumpView
+  onJump?: (jump: MemberJumpView) => void
 }): React.ReactElement {
-  const { row, task, done, onToggleTask, member, onOpenMember } = props
+  const { row, task, done, onToggleTask, jump, onJump } = props
   const panel = row.expanded ? taskDetailOf(task) : null
   const detailId = `auto-team-task-detail-${task.id}`
   return (
@@ -93,6 +100,16 @@ function TaskRow(props: {
           <span data-badge data-tone={row.badge.tone} title={`状态：${row.badge.text}`}>
             <span aria-hidden="true">{row.badge.icon}</span> {row.badge.text}
           </span>
+          {row.awaitingReceipt ? (
+            // r33：附加标记，不改上面那枚状态徽标 —— 任务仍是执行中，缺的是回执。
+            <span
+              data-awaiting-receipt
+              data-awaiting-receipt-scope="task"
+              title={row.awaitingReceipt.title}
+            >
+              {row.awaitingReceipt.text}
+            </span>
+          ) : null}
           {row.waitScopeText ? (
             // r21：等写域是「为什么还没跑」的具体原因，悬停给宿主生成的等待说明。
             <span data-task-wait-scope title={task.waitReason ?? row.waitScopeText}>
@@ -123,26 +140,21 @@ function TaskRow(props: {
           </span>
         ) : null}
       </button>
-      {member !== undefined && onOpenMember !== undefined ? (
+      {onJump !== undefined ? (
+        // 与展开按钮是**兄弟**而不是父子：点击不会冒泡到 data-task-toggle，
+        // 因此展开态不受影响，也不需要 stopPropagation（嵌套可交互元素才是真冲突）。
+        // 无成员时按钮仍渲染并可点：点了由任务页给一行原因，禁止「点了没反应」。
         <button
           type="button"
           data-task-open-member
           data-task-id={task.id}
-          data-member-id={member.memberId}
-          title={`在主界面打开子智能体：${member.name}`}
-          style={{
-            margin: '0 12px 8px',
-            padding: 0,
-            border: 0,
-            background: 'transparent',
-            color: 'inherit',
-            cursor: 'pointer',
-            font: 'inherit',
-            textAlign: 'left',
-          }}
-          onClick={() => onOpenMember(member, task.id)}
+          data-member-id={jump.memberId}
+          data-member-jump={jump.available ? 'available' : 'unavailable'}
+          title={jump.title}
+          aria-label={jump.label}
+          onClick={() => onJump(jump)}
         >
-          子智能体 · {member.name} →
+          {jump.actionText}
         </button>
       ) : null}
       {panel ? (
@@ -219,6 +231,18 @@ function TaskRow(props: {
                 </dd>
               </>
             ) : null}
+            {panel.awaitingReceipt ? (
+              <>
+                <dt>回执</dt>
+                <dd
+                  data-awaiting-receipt
+                  data-awaiting-receipt-scope="detail"
+                  title={panel.awaitingReceipt.title}
+                >
+                  {panel.awaitingReceipt.text}
+                </dd>
+              </>
+            ) : null}
           </dl>
         </div>
       ) : null}
@@ -227,7 +251,7 @@ function TaskRow(props: {
 }
 
 export function TaskTable(props: TaskTableProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, grouped, members, onOpenMember } = props
+  const { tasks, expandedTaskId, onToggleTask, grouped, members, onJump } = props
   if (tasks.length === 0) {
     return (
       <EmptyState
@@ -271,8 +295,12 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
                     task={task}
                     done={key === 'done'}
                     onToggleTask={onToggleTask}
-                    member={memberForRole(members, task.roleId, task.id)}
-                    onOpenMember={onOpenMember}
+                    jump={memberJumpOf(
+                      { kind: 'task', roleId: task.roleId, taskId: task.id },
+                      members,
+                      { label: taskJumpLabelOf(task.id) },
+                    )}
+                    onJump={onJump}
                   />
                 )
               })}
@@ -298,8 +326,12 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
             task={task}
             done={task.status === 'done'}
             onToggleTask={onToggleTask}
-            member={memberForRole(members, task.roleId, task.id)}
-            onOpenMember={onOpenMember}
+            jump={memberJumpOf(
+              { kind: 'task', roleId: task.roleId, taskId: task.id },
+              members,
+              { label: taskJumpLabelOf(task.id) },
+            )}
+            onJump={onJump}
           />
         ))}
       </ul>

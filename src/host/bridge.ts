@@ -56,6 +56,7 @@ import type {
   ModelCatalogView,
   PanelAction,
   PanelSnapshot,
+  PanelTaskView,
   Plan,
   PlanTask,
   RejectionCode,
@@ -137,6 +138,7 @@ import {
 import type { DeviationRecorder } from './team/deviation.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
 import { normalizeHostStatus, type HostMember } from './team/watcher.ts'
+import { panelTaskViewOf } from './team/silent-finish.ts'
 import { isIrreversibleAction, pendingFor, pendingViewOf } from './team/confirm.ts'
 import { applyProjectionUsage, runUsageOf, taskUsageOf, type ProjectionUsageEntry } from './team/usage.ts'
 import { releaseScopes } from './team/scope-locks.ts'
@@ -1668,43 +1670,139 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 之后，下一次 `historyOf` 必须重新读盘，否则「终止成功」后历史行还会最多 5 秒显示旧状态。
    * 反向约束（AC：不得退化）保留：**没有写盘**时仍按 5 秒合并读；只改 usage 的投影写盘
    * 走 `historyNeutral`，不推进 epoch（见 `store.SaveOptions`），避免轮询帧把 memo 打穿。
+   *
+   * r34：memo 里除了 `RunSummary` 还要带上每个 run 的 `bindings` —— 存活成员数依赖宿主名单，
+   * 而名单（`deps.listMembers`）会随成员退出变化；不把 bindings 一起缓存的话，为了算这一格
+   * 就得每帧重读 ≤50 个 run 文件。bindings 是只读快照，和这一行的其它派生值一样**不落盘**。
    */
-  let historyMemo: { sessionId: string; at: number; epoch: number; runs: RunSummary[] } | null = null
+  interface HistoryRow {
+    run: RunSummary
+    /** 该 run 的 bindings；`null` = run 文件读不出来（与四项计数同样按「不可得」处理）。 */
+    bindings: RunState['bindings'] | null
+  }
+  let historyMemo: { sessionId: string; at: number; epoch: number; rows: HistoryRow[] } | null = null
+
+  /**
+   * r34：宿主成员名单的**一次读盘**缓存（异步读口 + 同步快照之间的适配层）。
+   *
+   * 为什么需要缓存：`snapshot()` 是同步契约（tools / prompt / 单测都同步取用），
+   * 而成员名单读口 `deps.listMembers` 是异步的。于是把「读」收敛到这里：同一时刻最多一个
+   * 在飞请求，结果按 `MEMBER_ROSTER_TTL_MS` 复用；`historyOf` 每次只触发**一次**，
+   * 再用同一份 rows 给**整批** run 逐条算存活数（绝不 per-run 读盘）。
+   * 代价是最多滞后一个轮询帧（面板 2 秒一刷），换来同步契约不被打破。
+   *
+   * 三态语义（客户端据此区分「确实没人」与「不知道」）：
+   *   - `null` = 还没读到过 → 历史行**不填** `liveMembers`；
+   *   - `{ unknown }` = 没有读口 / 读失败 → 同样不填（0 会被读成「确实没有存活成员」）；
+   *   - `{ rows }` = 读到名单 → 按 `normalizeHostStatus === 'alive'` 计数（与 `closeRun` 同源）。
+   */
+  let memberRoster: { rows: HostMember[] } | { unknown: string } | null = null
+  let memberRosterAt = 0
+  let memberRosterInFlight = false
+  const MEMBER_ROSTER_TTL_MS = 1500
+
+  function refreshMemberRoster(): void {
+    if (memberRosterInFlight) return
+    const at = now()
+    if (memberRoster !== null && at - memberRosterAt < MEMBER_ROSTER_TTL_MS) return
+    const read = deps.listMembers
+    if (read === undefined) {
+      memberRoster = { unknown: '装配层未提供宿主成员名单读口' }
+      memberRosterAt = at
+      return
+    }
+    memberRosterInFlight = true
+    let pending: Promise<HostMember[]>
+    try {
+      pending = read()
+    } catch (error) {
+      // 同步抛（非 async 读口）也要落成 unknown，绝不让它把这一帧快照整个炸掉。
+      memberRoster = { unknown: error instanceof Error ? error.message : String(error) }
+      memberRosterAt = now()
+      memberRosterInFlight = false
+      return
+    }
+    // 读失败 ≠ 没有成员：整体退成 unknown（历史行不填），绝不沿用上一轮名单冒充「此刻」。
+    void pending.then(
+      (rows) => {
+        memberRoster = { rows }
+        memberRosterAt = now()
+        memberRosterInFlight = false
+      },
+      (error: unknown) => {
+        memberRoster = { unknown: error instanceof Error ? error.message : String(error) }
+        memberRosterAt = now()
+        memberRosterInFlight = false
+      },
+    )
+  }
+
+  /**
+   * 历史行可填的存活成员数；`undefined` = 不知道（无读口 / 读失败 / 该 run 读不出来）。
+   *
+   * 没有未退休 binding 时直接给 0 —— 这与 `liveMemberNamesOf` 的第 1 步同源：
+   * 「一个绑定都没有」本身就是「确实没有存活成员」的事实，不需要读名单。
+   */
+  function liveMemberCountOf(bindings: RunState['bindings'] | null): number | undefined {
+    if (bindings === null) return undefined
+    const live = bindings.filter((binding) => binding.retired !== true)
+    if (live.length === 0) return 0
+    if (memberRoster === null || !('rows' in memberRoster)) return undefined
+    return aliveMemberNamesOf(live, memberRoster.rows).length
+  }
+
   function historyOf(sessionId: string): RunSummary[] {
     const at = now()
     const epoch = deps.store.writeEpoch()
+    let rows: HistoryRow[]
     if (
       historyMemo &&
       historyMemo.sessionId === sessionId &&
       historyMemo.epoch === epoch &&
       at - historyMemo.at < LIBRARY_CACHE_MS
     ) {
-      return historyMemo.runs
+      rows = historyMemo.rows
+    } else {
+      // r17：历史行要显示 token 六项。六项文案的唯一来源是宿主 `format.ts`，客户端不许自己拆，
+      // 所以在这里把落盘的 `usageTotals` 派生为 `UsageCell`（含 `text` + `details`）。
+      // 只派生不落盘：`usage` 是视图字段，run 文件里仍只有原始 `usageTotals`。
+      rows = deps.store
+        .list()
+        .filter((run) => run.sessionId === sessionId)
+        .slice(0, HISTORY_PAGE_SIZE)
+        .map((run) => {
+          // r26：阶段判定计数从 RunState 现算（落盘只保留原始事实，不新增字段）。
+          // 读盘失败时四项计数与 bindings 一起缺席 —— 宁可显示「不可得」，
+          // 也不拿 0 冒充「没有失败/没有成员」。
+          let counts: RunStageCounts | undefined
+          let bindings: RunState['bindings'] | null = null
+          try {
+            const state = deps.store.load(run.runId)
+            counts = runStageCountsOf(state)
+            bindings = state === null ? null : state.bindings
+          } catch {
+            counts = undefined
+            bindings = null
+          }
+          return {
+            bindings,
+            run: {
+              ...run,
+              ...(counts === undefined ? {} : counts),
+              usage: usageCellOf(run.usageTotals, HISTORY_USAGE_REASON),
+            },
+          }
+        })
+      historyMemo = { sessionId, at, epoch, rows }
     }
-    // r17：历史行要显示 token 六项。六项文案的唯一来源是宿主 `format.ts`，客户端不许自己拆，
-    // 所以在这里把落盘的 `usageTotals` 派生为 `UsageCell`（含 `text` + `details`）。
-    // 只派生不落盘：`usage` 是视图字段，run 文件里仍只有原始 `usageTotals`。
-    const runs = deps.store
-      .list()
-      .filter((run) => run.sessionId === sessionId)
-      .slice(0, HISTORY_PAGE_SIZE)
-      .map((run) => {
-        // r26：阶段判定计数从 RunState 现算（落盘只保留原始事实，不新增字段）。
-        // 读盘失败时四项缺席 —— 宁可显示「不可得」，也不拿 0 冒充「没有失败/没有成员」。
-        let counts: RunStageCounts | undefined
-        try {
-          counts = runStageCountsOf(deps.store.load(run.runId))
-        } catch {
-          counts = undefined
-        }
-        return {
-          ...run,
-          ...(counts === undefined ? {} : counts),
-          usage: usageCellOf(run.usageTotals, HISTORY_USAGE_REASON),
-        }
-      })
-    historyMemo = { sessionId, at, epoch, runs }
-    return runs
+    if (rows.length === 0) return []
+    // 一个没有 run 的会话不该为历史行去读宿主名单：先看有没有行，再决定要不要「一次读盘」。
+    refreshMemberRoster()
+    return rows.map((row) => {
+      const liveMembers = liveMemberCountOf(row.bindings)
+      // 读不到就**不填**（不要填 0）：客户端把缺省读成「不知道」，把 0 读成「确实没人」。
+      return liveMembers === undefined ? row.run : { ...row.run, liveMembers }
+    })
   }
 
   /**
@@ -1816,7 +1914,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // r21：目标全文与修订史（含「需求修订」段落）。缺省时字段缺席，客户端显示「不可得」而不是空串。
       ...(state?.plan.goal === undefined ? {} : { goal: state.plan.goal }),
       ...(state?.plan.revisions === undefined ? {} : { revisions: state.plan.revisions }),
-      tasks: state?.plan.tasks ?? [],
+      tasks: panelTasksOf(state),
       members: membersOf(state, roles, stallMs),
       ...(runCounts === undefined ? {} : { runCounts }),
       messages: state?.messages ?? [],
@@ -1920,6 +2018,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
       const reason = error instanceof Error ? error.message : String(error)
       return { names: namesOf(), unknown: `宿主成员名单读取失败（${reason}）` }
     }
+    // 读到了就按宿主 4 态归一，判定实现与历史行存活数共用同一处。
+    return { names: aliveMemberNamesOf(bindings, rows) }
+  }
+
+  /**
+   * r34：一组 binding 里宿主仍判 `alive` 的成员名 —— `liveMemberNamesOf`（`closeRun` 的判据）
+   * 与历史行 `liveMembers` 计数的**唯一**判定实现，两处不许各写一份。
+   *
+   * 只认 `normalizeHostStatus === 'alive'`（与 watcher 同源的四态归一），
+   * `unknown` / `dead` 一律不算存活：宁可显示「没人」让用户多看一眼，也不把已退出的成员算成在跑。
+   */
+  function aliveMemberNamesOf(bindings: RunState['bindings'], rows: HostMember[]): string[] {
     const names: string[] = []
     for (const binding of bindings) {
       const row = rows.find(
@@ -1931,7 +2041,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         names.push(binding.name || row.name || binding.memberId || binding.taskId)
       }
     }
-    return { names }
+    return names
   }
 
   /**
@@ -2447,7 +2557,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
           const downstream = downstreamOf(state, task.id)
           let next = withTask(base, task.id, (item) => {
-            const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+            // r33：任务被取消即离开 running →「待回执」观察事实一并清掉（不能留在终态任务上）。
+            const { waitingOn: _waiting, waitReason: _reason, silentFinish: _silentFinish, ...rest } = item
             return {
               ...rest,
               status: 'cancelled' as const,
@@ -2503,7 +2614,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
           const at = now()
           let next = withTask(state, task.id, (item) => {
-            const { waitingOn: _waiting, waitReason: _reason, ...rest } = item
+            // r33：跳过也让任务离开 running ⇒ 同一份「待回执」事实一并清掉。
+            const { waitingOn: _waiting, waitReason: _reason, silentFinish: _silentFinish, ...rest } = item
             return { ...rest, status: 'skipped' as const }
           })
           const released: string[] = []
@@ -2917,6 +3029,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
     }
   }
 
+  /**
+   * r34：装配后预热一次成员名单 —— 面板第一帧快照是同步的，等不到那次读盘；
+   * 预热失败只落成 unknown（历史行不填 liveMembers），下一次快照按 TTL 重试。
+   */
+  if (deps.listMembers !== undefined) refreshMemberRoster()
+
   return {
     enabled(sessionId: string): boolean {
       return flags[sessionId]?.enabled === true
@@ -3086,6 +3204,14 @@ function firstLine(text: string): string {
 
 function attemptsOf(task: { attempts?: number }): number {
   return typeof task.attempts === 'number' ? task.attempts : 0
+}
+
+/**
+ * r33：快照任务行。`awaitingReceipt` 由宿主现算（要结合 silentFinish 事实），
+ * 客户端只读不算 —— 否则每个客户端都要自己重推一遍「谁停了 / 有没有证据」。
+ */
+function panelTasksOf(state: RunState | null): PanelTaskView[] {
+  return (state?.plan.tasks ?? []).map(panelTaskViewOf)
 }
 
 function routeText(route: { provider: string; model: string; reasoningEffort?: string } | null | undefined): string {

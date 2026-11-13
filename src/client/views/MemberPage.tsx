@@ -46,6 +46,16 @@ export function MemberPage(props: MemberPageProps): React.ReactElement {
             <span data-member-status data-tone={view.statusTone} title={view.statusTitle}>
               {view.statusText}
             </span>
+            {view.awaitingReceipt ? (
+              // r33：与停滞是两件事 —— 这里回答「人已经停了、只差回执」，不是「还活着但没产出」。
+              <span
+                data-awaiting-receipt
+                data-awaiting-receipt-scope="member"
+                title={view.awaitingReceipt.title}
+              >
+                {view.awaitingReceipt.text}
+              </span>
+            ) : null}
             <span data-member-role data-role-id={view.roleId}>
               {view.roleName}
             </span>

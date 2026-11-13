@@ -15,6 +15,7 @@ import type { Role, RoleModelRoute } from '../../shared/types.ts'
 import type { RunState } from '../store.ts'
 import { describeRoute } from '../bridge.ts'
 import { appendMessage, makeMessage } from './messages.ts'
+import { withoutSilentFinish } from './silent-finish.ts'
 
 /** 路由解析端口：解析成功返回（可能被宿主改写过的）路由，解析失败返回 null。 */
 export interface RoutePort {
@@ -121,7 +122,10 @@ export function auditRoute(
       ...next,
       plan: {
         ...next.plan,
-        tasks: next.plan.tasks.map((item) => (item.id === taskId ? { ...item, status: 'failed' as const } : item)),
+        tasks: next.plan.tasks.map((item) =>
+          // r33：路由漂移直接把任务判失败（离开 running）⇒「待回执」事实一并清掉。
+          item.id === taskId ? withoutSilentFinish({ ...item, status: 'failed' as const }) : item,
+        ),
       },
     }
     next = appendMessage(

@@ -81,6 +81,10 @@ export function HistoryTab(props: TabProps): React.ReactElement {
   }
 
   const runs: RunSummary[] = props.snapshot?.runs ?? props.library?.runs ?? []
+  // 用户 2026-11-13：残留判定要「确认没有存活成员」。快照的成员列表只属于当前 run，
+  // 因此只给当前 run 传，供宿主缺 `liveMembers` 时兜底；别的 run 传 undefined（无法确认）。
+  const snapshotRunId = props.snapshot?.runId
+  const snapshotMembers = props.snapshot?.members
   const limit = memory.historyLimit > 0 ? memory.historyLimit : HISTORY_PAGE_SIZE
   const visible = runs.slice(0, limit)
   const hasMore = runs.length > visible.length
@@ -96,7 +100,11 @@ export function HistoryTab(props: TabProps): React.ReactElement {
       ) : (
         <ul data-region="history-list">
           {visible.map((run) => {
-            const row = runSummaryRowOf(run)
+            const row = runSummaryRowOf(
+              run,
+              Date.now(),
+              run.runId === snapshotRunId ? snapshotMembers : undefined,
+            )
             return (
               <li key={row.runId} data-history-row data-active={row.active ? 'true' : 'false'}>
                 <button type="button" data-history-open={row.runId} onClick={() => void props.openRun(row.runId)}>

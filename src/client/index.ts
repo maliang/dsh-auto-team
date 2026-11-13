@@ -27,6 +27,7 @@ import { LibraryPage, PanellistEntry } from './LibraryPage.tsx'
 import { Panel } from './Panel.tsx'
 import { TabTitle } from './TabTitle.tsx'
 import { SettingsSection } from './SettingsPage.tsx'
+import { registerMemberSession } from './session.ts'
 
 export const inject = ['slots']
 
@@ -53,4 +54,8 @@ export function apply(ctx: ClientContext): void {
   // r13 左栏栏目 + 主区项目库。两步各自 try/catch（见 slots.ts），
   // 主区不可用时降级为面板内联项目库，不影响右栏页签。
   registerPanellist(ctx, { PanellistEntry, LibraryPage })
+
+  // r33：角色卡 / 任务行 / 流程图节点 → 宿主成员会话。单独注册（不塞进 registerPanellist，
+  // 那个函数的注入面与返回值被契约测试逐字锁死）；服务缺失时调用方会拿到 unavailable 并给原因。
+  registerMemberSession(ctx)
 }

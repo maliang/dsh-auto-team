@@ -279,8 +279,10 @@ export function cancelResidualTasks(
   const tasks = state.plan.tasks.map((task) => {
     if (SUMMARY_TERMINAL_STATUSES.has(task.status)) return task
     changed += 1
+    // r33：收口即离开 running →「待回执」观察事实不能留在终态任务上。
+    const { silentFinish: _silentFinish, ...rest } = task
     return {
-      ...task,
+      ...rest,
       status: 'cancelled' as TaskStatus,
       cancelledAt: finishedAt,
       cancelReason,
@@ -1058,6 +1060,17 @@ function normalizeTask(raw: unknown): PlanTask | null {
       : undefined
   if (cancelledBy !== undefined) task.cancelledBy = cancelledBy
   else delete task.cancelledBy
+
+  // r33：待回执观察事实 —— 形状不完整（缺 at / memberId）就整条丢掉，绝不留半截记录。
+  const silentFinish = raw.silentFinish
+  const silentAt = isRecord(silentFinish) ? finiteOptional(silentFinish.at) : undefined
+  const silentMember =
+    isRecord(silentFinish) && typeof silentFinish.memberId === 'string' ? silentFinish.memberId.trim() : ''
+  if (silentAt !== undefined && silentMember !== '') {
+    task.silentFinish = { at: silentAt, memberId: silentMember }
+  } else {
+    delete task.silentFinish
+  }
 
   return task
 }

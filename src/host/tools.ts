@@ -740,6 +740,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           concurrency: snapshot.concurrency,
           tasks: snapshot.tasks.map((task) => ({
             ...taskBrief(task),
+            // r33：待回执是宿主算好的事实（快照行自带），客户端/队长不要自己推。
+            awaitingReceipt: task.awaitingReceipt,
             evidence: task.evidence
               ? { exitCode: task.evidence.exitCode, command: task.evidence.command, at: task.evidence.at }
               : undefined,

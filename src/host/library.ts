@@ -310,6 +310,8 @@ function taskDetailOf(
   if (task.cancelledAt !== undefined) view.cancelledAt = task.cancelledAt
   if (task.cancelReason !== undefined && task.cancelReason !== '') view.cancelReason = task.cancelReason
   if (task.cancelledBy !== undefined) view.cancelledBy = task.cancelledBy
+  // r33：待回执是宿主现算的展示事实；只有真的有待回执事实时才出现该键。
+  if (task.silentFinish !== undefined) view.awaitingReceipt = true
   return view
 }
 

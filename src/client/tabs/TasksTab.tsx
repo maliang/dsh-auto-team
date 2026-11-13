@@ -16,11 +16,18 @@
  * 且**不提供成员导航**（历史快照没有成员/消息，导过去只会是空页）。
  */
 import * as React from 'react'
-import type { MemberView, PlanStatus, PanelSnapshot } from '../../shared/types.ts'
+import type { PlanStatus, PanelSnapshot } from '../../shared/types.ts'
 import type { TabProps } from '../Panel.tsx'
-import { buildRunDetail, planGoalOf, stageOfDetail } from '../viewmodel.ts'
-import type { InflightState, RunStageView } from '../viewmodel.ts'
-import { activeRunRowsOf, memberForRole, navigateToMember, tasksEmptyStateOf } from '../nav.ts'
+import {
+  awaitingReceiptSummaryOf,
+  buildRunDetail,
+  memberJumpNoticeOf,
+  planGoalOf,
+  stageOfDetail,
+} from '../viewmodel.ts'
+import type { InflightState, MemberJumpView, RunStageView } from '../viewmodel.ts'
+import { activeRunRowsOf, tasksEmptyStateOf } from '../nav.ts'
+import { requestMemberSession } from '../session.ts'
 import { RunHeader } from '../views/RunHeader.tsx'
 import { RunSwitcher } from '../views/RunSwitcher.tsx'
 import { RunCloseAction } from '../views/RunCloseAction.tsx'
@@ -103,10 +110,27 @@ export function TasksTab(props: TabProps): React.ReactElement {
     [detail],
   )
   const members = historicalRunId === null && snapshot !== undefined ? snapshot.members : []
+  // r33：待回执的聚合提示（只回答「有几件事」，是哪几行由任务行自己的标记回答）。
+  const awaitingReceipt = React.useMemo(
+    () => awaitingReceiptSummaryOf(detail === null ? [] : detail.tasks),
+    [detail],
+  )
+  // r33：三入口共用一份「点了没跳成」的原因；成功时清空（占位折叠为零高，不留空行）。
+  const [jumpNotice, setJumpNotice] = React.useState<string | null>(null)
 
-  const openMember = (member: MemberView, taskId?: string): void => {
-    navigateToMember(props.sessionId, member.memberId, taskId)
+  /**
+   * 角色卡 / 任务行 / 流程图节点的唯一落地动作：判定已由 `memberJumpOf` 做完，
+   * 这里只负责「调宿主会话服务 + 把结局翻成人话」。任何没跳成的情况都要留一行原因。
+   */
+  const jumpToMember = (jump: MemberJumpView): void => {
+    if (!jump.available || jump.memberId === undefined) {
+      setJumpNotice(memberJumpNoticeOf('no-member', jump) ?? null)
+      return
+    }
+    setJumpNotice(memberJumpNoticeOf(requestMemberSession(jump.memberId), jump) ?? null)
   }
+  // 历史 run 没有成员/消息，入口保持不可点（与 r17 的「历史不提供成员导航」一致）。
+  const onJump = historicalRunId === null ? jumpToMember : undefined
 
   const selectRun = (runId: string): void => {
     if (runId === '') return
@@ -163,26 +187,35 @@ export function TasksTab(props: TabProps): React.ReactElement {
         plan={planGoal}
         stage={stage}
       />
-      <RoleGrid roles={detail.roles} members={members} onOpenMember={openMember} />
+      {awaitingReceipt !== null ? (
+        // 放在 run 头下方：用户和队长一眼能看到「有人停了、只差回执」，不必先翻任务列表。
+        <p data-awaiting-receipt-summary title={awaitingReceipt.title}>
+          {awaitingReceipt.text}
+        </p>
+      ) : null}
+      {/* 常驻 live region：内容为空时折叠为零高（不占位），换文案时读屏才会播报。 */}
+      <p
+        role="status"
+        aria-live="polite"
+        data-member-jump-notice
+        data-empty={jumpNotice === null ? 'true' : undefined}
+      >
+        {jumpNotice ?? ''}
+      </p>
+      <RoleGrid roles={detail.roles} members={members} tasks={detail.tasks} onJump={onJump} />
       <TaskOverview
         tasks={detail.tasks}
         expandedTaskId={expanded}
         onToggleTask={(taskId) => toggleTask(taskId)}
         members={members}
-        onOpenMember={openMember}
+        onJump={onJump}
       />
       <FlowCanvas
         flow={detail.flow}
         members={members}
-        onOpenMember={openMember}
+        onJump={onJump}
         onSelectTask={(taskId) => {
-          // 当前 run 里节点一定绑着角色 → 优先打开成员；找不到成员时退回「展开并滚到任务行」。
-          const task = detail.tasks.find((item) => item.id === taskId)
-          const member = task === undefined ? undefined : memberForRole(members, task.roleId, task.id)
-          if (member !== undefined) {
-            openMember(member, taskId)
-            return
-          }
+          // 跳转由节点自己的 onJump 负责；这里只保留「选中并滚到任务行」的回退行为。
           expandTask(taskId)
           if (typeof requestAnimationFrame === 'function') {
             requestAnimationFrame(() => scrollToTaskRow(taskId, taskIds))

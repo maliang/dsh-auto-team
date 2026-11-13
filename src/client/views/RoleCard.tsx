@@ -12,41 +12,57 @@
  *      `taskRefs` 缺省/空则整行不渲染 —— 旧快照不显示「0 个任务」；
  *   4. token · 用时 · 已完成 N/总数（11px tabular-nums）。
  * 卡片数 = 不同 roleId 数（分组已在宿主/客户端聚合层完成）。
+ *
+ * r33：整卡点击 = 跳到该角色成员的宿主会话。跳不跳、为什么不能跳，一律由
+ * `memberJumpOf` 判定（三入口唯一实现）；卡片内没有折叠/展开控件，故不需要
+ * stopPropagation —— 成员态 chip 是不可交互的 span，键盘事件只会落到卡片本身。
  */
 import * as React from 'react'
 import type { MemberView, RoleUsageView } from '../../shared/types.ts'
 import { ROLE_STATE_TEXT, ROLE_STATE_TONE } from '../../shared/role-view.ts'
 import type { RoleStateKind } from '../../shared/role-view.ts'
-import { memberForRole } from '../nav.ts'
 import {
+  AWAITING_RECEIPT_MEMBER_TEXT,
+  awaitingReceiptOf,
+  awaitingReceiptTitleOf,
   memberCardChipOf,
+  memberJumpOf,
   memberStatusTitleOf,
+  roleJumpLabelOf,
   roleDurationTitleOf,
   roleTaskRefViewOf,
   tokenTextOf,
   tokenTitleOf,
 } from '../viewmodel.ts'
+import type { MemberJumpView, TaskCardSource } from '../viewmodel.ts'
 
 export interface RoleCardProps {
   role: RoleUsageView
-  /** 执行该角色任务的成员（r17：点卡片 = 在主界面打开它）。 */
-  member?: MemberView
-  /** 缺省 = 卡片不可点（历史 run / 找不到成员）。 */
-  onOpen?: () => void
+  /** 当前 run 的成员；历史 run 不传（历史无成员会话可跳）。 */
+  members?: MemberView[]
+  /**
+   * r33：当前 run 的任务视图。角色卡据此判断「当前任务是否待回执」——
+   * 宿主只把 `awaitingReceipt` 放在任务上，角色聚合视图里没有该事实位。
+   */
+  tasks?: readonly TaskCardSource[]
+  /** 缺省 = 卡片不可点（历史 run / 非任务页用法）。 */
+  onJump?: (jump: MemberJumpView) => void
 }
 
 export interface RoleGridProps {
   roles: RoleUsageView[]
   /** 当前 run 的成员；历史 run 不传（成员页对历史无意义）。 */
   members?: MemberView[]
-  onOpenMember?: (member: MemberView, taskId?: string) => void
+  /** r33：当前 run 的任务视图（逐卡片查「当前任务待回执」）。 */
+  tasks?: readonly TaskCardSource[]
+  onJump?: (jump: MemberJumpView) => void
 }
 
 /** 旧快照/旧夹具缺派生字段时的兜底（不改写统计，只保证界面不空）。 */
 const FALLBACK_STATE: RoleStateKind = 'idle'
 
 export function RoleCard(props: RoleCardProps): React.ReactElement {
-  const { role, member, onOpen } = props
+  const { role, members, tasks, onJump } = props
   const state = role.state ?? FALLBACK_STATE
   const stateText = role.stateText ?? ROLE_STATE_TEXT[state]
   const tone = ROLE_STATE_TONE[state] ?? 'neutral'
@@ -55,8 +71,27 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   const duration = role.duration
   // r16 AC-16：只渲染、不排序 —— 顺序 = 计划顺序，数量 = role.tasks（空/缺省整行不渲染）。
   const refs = (role.taskRefs ?? []).map((ref) => roleTaskRefViewOf(ref))
+  // r33：成员态 chip 与跳转判定看的是同一个成员（同一 taskId 绑定优先规则）。
+  const jump = memberJumpOf(
+    { kind: 'role', roleId: role.roleId, taskId: role.activeTaskId },
+    members,
+    { label: roleJumpLabelOf(role.name) },
+  )
+  const member = jump.member
   // r21：角色的聚合状态看不出成员被中断/作废/等写域 —— 这类实况用一枚成员态 chip 补上。
   const memberChip = memberCardChipOf(member)
+  // r33：角色聚合状态看不出「人已经停了、只差回执」——补一枚与停滞黄条不同的标记。
+  const activeTask =
+    role.activeTaskId === undefined ? undefined : tasks?.find((task) => task.id === role.activeTaskId)
+  const awaitingReceiptEl = awaitingReceiptOf(activeTask) ? (
+    <span
+      data-awaiting-receipt
+      data-awaiting-receipt-scope="role"
+      title={awaitingReceiptTitleOf(activeTask)}
+    >
+      {AWAITING_RECEIPT_MEMBER_TEXT}
+    </span>
+  ) : null
   const memberChipEl =
     memberChip === undefined || member === undefined ? null : (
       <span
@@ -75,20 +110,22 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
       data-role-id={role.roleId}
       data-role-state={state}
       data-role-done={String(done)}
-      data-role-card-open={onOpen === undefined ? undefined : 'true'}
-      data-member-id={member?.memberId}
-      role={onOpen === undefined ? undefined : 'button'}
-      tabIndex={onOpen === undefined ? undefined : 0}
-      aria-label={onOpen === undefined ? undefined : `打开子智能体：${member?.name ?? role.name}`}
-      style={onOpen === undefined ? undefined : { cursor: 'pointer' }}
-      onClick={onOpen}
+      data-role-card-open={onJump === undefined ? undefined : 'true'}
+      data-member-jump={onJump === undefined ? undefined : jump.available ? 'available' : 'unavailable'}
+      data-member-id={jump.memberId}
+      role={onJump === undefined ? undefined : 'button'}
+      tabIndex={onJump === undefined ? undefined : 0}
+      aria-label={onJump === undefined ? undefined : jump.label}
+      title={onJump === undefined ? undefined : jump.title}
+      style={onJump === undefined ? undefined : { cursor: 'pointer' }}
+      onClick={onJump === undefined ? undefined : () => onJump(jump)}
       onKeyDown={
-        onOpen === undefined
+        onJump === undefined
           ? undefined
           : (event) => {
               if (event.key !== 'Enter' && event.key !== ' ') return
               event.preventDefault()
-              onOpen()
+              onJump(jump)
             }
       }
     >
@@ -109,8 +146,12 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
           无进行中任务
         </span>
       )}
-      {refs.length > 0 ? (
-        <div data-role-line="refs" data-role-task-refs>
+      {refs.length > 0 || memberChipEl !== null || awaitingReceiptEl !== null ? (
+        <div
+          data-role-line="refs"
+          data-role-task-refs={refs.length > 0 ? '' : undefined}
+          data-role-member-line={refs.length === 0 && memberChipEl !== null ? '' : undefined}
+        >
           {refs.map((chip) => (
             <span
               key={chip.id}
@@ -126,11 +167,7 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
             </span>
           ))}
           {memberChipEl}
-        </div>
-      ) : memberChipEl !== null ? (
-        // 没有任务 chip 时单独一行（旧快照无 taskRefs 也要能看见成员停止/等待写域）。
-        <div data-role-line="refs" data-role-member-line>
-          {memberChipEl}
+          {awaitingReceiptEl}
         </div>
       ) : null}
       <div data-role-line="meta">
@@ -160,15 +197,15 @@ export function RoleGrid(props: RoleGridProps): React.ReactElement {
   return (
     <section data-region="task-roles" data-role-grid-view aria-label="本轮角色状态">
       <div data-role-grid>
-        {props.roles.map((role) => {
-          const taskId = role.activeTaskId
-          const member = memberForRole(props.members, role.roleId, taskId)
-          const open =
-            member === undefined || props.onOpenMember === undefined
-              ? undefined
-              : () => props.onOpenMember?.(member, taskId ?? member.taskId)
-          return <RoleCard key={role.roleId} role={role} member={member} onOpen={open} />
-        })}
+        {props.roles.map((role) => (
+          <RoleCard
+            key={role.roleId}
+            role={role}
+            members={props.members}
+            tasks={props.tasks}
+            onJump={props.onJump}
+          />
+        ))}
       </div>
     </section>
   )

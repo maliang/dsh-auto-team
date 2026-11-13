@@ -16,6 +16,7 @@ import type { ActivityEvent, PlanTask } from '../../shared/types.ts'
 import { MAX_ATTEMPTS, STALL_MS, WATCHER_INTERVAL_MS } from '../config.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { releaseScopes } from './scope-locks.ts'
+import { isSilentFinish, silentFinishBodyOf, withSilentFinish, withoutSilentFinish } from './silent-finish.ts'
 import { clearAlerted, stallOf, stallSentence } from './stall.ts'
 
 /** 宿主成员行：只信任这三个字段，其余一律不读（宿主形状可能变，见 adapters）。 */
@@ -116,6 +117,22 @@ export function reconcileMembers(
 
     const status = normalizeHostStatus(member.status)
 
+    // r33「待回执」：成员已停（宿主归一 dead）但任务仍 running、且没有门禁证据。
+    // 这是**事件源降级时的第二路信号**：事件收不到也照样判得出来。只记事实 + 通知队长，
+    // 不写 done / 不返工 / 不续聊；下面既有的 interrupted 对账照旧执行。
+    if (binding !== undefined && isSilentFinish({ task, binding, memberStopped: status === 'dead' })) {
+      const recorded = recordSilentFinish(next, {
+        taskId: task.id,
+        memberId: binding.memberId,
+        memberName: member.name,
+        at,
+      })
+      if (recorded !== next) {
+        next = recorded
+        changed += 1
+      }
+    }
+
     if (status === 'dead') {
       if (task.status === 'interrupted') continue
       const exhausted = (task.attempts ?? 0) >= limit
@@ -140,7 +157,15 @@ export function reconcileMembers(
 
     if (status === 'alive' && task.status === 'interrupted') {
       // 成员回来了（宿主重启后按名字重绑成功等）：状态跟着事实走。
+      // r33：人又在跑了，「待回执」不再成立 —— 不清就会让面板一直提示「没人干了」。
       next = patch(next, task.id, { status: 'running' })
+      next = {
+        ...next,
+        plan: {
+          ...next.plan,
+          tasks: next.plan.tasks.map((item) => (item.id === task.id ? withoutSilentFinish(item) : item)),
+        },
+      }
       changed += 1
       continue
     }
@@ -149,6 +174,53 @@ export function reconcileMembers(
   }
 
   return { state: next, changed }
+}
+
+/** 一条「待回执」观察事实的落盘入参（时间由调用方给：事件路径用事件时刻，轮询用 tick 时刻）。 */
+export interface SilentFinishNotice {
+  taskId: string
+  memberId: string
+  memberName: string
+  at: number
+}
+
+/**
+ * r33：把「成员已结束本轮但未交回执」写进任务并通知队长（captain → user，带 taskId）。
+ *
+ * 幂等：任务已有 `silentFinish`、已不是 `running`、或已有门禁证据时**原样返回**
+ * （不刷新 `at`、不重复写消息）。返回值换了引用 = 有新事实落盘，调用方据此 save。
+ *
+ * 只记事实：绝不写 done / rework / resume，也绝不替成员执行门禁。
+ */
+export function recordSilentFinish(state: RunState, notice: SilentFinishNotice): RunState {
+  const task = state.plan.tasks.find((item) => item.id === notice.taskId)
+  if (
+    task === undefined ||
+    task.status !== 'running' ||
+    task.evidence !== undefined ||
+    task.silentFinish !== undefined
+  ) {
+    return state
+  }
+  const next: RunState = {
+    ...state,
+    plan: {
+      ...state.plan,
+      tasks: state.plan.tasks.map((item) =>
+        item.id === notice.taskId ? withSilentFinish(item, notice.at, notice.memberId) : item,
+      ),
+    },
+  }
+  return appendMessage(
+    next,
+    makeMessage({
+      from: 'captain',
+      to: 'user',
+      taskId: notice.taskId,
+      at: notice.at,
+      body: silentFinishBodyOf(notice.memberName, task),
+    }),
+  )
 }
 
 /**

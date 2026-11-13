@@ -15,6 +15,8 @@ import { durationCellOf } from '../../shared/duration.ts'
 import * as React from 'react'
 import type {
   DurationCell,
+  MemberStatus,
+  MemberView,
   ProjectRunSummaryView,
   ProjectView,
   RunSummary,
@@ -94,7 +96,10 @@ function rowOf(input: {
   active: boolean
   /** r21：宿主下发的终止原因（已 `trim`，空串视同缺席）。 */
   terminationText?: string
-  /** r24：残留计划徽标；由 `runSummaryRowOf` 按宿主事实判定后传入（投影本身不判定）。 */
+  /**
+   * r24 / 用户 2026-11-13：残留计划徽标；由 `runSummaryRowOf` 按宿主事实判定后传入
+   * （投影本身不判定）。判定要求「确认没有存活成员」，有存活成员或读不到存活数都不出徽标。
+   */
   residualBadge?: Badge
 }): RunRowView {
   const badge = input.badge ?? statusBadge(input.status)
@@ -174,14 +179,46 @@ function historyDurationTitleOf(cell: DurationCell, run: RunSummary): string {
 }
 
 /**
+ * 快照兜底：宿主没下发 `liveMembers` 时，按成员列表数「还有可能在跑」的成员。
+ *
+ * `MemberView.status` 是面板态（由任务状态派生），**不是**宿主 4 态，所以这里只认
+ * 含「工作还在进行中」的态（含等写域、派发前、停止中）；`done` / `failed` /
+ * `interrupted` / `cancelled` / `stopped` 一律不算 —— 它们不含「此刻有人在跑」的证据，
+ * 把 `done` 算成存活还会让「任务全完成、进程已退」的旧残留永远显示不出来。
+ *
+ * 传 `undefined`（快照还没到 / 旧载荷不带 members）→ 返回 `undefined`（无法确认），
+ * 调用方据此不提示；**不补 0**。
+ */
+const LIVE_MEMBER_STATUSES: readonly MemberStatus[] = [
+  'running',
+  'idle',
+  'blocked',
+  'rework',
+  'waiting',
+  'stopping',
+]
+
+export function liveMembersOfSnapshot(members: readonly MemberView[] | undefined): number | undefined {
+  if (members === undefined) return undefined
+  return members.filter((member) => LIVE_MEMBER_STATUSES.includes(member.status)).length
+}
+
+/**
  * 历史列表行（右栏「历史」页）—— 数据来自 `snapshot.runs` / `library.runs`（`RunSummary`）。
  *
  * r17：顶部是「任务名」（run 级 goal；缺省走 `goalTitleOf` 的诚实 fallback），
  * 底部是 token 六项（`RunSummary.usage.details`，宿主 `format.ts` 单一来源，客户端只透传）。
  * 旧数据没有 `usage` 时退回 `usageTotals`：只显示合计，不自己拆六项。
  * r20：次行补上用时（`historyDurationOf`，宿主时间戳 + shared 唯一实现；缺值即不可得）。
+ *
+ * `members` 只在**该 run 就是快照当前 run** 时传入：快照的成员列表不区分 run，
+ * 拿别的 run 的成员兜底会把存活数算错。宿主字段 `liveMembers` 优先，快照只是兜底。
  */
-export function runSummaryRowOf(run: RunSummary, now: number = Date.now()): RunRowView {
+export function runSummaryRowOf(
+  run: RunSummary,
+  now: number = Date.now(),
+  members?: readonly MemberView[],
+): RunRowView {
   const goal = goalTitleOf(run.goal, run.runId)
   const start = formatStamp(run.plannedAt ?? run.createdAt)
   // r25：终态 run 即使旧宿主还下发 active=true/ongoing>0，也不能显示成「进行中」。
@@ -200,6 +237,9 @@ export function runSummaryRowOf(run: RunSummary, now: number = Date.now()): RunR
     ...(run.terminationReason !== undefined ? { terminationReason: run.terminationReason } : {}),
     ...(run.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
   })
+  // 用户 2026-11-13：残留判定再收一道 —— 宿主存活成员数优先，宿主没给（旧快照 /
+  // 读失败）才用该 run 的成员快照兜底；两路都拿不到就是「无法确认」，不提示。
+  const liveMembers = run.liveMembers ?? liveMembersOfSnapshot(members)
   return rowOf({
     runId: run.runId,
     title: goal.text,
@@ -214,8 +254,11 @@ export function runSummaryRowOf(run: RunSummary, now: number = Date.now()): RunR
     durationTitle: historyDurationTitleOf(duration, run),
     active: live,
     ...(run.terminationReason !== undefined ? { terminationText: run.terminationReason } : {}),
-    // r24：三种未收口计划态且没有结束时刻 → 历史行/顶部 run 卡都可见「可能残留」并给终止入口。
-    ...(isResidualRun(run) ? { residualBadge: RESIDUAL_RUN_BADGE } : {}),
+    // r24：三种未收口计划态、没有结束时刻，且确认没有存活成员 → 历史行/顶部 run 卡都
+    // 可见「可能残留」并给终止入口。有存活成员或读不到存活数时不显示（不制造噪音）。
+    ...(isResidualRun({ status: run.status, finishedAt: run.finishedAt, liveMembers })
+      ? { residualBadge: RESIDUAL_RUN_BADGE }
+      : {}),
   })
 }
 

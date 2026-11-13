@@ -768,6 +768,8 @@ import {
   NOT_STARTED_TEXT,
   TASK_TABLE_HEADER,
   UNAVAILABLE_TEXT,
+  AWAITING_RECEIPT_TEXT,
+  awaitingReceiptOf,
   buildFlow,
   buildRunDetail,
   buildTaskDetail,
@@ -965,6 +967,29 @@ test('任务行：两行式字段齐全，token 与用时同源于同一单元�
   assert.equal(taskRowOf(detail, true).expanded, true)
   // 两行式：标题行与 meta 行的字段集合固定（DESIGN §2.1）
   assert.deepEqual(TASK_TABLE_HEADER, { left: '任务 · 角色 · 状态', token: 'token', duration: '用时' })
+})
+
+test('r33 待回执：附加标记不改状态徽标，宿主布尔优先、旧快照退回 silentFinish', () => {
+  const legacy = buildTaskDetail(
+    taskOf('t1', 'running', { silentFinish: { at: 1_760_000_000_000, memberId: 'm1' } }),
+    { roleName: 'dev', messageCount: 0 },
+  )
+  // 旧快照没有 awaitingReceipt 键：兜底看 silentFinish 是否存在
+  assert.equal(awaitingReceiptOf(legacy), true)
+  const row = taskRowOf(legacy, false)
+  assert.deepEqual(row.badge, statusBadge('running'), '待回执是附加事实，任务仍是执行中')
+  assert.equal(row.awaitingReceipt?.text, AWAITING_RECEIPT_TEXT)
+  assert.match(row.awaitingReceipt?.title ?? '', /未提交回执/)
+  assert.match(row.awaitingReceipt?.title ?? '', /auto_team_receipt/)
+  // 宿主显式 false 时不再拿 silentFinish 反推
+  const explicit = { ...legacy, awaitingReceipt: false }
+  assert.equal(awaitingReceiptOf(explicit), false)
+  assert.equal(taskRowOf(explicit, false).awaitingReceipt, undefined)
+  // 正常执行中的任务没有这枚标记
+  const normal = buildTaskDetail(taskOf('t2', 'running'), { roleName: 'dev', messageCount: 0 })
+  assert.equal(taskRowOf(normal, false).awaitingReceipt, undefined)
+  // 展开区也给出回执行
+  assert.equal(taskDetailOf(legacy).awaitingReceipt?.text, AWAITING_RECEIPT_TEXT)
 })
 
 test('任务详情：没有计时/用量的任务显式说不可得，未开始的任务说未开始', () => {

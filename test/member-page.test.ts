@@ -33,7 +33,7 @@ import {
   resolveMemberSessionId,
   subscribeMainNav,
 } from '../src/client/nav.ts'
-import { formatStamp } from '../src/client/viewmodel.ts'
+import { AWAITING_RECEIPT_MEMBER_TEXT, formatStamp } from '../src/client/viewmodel.ts'
 import { resetLibrarySurfaceOpener } from '../src/client/slots.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -283,6 +283,32 @@ test('memberPageOf：停滞只在 running + stalled 时显示，且只读宿主�
   assert.equal(done.stalledText, '')
 })
 
+test('memberPageOf：待回执与停滞是两件事（事实来源与文案都不同）', () => {
+  const awaiting = memberPageOf({
+    member: memberOf({ stalled: false }),
+    // 旧快照只有 silentFinish：兜底也要能判出来
+    task: { ...taskOf(), silentFinish: { at: AT, memberId: 'm1' } },
+  })
+  assert.equal(awaiting.stalled, false, '已结束本轮 ≠ 停滞')
+  assert.equal(awaiting.awaitingReceipt?.text, AWAITING_RECEIPT_MEMBER_TEXT)
+  assert.match(awaiting.awaitingReceipt?.title ?? '', /未提交回执/)
+
+  // 还活着但没产出（停滞）→ 只有黄条，没有待回执
+  const stalled = memberPageOf({
+    member: memberOf({ stalled: true, stalledSecondsText: '3 分 20 秒' }),
+    task: taskOf(),
+  })
+  assert.equal(stalled.stalled, true)
+  assert.equal(stalled.awaitingReceipt, undefined)
+
+  // 宿主显式 false（已补回执）→ 不再拿 silentFinish 反推
+  const cleared = memberPageOf({
+    member: memberOf(),
+    task: { ...taskOf(), awaitingReceipt: false, silentFinish: { at: AT, memberId: 'm1' } },
+  })
+  assert.equal(cleared.awaitingReceipt, undefined)
+})
+
 test('memberPageOf：任务用量不可得时沿用「不可得」而不是 0', () => {
   const view = memberPageOf({ member: memberOf(), task: taskOf({ usage: UNAVAILABLE }) })
   assert.equal(view.task?.tokenText, '不可得')
@@ -404,32 +430,38 @@ test('MemberPage.tsx：找不到成员时给可读空态与返回入口', () => 
 test('RoleCard.tsx：整张卡片可点，打开执行该角色的成员', () => {
   const source = codeOf('src/client/views/RoleCard.tsx')
   assert.ok(source.includes('data-role-card-open'), '角色卡缺 data-role-card-open')
-  assert.match(source, /memberForRole\(/)
-  assert.match(source, /role=\{onOpen === undefined \? undefined : 'button'\}/)
-  assert.match(source, /onOpenMember\?\.\(member, taskId \?\? member\.taskId\)/)
+  // r33：判定统一收口到 memberJumpOf（三入口唯一实现），组件不再直接找成员。
+  assert.match(source, /memberJumpOf\(/)
+  assert.equal(source.includes('memberForRole('), false)
+  assert.match(source, /role=\{onJump === undefined \? undefined : 'button'\}/)
+  assert.match(source, /onClick=\{onJump === undefined \? undefined : \(\) => onJump\(jump\)\}/)
+  assert.match(source, /onKeyDown=/)
 })
 
 test('TaskTable.tsx：任务行有独立的「子智能体」入口且不吞展开事件', () => {
   const source = codeOf('src/client/views/TaskTable.tsx')
   assert.ok(source.includes('data-task-open-member'), '任务行缺 data-task-open-member')
-  assert.match(source, /memberForRole\(members, task\.roleId, task\.id\)/)
-  assert.match(source, /onClick=\{\(\) => onOpenMember\(member, task\.id\)\}/)
+  assert.match(source, /memberJumpOf\(/)
+  assert.equal(source.includes('memberForRole('), false)
+  assert.match(source, /onClick=\{\(\) => onJump\(jump\)\}/)
   assert.ok(source.includes('data-task-toggle'), '原有展开按钮必须保留')
 })
 
 test('TaskOverview.tsx：把成员导航透传给分组任务表', () => {
   const source = codeOf('src/client/views/TaskOverview.tsx')
-  assert.match(source, /members\?: MemberView\[\]/)
-  assert.match(source, /onOpenMember\?: \(member: MemberView, taskId: string\) => void/)
+  assert.match(source, /onJump\?: \(jump: MemberJumpView\) => void/)
   assert.match(source, /members=\{members\}/)
+  assert.match(source, /onJump=\{onJump\}/)
 })
 
 test('FlowCanvas.tsx：点节点优先打开成员，找不到成员才退回选中任务', () => {
   const source = codeOf('src/client/views/FlowCanvas.tsx')
-  assert.match(source, /memberForRole\(members, node\.roleId, node\.id\)/)
-  assert.match(source, /onOpenMember\(member, node\.id\)/)
+  assert.match(source, /memberJumpOf\(/)
+  assert.equal(source.includes('memberForRole('), false)
+  assert.match(source, /onJump\(jump\)/)
   assert.match(source, /onSelectTask\(node\.id\)/)
 })
+
 
 test('LibraryPage.tsx：主界面按导航渲染项目库或成员页', () => {
   const source = codeOf('src/client/LibraryPage.tsx')

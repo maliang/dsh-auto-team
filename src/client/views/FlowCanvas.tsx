@@ -23,15 +23,15 @@
  */
 import * as React from 'react'
 import type { FlowView, MemberView } from '../../shared/types.ts'
-import { memberForRole } from '../nav.ts'
-import { flowLayoutOf } from '../viewmodel.ts'
+import { flowLayoutOf, memberJumpOf } from '../viewmodel.ts'
+import type { MemberJumpView } from '../viewmodel.ts'
 
 export interface FlowCanvasProps {
   flow: FlowView
   onSelectTask: (taskId: string) => void
-  /** r17：点节点优先打开执行它的子智能体。 */
+  /** r17/r33：点节点 = 跳到执行它的子智能体会话；没有成员时退回选中任务。 */
   members?: MemberView[]
-  onOpenMember?: (member: MemberView, taskId: string) => void
+  onJump?: (jump: MemberJumpView) => void
 }
 
 /** 平移上限（±）：与 DESIGN §2.4 一致，够远但不会迷失。 */
@@ -53,7 +53,7 @@ function stageNumberText(index: number): string {
 }
 
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { flow, onSelectTask, members, onOpenMember } = props
+  const { flow, onSelectTask, members, onJump } = props
   const layout = React.useMemo(() => flowLayoutOf(flow), [flow])
   const instanceId = React.useId().replace(/[^a-zA-Z0-9_-]/g, '')
   const markerId = `auto-team-flow-arrow-${instanceId}`
@@ -330,49 +330,63 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               <span data-flow-stage-count>×{stage.count}</span>
             </div>
           ))}
-          {layout.nodes.map(({ node, cell, x, y, column, row }) => (
-            <button
-              key={node.id}
-              type="button"
-              data-flow-node={node.id}
-              data-status={node.status}
-              data-flow-column={String(column)}
-              data-flow-row={String(row)}
-              style={{ left: `${x}px`, top: `${y}px` }}
-              title={cell.title}
-              aria-label={cell.label}
-              onClick={() => {
-                const member =
-                  node.roleId === undefined ? undefined : memberForRole(members, node.roleId, node.id)
-                if (member !== undefined && onOpenMember !== undefined) {
-                  onOpenMember(member, node.id)
-                  return
-                }
-                onSelectTask(node.id)
-              }}
-            >
-              <span data-flow-line="title">
-                <span data-flow-node-id>{node.id}</span>
-                <span data-flow-node-title title={node.title}>
-                  {cell.taskTitle}
+          {layout.nodes.map(({ node, cell, x, y, column, row }) => {
+            // 三入口同一判定：能不能跳、跳到谁、为什么不能跳，都由 memberJumpOf 一次给出。
+            const jump = memberJumpOf(
+              { kind: 'node', roleId: node.roleId, taskId: node.id },
+              members,
+              { title: cell.title, label: cell.label },
+            )
+            return (
+              <button
+                key={node.id}
+                type="button"
+                data-flow-node={node.id}
+                data-status={node.status}
+                data-flow-column={String(column)}
+                data-flow-row={String(row)}
+                data-member-jump={jump.available ? 'available' : 'unavailable'}
+                data-member-id={jump.memberId}
+                style={{ left: `${x}px`, top: `${y}px` }}
+                title={jump.title}
+                aria-label={jump.label}
+                onClick={() => {
+                  // 可跳转：有 onJump 就打开成员会话；不可跳转：先把原因交上去（禁止静默），
+                  // 两种情况都保留原有的「选中任务并定位」行为作为回退。
+                  if (jump.available) {
+                    if (onJump !== undefined) {
+                      onJump(jump)
+                      return
+                    }
+                  } else {
+                    onJump?.(jump)
+                  }
+                  onSelectTask(node.id)
+                }}
+              >
+                <span data-flow-line="title">
+                  <span data-flow-node-id>{node.id}</span>
+                  <span data-flow-node-title title={node.title}>
+                    {cell.taskTitle}
+                  </span>
+                  <span data-flow-status data-tone={cell.tone}>
+                    {cell.statusText}
+                  </span>
                 </span>
-                <span data-flow-status data-tone={cell.tone}>
-                  {cell.statusText}
+                <span data-flow-line="meta">
+                  <span data-cell="token" data-usage-source={node.usage.source}>
+                    {cell.tokenText}
+                  </span>
+                  <span data-flow-sep aria-hidden="true">
+                    ·
+                  </span>
+                  <span data-cell="duration" data-duration-state={node.duration.state}>
+                    {cell.durationText}
+                  </span>
                 </span>
-              </span>
-              <span data-flow-line="meta">
-                <span data-cell="token" data-usage-source={node.usage.source}>
-                  {cell.tokenText}
-                </span>
-                <span data-flow-sep aria-hidden="true">
-                  ·
-                </span>
-                <span data-cell="duration" data-duration-state={node.duration.state}>
-                  {cell.durationText}
-                </span>
-              </span>
-            </button>
-          ))}
+              </button>
+            )
+          })}
         </div>
         <button
           type="button"
