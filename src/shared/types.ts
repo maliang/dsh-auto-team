@@ -361,7 +361,27 @@ export interface MemberView {
   stalledForMs: number
   /** 已停滞时长的展示文案（如「92 秒」/「20 分 34 秒」）；未停滞为空串。客户端零格式化。 */
   stalledSecondsText: string
+  /**
+   * 停滞判定的**证据类型**（r32）：`quiet` = 有推进信号但久未推进（真停滞）；
+   * `unreported` = 宿主一次进度都没上报（证据不足，**不得**染成停滞）；
+   * `none` = 有信号且没超阈值 / 非 running。
+   */
+  stallReason?: StallReason
+  /**
+   * 证据不足时的唯一措辞（由宿主算好，客户端零判断）。`stallReason === 'unreported'` 时非空，
+   * 其余情况为空串。它与 `stalledSecondsText` 互斥：秒数只描述「有信号」的静默时长。
+   */
+  stallNote?: string
 }
+
+/**
+ * 停滞判定的证据类型（r32 真机假停滞的唯一区分位）。
+ *
+ * 为什么必须显式：`stalled=false` 有两种完全不同的含义 ——「刚有推进」与「宿主根本没上报」。
+ * 把它们混在同一个布尔里，面板要么把「无信号」说成健康（骗人），要么按 `spawnedAt` 倒计时
+ * 说成停滞（r32 的假黄条）。所以判定输出三态，客户端只渲染不再推断。
+ */
+export type StallReason = 'none' | 'quiet' | 'unreported'
 
 /**
  * 成员推进记录（`RunState.progress` 的值，key = memberId）。

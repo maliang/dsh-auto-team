@@ -180,7 +180,10 @@ export function stallAlertsOf(
     if (!binding) continue
     const memberId = binding.memberId
     const record = progress[memberId]
-    const judge = stallOf(record?.at, binding.spawnedAt, now, stallMs)
+    // r32：没有推进信号（`record?.at` 缺失）时 `stallOf` 返回 `reason='unreported'`，
+    // 也就是**不告警**。旧实现回落 `binding.spawnedAt` 倒计时，会把「宿主没上报进度」
+    // 变成一条假的「疑似停滞」告警（真机 r32：成员明明在跑）。
+    const judge = stallOf(record?.at, now, stallMs)
 
     if (!judge.stalled) {
       if (record?.alertedAt !== undefined) {
@@ -192,7 +195,8 @@ export function stallAlertsOf(
 
     if (record?.alertedAt !== undefined) continue // 本 episode 已告警：静默（一次 episode 一条）
 
-    const at = record?.at ?? binding.spawnedAt
+    // 能走到这里 ⇒ `judge.reason === 'quiet'` ⇒ `record.at` 一定存在。
+    const at = record?.at ?? now
     progress = { ...progress, [memberId]: { at, alertedAt: now } }
     mutated = true
     raised.push({

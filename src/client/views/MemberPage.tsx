@@ -61,7 +61,7 @@ export function MemberPage(props: MemberPageProps): React.ReactElement {
             <dd data-member-last-active>{view.lastActiveText}</dd>
             <dt>停滞</dt>
             <dd data-member-stalled data-stalled={view.stalled ? 'true' : 'false'}>
-              {view.stalled ? view.stalledText : '未停滞'}
+              {view.stalled ? view.stalledText : view.stallNote === '' ? '未停滞' : view.stallNote}
             </dd>
             <dt>续聊</dt>
             <dd data-member-resume>{view.resumeText}</dd>

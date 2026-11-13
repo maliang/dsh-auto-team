@@ -66,6 +66,7 @@ import type {
   SkillDraft,
   SkillInfo,
   SkillMutation,
+  StallReason,
   TaskStatus,
   TokenTotals,
   UsageCell,
@@ -139,7 +140,7 @@ import { normalizeHostStatus, type HostMember } from './team/watcher.ts'
 import { isIrreversibleAction, pendingFor, pendingViewOf } from './team/confirm.ts'
 import { applyProjectionUsage, runUsageOf, taskUsageOf, type ProjectionUsageEntry } from './team/usage.ts'
 import { releaseScopes } from './team/scope-locks.ts'
-import { secondsText, stallOf } from './team/stall.ts'
+import { secondsText, stallNoteOf, stallOf } from './team/stall.ts'
 
 
 /** 门禁串行队列上限（TECHNICAL §5.3：避免一次 receipt 风暴炸出多个 shell）。 */
@@ -1244,7 +1245,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         // r21 AC-4：两个停止事实位只在 binding 上真的存在时才出现（缺席 = 没发生过，客户端不补 0）。
         ...(binding.stopping === true ? { stopping: true } : {}),
         ...(binding.stoppedAt !== undefined ? { stoppedAt: binding.stoppedAt } : {}),
-        ...stallFieldsOf(state, binding.memberId, status, binding.spawnedAt, stallMs),
+        ...stallFieldsOf(state, binding.memberId, status, stallMs),
         lastEventAt: lastEventAtOf(state, binding.memberId, binding.spawnedAt),
         modelRoute: describeRoute(roleById.get(binding.roleId)),
         canResume: status !== 'done',
@@ -1263,7 +1264,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         roleId: task.roleId,
         taskId: task.id,
         status,
-        ...stallFieldsOf(state, task.memberId, status, state.plannedAt, stallMs),
+        ...stallFieldsOf(state, task.memberId, status, stallMs),
         lastEventAt: lastEventAtOf(state, task.memberId, state.plannedAt),
         modelRoute: describeRoute(roleById.get(task.roleId)),
         canResume: status !== 'done',
@@ -1283,22 +1284,29 @@ export function createBridge(deps: BridgeDeps): Bridge {
     state: RunState,
     memberId: string,
     status: MemberStatus,
-    fallbackAt: number,
     stallMs: number,
-  ): { stalled: boolean; stalledForMs: number; stalledSecondsText: string } {
-    if (status !== 'running') return { stalled: false, stalledForMs: 0, stalledSecondsText: '' }
-    const progressAt = state.progress?.[memberId]?.at
-    const baseline = progressAt ?? fallbackAt
-    const judge = stallOf(progressAt, baseline, now(), stallMs)
+  ): { stalled: boolean; stalledForMs: number; stalledSecondsText: string; stallReason: StallReason; stallNote: string } {
+    if (status !== 'running') {
+      return { stalled: false, stalledForMs: 0, stalledSecondsText: '', stallReason: 'none', stallNote: '' }
+    }
+    // r32：判定只看 `progress`。**绝不**拿 spawnedAt 当基线 —— 没有信号就是「证据不足」，
+    // 那是 `stallReason='unreported'`，不是停滞（旧实现正是在这里把 20 分钟的活说成停滞）。
+    const judge = stallOf(state.progress?.[memberId]?.at, now(), stallMs)
     return {
       stalled: judge.stalled,
       stalledForMs: judge.stalledForMs,
       stalledSecondsText: judge.stalled ? secondsText(judge.stalledForMs) : '',
+      stallReason: judge.reason,
+      stallNote: stallNoteOf(judge.reason),
     }
   }
 
   function lastEventAtOf(state: RunState, memberId: string, fallback: number): number {
     let at = fallback
+    // r32：实质推进也是活动 —— 旧实现只叠加消息与证据，于是「成员在跑」的快照里
+    // `lastEventAt` 永远停在派发时刻，看起来像 20 分钟没有任何动静。
+    const progressAt = state.progress?.[memberId]?.at
+    if (typeof progressAt === 'number' && Number.isFinite(progressAt)) at = Math.max(at, progressAt)
     for (const message of state.messages) {
       if (message.toMemberId === memberId || message.from === memberId) at = Math.max(at, message.at)
     }

@@ -465,6 +465,12 @@ export interface MemberPageView {
   lastActiveText: string
   stalled: boolean
   stalledText: string
+  /**
+   * r32：宿主下发的「证据不足」说明（如「宿主未上报推进信号，无法判定是否停滞」）。
+   * 客户端**原样渲染**、不做任何阈值判断：`stalled` 为 false 且这里非空时说明「没信号」，
+   * 既不能说「未停滞」（骗人）也不能染成停滞黄条（r32 的假黄条正是这么来的）。
+   */
+  stallNote: string
   canResume: boolean
   resumeText: string
   taskText: string
@@ -612,6 +618,7 @@ export function memberPageOf(source: MemberPageSource): MemberPageView {
     lastActiveText: formatStamp(member.lastEventAt) || '无活动记录',
     stalled,
     stalledText: stalled ? `⏳ ${member.stalledSecondsText || '—'} 无实质产出` : '',
+    stallNote: stalled ? '' : typeof member.stallNote === 'string' ? member.stallNote.trim() : '',
     canResume: member.canResume === true,
     resumeText: member.canResume === true ? '可从面板「继续」恢复该成员' : '不可续聊',
     taskText,

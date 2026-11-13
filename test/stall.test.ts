@@ -16,7 +16,7 @@ import { DEFAULT_MAX_CONCURRENT, STALL_MS } from '../src/host/config.ts'
 import { RunsStore, RUN_STATE_VERSION, STALL_ALERTS_LIMIT } from '../src/host/store.ts'
 import type { RunState } from '../src/host/store.ts'
 import type { MemberBinding, Plan, PlanTask } from '../src/shared/types.ts'
-import { clearAlerted, secondsText, stallOf, stallSentence, touchProgress } from '../src/host/team/stall.ts'
+import { clearAlerted, secondsText, stallNoteOf, stallOf, stallSentence, touchProgress } from '../src/host/team/stall.ts'
 import { createMemberWatcher, stallAlertsOf } from '../src/host/team/watcher.ts'
 
 const NOW = 1_700_000_000_000
@@ -73,25 +73,36 @@ test('STALL_MS 是 90 秒（全仓唯一定义处，stallOf 只接收参数）',
 })
 
 test('stallOf：阈值是「达到即停滞」，89999 不判、90000 判', () => {
-  const below = stallOf(NOW - 89_999, NOW, NOW, THRESHOLD)
-  assert.deepEqual(below, { stalled: false, stalledForMs: 0 }, '未停滞时 stalledForMs 恒 0')
+  const below = stallOf(NOW - 89_999, NOW, THRESHOLD)
+  assert.deepEqual(below, { stalled: false, stalledForMs: 0, reason: 'none' }, '未停滞时 stalledForMs 恒 0')
 
-  const exact = stallOf(NOW - 90_000, NOW, NOW, THRESHOLD)
+  const exact = stallOf(NOW - 90_000, NOW, THRESHOLD)
   assert.equal(exact.stalled, true)
   assert.equal(exact.stalledForMs, 90_000)
+  assert.equal(exact.reason, 'quiet')
 })
 
-test('stallOf：没有推进记录时基线回落到 spawnedAt（刚创建的成员不会立刻被判停滞）', () => {
-  const fresh = stallOf(undefined, NOW - 1_000, NOW, THRESHOLD)
-  assert.deepEqual(fresh, { stalled: false, stalledForMs: 0 })
+test('stallOf：没有推进记录 = 证据不足（unreported），绝不计时成停滞（r32）', () => {
+  // 旧实现会回落到 spawnedAt：派发 120 秒后即使一次信号都没有也判「停滞 120 秒」，
+  // 真机 r32 就是这样把正在干活的成员说成 stalledForMs=1210840。
+  const noSignal = stallOf(undefined, NOW, THRESHOLD)
+  assert.deepEqual(noSignal, { stalled: false, stalledForMs: 0, reason: 'unreported' })
+  assert.equal(stallOf(Number.NaN, NOW, THRESHOLD).reason, 'unreported', 'NaN 也要落到证据不足，不能算停滞')
+  assert.equal(stallOf(Number.POSITIVE_INFINITY, NOW, THRESHOLD).reason, 'unreported')
 
-  const old = stallOf(undefined, NOW - 120_000, NOW, THRESHOLD)
-  assert.deepEqual(old, { stalled: true, stalledForMs: 120_000 }, '从未有实质调用也要能告警（L3 语义）')
+  // 有信号但恰好没超阈值：reason 必须是 none，不能混成 unreported（否则面板会误报「无信号」）。
+  assert.equal(stallOf(NOW - 1_000, NOW, THRESHOLD).reason, 'none')
 })
 
 test('stallOf：时钟回拨不产生负数停滞', () => {
-  const back = stallOf(NOW + 60_000, NOW, NOW, THRESHOLD)
-  assert.deepEqual(back, { stalled: false, stalledForMs: 0 })
+  const back = stallOf(NOW + 60_000, NOW, THRESHOLD)
+  assert.deepEqual(back, { stalled: false, stalledForMs: 0, reason: 'none' })
+})
+
+test('stallNoteOf：只有「证据不足」有措辞，停滞时长另有 secondsText', () => {
+  assert.equal(stallNoteOf('unreported'), '宿主未上报推进信号，无法判定是否停滞')
+  assert.equal(stallNoteOf('quiet'), '')
+  assert.equal(stallNoteOf('none'), '')
 })
 
 test('secondsText：<600 秒直写、≥600 秒换「M 分 S 秒」且永不省略秒', () => {
@@ -183,6 +194,24 @@ test('stallAlertsOf：终态任务 / 无 live binding 一律不判（少一条�
 
   const unbound = stateOf({ bindings: [] })
   assert.equal(stallAlertsOf(unbound, NOW, THRESHOLD).raised.length, 0)
+})
+
+test('stallAlertsOf：从未收到推进信号 → 一条告警都不许发（r32 假停滞的真机形态）', () => {
+  // 真机场景：binding 派发已 20 分钟（spawnedAt 很远），但宿主一次进度都没上报（progress 为空）。
+  // 旧实现回落到 spawnedAt，于是把「正在干活的成员」告警成「疑似停滞 1210 秒」。
+  const silent = stateOf({ bindings: [bindingOf({ spawnedAt: NOW - 1_210_840 })] })
+  const result = stallAlertsOf(silent, NOW, THRESHOLD)
+  assert.equal(result.raised.length, 0, '证据不足不得转成停滞告警')
+  assert.equal(result.state.stallAlerts?.length ?? 0, 0)
+  assert.equal(result.state.progress?.['member-1'], undefined, '没有信号就不许凭空写 progress')
+
+  // 对照证明这条断言不是恒真：同样的 spawnedAt、只要有一条 100 秒前的推进记录，就必须告警。
+  const withSignal = stallAlertsOf(
+    stateOf({ bindings: [bindingOf({ spawnedAt: NOW - 1_210_840 })], progress: { 'member-1': { at: NOW - 100_000 } } }),
+    NOW,
+    THRESHOLD,
+  )
+  assert.equal(withSignal.raised.length, 1)
 })
 
 test('stallAlertsOf：不碰 plan（tasks 深相等），无变更时返回原引用', () => {

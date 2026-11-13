@@ -740,6 +740,34 @@ test('membersOf：running 且进度落后 → stalled 三字段齐；终态成�
   assert.equal(finished?.stalledSecondsText, '')
 })
 
+test('r32：running 成员一次进度都没上报时输出「证据不足」，不得按 spawnedAt 倒计时判停滞', async () => {
+  const { bridge, store } = setup()
+  await enable(bridge)
+  store.save(
+    stateOf({
+      plan: planOf({ status: 'dispatching', tasks: [taskOf('t1', { status: 'running', memberId: 'member-1' })] }),
+      // 真机证据：派发已 20 分钟，progress 仍是空的。
+      bindings: [bindingOf({ spawnedAt: NOW - 1_210_840 })],
+    }),
+  )
+
+  const member = bridge.snapshot(SESSION).members.find((item) => item.memberId === 'member-1')
+  assert.equal(member?.stalled, false, '没有信号 ≠ 停滞（旧实现这里会输出 stalled=true + 1210 秒）')
+  assert.equal(member?.stalledForMs, 0)
+  assert.equal(member?.stalledSecondsText, '', '证据不足时不得给秒数，否则面板会自己长出一条黄条')
+  assert.equal(member?.stallReason, 'unreported', '证据类型必须唯一可判，客户端零阈值')
+  assert.equal(member?.stallNote, '宿主未上报推进信号，无法判定是否停滞')
+  // 进度也是活动：lastEventAt 必须能反映它，而不是永远停在派发时刻。
+  store.save({
+    ...(store.load('run-t4') as RunState),
+    progress: { 'member-1': { at: NOW - 1_000 } },
+  })
+  const touched = bridge.snapshot(SESSION).members.find((item) => item.memberId === 'member-1')
+  assert.equal(touched?.lastEventAt, NOW - 1_000, '有推进时 lastEventAt 必须前移')
+  assert.equal(touched?.stallReason, 'none', '刚有推进 → 既不判停滞也不是证据不足')
+  assert.equal(touched?.stallNote, '')
+})
+
 test('activityOf：只读合并落盘的 stallAlerts，同一次停滞不得被重算出第二条（AC-8）', async () => {
   const { bridge, store } = setup()
   await enable(bridge)

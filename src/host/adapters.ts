@@ -1735,8 +1735,11 @@ export function onCaptainToolResult(
  *  - L2 `agent/status`：兜底。万一宿主把 `tools/result` 过滤在本成员作用域内、根作用域收不到，
  *    状态变化仍能给出推进信号（两者都注册，去重交给 `touchProgress`：同一时刻多记一次无副作用）。
  *
- * 降级：宿主没有 `ctx.on` 时 **warn 并返回空 stop**，绝不抛错 —— 停滞判定会退化成
- * 「以 `binding.spawnedAt` 为基线」，仍然会在成员真的不动时告警（L3 的语义）。
+ * 降级：宿主没有 `ctx.on` 时 **warn 并返回空 stop**，绝不抛错。此时**没有任何推进信号**，
+ * 停滞判定输出 `reason='unreported'`（证据不足，不判停滞）—— r32 起绝不拿 `spawnedAt`
+ * 倒计时假装「已停滞 N 分钟」。
+ *
+ * r32：本函数是**兜底**，真机主力是 {@link watchMemberProgress}（挂在成员自己的 `agent.ctx` 上）。
  */
 export function onMemberProgress(
   ctx: HostContext,
@@ -1781,6 +1784,101 @@ export function onMemberProgress(
       }
     },
   }
+}
+
+/** 成员级推进订阅的结果：`ok=false` 时 `reason` 说明装不上的原因（调用方按它 warn 一次）。 */
+export interface MemberProgressWatch {
+  ok: boolean
+  reason?: string
+  stop(): void
+}
+
+/** 按 SessionId 取宿主**活着的** agent（`agents.get` 已在本文件其他读口实测使用）。 */
+function liveAgentOf(ctx: HostContext, memberId: string): unknown {
+  try {
+    return ctx.agents?.get?.(memberId) ?? undefined
+  } catch {
+    /* 已卸载 / 非会话 id：视为取不到，由调用方降级 */
+    return undefined
+  }
+}
+
+/**
+ * 在**成员自己的 `agent.ctx`** 上订阅推进信号（r32 真机假停滞的修复点）。
+ *
+ * 为什么必须挂在成员 ctx 上：宿主 `tools/result` 的作用域过滤按 `exec.agent` 做，宿主文档
+ * 给的唯一正路就是「在 `agent.ctx` 上注册」（HOST-EVENTS §3.1）。根作用域订阅即使带
+ * `{global:true}` 也只是「不被过滤」，而 r32 真机证据是反过来的：`RunState.progress` 在
+ * **全部历史 run** 里恒为空对象，同一批成员会话里却有 63 次 `tool.call`。所以真正能保证
+ * 「成员在跑 ⇒ 进度推进」的挂载点只有成员 ctx 本身。
+ *
+ * 挂在这里还有第二个好处：`memberId` 在 spawn 返回时就已知，**不需要**再从 agent 反查
+ * binding（旧链路正是靠 `namesOf(agent).name` 反查，而宿主返回的是 `self`，那条路一直死着）。
+ *
+ * @param memberId 宿主 SessionId（= spawn 返回的 `childId`，也是 `binding.memberId`）
+ * @param handler  收到一次实质工具调用 / 状态变化时回调（由调用方做节流与落盘）
+ */
+export function watchMemberProgress(
+  ctx: HostContext,
+  memberId: string,
+  handler: (info: { memberId: string; at: number }) => void,
+): MemberProgressWatch {
+  const stops: Array<() => void> = []
+  const stop = (): void => {
+    while (stops.length > 0) {
+      const dispose = stops.pop()
+      try {
+        dispose?.()
+      } catch {
+        /* 单个 disposer 失败不影响其余清理 */
+      }
+    }
+  }
+  if (typeof memberId !== 'string' || memberId === '') return { ok: false, reason: '成员 id 为空', stop }
+  // 老宿主没有 `ctx.agents.get`：这是**已知的能力缺口**，不是成员异常。静默降级（根作用域
+  // 兜底 + stalled 判成「证据不足」），不要每个成员刷一条 warn —— 那会把真告警淹掉。
+  if (typeof ctx.agents?.get !== 'function') {
+    return { ok: false, reason: '宿主未提供 agents.get（旧宿主）：成员级订阅不可用', stop }
+  }
+  const agent = liveAgentOf(ctx, memberId)
+  if (agent === undefined) {
+    return { ok: false, reason: '宿主 agents.get 拿不到该成员的 agent（可能已卸载）', stop }
+  }
+  const scope = agentContextOf(agent)
+  if (scope === null) return { ok: false, reason: '该 agent 上没有可订阅的 ctx', stop }
+  const on = scope.on.bind(scope)
+  const advance = (): void => {
+    try {
+      handler({ memberId, at: Date.now() })
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] 成员推进处理失败（${messageOf(error)}）`)
+    }
+  }
+  /**
+   * 作用域已经是该成员，再按 id 核一遍：宿主若不做过滤（旧宿主 / 形状变动），
+   * 全局投递会把别人的调用算到这个成员头上（「A 的调用救了 B 的停滞」比漏记更糟）。
+   */
+  const accepts = (owner: unknown): boolean => {
+    if (owner === undefined || owner === null) return true
+    const id = (owner as { id?: unknown }).id
+    return typeof id !== 'string' || id === '' || id === memberId
+  }
+  const install = (event: string, ownerOf: (args: unknown[]) => unknown): void => {
+    try {
+      const dispose = on(event, (...args: unknown[]) => {
+        if (!accepts(ownerOf(args))) return
+        advance()
+      })
+      if (typeof dispose === 'function') stops.push(dispose)
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] 成员级订阅 ${event} 失败（${messageOf(error)}）`)
+    }
+  }
+  install('tools/result', (args) => agentOfToolEvent({ exec: args[0] }))
+  install('agent/status', (args) => agentOfToolEvent(args[0] ?? args))
+  return stops.length > 0
+    ? { ok: true, stop }
+    : { ok: false, reason: '成员 ctx 上两条订阅都没装上', stop }
 }
 
 /**
@@ -1860,7 +1958,19 @@ export function memberIdentityOf(ctx: HostContext, agent: unknown): { id: string
   const own = agent as { id?: unknown; name?: unknown } | null | undefined
   try {
     const named = readServiceQuietly(ctx, 'subagents')?.namesOf?.(agent)
-    const path = typeof named?.name === 'string' ? named.name : ''
+    /**
+     * r32：宿主 `namesOf(agent)` 的返回值是 `{ self, parent }`（`self` = 从 root 起的斜杠路径，
+     * 如 `lead/dev-t1-xxx`），**没有 `name` 字段**。旧代码只读 `named.name`，于是名字恒为空、
+     * 反查 binding 只能靠 id —— 而这条 NULL 路径没有任何日志，真机上表现为「事件来了也不记账」。
+     * 现在按宿主真实形状读 `self`（仍保留 `name` 兼容旧桩/旧宿主）。
+     */
+    const candidate = named as { self?: unknown; name?: unknown } | null | undefined
+    const path =
+      typeof candidate?.self === 'string' && candidate.self !== ''
+        ? candidate.self
+        : typeof candidate?.name === 'string'
+          ? candidate.name
+          : ''
     if (path !== '') name = path.split('/').pop() ?? ''
     if (typeof own?.id === 'string') id = own.id
   } catch {

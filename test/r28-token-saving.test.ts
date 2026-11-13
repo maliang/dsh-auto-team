@@ -212,7 +212,12 @@ test('r28⑦ dispatchReady：派发消息用短标签，成员拿到的 task 仍
       now: () => NOW,
     }
     const result = await dispatchReady(makeState([makeTask('t1')]), deps)
-    const body = result.state.messages.at(-1)?.body ?? ''
+    // 派发消息按稳定特征选：body 含「已派发给你」且带 toMemberId（r29 起派发之后还会追加一条
+    // 同 taskId 的 captain→user 软提示，不能再靠「最后一条」定位）。
+    const body =
+      result.state.messages.find(
+        (message) => message.from === 'captain' && message.toMemberId !== undefined && message.body.includes('已派发给你'),
+      )?.body ?? ''
     const label = taskLabelOf(makeTask('t1'))
 
     assert.deepEqual(result.started, ['t1'])

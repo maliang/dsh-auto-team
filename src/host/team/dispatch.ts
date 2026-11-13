@@ -529,6 +529,30 @@ export function taskCardText(task: PlanTask, role: Role | undefined, handoffs: r
 }
 
 
+/**
+ * r29/r31：任务卡行号指针的软提示。spawn 与复用两条派发路径共用同一判据，避免只修一条。
+ *
+ * 只提示、不拦截；只在**首次派发**写一次。判据用 `state`（本次派发前的快照）：
+ * 复用时 `next.bindings` 已经追加了当前任务的 binding，拿 `next` 判会把首次派发误判成返工。
+ * 调用点负责把这条提示排在派发消息之后，并沿用同一个 `task.id` 归属。
+ */
+function appendMissingPointerHint(next: RunState, state: RunState, task: PlanTask, at: number): RunState {
+  const dispatchedBefore =
+    (task.attempts ?? 0) > 0 || state.bindings.some((item) => item.taskId === task.id)
+  const cardText = `${task.title}\n${(task.writeScopes ?? []).join('\n')}`
+  if (dispatchedBefore || hasLinePointer(cardText)) return next
+  return appendMessage(
+    next,
+    makeMessage({
+      from: 'captain',
+      to: 'user',
+      taskId: task.id,
+      at,
+      body: `任务 ${task.id} 的任务卡未给 path:line 指针，成员需自行搜索定位`,
+    }),
+  )
+}
+
 /** 派发：把 ready 的任务按空闲并发位创建成员。 */
 export async function dispatchReady(state: RunState, deps: DispatchDeps): Promise<DispatchResult> {
   const now = deps.now ?? Date.now
@@ -816,6 +840,8 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
                 body: card,
               }),
             )
+            // r31 D1：复用时同样要给「任务卡缺 path:line」软提示；判据与 spawn 分支共用。
+            next = appendMissingPointerHint(next, state, task, at)
             started.push(taskId)
             claimedMembers.add(reusable.memberId)
             changed = true
@@ -915,6 +941,8 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
           body: `任务 ${task.id}「${taskLabelOf(task)}」已派发给你（角色 ${role.name}）。验收判定：${task.acceptance === '' ? '（未声明，需人工确认）' : task.acceptance}`,
         }),
       )
+      // r29/r31：任务卡行号指针的软提示（与复用路径共用 appendMissingPointerHint）。
+      next = appendMissingPointerHint(next, state, task, at)
       started.push(taskId)
       // 只在 spawn 成功后记录消歧（失败侧不产生 notice），且只记录**真消歧**：
       // 本名不算（suffix=0）、沿用自己老 binding 的同名也不算（重试/重建不重复提示）。
@@ -1168,6 +1196,24 @@ export function taskLabelOf(task: Pick<PlanTask, 'title'>): string {
   const chars = Array.from(firstLine)
   if (chars.length <= TASK_LABEL_MAX) return firstLine
   return `${chars.slice(0, TASK_LABEL_MAX - 1).join('')}…`
+}
+
+/**
+ * 任务卡里是否给了 `path:line` 行号指针（r29）。
+ *
+ * 判据是「带扩展名的路径 + 冒号 + 数字」，且路径前面必须是行首/空白/标点 ——
+ * 这样 `src/host/tools.ts:123` 命中，而 `src/host/tools.ts`（无行号）、
+ * `12:30`（时间）、`https://x:443`（URL 的端口，路径段没有扩展名）都不命中。
+ *
+ * 为什么不用更宽的 `\w+:\d+`：任务卡里到处都是时间、端口、版本号，
+ * 一个宽正则会让「没给指针」的提示永不触发，等于没做。
+ */
+const LINE_POINTER_RE =
+  /(?:^|[\s(（[【{「"'`<>,，;；、])[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z][\w-]*:[0-9]+(?![A-Za-z0-9_])/u
+
+/** 纯函数：给一段文本，判断是否含可点击的 `path:line` 指针。 */
+export function hasLinePointer(text: string): boolean {
+  return LINE_POINTER_RE.test(text ?? '')
 }
 
 /** 续跑文案：明确「从哪继续」，避免成员当作新任务重头做一遍。 */

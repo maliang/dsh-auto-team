@@ -70,6 +70,15 @@ export function buildMemberPrompt(input: PromptInput, deps: MemberPromptDeps): s
     '- 全量门禁只在收尾跑一次；过程中用定向测试（只跑相关 test 文件）。',
     '- 探索结果/日志用完后立即 `compress` 折叠，不要囤在上下文里。',
     '- reasoning 只写决策与下一步，不复述计划、不复述代码全文。',
+    // r29：读取纪律 —— 上面六条说「怎么省」，这里钉死「单条命令的边界」。
+    // 与工作纪律分开成段：那段是行为契约（固定 6 条），这段是可以独立增删的命令口径。
+    // 正文（不含标题）刻意压到 400 字符以内：它同样每次 spawn 都进上下文。
+    '## 读取纪律（单条命令的边界）',
+    '- 单次读取 ≤120 行（`sed -n \'110,230p\'`，禁 `sed -n \'1,2000p\'`；日志/文档 `head -40`；`git diff` 先 `--stat` 再单文件 `| head -60`）。',
+    '- `cat` 只用于 <100 行短文件，禁 cat 长文档/长日志/artifacts。',
+    '- 搜索必须收窄（`grep -rn --include=\'*.ts\' src test | head -20`，禁扫 node_modules、*.asar、~/.dsh 整树）。',
+    '- 先 `grep -n` 定行号再只读该段、同一文件不整段重读。',
+    '- 任务卡含 `path:line` 时直接从该行附近读，不通读整个文件。',
     '',
     '## 验收判定（必须实际执行并回报退出码）',
     input.task.acceptance === '' ? '（未声明；视为需要人工确认，不得自称完成）' : `\`${input.task.acceptance}\``,

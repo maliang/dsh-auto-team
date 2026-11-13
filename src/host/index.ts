@@ -50,6 +50,7 @@ import {
   registerToolGuard,
   resolveConcurrencyLimit,
   sessionWorkspaceOf,
+  watchMemberProgress,
   type HostContext,
   type HostWorkspaceEntry,
 } from './adapters.ts'
@@ -252,16 +253,84 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     })
   }
 
+  /**
+   * 推进落盘（r32）：`progress[memberId].at` 的**唯一写点**。
+   *
+   * 三条纪律：
+   *  1. **按 memberId 直写**，不再从 agent 反查 binding —— 旧链路靠 `namesOf(agent).name` 反查，
+   *     而宿主返回的是 `self`（详见 adapters.memberIdentityOf 的注释），那条路一直是死的。
+   *  2. **节流**：`PROGRESS_SAVE_MIN_MS` 内的重复信号合并成一次 `store.save`（一次 save 是
+   *     整份 run JSON 的 tmp+rename），既不丢「成员在推进」的事实，也不把磁盘刷爆。
+   *  3. **绝不静默**：匹配不到 binding 时按 memberId 记一次 warn（真机上这正是「事件来了但
+   *     面板还是说停滞」的唯一可见证据）。
+   */
+  const PROGRESS_SAVE_MIN_MS = 1_000
+  const progressMissLogged = new Set<string>()
+  function recordProgress(memberId: string, at: number): void {
+    if (typeof memberId !== 'string' || memberId === '') return
+    try {
+      for (const summary of store.list()) {
+        const state = store.load(summary.runId)
+        if (!state) continue
+        const binding = state.bindings.find((item) => item.retired !== true && item.memberId === memberId)
+        if (!binding) continue
+        const prev = state.progress?.[memberId]?.at
+        if (typeof prev === 'number' && at - prev < PROGRESS_SAVE_MIN_MS) continue
+        store.save({ ...state, progress: touchProgress(state.progress, memberId, at) })
+      }
+    } catch (error) {
+      // 事件处理异常绝不能冒泡到宿主工具执行链（AC-9）：记一条 warn 就够。
+      warn(ctx, `推进记录失败：${messageOf(error)}`)
+    }
+  }
+
+  /**
+   * 成员级推进订阅（r32 真机假停滞的修复点）：spawn 一返回就按已知 memberId 装到
+   * **成员自己的 `agent.ctx`** 上，不再依赖根作用域投递，也不依赖名字反查。
+   */
+  const memberWatches = new Map<string, () => void>()
+  const memberWatchWarned = new Set<string>()
+  function watchMember(memberId: string): void {
+    if (typeof memberId !== 'string' || memberId === '' || memberWatches.has(memberId)) return
+    const watch = watchMemberProgress(ctx, memberId, (info) => recordProgress(info.memberId, info.at))
+    if (watch.ok) {
+      memberWatches.set(memberId, watch.stop)
+      return
+    }
+    // 老宿主没有 agents.get 是能力缺口（不是异常）：静默降级到根作用域兜底，
+    // 面板侧届时会显示「证据不足」而不是假停滞。其余失败必须可见。
+    if ((watch.reason ?? '').includes('旧宿主')) return
+    if (!memberWatchWarned.has(memberId)) {
+      memberWatchWarned.add(memberId)
+      warn(ctx, `成员 ${memberId} 装不上成员级推进订阅（${watch.reason ?? '未知原因'}）：本轮进度可能不推进`)
+    }
+  }
+  /** 停止全部成员级订阅（由下面**同一个** effect 一起清理，别再多挂一份 disposer）。 */
+  function stopMemberWatches(): void {
+    for (const stop of memberWatches.values()) {
+      try {
+        stop()
+      } catch {
+        /* 单个订阅释放失败不影响其余清理 */
+      }
+    }
+    memberWatches.clear()
+  }
+
   // 成员名由 dispatch 决定（`<roleId>-<taskId>`，确定性，AC-17 的幂等地基）；
   // 这里只把「计划里的任务」翻译成宿主的 spawn 请求，不再自己起名。
-  const spawn: SpawnPort = (input) =>
-    spawnPorts.spawn({
+  const spawn: SpawnPort = async (input) => {
+    const result = await spawnPorts.spawn({
       prompt: input.prompt,
       name: input.name,
       route: input.role?.model,
       sessionId: input.plan.sessionId,
       taskId: input.task.id,
     })
+    // spawn 成功即拿到 memberId：**此刻**就装上订阅，早于成员的第一次工具调用。
+    if (result.ok) watchMember(result.memberId)
+    return result
+  }
 
   /** 派发端口：并发切片、角色缺失拒绝、幂等复用、逐角色模型预校验都在 dispatchReady 里。 */
   const dispatch: DispatchPort = async (state: RunState) => {
@@ -323,6 +392,10 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   /** 恢复端口：只处理 running/gate/interrupted，重复调用必须幂等（AC-17）。 */
   const resume: ResumePort = async (state: RunState) => {
     const result = await resumeRun(state, { store, listMembers, sendMessage: spawnPorts.sendMessage, now })
+    // r32：续聊恢复出来的成员同样要装订阅（新 spawn 之外的第二条来路）。
+    for (const binding of state.bindings) {
+      if (binding.retired !== true) watchMember(binding.memberId)
+    }
     return { resumed: result.resumed, skipped: result.skipped, unchanged: result.unchanged }
   }
 
@@ -582,21 +655,40 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
         // 宿主形状解析只在 adapters 里（AGENTS §4）：这里只拿 id/name，不摸 exec/status 字段。
         const identity = agent === undefined ? undefined : memberIdentityOf(ctx, agent)
         if (!identity) return
+        // 兜底路径也顺手补装成员级订阅：冷恢复出来的成员在 spawn 时刻还不存在，
+        // 等它第一次冒泡事件时再挂上（幂等，已挂过就直接返回）。
+        if (typeof identity.id === 'string' && identity.id !== '') watchMember(identity.id)
+        const memberId = typeof identity.id === 'string' ? identity.id : ''
+        let matched = false
         for (const summary of store.list()) {
           const state = store.load(summary.runId)
           if (!state) continue
           const hit = state.bindings.find(
-            (binding) => binding.retired !== true && (binding.memberId === identity.id || binding.name === identity.name),
+            (binding) =>
+              binding.retired !== true &&
+              ((memberId !== '' && binding.memberId === memberId) || (identity.name !== '' && binding.name === identity.name)),
           )
           if (!hit) continue
-          store.save({ ...state, progress: touchProgress(state.progress, hit.memberId, at) })
+          matched = true
+          recordProgress(hit.memberId, at)
+        }
+        // 事件确实到了、却对不上任何 binding：**必须留痕**。旧实现这里是一条静默的
+        // `continue`，于是真机上「工具调用一直在来、进度一直是空」没有任何证据可查（r32）。
+        if (!matched && memberId !== '' && !progressMissLogged.has(memberId)) {
+          progressMissLogged.add(memberId)
+          warn(ctx, `推进信号来自未登记的 agent（id=${memberId} name=${identity.name || '?'}）：本轮进度不会推进`)
         }
       } catch (error) {
         // 事件处理异常绝不能冒泡到宿主工具执行链（AC-9）：记一条 warn 就够。
         warn(ctx, `推进记录失败：${messageOf(error)}`)
       }
     })
-    registerEffect(ctx, () => progressSub.stop())
+    // 一份 disposer 同时收掉「根作用域兜底订阅」与「成员级订阅」：两者是同一件事的两条来路，
+    // 分开挂会多出一份 effect（装配契约测试把它当清单数，见 test/wire.test.ts）。
+    registerEffect(ctx, () => {
+      progressSub.stop()
+      stopMemberWatches()
+    })
   } catch (error) {
     warn(ctx, `成员推进事件订阅失败：${messageOf(error)}`)
   }

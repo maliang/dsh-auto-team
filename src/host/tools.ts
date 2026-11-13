@@ -305,7 +305,7 @@ const TASK_ITEM_SCHEMA: Record<string, unknown> = {
     title: {
       type: 'string',
       description:
-        '写清要实现什么 + 关键文件与符号（成员据此定位；不要写「看一下相关代码」）；一行结论在前，细节在后',
+        '写清要实现什么 + 关键文件与符号，尽量带 path:line 行号（如 src/host/tools.ts:1158；成员据此直接跳到该段，不要写「看一下相关代码」）；一行结论在前，细节在后',
     },
     roleId: { type: 'string', description: '执行该任务的角色 id' },
     dependsOn: {
