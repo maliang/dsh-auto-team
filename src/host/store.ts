@@ -256,7 +256,12 @@ export function lastActivityAtOf(state: RunState): number {
   }
   for (const message of state.messages ?? []) bump(message?.at)
   for (const revision of state.plan.revisions ?? []) bump(revision?.at)
-  for (const task of state.plan.tasks) bump(task.revisedAt)
+  for (const task of state.plan.tasks) {
+    bump(task.revisedAt)
+    // r36④：「成员已结束、等回执」也是真活动 —— 不计入会让 30 分钟无活动的计划被判 stale，
+    // 连同**还没开始**的任务一起 cancelled（今天 11:03–11:06 三条 run 就是这么被作废的）。
+    bump(task.silentFinish?.at)
+  }
   return latest
 }
 

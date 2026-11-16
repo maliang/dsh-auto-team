@@ -1540,20 +1540,34 @@ function hostError(message: string, code: RejectionCode): HostError {
  *
  * 拿不到名单时 **抛错**（而不是返回空数组）——空数组在 watcher 眼里等于「成员全死了」，
  * 会把所有任务误标 interrupted；抛错则本轮跳过，宁可漏报一轮也不误杀。
+ *
+ * r36（静默退出漏报的根因）：定时器回调发生在任何 initiator 边界之外，
+ * `resolveCaller` 恒 `undefined` 于是一直抛 `NO_CALLER`。因此这里接受可选的 `rootId`：
+ * 有它时直接 `listDescendants(rootId)`（run 的 `plan.sessionId` 就是 subagent 树的根），
+ * 完全跳过 `resolveCaller`；没有它才回退到「按当前 caller 求 root」的旧逻辑。
+ * 旧宿主（无 `subagents`）与空名单行为不变。
  */
-export async function listHostMembers(ctx: HostContext): Promise<HostMember[]> {
+export async function listHostMembers(ctx: HostContext, rootId?: string): Promise<HostMember[]> {
   const subagents = readServiceQuietly(ctx, 'subagents')
   const teams = ctx.agentTeams
+  const requestedRoot = typeof rootId === 'string' && rootId.trim() !== '' ? rootId.trim() : undefined
+  if (typeof subagents?.listDescendants === 'function') {
+    let targetRoot = requestedRoot
+    if (targetRoot === undefined) {
+      const caller = resolveCaller(ctx)
+      if (!caller) throw hostError(NO_CALLER, 'NO_CALLER')
+      const root = subagents.rootOf?.(caller) as { id?: unknown } | string | undefined
+      const id = typeof root === 'string' ? root : root?.id
+      targetRoot = typeof id === 'string' ? id : undefined
+      if (typeof targetRoot !== 'string' || targetRoot === '') {
+        throw hostError('宿主 subagents.rootOf 未返回 root 会话 id：无法核对成员存活状态。', 'NOT_FOUND')
+      }
+    }
+    return normalizeDescendantRows(await subagents.listDescendants(targetRoot))
+  }
+  // 旧宿主只有 `agentTeams.listMembers(caller)`：仍然只能按当前 caller 查。
   const caller = resolveCaller(ctx)
   if (!caller) throw hostError(NO_CALLER, 'NO_CALLER')
-  if (typeof subagents?.listDescendants === 'function') {
-    const root = subagents.rootOf?.(caller) as { id?: unknown } | string | undefined
-    const rootId = typeof root === 'string' ? root : root?.id
-    if (typeof rootId !== 'string' || rootId === '') {
-      throw hostError('宿主 subagents.rootOf 未返回 root 会话 id：无法核对成员存活状态。', 'NOT_FOUND')
-    }
-    return normalizeDescendantRows(await subagents.listDescendants(rootId))
-  }
   if (typeof teams?.listMembers === 'function') {
     return normalizeMemberRows(await teams.listMembers(caller))
   }
@@ -2250,6 +2264,21 @@ export const TRIGGER_EVENT_NAMES = ['agent/status', 'subagent/end', 'agent/error
 
 export type TriggerEventName = (typeof TRIGGER_EVENT_NAMES)[number]
 
+/**
+ * r36③：**只在队长 agent 自己的作用域**上补订的两类「成员终结」事件。
+ *
+ * 宿主对 `subagent/end` / `agent/error` 做的是带 scope carrier 的定向派发
+ * （见 r36 ROOT-CAUSE §2），只挂在 `ctx.root + {global:true}` 上在真机上可能一条都收不到。
+ * 这里在队长的 `agent.ctx` 上再订一份：作用域正是 carrier 的比对对象，判定仍复用同一个 handler。
+ */
+export const CAPTAIN_TRIGGER_EVENT_NAMES = ['subagent/end', 'agent/error'] as const
+
+/** 队长作用域事件订阅结果：`degraded` = 拿不到队长 agent 作用域（调用方可在捕获到后再试）。 */
+export interface CaptainTriggerSubscription {
+  stop(): void
+  degraded: boolean
+}
+
 /** 事件订阅结果：`degraded` 供装配层调 `bus.setEventSource(false)`（AC-18 的可读降级）。 */
 export interface TriggerEventSubscription {
   stop(): void
@@ -2301,6 +2330,49 @@ export function onHostTriggerEvents(
 
   return {
     degraded: failed > 0,
+    stop() {
+      while (disposers.length > 0) {
+        const dispose = disposers.pop()
+        try {
+          dispose?.()
+        } catch {
+          /* 单个 disposer 失败不影响其余清理 */
+        }
+      }
+    },
+  }
+}
+
+/**
+ * r36③：在队长 agent 的 `agent.ctx` 上补订「成员终结」事件（与上者同一个 handler，同源判定）。
+ *
+ * `apply` 时刻 `currentInitiator()` 通常还是空，所以**能订上就订、订不上返回 `degraded`**；
+ * 装配层在捕获到队长工具结果（异步链内）时再调一次即可。
+ * 监听器异常自己兜住：事件处理里还有 store/bridge 写入，绝不能抛回宿主总线。
+ */
+export function onCaptainScopedTriggerEvents(
+  ctx: HostContext,
+  handler: (name: TriggerEventName, payload: unknown) => void,
+): CaptainTriggerSubscription {
+  const scope = agentContextOf(captainAgentOf(ctx))
+  if (scope === null) return { stop() {}, degraded: true }
+  const disposers: Array<() => void> = []
+  for (const name of CAPTAIN_TRIGGER_EVENT_NAMES) {
+    try {
+      const dispose = scope.on(name, (...args: unknown[]) => {
+        try {
+          handler(name, payloadOfEvent(name, args))
+        } catch (error) {
+          ctx.logger?.warn?.(`[auto-team] 队长作用域 Trigger 事件处理失败（${name}：${messageOf(error)}）`)
+        }
+      })
+      if (typeof dispose === 'function') disposers.push(dispose)
+    } catch (error) {
+      ctx.logger?.warn?.(`[auto-team] 队长作用域订阅 ${name} 失败：${messageOf(error)}`)
+    }
+  }
+  return {
+    degraded: disposers.length === 0,
     stop() {
       while (disposers.length > 0) {
         const dispose = disposers.pop()

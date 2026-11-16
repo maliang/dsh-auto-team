@@ -37,22 +37,43 @@ interface Harness {
   warnings: string[]
   /** 事件名 → 监听器（`subscribeHostEvent` 走 `ctx.on(event, listener, {global:true})`）。 */
   events: Map<string, Array<(...args: unknown[]) => void>>
+  captainEvents: Map<string, Array<(...args: unknown[]) => void>>
   emit(event: string, payload: unknown): void
 }
 
 /** 与 `test/wire.test.ts` 同源的假宿主：只提供 `apply()` 真正读取的那几个服务。 */
-function makeHarness(): Harness {
+/**
+ * r36③：`captainScope` 打开时队长 agent 挂 `ctx.on`，与根作用域登记进**同一个** events 表 ——
+ * 一次 emit 会同时打到两边，用来断言「两路同源、重复投递不双写」。
+ */
+function makeHarness(options: { captainScope?: boolean } = {}): Harness {
   const tools: FakeToolDef[] = []
   const disposers: Array<() => void | Promise<void>> = []
   const warnings: string[] = []
   const events = new Map<string, Array<(...args: unknown[]) => void>>()
+  const captainEvents = new Map<string, Array<(...args: unknown[]) => void>>()
   const members = [{ id: MEMBER_ID, name: MEMBER_NAME, status: 'running' }]
 
   const ctx: Record<string, unknown> = {
     tools: { register: (def: unknown) => void tools.push(def as FakeToolDef) },
     systemPrompt: { section: () => {} },
     webServer: { register: () => {} },
-    agents: { currentInitiator: () => ({ id: 'captain', name: 'captain' }) },
+    agents: {
+      currentInitiator: () =>
+        options.captainScope === true
+          ? ({
+              id: 'captain',
+              name: 'captain',
+              ctx: {
+                on: (event: string, listener: (...args: unknown[]) => void) => {
+                  const list = captainEvents.get(event) ?? []
+                  list.push(listener)
+                  captainEvents.set(event, list)
+                },
+              },
+            } as unknown)
+          : { id: 'captain', name: 'captain' },
+    },
     get(name: string): unknown {
       return ctx[name]
     },
@@ -80,6 +101,7 @@ function makeHarness(): Harness {
     disposers,
     warnings,
     events,
+    captainEvents,
     emit(event, payload) {
       for (const listener of events.get(event) ?? []) listener(payload)
     },
@@ -210,4 +232,42 @@ test('r34 两路一致：事件路径与轮询路径落盘的 silentFinish 字�
   const eventBody = eventNext.messages.find((message) => message.taskId === 't1')?.body ?? ''
   const pollBody = pollNext.messages.find((message) => /已结束本轮但未提交回执/.test(message.body))?.body ?? ''
   assert.equal(eventBody, pollBody, '两条路径的通知正文必须同口径（同一句文案）')
+})
+
+test('r36③：根 + 队长作用域各投一次同一条 subagent/end → 只落一份 silentFinish、只发一条通知', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'auto-team-r36-dupe-'))
+  const previousHome = process.env.HOME
+  process.env.HOME = home
+  const h = makeHarness({ captainScope: true })
+  try {
+    apply(h.ctx as never, { workspace: home })
+  } finally {
+    process.env.HOME = previousHome
+  }
+
+  try {
+    assert.ok(h.events.has('subagent/end'), '根作用域仍要订阅（老宿主没有队长 agent 时的唯一事件源）')
+    assert.ok(h.captainEvents.has('subagent/end'), '队长作用域必须补订 subagent/end')
+    assert.ok(h.captainEvents.has('agent/error'), '队长作用域必须补订 agent/error')
+
+    const store = new RunsStore(join(home, '.dsh/auto-team/runs'))
+    store.save(stateOf([taskOf()], [bindingOf()]))
+
+    // 一次 emit 同时打到根作用域与队长作用域：handler 会被调两次。
+    h.emit('subagent/end', { memberId: MEMBER_ID, name: MEMBER_NAME })
+    const after = store.load(RUN)!
+    const firstAt = after.plan.tasks[0]?.silentFinish?.at
+    assert.equal(typeof firstAt, 'number')
+    assert.equal(silentMessagesOf(after), 1, '两路同源：重复投递不得双写通知')
+    assert.equal(after.plan.tasks[0]?.status, 'running', 'silentFinish 语义不变：不自动 done/rework')
+
+    h.emit('subagent/end', { memberId: MEMBER_ID, name: MEMBER_NAME })
+    h.emit('agent/error', { memberId: MEMBER_ID, name: MEMBER_NAME })
+    const replay = store.load(RUN)!
+    assert.equal(replay.plan.tasks[0]?.silentFinish?.at, firstAt, '重复投递不得刷新 at')
+    assert.equal(silentMessagesOf(replay), 1, '重复投递不得重复通知（幂等，不靠去重列表）')
+  } finally {
+    for (const dispose of h.disposers.reverse()) await dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
 })

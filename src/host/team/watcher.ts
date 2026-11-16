@@ -28,7 +28,16 @@ export interface HostMember {
 
 export interface WatcherDeps {
   store: RunsStore
-  listMembers(): Promise<HostMember[]>
+  /**
+   * 宿主成员名单。`rootId` = 本次 run 的 `plan.sessionId`（subagent 树的根）：
+   * r36 起必须传它 —— 定时器回调不在任何 initiator 边界内，按 caller 求 root 会恒抛 `NO_CALLER`。
+   */
+  listMembers(rootId?: string): Promise<HostMember[]>
+  /**
+   * 名单不可得时的告警出口（r36）：不再静默吞错。
+   * 同一种错误只在状态变化时报一次（由本文件去重），装配层接到宿主 warn / 面板降级通道。
+   */
+  onWarn?(message: string): void
   now?(): number
   intervalMs?: number
   /**
@@ -380,6 +389,11 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
   const stepReminderAt = deps.stepReminderAt ?? STEP_REMINDER_AT
   let timer: ReturnType<typeof setInterval> | null = null
   let busy = false
+  /**
+   * 上一次「名单不可得」的告警键（r36）：同一种错误只报一次，错误换了才再报。
+   * 成功取到名单即清空 —— 恢复后再次故障算一次新的状态变化。
+   */
+  let lastListError: string | null = null
 
   async function tick(): Promise<number> {
     if (busy) return 0
@@ -407,9 +421,21 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
 
         if (members === null) {
           try {
-            members = await deps.listMembers()
-          } catch {
+            // r36：带 rootId —— 定时器回调没有 initiator 边界，按 caller 求 root 会每轮抛 NO_CALLER。
+            members = await deps.listMembers(state.plan.sessionId)
+            lastListError = null
+          } catch (error) {
             // 名单不可得：本轮什么都不改，等下一轮（宁可漏报一轮，也不误杀全部成员）。
+            // 但**不许静默**（r36）：喂给降级通道，同一种错误只在状态变化时报一次。
+            const text = `成员名单不可得（本轮跳过存活对账，不据此判定任何成员死亡）：${errorTextOf(error)}`
+            if (text !== lastListError) {
+              lastListError = text
+              try {
+                deps.onWarn?.(text)
+              } catch {
+                /* 告警出口自身失败不得打断对账循环 */
+              }
+            }
             return changed
           }
         }
@@ -478,6 +504,11 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
       timer = null
     },
   }
+}
+
+/** 错误正文（只给告警文案用：本文件不引入其它模块的错误格式化，避免依赖方向反转）。 */
+function errorTextOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** 宿主 4 态 → 本项目需要的三分法：alive / dead / unknown。 */

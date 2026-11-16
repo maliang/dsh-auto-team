@@ -35,6 +35,7 @@ import {
   listHostMembers,
   memberIdentityOf,
   onHostTriggerEvents,
+  onCaptainScopedTriggerEvents,
   onCaptainToolResult,
   onMemberProgress,
   onSessionEvents,
@@ -178,8 +179,9 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     createExpander({ roots }).expand(id, depth)
 
   /** 宿主成员名单（做成方法而不是快照：每次对账都取当时的事实，不用缓存的旧名单）。 */
-  function listMembers(): ReturnType<typeof listHostMembers> {
-    return listHostMembers(ctx)
+  function listMembers(rootId?: string): ReturnType<typeof listHostMembers> {
+    // r36：有 rootId（run 的 plan.sessionId = subagent 树根）时不再依赖 initiator 边界。
+    return listHostMembers(ctx, rootId)
   }
 
   function hostConcurrency(): {
@@ -502,6 +504,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     watcherRef = createMemberWatcher({
       store,
       listMembers,
+      // r36②：名单不可得不再静默 —— 同一种错误只报一次（去重在 watcher 里），走宿主 warn 降级通道。
+      onWarn: (text) => warn(ctx, text),
       now,
       // AC-13 生效点④：停滞阈值从设置读（缺省 = config.STALL_MS，值不变）。
       stallMs: settings.stallMs,
@@ -717,12 +721,41 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     warn(ctx, `成员推进事件订阅失败：${messageOf(error)}`)
   }
 
+  /**
+   * 队长作用域的事件补订（r36③）：`subagent/end` / `agent/error` 在宿主里是**带 scope carrier 的
+   * 定向派发**，只挂 `ctx.root + {global:true}` 在真机上可能一条都收不到（r36 取证：handler 从未被有效调用）。
+   * 这里在队长自己的 `agent.ctx` 上再订一份，判定复用同一个 `handleTriggerEvent`（同源，不写第二套）。
+   *
+   * apply 期通常拿不到队长 agent（`currentInitiator` 只在工具执行链里有值），所以先试一次，
+   * 拿不到就静默等下一次队长工具结果 —— 本函数幂等，已订上后直接返回。
+   */
+  let captainEventSub: { stop(): void } | null = null
+  let captainEventWarned = false
+  function ensureCaptainTriggerEvents(): void {
+    if (captainEventSub !== null) return
+    try {
+      const sub = onCaptainScopedTriggerEvents(ctx, handleTriggerEvent)
+      if (sub.degraded) return
+      captainEventSub = sub
+      registerEffect(ctx, () => {
+        captainEventSub = null
+        sub.stop()
+      })
+    } catch (error) {
+      if (captainEventWarned) return
+      captainEventWarned = true
+      warn(ctx, `队长作用域事件订阅失败（成员终结仍靠根作用域 + 轮询兜底）：${messageOf(error)}`)
+    }
+  }
+
   // ④½ 队长留痕（r11 F7）：只观察、不拦截。
   //     订阅根作用域的 `tools/result`，监听器里按 `exec.agent` 缺省判队长（与 ⑤ 的 guard 同口径）；
   //     记录器自己 fail-open，这里再兜一层 —— 留痕失败绝不能影响工具结果（AC-23）。
   try {
     const deviationSub = onCaptainToolResult(ctx, ({ toolName, args }) => {
       deviations.record({ toolName, args })
+      // 工具执行链内 `currentInitiator()` 才有值：这是补订队长作用域事件的最佳时机（幂等）。
+      ensureCaptainTriggerEvents()
     })
     registerEffect(ctx, deviationSub.stop)
   } catch (error) {
@@ -748,8 +781,11 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
 
   // ⑥ 四类宿主事件 → Trigger（AC-13/AC-18）：事件是 push 型，零定时器、零模型调用。
   //    推进语义仍然只走 bridge.act（在总线里），这里只把「谁退出了」交给总线判定。
-  try {
-    const subscription = onHostTriggerEvents(ctx, (eventName, payload) => {
+  /**
+   * 成员终结事件 → Trigger 的**唯一判定入口**：根作用域订阅与队长作用域补订都调它。
+   * 两路同源，判定只有这一份；`recordSilentFinish` 幂等，重复投递不会双写。
+   */
+  const handleTriggerEvent = (eventName: string, payload: unknown): void => {
       try {
         // 只认「成员终结」两类事件：`agent/status` 里混着 running 心跳（④ 用它记 lastProgress），
         // 拿它当退出会产出大量假 resume；`tools/result` 是工具结果，门禁证据走 receipt 同步路径。
@@ -796,7 +832,12 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
         // 事件处理异常绝不能冒泡到宿主事件总线（AC-9）。
         warn(ctx, `Trigger 事件处理失败：${messageOf(error)}`)
       }
-    })
+  }
+
+  try {
+    const subscription = onHostTriggerEvents(ctx, handleTriggerEvent)
+    // r36③：apply 期通常拿不到队长作用域；先试一次，拿不到就等队长工具结果时再补订。
+    ensureCaptainTriggerEvents()
     if (subscription.degraded) {
       // 部分事件订阅失败：如实降级，面板 header 会亮「事件源降级」，四类推进靠 poll。
       bus?.setEventSource(false)
