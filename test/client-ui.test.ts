@@ -879,7 +879,7 @@ const SIX_METRICS: UsageMetric[] = [
   // r18b t6 起 details 的四项 token 带单位；r19 起合计 text 同口径（不再有逗号数字）。
   { key: 'input', label: '输入未命中', text: '29.23K', available: true },
   { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
-  { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
+  { key: 'avgContext', label: '平均上下文', text: '60.42K', available: true },
   { key: 'output', label: '输出', text: '344', available: true },
   { key: 'calls', label: '调用次数', text: '1', available: true },
   { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
@@ -917,7 +917,7 @@ test('历史行（r17）：底部六项原样透传宿主 details，客户端零
   assert.equal(row.tokenSource, 'provider')
   // title 展开六项：任何人都能从悬停看到「为什么命中率是 51.3%」
   assert.match(row.tokenTitle, /输入未命中 29\.23K/)
-  assert.match(row.tokenTitle, /写缓存 不可得/)
+  assert.match(row.tokenTitle, /平均上下文 60\.42K/)
   assert.match(row.tokenTitle, /缓存命中率 51\.3%/)
 })
 

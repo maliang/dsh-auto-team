@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { readSessionTokenUsage, type HostContext } from '../src/host/adapters.ts'
+import { UNAVAILABLE_TEXT } from '../src/host/format.ts'
 import { createBridge, type BridgeDeps } from '../src/host/bridge.ts'
 import { createRoleRepo } from '../src/host/roles/repo.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState, type UsageRecord } from '../src/host/store.ts'
@@ -32,7 +33,7 @@ const RUN = 'run-t6'
 const NOW = 1_700_000_000_000
 
 /** 六项指标的固定顺序（与 `src/host/format.ts` 的 usageMetricsOf 同源，客户端只读透传）。 */
-const METRIC_KEYS = ['input', 'cacheRead', 'cacheWrite', 'output', 'calls', 'hitRate']
+const METRIC_KEYS = ['input', 'cacheRead', 'output', 'calls', 'hitRate', 'avgContext']
 
 /** 宿主 token-meter 投影的 state 形状（`@deepseek-ai/dsh-token-meter` 的 tokenUsage）。 */
 const TOKEN_USAGE_STATE = {
@@ -202,12 +203,12 @@ test('runUsageOf / taskUsageOf：六项指标顺序与可读性（calls 不可�
   assert.deepEqual(
     (cell.details ?? []).map((detail) => detail.key),
     METRIC_KEYS,
-    '六项顺序由宿主 format.ts 统一生成：input/cacheRead/cacheWrite/output/calls/hitRate',
+    '六项顺序由宿主 format.ts 统一生成：input/cacheRead/output/calls/hitRate/avgContext',
   )
   const byKey = new Map((cell.details ?? []).map((detail) => [detail.key, detail]))
   assert.equal(byKey.get('input')?.text, '120')
-  assert.equal(byKey.get('cacheWrite')?.text, '7', '投影给了 cacheWrite 就必须显示真数')
-  assert.equal(byKey.get('cacheWrite')?.available, true)
+  assert.equal((cell.details ?? []).some((detail) => detail.label === '写缓存'), false, '写缓存恒 0，不进展示明细（数据仍保留在 tokens 里）')
+  assert.equal(byKey.get('avgContext')?.text, UNAVAILABLE_TEXT, '宿主投影没有 calls → 平均上下文不可得，不补 0')
   assert.equal(byKey.get('calls')?.available, false, '宿主投影没有调用次数 → 不可得')
   assert.equal(byKey.get('hitRate')?.text, '25%', '40 / (120 + 40)')
 

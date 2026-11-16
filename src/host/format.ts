@@ -112,11 +112,38 @@ export function formatCacheHitRate(totals: TokenTotals | undefined): string {
 }
 
 /**
+ * 平均上下文：`total / calls`，单位文本与其余 token 项同一口径（`formatTokenUnits`）。
+ *
+ * 口径：`total` 是该来源的全部 token（含命中缓存的部分），`calls` 是一条 assistant 消息
+ * 算一次；两者相除即「每次调用平均带了多少上下文」。例：`3_339_386 / 51 = 65_478.16` → `65.48K`。
+ *
+ * 降级（r21）：`calls` 缺失或 ≤ 0 时返回 `不可得` —— **绝不在 calls 缺失时补 0**，
+ * 补 0 会让「没有数据」显示成「平均上下文 0」，那是编数据。`total = 0` 是合法真值
+ * （provider 明确说这次没花钱），照实显示 `0`，不降级成不可得。
+ */
+export function avgContextTextOf(totals: TokenTotals | undefined): string {
+  if (!totals) return UNAVAILABLE_TEXT
+  const total = totals.total
+  const calls = totals.calls
+  if (!usableNumber(total) || !usableNumber(calls) || calls <= 0) return UNAVAILABLE_TEXT
+  return formatTokenUnits(Math.round(total / calls))
+}
+
+/**
  * 六项指标（顺序固定）；分项缺失时该项 `text` 为 `不可得`，不补 0。
  *
  * r18b t6：前四项 token 数量改用 `formatTokenUnits`（带 K/M/B 单位、固定两位小数）；
  * `calls` 仍是次数整数、`hitRate` 仍是百分比——这两项不是 token 量，不许套单位。
  * r19：合计 `UsageCell.text` 也改走 `formatTokenUnits`，面板不再出现逗号 token 数字。
+ *
+ * r21 展示取舍：
+ * - 去掉「写缓存」：宿主始终上报 `cacheWriteTokens: 0`（34 个真实 run 全部为 0），
+ *   provider 也不上报这一项；展示一个恒为零的格子等于编数据，也和「缺失写不可得」的
+ *   纪律冲突。数据仍在 `TokenTotals.cacheWrite` 里保留，只是不进明细。
+ * - 末尾换成「平均上下文」(`avgContext`)：`total / calls`，口径与降级见 `avgContextTextOf`。
+ * - 顺序：输入未命中 → 输入命中 → 输出 → 调用次数 → 缓存命中率 → 平均上下文。
+ *   先分项、再次数、然后两个派生比率/均值——派生指标放在其分子分母之后，读起来才是
+ *   「这些数怎么来的」；顺序是契约，客户端按数组原样渲染，不许重排。
  */
 export function usageMetricsOf(totals: TokenTotals | undefined): UsageMetric[] {
   const metric = (key: UsageMetricKey, label: string, value: string): UsageMetric => ({
@@ -128,10 +155,10 @@ export function usageMetricsOf(totals: TokenTotals | undefined): UsageMetric[] {
   return [
     metric('input', '输入未命中', formatTokenUnits(totals?.input)),
     metric('cacheRead', '输入命中', formatTokenUnits(totals?.cacheRead)),
-    metric('cacheWrite', '写缓存', formatTokenUnits(totals?.cacheWrite)),
     metric('output', '输出', formatTokenUnits(totals?.output)),
     metric('calls', '调用次数', formatTokens(totals?.calls)),
     metric('hitRate', '缓存命中率', formatCacheHitRate(totals)),
+    metric('avgContext', '平均上下文', avgContextTextOf(totals)),
   ]
 }
 

@@ -335,7 +335,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             const jump = memberJumpOf(
               { kind: 'node', roleId: node.roleId, taskId: node.id },
               members,
-              { title: cell.title, label: cell.label },
+              { title: cell.title, label: cell.label, taskTitle: cell.taskTitle },
             )
             return (
               <button

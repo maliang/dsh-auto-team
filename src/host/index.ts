@@ -267,6 +267,17 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    */
   const PROGRESS_SAVE_MIN_MS = 1_000
   const progressMissLogged = new Set<string>()
+  /**
+   * r39：累计调用数的内存计数（`progress[memberId].calls` 的真值来源）。
+   *
+   * 为什么不在节流分支里 `continue`：节流是为了少刷盘，不是为了少数调用 —— 1 秒内连发
+   * 5 个工具调用时，旧写法会把 4 次吞掉，步数预算就永远到不了 40。计数先记内存，落盘
+   * 仍按节流走：下一次 save 会带上累计值，最多晚一个节流窗口（≤1s）。
+   *
+   * 带 `taskId`：成员复用（同一 memberId 接下一个任务）时 dispatch 会删掉旧 progress 记录，
+   * 内存计数必须跟着归零 —— 否则新任务开局就背着上一个任务的步数，40 次提醒会提前响。
+   */
+  const progressCalls = new Map<string, { taskId: string; calls: number }>()
   function recordProgress(memberId: string, at: number): void {
     if (typeof memberId !== 'string' || memberId === '') return
     try {
@@ -275,9 +286,16 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
         if (!state) continue
         const binding = state.bindings.find((item) => item.retired !== true && item.memberId === memberId)
         if (!binding) continue
+        const tracked = progressCalls.get(memberId)
+        const base =
+          tracked !== undefined && tracked.taskId === binding.taskId
+            ? tracked.calls
+            : (state.progress?.[memberId]?.calls ?? 0)
+        const calls = base + 1
+        progressCalls.set(memberId, { taskId: binding.taskId, calls })
         const prev = state.progress?.[memberId]?.at
         if (typeof prev === 'number' && at - prev < PROGRESS_SAVE_MIN_MS) continue
-        store.save({ ...state, progress: touchProgress(state.progress, memberId, at) })
+        store.save({ ...state, progress: touchProgress(state.progress, memberId, at, calls) })
       }
     } catch (error) {
       // 事件处理异常绝不能冒泡到宿主工具执行链（AC-9）：记一条 warn 就够。
@@ -489,6 +507,11 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       stallMs: settings.stallMs,
       // AC-13 生效点⑤：返工上限同样可配（缺省 = config.MAX_ATTEMPTS）。
       maxAttempts: settings.maxAttempts,
+      // r39：步数提醒阈值（缺省 = config.STEP_REMINDER_AT；0 = 关闭）。
+      stepReminderAt: settings.stepReminderAt,
+      // r39：提醒的实发口 —— 与面板「直达消息」同一个宿主端口（按 SessionId 直发）。
+      // 老宿主没有该能力时 adapters 的 sendMessage 返回 ok:false，提醒不落账、静默重试。
+      sendMemberMessage: (memberId, text) => spawnPorts.sendMessage(memberId, text),
       // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
       // r13 AC-8 第五个触发点：每轮 tick 先驱动一次自动派发（补成员退出/漏 kick 的窗口），
       // 派发语义仍在 dispatcher 里，这里只是「顺手推一下」。

@@ -233,7 +233,7 @@ test('repo.save()：首次保存会建父目录（settings.json 与 roles/ 同�
   })
 })
 
-test('repo.save() → repo.read() 往返：captainModel 与五个数字项都不丢', () => {
+test('repo.save() → repo.read() 往返：captainModel 与六个数字项都不丢', () => {
   withTempFile((file) => {
     const repo = createSettingsRepo({ file })
     const input = {
@@ -242,6 +242,8 @@ test('repo.save() → repo.read() 往返：captainModel 与五个数字项都不
       stallMs: 600_000,
       maxAttempts: 10,
       gateTimeoutMs: 1_000,
+      // r39：步数提醒阈值（0 = 关闭）。缺席时 read() 会补缺省值，往返断言必须写全。
+      stepReminderAt: 40,
       captainModel: { provider: 'p', model: 'm' },
     }
     assert.equal(repo.save(input).ok, true)

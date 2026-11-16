@@ -75,7 +75,7 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   const jump = memberJumpOf(
     { kind: 'role', roleId: role.roleId, taskId: role.activeTaskId },
     members,
-    { label: roleJumpLabelOf(role.name) },
+    { label: roleJumpLabelOf(role.name), taskTitle: role.activeTaskTitle },
   )
   const member = jump.member
   // r21：角色的聚合状态看不出成员被中断/作废/等写域 —— 这类实况用一枚成员态 chip 补上。

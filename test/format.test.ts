@@ -14,10 +14,12 @@ import {
   formatCacheHitRate,
   formatCompactTokens,
   formatDuration,
+  avgContextTextOf,
   formatTokenUnits,
   formatTokens,
   memoryTokenEstimate,
   usageCellOf,
+  usageMetricsOf,
   waitedTextOf,
 } from '../src/host/format.ts'
 
@@ -109,10 +111,10 @@ test('usageCellOf：有数字就是 provider（含 0），没有就 unavailable 
     [
       ['input', '4'],
       ['cacheRead', UNAVAILABLE_TEXT],
-      ['cacheWrite', UNAVAILABLE_TEXT],
       ['output', '6'],
       ['calls', UNAVAILABLE_TEXT],
       ['hitRate', UNAVAILABLE_TEXT],
+      ['avgContext', UNAVAILABLE_TEXT],
     ],
     '没给分项就不凭空补 0：缺失项一律「不可得」',
   )
@@ -134,12 +136,40 @@ test('usageCellOf 六项：真实宿主 usage 的命中率与四项 token 分量
     [
       ['input', '输入未命中', '29.23K', true],
       ['cacheRead', '输入命中', '30.85K', true],
-      ['cacheWrite', '写缓存', '0', true],
       ['output', '输出', '344', true],
       ['calls', '调用次数', '1', true],
       ['hitRate', '缓存命中率', '51.3%', true],
+      ['avgContext', '平均上下文', '60.42K', true],
     ],
-    '四项 token 带单位；calls 仍是次数、hitRate 仍是百分比；命中率 = cacheRead / (input + cacheRead)',
+    '四项 token 带单位；calls 仍是次数、hitRate 仍是百分比；平均上下文 = total / calls；命中率 = cacheRead / (input + cacheRead)',
+  )
+})
+
+test('平均上下文（r21）：total / calls，calls 缺失或 0 一律「不可得」——绝不补 0', () => {
+  assert.equal(avgContextTextOf(undefined), UNAVAILABLE_TEXT)
+  assert.equal(avgContextTextOf({ total: 3_339_386, calls: 51 }), '65.48K', '真实 run：3339386 / 51 = 65,478.16，故 65.48K（任务卡里写 64.00K 是笔误）')
+  assert.equal(avgContextTextOf({ total: 3_339_386 }), UNAVAILABLE_TEXT, '没有 calls 就是不可得，不补 0')
+  assert.equal(avgContextTextOf({ total: 3_339_386, calls: 0 }), UNAVAILABLE_TEXT, '分母 0 不产生 Infinity')
+  assert.equal(avgContextTextOf({ total: 3_339_386, calls: Number.NaN }), UNAVAILABLE_TEXT)
+  assert.equal(avgContextTextOf({ total: 0, calls: 4 }), '0', '0 token 是真实值，照实显示 0')
+  assert.equal(avgContextTextOf({ total: 10, calls: 4 }), '3', '四舍五入到整数再套单位')
+
+  assert.deepEqual(
+    usageMetricsOf({ total: 3_339_386, calls: 51, input: 146_637 }).map((metric) => [metric.label, metric.text]),
+    [
+      ['输入未命中', '146.64K'],
+      ['输入命中', UNAVAILABLE_TEXT],
+      ['输出', UNAVAILABLE_TEXT],
+      ['调用次数', '51'],
+      ['缓存命中率', UNAVAILABLE_TEXT],
+      ['平均上下文', '65.48K'],
+    ],
+    '六项顺序是契约：分项 → 次数 → 派生的命中率/均值；写缓存不再出现',
+  )
+  assert.deepEqual(
+    usageMetricsOf({ total: 3_339_386 }).map((metric) => metric.text),
+    [UNAVAILABLE_TEXT, UNAVAILABLE_TEXT, UNAVAILABLE_TEXT, UNAVAILABLE_TEXT, UNAVAILABLE_TEXT, UNAVAILABLE_TEXT],
+    '只有 total 时六项全不可得',
   )
 })
 

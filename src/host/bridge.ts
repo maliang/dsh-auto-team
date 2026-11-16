@@ -432,8 +432,13 @@ export interface BridgeDeps {
 export interface Bridge {
   enabled(sessionId: string): boolean
   setEnabled(sessionId: string, enabled: boolean): void
-  snapshot(sessionId: string): PanelSnapshot
-  act(sessionId: string, action: PanelAction): Promise<ActResult>
+  snapshot(sessionId: string, runId?: string): PanelSnapshot
+  /**
+   * 执行一个面板动作。`runId`（t3，可选）只对 `message` / `receipt` 生效：
+   * 缺省 = 现有「活动 run」逻辑；给了就只认那一份，不存在/不属于本会话回 NOT_FOUND，
+   * **绝不回退到活动 run**（跨 run 收口时发错人的根因）。
+   */
+  act(sessionId: string, action: PanelAction, runId?: string): Promise<ActResult>
   /**
    * r21：把「同一条需求的修改」并入既有 run（显式通道，队长判定后由 auto_team_plan 调用）。
    *
@@ -687,6 +692,22 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
   function loadState(sessionId: string): RunState | null {
     return deps.store.latestForSession(sessionId)
+  }
+
+  /**
+   * 指定 run 的读取口（t3）：`runId` 缺省 = 现有「活动 run」逻辑，一字不改；
+   * 给了 `runId` 就只认那一份 —— 不存在或不属于本会话一律 null，**绝不回退到活动 run**
+   *（静默回退正是「跨 run 把消息发到别人成员身上」的根因）。
+   */
+  function stateOf(sessionId: string, runId?: string): RunState | null {
+    if (runId === undefined) return loadState(sessionId)
+    const state = deps.store.load(runId)
+    return state !== null && state.plan.sessionId === sessionId ? state : null
+  }
+
+  /** 指定 run 找不到时的统一文案（工具侧与桥侧同一句，不各写一份）。 */
+  function runNotFoundText(runId: string): string {
+    return `找不到运行 ${runId}（会话里没有这个 run）`
   }
 
   /**
@@ -1874,8 +1895,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return updated
   }
 
-  function snapshot(sessionId: string): PanelSnapshot {
-    const state = refreshUsage(loadState(sessionId))
+  function snapshot(sessionId: string, runId?: string): PanelSnapshot {
+    const state = refreshUsage(stateOf(sessionId, runId))
     const roles = deps.roles.list()
     // 一次快照只取一次时间：记忆视图的「相对时刻」与页脚时间必须来自同一个 now。
     const at = now()
@@ -1980,12 +2001,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
   // ---------- 动作 ----------
 
-  function reject(code: RejectionCode, message: string, sessionId: string, notices?: string[]): ActResult {
-    return { snapshot: snapshot(sessionId), notices, rejected: { code, message } }
+  function reject(
+    code: RejectionCode,
+    message: string,
+    sessionId: string,
+    notices?: string[],
+    runId?: string,
+  ): ActResult {
+    return { snapshot: snapshot(sessionId, runId), notices, rejected: { code, message } }
   }
 
-  function accept(sessionId: string, notices?: string[]): ActResult {
-    return { snapshot: snapshot(sessionId), notices }
+  function accept(sessionId: string, notices?: string[], runId?: string): ActResult {
+    return { snapshot: snapshot(sessionId, runId), notices }
   }
 
   function bindingFor(state: RunState, taskId: string | undefined): RunState['bindings'][number] | undefined {
@@ -2072,17 +2099,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 提取出来是因为入口 `act` 与执行体 `executeAction` 都要过同一道闸 —— 确认后重放的动作
    * 期间用户可能已经把插件关掉或暂停了，那时**确认也不该放行**（拒绝语义与直接调用完全一致）。
    */
-  function preflightGate(sessionId: string, action: PanelAction): ActResult | null {
+  function preflightGate(sessionId: string, action: PanelAction, runId?: string): ActResult | null {
     // 开关是唯一的例外：它必须在「未启用」时也能把开关打开。
     if (action.type !== 'toggle' && flags[sessionId]?.enabled !== true) {
-      return reject('NOT_ENABLED', NOT_ENABLED_TEXT, sessionId)
+      return reject('NOT_ENABLED', NOT_ENABLED_TEXT, sessionId, undefined, runId)
     }
     // PAUSED 闸门（r7 AC-16）：**只拦推进类动作**，一个判断点，不散落到各个 case 与组件里。
     // 放行的动作（toggle/cancel/message/saveRole/pause/resumeTeam/confirmPending/...）在暂停时仍然可用：
     // 用户暂停后还得能停用、能发消息问成员、能改角色、能继续、能处理已挂起的确认。见 TECHNICAL §2.3。
     if (PAUSED_BLOCKED.has(action.type)) {
-      const paused = loadState(sessionId)
-      if (paused?.plan.status === 'paused') return reject('PAUSED', PAUSED_TEXT, sessionId)
+      // t3：暂停判据同样按目标 run 取（跨 run 收口时，活动 run 暂停不代表目标 run 暂停）。
+      const paused = stateOf(sessionId, runId)
+      if (paused?.plan.status === 'paused') return reject('PAUSED', PAUSED_TEXT, sessionId, undefined, runId)
     }
     return null
   }
@@ -2128,13 +2156,17 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 顺序是刻意的：前置闸（未启用/暂停）在挂 pending **之前**跑 —— 用户不该去确认一个
    * 注定被拒绝的动作。可逆动作（AC-12 的 7 类）在这里不产生任何 pending，直接执行。
    */
-  async function act(sessionId: string, action: PanelAction): Promise<ActResult> {
+  async function act(sessionId: string, action: PanelAction, runId?: string): Promise<ActResult> {
+    // t3：显式 runId 只认那一份 —— 不存在/不属于本会话直接 NOT_FOUND，绝不静默回退到活动 run。
+    if (runId !== undefined && stateOf(sessionId, runId) === null) {
+      return reject('NOT_FOUND', runNotFoundText(runId), sessionId, undefined, runId)
+    }
     if (action.type === 'confirmPending' || action.type === 'rejectPending') {
       return resolvePending(sessionId, action)
     }
-    const blocked = preflightGate(sessionId, action)
+    const blocked = preflightGate(sessionId, action, runId)
     if (blocked) return blocked
-    if (!isIrreversibleAction(action)) return executeAction(sessionId, action)
+    if (!isIrreversibleAction(action)) return executeAction(sessionId, action, runId)
 
     const state = loadState(sessionId)
     // 没有运行：交给执行体产出原来的 NO_PLAN / NOT_FOUND 语义（不在这里编第二套码）。
@@ -2214,9 +2246,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
   }
 
   /** 执行体：所有 Action 的唯一实现（确认闸确认后也回到这里）。 */
-  async function executeAction(sessionId: string, action: PanelAction): Promise<ActResult> {
+  async function executeAction(
+    sessionId: string,
+    action: PanelAction,
+    runId?: string,
+  ): Promise<ActResult> {
     try {
-      const blocked = preflightGate(sessionId, action)
+      const blocked = preflightGate(sessionId, action, runId)
       if (blocked) return blocked
 
       switch (action.type) {
@@ -2720,10 +2756,35 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         case 'message': {
-          const state = loadState(sessionId)
-          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可对话的成员', sessionId)
+          // t3：传了 runId 就只在该 run 里找成员（找不到 → NOT_FOUND，不跨 run 退避）。
+          const state = stateOf(sessionId, runId)
+          if (!state) {
+            return runId !== undefined
+              ? reject('NOT_FOUND', runNotFoundText(runId), sessionId, undefined, runId)
+              : reject('NO_PLAN', '当前会话还没有执行计划：没有可对话的成员', sessionId)
+          }
           const text = (action.text ?? '').trim()
-          if (text === '') return reject('BAD_REQUEST', '消息内容不能为空', sessionId)
+          if (text === '') return reject('BAD_REQUEST', '消息内容不能为空', sessionId, undefined, runId)
+          // 指定 run 时，taskId 必须属于这一份计划：另一个 run 的同名任务不能拿来定位。
+          if (runId !== undefined && action.taskId !== undefined && !state.plan.tasks.some((task) => task.id === action.taskId)) {
+            return reject(
+              'NOT_FOUND',
+              `找不到任务 ${action.taskId}（运行 ${runId} 里没有这个任务）`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
+          // 直接点名 memberId 时同样限定在这份 run 的 bindings 里（否则照样能跨 run 发错人）。
+          if (runId !== undefined && action.memberId !== undefined && !state.bindings.some((item) => item.memberId === action.memberId)) {
+            return reject(
+              'NOT_FOUND',
+              `找不到成员 ${action.memberId}（运行 ${runId} 里没有这个成员）`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
           const binding = bindingFor(state, action.taskId)
           const memberId = action.memberId ?? binding?.memberId
           if (memberId === undefined) {
@@ -2731,11 +2792,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
               'NOT_FOUND',
               action.taskId !== undefined ? `任务 ${action.taskId} 还没有成员` : '缺少 memberId 或 taskId',
               sessionId,
+              undefined,
+              runId,
             )
           }
           const sent = await deps.sendMessage(memberId, text)
           if (!sent.ok) {
-            return reject(sent.code ?? 'NOT_FOUND', sent.error ?? '直达消息发送失败', sessionId)
+            return reject(sent.code ?? 'NOT_FOUND', sent.error ?? '直达消息发送失败', sessionId, undefined, runId)
           }
           const next = withMessage(
             state,
@@ -2749,7 +2812,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
             }),
           )
           saveState(next)
-          return accept(sessionId, [`已发送给 ${binding?.name ?? memberId}`])
+          return accept(sessionId, [`已发送给 ${binding?.name ?? memberId}`], runId)
         }
 
         case 'resume': {
@@ -2775,11 +2838,19 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         case 'receipt': {
-          const state = loadState(sessionId)
-          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
+          // t3：传了 runId 就只在该 run 上跑门禁（同一道 preflightGate + acceptance），
+          // 不存在/不属于本会话在上游 act 已回 NOT_FOUND，这里不会回退到活动 run。
+          const state = stateOf(sessionId, runId)
+          if (!state) {
+            return runId !== undefined
+              ? reject('NOT_FOUND', runNotFoundText(runId), sessionId, undefined, runId)
+              : reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
+          }
           const task = state.plan.tasks.find((item) => item.id === action.taskId)
-          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
-          if (task.status === 'done') return accept(sessionId, [`任务 ${action.taskId} 已完成，不重复跑门禁`])
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId, undefined, runId)
+          if (task.status === 'done') {
+            return accept(sessionId, [`任务 ${action.taskId} 已完成，不重复跑门禁`], runId)
+          }
 
           const empty = task.acceptance.trim() === ''
           // settings 一次读：门禁超时与返工上限来自同一次读（否则一次回执会用到两个版本的设置）。
@@ -2810,6 +2881,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
               'BAD_REQUEST',
               `门禁执行失败：${error instanceof Error ? error.message : String(error)}`,
               sessionId,
+              undefined,
+              runId,
             )
           }
 
@@ -2819,7 +2892,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
             saveState(reverted)
             return reject(GATE_FAILED, '该任务没有验收命令，需要人工确认后放行', sessionId, [
               `门禁未执行：${action.taskId} 的 acceptance 为空（退出码 ${evidence.exitCode}）`,
-            ])
+            ], runId)
           }
 
           const verdict: ReceiptInput['verdict'] = outcome.ok ? 'done' : 'rework'
@@ -2874,7 +2947,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
           // receipt 是本任务的状态机出口（done / rework / failed）→ `task-terminal`，
           // 下游被解锁后自动派发应立即补位（不必等 3s tick）。
           saveState(next, 'task-terminal')
-          return accept(sessionId, notices)
+          return accept(sessionId, notices, runId)
         }
 
         case 'saveMemory': {

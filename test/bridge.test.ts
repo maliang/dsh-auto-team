@@ -634,7 +634,7 @@ test('snapshot 契约：plannedAt / concurrency 三元组 / messages / routeAudi
 
 test('snapshot.runs（r17）：宿主把落盘 usageTotals 派生为历史行六项，无用量给 unavailable 原因', async () => {
   const { bridge, store } = setup()
-  // 两个同 session 的 run：旧的用量齐全（含宿主通常不上报的 cacheWrite），新的完全没有用量。
+  // 两个同 session 的 run：旧的用量齐全（六项含平均上下文），新的完全没有用量。
   store.save(
     stateOf({
       plan: planOf({ runId: 'run-old', createdAt: NOW - 60_000, status: 'terminated' }),
@@ -664,10 +664,10 @@ test('snapshot.runs（r17）：宿主把落盘 usageTotals 派生为历史行六
   assert.deepEqual(usage.details, [
     { key: 'input', label: '输入未命中', text: '29.23K', available: true },
     { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
-    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
     { key: 'output', label: '输出', text: '344', available: true },
     { key: 'calls', label: '调用次数', text: '3', available: true },
     { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
+    { key: 'avgContext', label: '平均上下文', text: '20.14K', available: true },
   ])
   // 派生只发生在读取时：摘要仍带原始 usageTotals（run 文件里没有 usage 字段）
   assert.equal(withUsage.usageTotals?.total, 60_421)

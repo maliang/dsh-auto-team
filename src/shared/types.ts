@@ -327,6 +327,15 @@ export interface AutoTeamSettings {
   maxAttempts: number
   /** 门禁命令超时（毫秒，1000..600000）。 */
   gateTimeoutMs: number
+  /**
+   * 步数提醒阈值（累计工具调用数，0..200；**0 = 关闭**）。
+   *
+   * r39：到达阈值给成员发**一条**直达提醒（不阻断、不改任务状态），文案见
+   * `team/watcher.ts` 的 `stepReminderTextOf`。缺省 40（`config.STEP_REMINDER_AT`）；
+   * 面板设置页暂不渲染这一项（6 行布局已被测试钉住），先经 settings.json 配置。
+   * 可选：缺席 = 取缺省值，老版本写下的 settings.json 与单测桩都不必补字段。
+   */
+  stepReminderAt?: number
   /** 队长默认模型（缺省 = 跟随会话默认）；settings.json 是唯一写入点。 */
   captainModel?: RoleModelRoute
 }
@@ -402,6 +411,13 @@ export type StallReason = 'none' | 'quiet' | 'unreported'
 export interface ProgressRecord {
   at: number
   alertedAt?: number
+  /**
+   * 本次任务累计的实质工具调用数（r39 步数预算的机械计数）。
+   *
+   * 只增不减、随任务结束一起清（成员复用/绑定释放时删整条记录）；缺席 = 老宿主没上报过
+   * 工具事件，此时步数提醒**静默跳过**（与停滞判定的 `unreported` 同一降级口径）。
+   */
+  calls?: number
 }
 
 /** 记忆双轨（AC-24）：公共轨跨会话共享，项目轨跟随当前工作目录。 */
@@ -622,8 +638,14 @@ export interface TokenTotals {
   calls?: number
 }
 
-/** 六项用量指标：输入未命中 / 输入命中 / 写缓存 / 输出 / 调用次数 / 缓存命中率。 */
-export type UsageMetricKey = 'input' | 'cacheRead' | 'cacheWrite' | 'output' | 'calls' | 'hitRate'
+/**
+ * 六项用量指标：输入未命中 / 输入命中 / 输出 / 调用次数 / 缓存命中率 / 平均上下文。
+ *
+ * r21：`cacheWrite` 换成 `avgContext`。宿主与 provider 都不上报写缓存（`cacheWriteTokens`
+ * 恒为 0），展示零值等于编数据；`TokenTotals.cacheWrite` 字段与采集链路保留不动（不删数据），
+ * 只是不再进展示明细。
+ */
+export type UsageMetricKey = 'input' | 'cacheRead' | 'output' | 'calls' | 'hitRate' | 'avgContext'
 
 /**
  * 一项用量指标（r17）：`text` 由宿主 `format.ts` 生成，客户端只渲染。

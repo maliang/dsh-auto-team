@@ -849,16 +849,16 @@ test('token 六项（r17）：title 透传宿主 details，text 优先用宿主�
   const metrics: UsageMetric[] = [
     { key: 'input', label: '输入未命中', text: '29.23K', available: true },
     { key: 'cacheRead', label: '输入命中', text: '30.85K', available: true },
-    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
     { key: 'output', label: '输出', text: '344', available: true },
     { key: 'calls', label: '调用次数', text: '1', available: true },
     { key: 'hitRate', label: '缓存命中率', text: '51.3%', available: true },
+    { key: 'avgContext', label: '平均上下文', text: '60.42K', available: true },
   ]
   const cell: UsageCell = { source: 'provider', tokens: { total: 60_421 }, text: '60.42K', details: metrics }
   assert.equal(tokenTextOf(cell), '60.42K', '宿主 text 优先，客户端不再自己分组')
   assert.equal(
     tokenTitleOf(cell),
-    '合计 60.42K token · 输入未命中 29.23K · 输入命中 30.85K · 写缓存 不可得 · 输出 344 · 调用次数 1 · 缓存命中率 51.3%',
+    '合计 60.42K token · 输入未命中 29.23K · 输入命中 30.85K · 输出 344 · 调用次数 1 · 缓存命中率 51.3% · 平均上下文 60.42K',
   )
   assert.deepEqual(usageMetricsOf(cell), metrics)
   assert.deepEqual(usageMetricsOf(unavailableCell()), [], '不可得时没有明细（走原因文案）')
@@ -869,10 +869,10 @@ test('任务详情六项（r17）：provider 时带 usageMetrics，旧数据只�
   const metrics: UsageMetric[] = [
     { key: 'input', label: '输入未命中', text: '4', available: true },
     { key: 'cacheRead', label: '输入命中', text: '不可得', available: false },
-    { key: 'cacheWrite', label: '写缓存', text: '不可得', available: false },
     { key: 'output', label: '输出', text: '6', available: true },
     { key: 'calls', label: '调用次数', text: '1', available: true },
     { key: 'hitRate', label: '缓存命中率', text: '不可得', available: false },
+    { key: 'avgContext', label: '平均上下文', text: '10', available: true },
   ]
   const withDetails = buildTaskDetail(taskOf('t1', 'done'), {
     roleName: 'dev',

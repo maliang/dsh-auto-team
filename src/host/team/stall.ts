@@ -70,17 +70,21 @@ export function stallNoteOf(reason: StallReason): string {
 /**
  * 记一次实质工具调用（返回新对象，不改入参：调用方拿它去 `store.save`）。
  *
- * 只推进 `at`，**保留** `alertedAt`：episode 的结束由 `watcher.tick` 观察到
- * 「不再停滞」后调用 {@link clearAlerted} 统一收口（单一清理点，避免两处都能改状态）。
+ * 只推进 `at`（r39 起可同时带累计调用数 `calls`），**保留** `alertedAt`：episode 的结束由
+ * `watcher.tick` 观察到「不再停滞」后调用 {@link clearAlerted} 统一收口（单一清理点，避免两处都能改状态）。
+ *
+ * `calls` 缺省 = 不改计数：老调用点（只关心推进时间）行为逐字不变。
  */
 export function touchProgress(
   progress: Record<string, ProgressRecord> | undefined,
   memberId: string,
   at: number,
+  calls?: number,
 ): Record<string, ProgressRecord> {
   const base = progress ?? {}
   const prev = base[memberId]
   const next: ProgressRecord = prev ? { ...prev, at } : { at }
+  if (typeof calls === 'number' && Number.isFinite(calls)) next.calls = calls
   return { ...base, [memberId]: next }
 }
 
@@ -97,7 +101,9 @@ export function clearAlerted(
   const record = base[memberId]
   if (!record || record.alertedAt === undefined) return base
   // 重建记录而不是 delete 字段：`alertedAt` 在类型上可选，显式重建能让落盘 JSON 干净。
+  // r39：`calls` 必须跟着保留 —— 清停滞标记不是清零步数预算，丢了它会让提醒重新触发。
   const next: ProgressRecord = { at: record.at }
+  if (record.calls !== undefined) next.calls = record.calls
   return { ...base, [memberId]: next }
 }
 

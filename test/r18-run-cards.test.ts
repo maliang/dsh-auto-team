@@ -38,7 +38,7 @@ const T1 = Date.parse('2026-11-04T10:00:00+08:00')
 const T2 = Date.parse('2026-11-05T09:00:00+08:00')
 const T3 = Date.parse('2026-11-05T10:00:00+08:00')
 
-const METRIC_KEYS = ['input', 'cacheRead', 'cacheWrite', 'output', 'calls', 'hitRate']
+const METRIC_KEYS = ['input', 'cacheRead', 'output', 'calls', 'hitRate', 'avgContext']
 
 type RunSummaryFixture = RunSummary & { ongoing?: number }
 
@@ -52,10 +52,10 @@ function usageOf(): UsageCell {
     details: [
       { key: 'input', label: '输入', text: '1,000', available: true },
       { key: 'cacheRead', label: '缓存读', text: '500', available: true },
-      { key: 'cacheWrite', label: '写缓存', text: '200', available: true },
       { key: 'output', label: '输出', text: '400', available: true },
       { key: 'calls', label: '调用', text: '3', available: true },
       { key: 'hitRate', label: '命中率', text: '不可得', available: false },
+      { key: 'avgContext', label: '平均上下文', text: '700', available: true },
     ],
   }
 }
@@ -488,7 +488,7 @@ test('每张卡六项：3 列 × 2 行所对应的 6 个 span，key 顺序固定
     assert.deepEqual(metrics.map((node) => node.props['data-active-run-metric']), METRIC_KEYS)
     assert.deepEqual(
       metrics.map((node) => node.props['data-available']),
-      ['true', 'true', 'true', 'true', 'true', 'false'],
+      ['true', 'true', 'true', 'true', 'false', 'true'],
     )
     // 每格 = label span + b 值（卡内只有 span/b）；t10 只是 CSS 改成上下两行，
     // DOM 上仍是「两个元素」，标签在前、值在后。
@@ -507,17 +507,18 @@ test('每张卡六项：3 列 × 2 行所对应的 6 个 span，key 顺序固定
   const metrics = metricsOf(cardOf(nodes, 'r2'))
   const texts = metrics.map((node) => textOf(node.props.children))
   assert.equal(texts[0], '输入 1,000', '数值是宿主格式化好的文本，组件不补千分位')
-  assert.equal(texts.at(-1), '命中率 不可得', '缺项不许补 0')
+  assert.equal(texts.at(-2), '命中率 不可得', '缺项不许补 0')
+  assert.equal(texts.at(-1), '平均上下文 700', '平均上下文同样来自宿主文本')
 })
 
 test('r18b t10 真机最长文案原样进 DOM：5 字标签 + 7 字符数值都不截断', () => {
   // 真机（216×96 卡）t9 实测被省略号截断的六项原文，按同一顺序做夹具：
-  //   「输入未命中 246.…」「输入命中 2」「写缓存 0」「输出 12.3.…」
+  //   「输入未命中 246.…」「输入命中 2」「平均上下文 86.…」「输出 12.3.…」
   //   「调用次数 不…」「缓存命中率 7」
   const longDetails = [
     { key: 'inputMiss', label: '输入未命中', text: '246.91K', available: true },
     { key: 'inputHit', label: '输入命中', text: '2', available: true },
-    { key: 'cacheWrite', label: '写缓存', text: '0', available: true },
+    { key: 'avgContext', label: '平均上下文', text: '86.40K', available: true },
     { key: 'output', label: '输出', text: '12.3K', available: true },
     { key: 'calls', label: '调用次数', text: '不可得', available: false },
     { key: 'hitRate', label: '缓存命中率', text: '78%', available: true },
@@ -540,7 +541,7 @@ test('r18b t10 真机最长文案原样进 DOM：5 字标签 + 7 字符数值都
   assert.deepEqual(pairs, [
     ['输入未命中', '246.91K', '输入未命中 246.91K'],
     ['输入命中', '2', '输入命中 2'],
-    ['写缓存', '0', '写缓存 0'],
+    ['平均上下文', '86.40K', '平均上下文 86.40K'],
     ['输出', '12.3K', '输出 12.3K'],
     ['调用次数', '不可得', '调用次数 不可得'],
     ['缓存命中率', '78%', '缓存命中率 78%'],

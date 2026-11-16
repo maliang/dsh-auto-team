@@ -88,6 +88,9 @@ function TaskRow(props: {
               ✓
             </span>
           ) : null}
+          <span data-task-ref title={`任务 ${row.ref}`}>
+            {row.ref}
+          </span>
           <span data-task-title title={row.title} data-done={done ? 'true' : 'false'}>
             {row.title}
           </span>
@@ -298,7 +301,7 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
                     jump={memberJumpOf(
                       { kind: 'task', roleId: task.roleId, taskId: task.id },
                       members,
-                      { label: taskJumpLabelOf(task.id) },
+                      { label: taskJumpLabelOf(task.id), taskTitle: task.title },
                     )}
                     onJump={onJump}
                   />
@@ -329,7 +332,7 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
             jump={memberJumpOf(
               { kind: 'task', roleId: task.roleId, taskId: task.id },
               members,
-              { label: taskJumpLabelOf(task.id) },
+              { label: taskJumpLabelOf(task.id), taskTitle: task.title },
             )}
             onJump={onJump}
           />

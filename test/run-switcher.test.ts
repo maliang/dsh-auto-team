@@ -30,10 +30,10 @@ type RunSummaryFixture = RunSummary & { ongoing?: number }
 const METRIC_KEYS: readonly UsageMetricKey[] = [
   'input',
   'cacheRead',
-  'cacheWrite',
   'output',
   'calls',
   'hitRate',
+  'avgContext',
 ]
 
 function usageOf(): UsageCell {
@@ -44,10 +44,10 @@ function usageOf(): UsageCell {
     details: [
       { key: 'input', label: '输入', text: '1,000', available: true },
       { key: 'cacheRead', label: '缓存读', text: '500', available: true },
-      { key: 'cacheWrite', label: '写缓存', text: '200', available: true },
       { key: 'output', label: '输出', text: '400', available: true },
       { key: 'calls', label: '调用', text: '3', available: true },
       { key: 'hitRate', label: '命中率', text: '不可得', available: false },
+      { key: 'avgContext', label: '平均上下文', text: '700', available: true },
     ],
   }
 }
@@ -244,13 +244,16 @@ test('activeRunRowsOf：每行字段与 runSummaryRowOf 完全一致（标题/�
   assert.deepEqual(row.usageMetrics, base.usageMetrics)
 })
 
-test('activeRunRowsOf：token 六项按宿主下发的顺序透传（input/cacheRead/cacheWrite/output/calls/hitRate）', () => {
+test('activeRunRowsOf：token 六项按宿主下发的顺序透传（input/cacheRead/output/calls/hitRate/avgContext）', () => {
   const view = activeRunRowsOf({ snapshot: snapshotOf({ runs: [summaryOf('r2')] }) })
   assert.ok(view)
   const metrics = view.rows[0]?.usageMetrics ?? []
   assert.deepEqual(metrics.map((metric) => metric.key), [...METRIC_KEYS])
-  assert.equal(metrics.at(-1)?.available, false, '缺项保留 available:false，不改写成 0')
-  assert.equal(metrics.at(-1)?.text, '不可得', '缺项文案来自宿主，客户端不重算')
+  assert.equal(metrics.at(-2)?.key, 'hitRate')
+  assert.equal(metrics.at(-2)?.available, false, '缺项保留 available:false，不改写成 0')
+  assert.equal(metrics.at(-2)?.text, '不可得', '缺项文案来自宿主，客户端不重算')
+  assert.equal(metrics.at(-1)?.key, 'avgContext')
+  assert.equal(metrics.at(-1)?.text, '700', '平均上下文来自宿主计算文本，客户端不重算')
 })
 
 /* ───────────────── r18b t11：卡内 meta 紧凑全文（cardMetaText） ───────────────── */

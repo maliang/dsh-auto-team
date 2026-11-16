@@ -67,6 +67,22 @@ export const RESUME_DEBOUNCE_MS = 3000
 /** 同一任务允许的最大返工次数（AC-19）：达到后转 failed，不再自动重派。 */
 export const MAX_ATTEMPTS = 3
 
+/**
+ * 单任务工具调用预算（r39）：成员提示词里的硬指标，也是步数提醒文案里的分母。
+ *
+ * 与 `STALL_MS` 同一纪律：只在这里定义，`team/member-prompt.ts` 与 `team/watcher.ts`
+ * 都从这里 import —— 提示词说 60、提醒说别的数字，成员只会当耳边风。
+ */
+export const STEP_BUDGET = 60
+
+/**
+ * 步数提醒阈值（r39 缺省值）：成员本次任务累计工具调用数达到它时发**一条**直达提醒。
+ *
+ * 0 = 关闭（面板/设置页可经 `settings.stepReminderAt` 覆盖）。提醒只折叠上下文，
+ * **不阻断、不改任务状态、不杀成员** —— 它是省 token 的机械提示，不是护栏。
+ */
+export const STEP_REMINDER_AT = 40
+
 /* ───────────────────────── r5：队长分层 / Inline & Spill / Trigger 总线 ───────────────────────── */
 
 /**
@@ -184,6 +200,7 @@ export const DEFAULT_SETTINGS: AutoTeamSettings = {
   stallMs: STALL_MS,
   maxAttempts: MAX_ATTEMPTS,
   gateTimeoutMs: GATE_TIMEOUT_MS,
+  stepReminderAt: STEP_REMINDER_AT,
 }
 
 /**
@@ -197,6 +214,8 @@ export const SETTINGS_LIMITS = {
   stallMs: [1_000, 600_000],
   maxAttempts: [1, 10],
   gateTimeoutMs: [1_000, 600_000],
+  // r39：步数提醒阈值，0 = 关闭；上界只防止误填一个荒唐的大数（提醒不是护栏，无需更细）。
+  stepReminderAt: [0, 200],
 } as const
 
 /**

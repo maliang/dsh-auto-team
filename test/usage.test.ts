@@ -192,12 +192,12 @@ test('端到端：真实宿主事件 → applyUsage → 落盘 → 读回，六�
     [
       ['input', '29.23K'],
       ['cacheRead', '30.85K'],
-      ['cacheWrite', '不可得'],
       ['output', '344'],
       ['calls', '1'],
       ['hitRate', '51.3%'],
+      ['avgContext', '60.42K'],
     ],
-    '面板六项：输入未命中 / 输入命中 / 写缓存 / 输出 / 调用次数 / 缓存命中率',
+    '面板六项：输入未命中 / 输入命中 / 输出 / 调用次数 / 缓存命中率 / 平均上下文',
   )
   // 任务级走 byTask，六项与 run 级同源（同一份累加结果，不会两套口径）
   assert.deepEqual(taskUsageOf(loaded.usage, 't1').details, cell.details)

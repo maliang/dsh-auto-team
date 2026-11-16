@@ -64,6 +64,8 @@ export function validateSettings(raw: unknown): SettingsValidation {
     { key: 'stallMs', label: '停滞阈值' },
     { key: 'maxAttempts', label: '返工上限' },
     { key: 'gateTimeoutMs', label: '门禁超时' },
+    // r39：步数提醒阈值（0 = 关闭）。面板设置页暂不渲染这一项，经 settings.json 配置。
+    { key: 'stepReminderAt', label: '步数提醒阈值' },
   ]
   for (const item of numbers) {
     const value = raw[item.key]
@@ -126,7 +128,17 @@ export function createSettingsRepo(deps: SettingsRepoDeps): SettingsRepo {
       const checked = validateSettings(raw)
       // 关键：校验失败时**一个字节都不写**（AC-17 的可判定形态）。
       if (!checked.ok) return checked
-      const body = `${JSON.stringify(checked.settings, null, 2)}\n`
+      // r39：`stepReminderAt` 没有出现在面板表单里（设置页 6 行布局被测试钉住），面板保存时
+      // raw 里不会有这个键，而 validateSettings 是从缺省值起步的 —— 直接写会把用户经
+      // settings.json 设的「0 = 关闭」悄悄改回 40。缺键时沿用磁盘上的旧值。
+      const settings = { ...checked.settings }
+      const rawHasStep =
+        isRecord(raw) && raw.stepReminderAt !== undefined && raw.stepReminderAt !== null
+      if (!rawHasStep) {
+        const carried = readStepReminderAt(file)
+        if (carried !== undefined) settings.stepReminderAt = carried
+      }
+      const body = `${JSON.stringify(settings, null, 2)}\n`
       const tmp = `${file}.tmp`
       try {
         mkdirSync(dirname(file), { recursive: true })
@@ -141,13 +153,37 @@ export function createSettingsRepo(deps: SettingsRepoDeps): SettingsRepo {
         }
         return { ok: false, reason: `写入设置失败：${describe(error)}` }
       }
-      return { ok: true, settings: checked.settings }
+      return { ok: true, settings }
     },
   }
 }
 
+/**
+ * 读磁盘上已有的 `stepReminderAt`（r39）：面板保存时表单里没有这一项，缺键要沿用旧值，
+ * 否则「0 = 关闭」会被缺省值覆盖。读不到 / 不合法一律返回 undefined（走缺省值）。
+ */
+function readStepReminderAt(file: string): number | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (!isRecord(parsed)) return undefined
+    const value = parsed.stepReminderAt
+    if (typeof value !== 'number' || !Number.isInteger(value)) return undefined
+    const [min, max] = SETTINGS_LIMITS.stepReminderAt
+    return value >= min && value <= max ? value : undefined
+  } catch {
+    // 首次保存（文件还不存在）或旧文件坏掉：都不是错误路径。
+    return undefined
+  }
+}
+
 /** 可配的数字项（与 `SETTINGS_LIMITS` 的键一一对应）。 */
-type NumericKey = 'concurrencyLimit' | 'memoryBudget' | 'stallMs' | 'maxAttempts' | 'gateTimeoutMs'
+type NumericKey =
+  | 'concurrencyLimit'
+  | 'memoryBudget'
+  | 'stallMs'
+  | 'maxAttempts'
+  | 'gateTimeoutMs'
+  | 'stepReminderAt'
 
 function hasText(value: unknown): boolean {
   return typeof value === 'string' && value.trim() !== ''

@@ -42,7 +42,15 @@ export function MemberPage(props: MemberPageProps): React.ReactElement {
       ) : (
         <>
           <header data-member-head>
-            <h2 data-member-name>{view.name}</h2>
+            <h2 data-member-name title={view.headlineTitle}>
+              {/* r35：主行回答「这个人在做哪个任务」，名字与 taskId 退到下一行小字。 */}
+              <span data-member-name-main>{view.headlineText}</span>
+              {view.subheadText === undefined ? null : (
+                <span data-member-name-sub title={view.subheadText}>
+                  {view.subheadText}
+                </span>
+              )}
+            </h2>
             <span data-member-status data-tone={view.statusTone} title={view.statusTitle}>
               {view.statusText}
             </span>

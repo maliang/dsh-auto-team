@@ -2519,6 +2519,12 @@ export const AUTO_TEAM_CSS = `
   color: var(--dsw-alias-label-primary, inherit);
   font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
 }
+/* r35：标题前的 tN 前缀 —— 浅色小号，只做定位坐标，不抢任务标题（间距由 title 行的 6px gap 给）。 */
+[data-region="task-list"] [data-task-ref] {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+}
 [data-region="task-list"] [data-badge] {
   flex: 0 0 auto;
   display: inline-flex;
@@ -5066,12 +5072,31 @@ export const AUTO_TEAM_CSS = `
   flex: 0 1 auto;
   min-width: 0;
   margin: 0;
+  /* r35：两行结构 —— 主行是任务名（14px 粗体），下一行是 tN · 成员名（11px 浅色）。 */
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   overflow: hidden;
   color: var(--dsw-alias-label-primary, inherit);
   text-overflow: ellipsis;
   white-space: nowrap;
   font: var(--dsw-font-sm-14, 14px/20px sans-serif);
   font-weight: 600;
+}
+[data-member-page] [data-member-name] [data-member-name-main] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-member-page] [data-member-name] [data-member-name-sub] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary, inherit);
+  font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
+  font-weight: 400;
 }
 [data-member-page] [data-member-status] {
   flex: 0 0 auto;

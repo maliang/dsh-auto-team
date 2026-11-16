@@ -699,7 +699,14 @@ function capProgress(
   return out
 }
 
-/** `progress` 规范化：`at` 必须是有限数字，否则整条丢；`alertedAt` 非法则删（不影响 `at` 的有效性）。 */
+/**
+ * `progress` 规范化：`at` 必须是有限数字，否则整条丢；`alertedAt` / `calls` 非法则删
+ * （不影响 `at` 的有效性）。
+ *
+ * r39：`calls` 是步数提醒的唯一输入，**必须随 run 读回**。早先只保留 `at`/`alertedAt`，
+ * 于是 `recordProgress` 写进盘的计数在 watcher 下一次 `load()` 时被静默丢掉——提醒链路
+ * 看起来齐全，真机上却永远不会触发（r39 QA D1）。
+ */
 function normalizeProgress(raw: unknown): Record<string, ProgressRecord> {
   const out: Record<string, ProgressRecord> = {}
   if (!isRecord(raw)) return out
@@ -710,6 +717,8 @@ function normalizeProgress(raw: unknown): Record<string, ProgressRecord> {
     const record: ProgressRecord = { at }
     const alertedAt = value.alertedAt
     if (typeof alertedAt === 'number' && Number.isFinite(alertedAt)) record.alertedAt = alertedAt
+    const calls = value.calls
+    if (typeof calls === 'number' && Number.isFinite(calls) && calls >= 0) record.calls = Math.floor(calls)
     out[memberId] = record
   }
   return out

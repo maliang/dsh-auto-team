@@ -43,6 +43,7 @@ import {
   routeTextOf,
   runStageOf,
   statusBadge,
+  taskRefOf,
   tokenTextOf,
   tokenTitleOf,
 } from './viewmodel.ts'
@@ -456,6 +457,16 @@ export interface MemberPageView {
   resumeText: string
   taskText: string
   /**
+   * 成员页主标题：**优先任务名**（`task.title`），没有任务时回退成员名。
+   *
+   * 文案只在这里拼一次，组件直接渲染 —— 组件里禁止再写一份「有任务用任务名」的判断。
+   */
+  headlineText: string
+  /** 主标题的悬停全文（标题被 CSS 截断时也能看全）；无任务时等于成员名。 */
+  headlineTitle: string
+  /** 主标题下一行的小字：`t1 · dev-1-abcd12`；没有任务时不出（`undefined`）。 */
+  subheadText?: string
+  /**
    * r33：宿主判定「本轮已结束但未提交回执」时才出现。
    * 与停滞（执行中、还活着）是**互斥事实**，文案/颜色都必须能一眼区分。
    */
@@ -591,6 +602,10 @@ export function memberPageOf(source: MemberPageSource): MemberPageView {
       : member.taskId !== undefined && member.taskId !== ''
         ? `任务 ${member.taskId}（不在当前 run 的任务表里）`
         : '未绑定任务'
+  // r35：主标题用任务名（成员名退到副行），任务名缺失时回退成员名 —— 绝不显示空标题。
+  const taskTitle = task === null ? '' : task.title.trim()
+  const headlineText = taskTitle === '' ? member.name : taskTitle
+  const subheadText = task === null ? undefined : `${taskRefOf(task.id)} · ${member.name}`
 
   const view: MemberPageView = {
     memberId: member.memberId,
@@ -608,6 +623,9 @@ export function memberPageOf(source: MemberPageSource): MemberPageView {
     canResume: member.canResume === true,
     resumeText: member.canResume === true ? '可从面板「继续」恢复该成员' : '不可续聊',
     taskText,
+    headlineText,
+    headlineTitle: headlineText,
+    ...(subheadText === undefined ? {} : { subheadText }),
     messages: views,
     messageCount: scoped.length,
     emptyMessagesText:

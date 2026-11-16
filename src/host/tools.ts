@@ -124,6 +124,31 @@ const STATUS_MESSAGES_COMPACT_LIMIT = 8
 const STATUS_MESSAGES_FULL_LIMIT = 20
 const STATUS_MESSAGE_BODY_MAX = 400
 
+/**
+ * t3：三个工具共用的可选 `runId` 解析与归属判定。
+ *
+ * - 缺省（没传/空白）= 沿用现有「活动 run」逻辑，行为一字不改；
+ * - 传了就必须命中**本会话**的 run：不存在或属于别的会话一律 `NOT_FOUND`，
+ *   **绝不静默回退到活动 run**（跨 run 收口时发错人的根因）。
+ */
+function runIdOf(args: Record<string, unknown>): string | undefined {
+  const raw = args.runId
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined
+}
+
+function runTargetError(
+  store: RunsStore,
+  sessionId: string,
+  runId: string | undefined,
+): { ok: false; code: 'NOT_FOUND'; error: string } | null {
+  if (runId === undefined) return null
+  const state = store.load(runId)
+  if (state === null || state.plan.sessionId !== sessionId) {
+    return { ok: false, code: 'NOT_FOUND', error: `找不到运行 ${runId}（会话里没有这个 run）` }
+  }
+  return null
+}
+
 /** 一条消息的投影：正文超长时截断并标 `truncated`+`bodyChars`，其余字段原样保留。 */
 function messageBrief(
   message: PanelSnapshot['messages'][number],
@@ -698,11 +723,18 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
               `compact（默认）：消息只留最近 ${STATUS_MESSAGES_COMPACT_LIMIT} 条、正文截断 ${STATUS_MESSAGE_BODY_MAX} 字；`
               + `full：最近 ${STATUS_MESSAGES_FULL_LIMIT} 条、正文不截断`,
           },
+          runId: {
+            type: 'string',
+            description: '不传 = 当前会话的活动运行（最近一个未终止的 run）；跨 run 收口时传它',
+          },
         },
         required: [],
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
+        const runId = runIdOf(args)
+        const targetError = runTargetError(deps.store, sessionId, runId)
+        if (targetError) return targetError
         // 队长路径完全不变：开关打开时先走原分支。成员的「查看自己任务」只在 run 所属队长会话
         // 的开关仍开着时成立（memberSelfServiceOf 身份 + 开关一次判定）；关闭时与其它工具同回旧文案。
         if (!deps.bridge.enabled(sessionId)) {
@@ -725,7 +757,7 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             notice: '成员视角：只显示你自己被派发的任务；完成后用 auto_team_receipt 提交回执（门禁由宿主执行）。其它工具在成员会话不可用。',
           }
         }
-        const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId)
+        const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId, runId)
         // 默认精简：不传即 compact；只有显式 full 才回正文全文（默认值写死在实现里，schema 只是提示）。
         const detail = args?.detail === 'full' ? 'full' : 'compact'
         const limit = detail === 'full' ? STATUS_MESSAGES_FULL_LIMIT : STATUS_MESSAGES_COMPACT_LIMIT
@@ -783,26 +815,38 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           taskId: { type: 'string', description: '按任务定位成员' },
           memberName: { type: 'string', description: '按成员名定位（优先于 taskId）' },
           text: { type: 'string' },
+          runId: {
+            type: 'string',
+            description: '不传 = 当前会话的活动运行（最近一个未终止的 run）；跨 run 收口时传它',
+          },
         },
         required: ['text'],
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
         if (!deps.bridge.enabled(sessionId)) return { ok: false, error: NOT_ENABLED }
+        const runId = runIdOf(args)
+        const targetError = runTargetError(deps.store, sessionId, runId)
+        if (targetError) return targetError
 
         const text = typeof args.text === 'string' ? args.text : ''
         if (text.trim() === '') return { ok: false, error: 'text 不能为空' }
         const taskId = typeof args.taskId === 'string' && args.taskId.trim() !== '' ? args.taskId.trim() : undefined
         const memberName = typeof args.memberName === 'string' ? args.memberName.trim() : ''
 
-        const snapshot = deps.bridge.snapshot(sessionId)
+        // t3：传了 runId 就只在那一份 run 的成员里找，找不到即 NOT_FOUND —— 不许跨 run 退避。
+        const snapshot = deps.bridge.snapshot(sessionId, runId)
         const byName = memberName === '' ? undefined : snapshot.members.find((member) => member.name === memberName)
         if (memberName !== '' && !byName) {
-          return { ok: false, error: `找不到成员 ${memberName}：可用成员 ${snapshot.members.map((m) => m.name).join('、') || '（无）'}` }
+          return {
+            ok: false,
+            code: 'NOT_FOUND',
+            error: `找不到成员 ${memberName}：可用成员 ${snapshot.members.map((m) => m.name).join('、') || '（无）'}`,
+          }
         }
         const memberId = byName?.memberId
 
-        const result = await deps.bridge.act(sessionId, { type: 'message', memberId, taskId, text })
+        const result = await deps.bridge.act(sessionId, { type: 'message', memberId, taskId, text }, runId)
         const rejected = rejectedOf(result)
         if (rejected) return rejected
         return { ok: true, notices: result.notices }
@@ -817,6 +861,10 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         properties: {
           taskId: { type: 'string', description: '任务 id' },
           note: { type: 'string', description: '成员自述（写入证据说明）' },
+          runId: {
+            type: 'string',
+            description: '不传 = 当前会话的活动运行（最近一个未终止的 run）；跨 run 收口时传它',
+          },
         },
         required: ['taskId'],
       },
@@ -842,7 +890,11 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
 
         // 成员的门禁必须落在 run 所属会话上：成员的 agent id 不是任何一份 run 的 sessionId。
         const targetSessionId = member === null ? sessionId : member.sessionId
-        const result = await deps.bridge.act(targetSessionId, { type: 'receipt', taskId, note })
+        // t3：传了 runId 就只在那份 run 上跑门禁（同一道 preflightGate + acceptance）。
+        const runId = runIdOf(args)
+        const targetError = runTargetError(deps.store, targetSessionId, runId)
+        if (targetError) return targetError
+        const result = await deps.bridge.act(targetSessionId, { type: 'receipt', taskId, note }, runId)
         const rejected = rejectedOf(result)
         if (rejected) return rejected
 

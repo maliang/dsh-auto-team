@@ -1708,6 +1708,13 @@ export type TaskCardSource = TaskDetailView & TaskRevisionFacts
 
 export interface TaskRowView {
   id: string
+  /**
+   * 标题前那枚 `tN` 前缀（浅色小号，不抢主体）。
+   *
+   * 归一规则见 `taskRefOf`：宿主没给 id 时给 `—`，**绝不渲染空串**（空串会让前缀消失，
+   * 用户就分不清这行是哪个任务）。
+   */
+  ref: string
   title: string
   badge: Badge
   roleName: string
@@ -1738,6 +1745,15 @@ export interface TaskRowView {
 /** 修订徽标文案（r21）：宿主只下发事实位，中文在客户端这一处。 */
 export const TASK_REVISED_TEXT = '已修订'
 
+/** 任务 id 缺失时的前缀兜底：显示 `—` 而不是空串（空串等于前缀消失）。 */
+export const TASK_REF_FALLBACK = '—'
+
+/** 任务 id → 行首 `tN` 前缀（唯一归一入口，任务行与成员页副行共用）。 */
+export function taskRefOf(taskId: string | undefined | null): string {
+  const id = (taskId ?? '').trim()
+  return id === '' ? TASK_REF_FALLBACK : id
+}
+
 /**
  * r25：取消原因的中文兜底 —— **只读 `cancelledBy` 的语义，绝不回显英文枚举**。
  *
@@ -1756,6 +1772,7 @@ export const CANCEL_REASON_UNKNOWN_TEXT = '已取消，宿主未记录原因'
 export function taskRowOf(task: TaskCardSource, expanded: boolean): TaskRowView {
   const row: TaskRowView = {
     id: task.id,
+    ref: taskRefOf(task.id),
     title: task.title,
     badge: statusBadge(task.status),
     roleName: task.roleName || task.roleId,
@@ -1927,6 +1944,17 @@ export function taskOverviewOf(
 /** 行标题最多显示多少个字符（r14 AC-15 / DESIGN §3；按 code point 计，中文与 emoji 都算 1）。 */
 export const GOAL_TITLE_MAX = 24
 
+/**
+ * 按 **code point** 截断长文本（目标名与任务名共用这一处，组件里不得再截一次）。
+ *
+ * 中文与 emoji 都算 1 个字符；超出上限时补 `…`（完整原文由调用方给 `title` 悬停，本函数不返回它）。
+ */
+export function truncateCodePoints(text: string, max: number = GOAL_TITLE_MAX): string {
+  const chars = Array.from(text)
+  if (chars.length <= max) return text
+  return `${chars.slice(0, max).join('')}…`
+}
+
 export interface GoalTitleView {
   /** 行里显示的文本（超出 24 字截断并补 `…`）。 */
   text: string
@@ -1952,7 +1980,7 @@ export function goalTitleOf(goal: string | undefined, runId: string): GoalTitleV
   }
   const chars = Array.from(full)
   if (chars.length <= GOAL_TITLE_MAX) return { text: full, title: full, source: 'goal' }
-  return { text: `${chars.slice(0, GOAL_TITLE_MAX).join('')}…`, title: full, source: 'goal' }
+  return { text: truncateCodePoints(full, GOAL_TITLE_MAX), title: full, source: 'goal' }
 }
 
 /* ───────────── r21：需求修订（同一个 runId 内并入） ───────────── */
@@ -2980,6 +3008,13 @@ export interface MemberJumpView {
 export interface MemberJumpBase {
   title?: string
   label?: string
+  /**
+   * 入口已知的**任务名**（任务行 = 该行标题；流程图节点 = 对应任务标题；角色卡 = `activeTaskTitle`）。
+   *
+   * 给了就用它当主信息，成员名与 taskId 退成副信息（`t1 · dev-1-abcd12`）；
+   * 没给（或给空串）时回退成员名 —— **绝不显示空串**。
+   */
+  taskTitle?: string
 }
 
 /** 入口前缀（组件只传数据，中文拼装留在本文件，见文件头「文案集中」纪律）。 */
@@ -3061,15 +3096,39 @@ export function memberJumpOf(
       label: base.label === undefined ? reason : `${base.label}，${reason}`,
     }
   }
-  const open = `打开子智能体会话：${member.name}`
+  const open = memberJumpOpenTextOf(base.taskTitle, source.taskId, member.name)
   return {
     available: true,
     memberId: member.memberId,
     member,
-    actionText: `子智能体 · ${member.name} →`,
+    actionText: `子智能体 · ${truncateCodePoints(memberJumpNameOf(base.taskTitle, member.name))} →`,
     title: base.title === undefined ? open : `${base.title} · ${open}`,
     label: base.label === undefined ? open : `${base.label}，${open}`,
   }
+}
+
+/** 跳转入口的主信息：优先任务名（去掉首尾空白后非空才算），否则回退成员名。 */
+export function memberJumpNameOf(taskTitle: string | undefined, memberName: string): string {
+  const title = (taskTitle ?? '').trim()
+  return title === '' ? memberName : title
+}
+
+/**
+ * 可跳转时的悬停/朗读文案（唯一出处）：
+ *
+ * - 有任务名：`打开子智能体会话：<任务名>（t1 · dev-1-abcd12）` —— 任务名是主信息，id 与成员名是副信息；
+ * - 没有任务名：`打开子智能体会话：<成员名>`（旧行为，保持既有断言与旧快照可用）。
+ */
+export function memberJumpOpenTextOf(
+  taskTitle: string | undefined,
+  taskId: string | undefined,
+  memberName: string,
+): string {
+  const title = (taskTitle ?? '').trim()
+  if (title === '') return `打开子智能体会话：${memberName}`
+  const id = (taskId ?? '').trim()
+  const scope = id === '' ? memberName : `${taskRefOf(id)} · ${memberName}`
+  return `打开子智能体会话：${title}（${scope}）`
 }
 
 /** 会话打开结局：`no-member` 只在 memberId 为空时出现（正常路径由 `memberJumpOf` 先挡住）。 */

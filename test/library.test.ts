@@ -480,7 +480,7 @@ test('历史回退列表（library.runs）派生 usage 六项；缺用量记「�
   assert.equal(cell?.text, '1.23K', 'r19：合计与 details 同一口径（动态单位）')
   assert.deepEqual(
     cell?.details?.map((metric) => metric.key),
-    ['input', 'cacheRead', 'cacheWrite', 'output', 'calls', 'hitRate'],
+    ['input', 'cacheRead', 'output', 'calls', 'hitRate', 'avgContext'],
   )
   // r18b t6 起 details 里的 token 带单位；r19 起合计 cell.text 同口径。
   assert.equal(cell?.details?.find((metric) => metric.key === 'input')?.text, '1.00K')

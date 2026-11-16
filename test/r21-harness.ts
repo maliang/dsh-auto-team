@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createBridge, type Bridge } from '../src/host/bridge.ts'
+import { createBridge, type ApplyReceiptPort, type Bridge } from '../src/host/bridge.ts'
 import { createRoleRepo, type RoleRepo } from '../src/host/roles/repo.ts'
 import { RUN_STATE_VERSION, RunsStore, type RunState } from '../src/host/store.ts'
 import { buildToolSpecs } from '../src/host/tools.ts'
@@ -48,6 +48,11 @@ export interface HarnessOptions {
   interrupt?: (name: string) => Promise<{ ok: boolean; error?: string }>
   send?: (memberId: string, text: string) => Promise<{ ok: boolean; error?: string }>
   now?: () => number
+  /**
+   * r39：回执应用端口。缺省是恒等桩（既有 r21 用例只验落盘时序）；
+   * 需要断言「门禁通过后任务真的 done」的用例传入真实 `applyReceipt`。
+   */
+  applyReceipt?: ApplyReceiptPort
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
@@ -67,7 +72,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     dataRoot: join(dir, 'data'),
     dispatch: async () => ({ started: [], skipped: [], errors: [] }),
     resume: async () => ({ resumed: 0, skipped: 0, unchanged: true }),
-    applyReceipt: (state) => state,
+    applyReceipt: options.applyReceipt ?? ((state) => state),
     sendMessage: async (memberId, text) => {
       if (options.send) return options.send(memberId, text)
       sent.push({ memberId, text })

@@ -775,9 +775,15 @@ export function registerPromptSection(
     return false
   }
   try {
+    // 本段落文本含**用户可写**内容（记忆标题、角色名字与职责、角色列表），
+    // 而宿主 renderPrompt 默认对每个 section 的 text 做 `{{ 变量 }}` 插值：
+    // 遇到 `{{ … }}` 但不是合法变量名（^[a-z][a-z0-9_]*$）会抛
+    // `malformed prompt variable reference`，整轮对话直接 error。
+    // 故显式关掉插值，原文照发。该字段宿主侧可选、默认 true，旧宿主不认也无害。
     sink.section({
       name: section.name,
       order: section.order,
+      interpolate: false,
       text: () => (typeof section.content === 'function' ? section.content() : section.content),
     })
     return true

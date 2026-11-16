@@ -13,7 +13,7 @@ import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
 import { STALL_ALERTS_LIMIT } from '../store.ts'
 import type { ActivityEvent, PlanTask } from '../../shared/types.ts'
-import { MAX_ATTEMPTS, STALL_MS, WATCHER_INTERVAL_MS } from '../config.ts'
+import { MAX_ATTEMPTS, STALL_MS, STEP_BUDGET, STEP_REMINDER_AT, WATCHER_INTERVAL_MS } from '../config.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { releaseScopes } from './scope-locks.ts'
 import { isSilentFinish, silentFinishBodyOf, withSilentFinish, withoutSilentFinish } from './silent-finish.ts'
@@ -51,6 +51,19 @@ export interface WatcherDeps {
    * 抛错必须被吞掉：轮询失败不能打断成员存活对账（那会让「成员死了」永远报不出来）。
    */
   onPoll?(state: RunState): Promise<void>
+  /**
+   * r39：步数提醒阈值（成员本次任务累计工具调用数）。缺省 `config.STEP_REMINDER_AT`；
+   * **0 = 关闭**。判定实现只有一个，阈值只做参数（与 `stallMs` / `maxAttempts` 同一纪律）。
+   */
+  stepReminderAt?: number
+  /**
+   * 给成员发一条直达消息（r39 步数提醒的唯一出口）。
+   *
+   * 未装配时**静默跳过**：老宿主读不到工具事件 → `progress[memberId].calls` 恒缺席 →
+   * 本来就不会产生候选；单测桩不传本端口时同样什么都不发生（与 progress 同一降级口径）。
+   * 抛错/`ok:false` 时**不落账**，下一轮 tick 自然重试（提醒不是护栏，失败绝不打断对账）。
+   */
+  sendMemberMessage?(memberId: string, text: string): Promise<{ ok: boolean; error?: string }>
 }
 
 export interface ReconcileResult {
@@ -292,12 +305,79 @@ export function stallAlertsOf(
   }
 }
 
+/**
+ * 步数提醒的幂等键（r39：同一任务只发一条）。
+ *
+ * 用 `messageId` 而不是正文匹配：正文里带着当时的调用数，拿正文当键会让「40 次发过、
+ * 41 次再发」变成必然。`handoff:<上游>-><下游>` 是同一套既有做法（账本即幂等表）。
+ */
+export function stepReminderKeyOf(taskId: string): string {
+  return `step-reminder:${taskId}`
+}
+
+/** 步数提醒正文（**唯一**措辞来源；预算数字取自 `config.STEP_BUDGET`，不在文案里写死）。 */
+export function stepReminderTextOf(calls: number): string {
+  return `已用 ${calls} 次工具调用（预算 ${STEP_BUDGET}）：先 compress 折叠已完成的部分，再继续；剩余计划压到 5 步内，做不到就回报队长拆卡。`
+}
+
+/** 一条待发的步数提醒（发送成功后才会落进 `messages`）。 */
+export interface StepReminder {
+  taskId: string
+  memberId: string
+  memberName: string
+  text: string
+}
+
+/**
+ * 算出「该发但还没发过」的步数提醒（r39，**纯函数**）。
+ *
+ * 只对 `running` 任务判定：done/failed 是终态，rework/interrupted 等成员不在跑，发提醒没有意义。
+ * 调用数来自 `RunState.progress[memberId].calls` —— 老宿主读不到工具事件时该字段缺席，
+ * 于是候选恒为空，**静默跳过**（与停滞判定 `unreported` 同一口径，绝不编一个数字出来）。
+ *
+ * 幂等：账本里已有 `step-reminder:<taskId>` 即跳过；阈值 ≤ 0 = 关闭。
+ * 不改任务状态、不杀成员、不拦工具 —— 这是提醒，不是护栏。
+ */
+export function stepRemindersOf(state: RunState, threshold: number): StepReminder[] {
+  if (!(threshold > 0)) return []
+  const reminders: StepReminder[] = []
+  for (const task of state.plan.tasks) {
+    if (task.status !== 'running') continue
+    const binding = state.bindings.find((item) => item.retired !== true && item.taskId === task.id)
+    if (!binding) continue
+    const calls = state.progress?.[binding.memberId]?.calls
+    if (typeof calls !== 'number' || !Number.isFinite(calls) || calls < threshold) continue
+    const key = stepReminderKeyOf(task.id)
+    if (state.messages.some((message) => message.messageId === key)) continue
+    reminders.push({
+      taskId: task.id,
+      memberId: binding.memberId,
+      memberName: binding.name,
+      text: stepReminderTextOf(calls),
+    })
+  }
+  return reminders
+}
+
+/** 把一条**已发送成功**的步数提醒记进账本（幂等键固定，重复落账不会产生第二条）。 */
+export function recordStepReminder(state: RunState, reminder: StepReminder, at: number): RunState {
+  const message = makeMessage({
+    from: 'captain',
+    to: reminder.memberName,
+    toMemberId: reminder.memberId,
+    taskId: reminder.taskId,
+    at,
+    body: reminder.text,
+  })
+  return appendMessage(state, { ...message, messageId: stepReminderKeyOf(reminder.taskId) })
+}
+
 /** 轮询器：一个 run 一次 listMembers（不是一任务一次），只在存在非终态任务时才查。 */
-export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
-  const now = deps.now ?? Date.now
+export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const now = deps.now ?? Date.now
   const intervalMs = deps.intervalMs ?? WATCHER_INTERVAL_MS
   const stallMs = deps.stallMs ?? STALL_MS
   const maxAttempts = deps.maxAttempts ?? MAX_ATTEMPTS
+  const stepReminderAt = deps.stepReminderAt ?? STEP_REMINDER_AT
   let timer: ReturnType<typeof setInterval> | null = null
   let busy = false
 
@@ -340,9 +420,24 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
         const judged = paused
           ? { state: reconciled.state, raised: [] as ActivityEvent[] }
           : stallAlertsOf(reconciled.state, at, stallMs)
-        if (reconciled.changed > 0 || judged.state !== reconciled.state) {
-          deps.store.save(judged.state)
-          deps.onReconciled?.(judged.state)
+        // r39：步数提醒（幂等、不阻断）。顺序固定在「对账 → 停滞判定」之后：任务刚被判成
+        // interrupted 时成员已不在跑，不该再发提醒。发送成功才落账；失败/无端口静默跳过，
+        // 下一轮 tick 自然重试（提醒不是护栏，绝不能连累存活对账）。
+        let next = judged.state
+        if (!paused && stepReminderAt > 0 && deps.sendMemberMessage !== undefined) {
+          for (const reminder of stepRemindersOf(next, stepReminderAt)) {
+            try {
+              const sent = await deps.sendMemberMessage(reminder.memberId, reminder.text)
+              if (!sent.ok) continue
+              next = recordStepReminder(next, reminder, at)
+            } catch {
+              // 单条提醒失败只影响这一条：下一轮重算候选，不打断本轮其它对账。
+            }
+          }
+        }
+        if (reconciled.changed > 0 || next !== reconciled.state) {
+          deps.store.save(next)
+          deps.onReconciled?.(next)
           changed += reconciled.changed + judged.raised.length
         }
 
@@ -352,7 +447,7 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {
         // 但让它白跑一轮并在账本里留「被拒」记录没有意义。
         if (!paused && deps.onPoll !== undefined) {
           try {
-            await deps.onPoll(judged.state)
+            await deps.onPoll(next)
           } catch {
             // 兜底失败只影响本轮少一次推进，绝不能连累存活对账（下一轮 tick 会补上）。
           }
