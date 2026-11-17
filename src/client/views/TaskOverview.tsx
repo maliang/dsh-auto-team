@@ -14,7 +14,7 @@
  * 组件不二次筛选；空组由 TaskTable 的 grouped 分支隐藏。
  */
 import * as React from 'react'
-import type { MemberView, TaskDetailView } from '../../shared/types.ts'
+import type { MemberView, PanelAction, TaskDetailView } from '../../shared/types.ts'
 import { PROGRESS_RING_SIZE, taskOverviewOf } from '../viewmodel.ts'
 import type { MemberJumpView } from '../viewmodel.ts'
 import { ProgressRing } from './ProgressRing.tsx'
@@ -27,10 +27,14 @@ export interface TaskOverviewProps {
   /** r17/r33：任务行 → 子智能体会话（历史 run 不传）。 */
   members?: MemberView[]
   onJump?: (jump: MemberJumpView) => void
+  /** t2：单卡暂停/继续（历史 run 不传）；动作由行组件按状态派生。 */
+  onTaskAction?: (action: Extract<PanelAction, { taskId: string }>) => void
+  /** 在飞的任务 id：只禁用那一行，不锁整张表。 */
+  taskActionBusyId?: string | null
 }
 
 export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, members, onJump } = props
+  const { tasks, expandedTaskId, onToggleTask, members, onJump, onTaskAction, taskActionBusyId } = props
   const overview = taskOverviewOf(tasks, expandedTaskId)
   return (
     <section data-task-overview aria-label="任务总览">
@@ -49,6 +53,8 @@ export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
           onToggleTask={onToggleTask}
           members={members}
           onJump={onJump}
+          onTaskAction={onTaskAction}
+          taskActionBusyId={taskActionBusyId}
           grouped
         />
       </div>

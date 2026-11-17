@@ -1,5 +1,5 @@
 /**
- * 单任务干预（r11 F8）的**唯一允许集与唯一文案源**：13 态 × 3 动作。
+ * 单任务干预（r11 F8）的**唯一允许集与唯一文案源**：13 态 × 4 动作。
  *
  * 为什么放 `src/shared` 而不是 host/client 各写一份：宿主的拒绝文案与面板的 disabled 矩阵
  * 必须是同一张表派生的（AC-27）。两边各写一个 `switch`，第一次改允许集就会分叉，
@@ -14,11 +14,15 @@
  */
 import type { TaskStatus } from './types.ts'
 
-/** 三个单任务动作（与 `PanelAction` 的 `cancelTask` / `skipTask` / `updateAcceptance` 一一对应）。 */
-export type TaskActionName = 'cancel' | 'skip' | 'edit-acceptance'
+/**
+ * 四个单任务动作（与 `PanelAction` 的 `cancelTask` / `skipTask` / `updateAcceptance` 一一对应；
+ * r37 新增的 `pause` 对应 **两个**动作 `pauseTask` / `resumeTask` —— 暂停与继续共用同一格允许集，
+ * 因为「已暂停能否再暂停」的答案是「能」（= 继续），文案由客户端按当前状态切）。
+ */
+export type TaskActionName = 'cancel' | 'skip' | 'edit-acceptance' | 'pause'
 
 /** 允许表的列名：`edit-acceptance` 在表里叫 `acceptance`（与宿主字段同名）。 */
-export type TaskActionKey = 'cancel' | 'skip' | 'acceptance'
+export type TaskActionKey = 'cancel' | 'skip' | 'acceptance' | 'pause'
 
 /** 一格：是否允许 + 不允许时给用户看的中文原因（允许时为空串）。 */
 interface Cell {
@@ -33,43 +37,67 @@ function deny(reason: string): Cell {
 }
 
 /**
- * 13 态 × 3 动作的裁决表（DESIGN §3.4 逐格照抄）。
+ * 13 态 × 4 动作的裁决表（DESIGN §3.4 逐格照抄；`pause` 列见 r37）。
  *
  * 口径来源（PRD AC-26 + 技术方案 §7.1）：
  *  - `cancel`：pending/blocked/ready/waiting/running/rework/failed 允许；
  *  - `skip`：只有还没开跑的 pending/blocked/ready/waiting 允许（running 要先取消）；
  *  - `edit-acceptance`：除 cancelled/skipped 之外都允许；`done` 也允许（r13 PRD 取代
  *    r11#AC-26）—— 宿主对 `done` 走「确认 → 落新命令 → 重跑门禁」，不在允许表里一刀切拒绝。
+ *  - `pause`（r37）：除 `done/cancelled/skipped`（已结束）外都允许 —— 暂停是「冻结」而不是终态，
+ *    `paused` 行也必须允许（它语义上是「继续」，文案由客户端按状态切）。
+ *
  * `paused` / `gate` / `interrupted` 的取消与跳过不改：门禁在跑时有回执写回竞态，
  * 暂停有页头统一还原，中断的出路是续聊或改验收后重派。
  */
 const MATRIX: Record<TaskStatus, Record<TaskActionKey, Cell>> = {
-  pending: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW },
-  ready: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW },
-  blocked: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW },
-  waiting: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW },
-  running: { cancel: ALLOW, skip: deny('运行中请先取消'), acceptance: ALLOW },
-  rework: { cancel: ALLOW, skip: deny('待返工：请重跑或取消'), acceptance: ALLOW },
-  failed: { cancel: ALLOW, skip: deny('已失败：请重跑或取消'), acceptance: ALLOW },
+  pending: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW, pause: ALLOW },
+  ready: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW, pause: ALLOW },
+  blocked: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW, pause: ALLOW },
+  waiting: { cancel: ALLOW, skip: ALLOW, acceptance: ALLOW, pause: ALLOW },
+  running: { cancel: ALLOW, skip: deny('运行中请先取消'), acceptance: ALLOW, pause: ALLOW },
+  rework: { cancel: ALLOW, skip: deny('待返工：请重跑或取消'), acceptance: ALLOW, pause: ALLOW },
+  failed: { cancel: ALLOW, skip: deny('已失败：请重跑或取消'), acceptance: ALLOW, pause: ALLOW },
   interrupted: {
     cancel: deny('已中断：请续聊或改验收后重跑'),
     skip: deny('已中断：请续聊'),
     acceptance: ALLOW,
+    pause: ALLOW,
   },
-  gate: { cancel: deny('门禁执行中，等门禁结束'), skip: deny('门禁执行中'), acceptance: ALLOW },
-  paused: {
-    cancel: deny('已暂停：先点页头『继续任务』'),
-    skip: deny('已暂停：先继续任务'),
+  gate: {
+    cancel: deny('门禁执行中，等门禁结束'),
+    skip: deny('门禁执行中'),
     acceptance: ALLOW,
+    pause: ALLOW,
+  },
+  paused: {
+    // D1：两级暂停入口的按钮名不同（页头「继续团队」/ 行内「继续此任务」），文案必须分别点名，
+    // 否则用户按旧名找按钮找不到。
+    cancel: deny('已暂停：团队暂停请点页头『继续团队』。单卡暂停请点该行『继续此任务』'),
+    skip: deny('已暂停：跳过前需先恢复任务——团队暂停请点页头『继续团队』。单卡暂停请点该行『继续此任务』'),
+    acceptance: ALLOW,
+    // r37：`paused` 行必须允许 —— 对已暂停的任务点「暂停」语义上是「继续」（客户端按状态切文案）。
+    pause: ALLOW,
   },
   done: {
     cancel: deny('已完成，无需取消'),
     skip: deny('已完成'),
     // r13：done 允许改验收，但执行体必须重跑门禁（否则「完成」的含义可被静默改写）。
     acceptance: ALLOW,
+    pause: deny('任务已结束，不能暂停'),
   },
-  cancelled: { cancel: deny('已取消'), skip: deny('已取消'), acceptance: deny('已取消') },
-  skipped: { cancel: deny('已跳过'), skip: deny('已跳过'), acceptance: deny('已跳过') },
+  cancelled: {
+    cancel: deny('已取消'),
+    skip: deny('已取消'),
+    acceptance: deny('已取消'),
+    pause: deny('任务已结束，不能暂停'),
+  },
+  skipped: {
+    cancel: deny('已跳过'),
+    skip: deny('已跳过'),
+    acceptance: deny('已跳过'),
+    pause: deny('任务已结束，不能暂停'),
+  },
 }
 
 /** 动作名 → 允许表列名。 */
@@ -77,17 +105,26 @@ const KEY_OF: Record<TaskActionName, TaskActionKey> = {
   cancel: 'cancel',
   skip: 'skip',
   'edit-acceptance': 'acceptance',
+  pause: 'pause',
 }
 
 /**
- * 13 态 × 3 动作的允许集（蓝图声明的形状）：面板的 `disabled` 与宿主的拒绝面都读它。
+ * 13 态 × 4 动作的允许集（蓝图声明的形状）：面板的 `disabled` 与宿主的拒绝面都读它。
  *
  * 从 `MATRIX` 派生而不是手写第二份布尔表——两份表是 AC-27「矩阵与允许集一致」的唯一风险点。
  */
 export const TASK_ACTION_ALLOW: Record<TaskStatus, Record<TaskActionKey, boolean>> = Object.fromEntries(
   (Object.keys(MATRIX) as TaskStatus[]).map((status) => {
     const row = MATRIX[status]
-    return [status, { cancel: row.cancel.allow, skip: row.skip.allow, acceptance: row.acceptance.allow }]
+    return [
+      status,
+      {
+        cancel: row.cancel.allow,
+        skip: row.skip.allow,
+        acceptance: row.acceptance.allow,
+        pause: row.pause.allow,
+      },
+    ]
   }),
 ) as Record<TaskStatus, Record<TaskActionKey, boolean>>
 

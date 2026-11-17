@@ -2504,6 +2504,51 @@ export const AUTO_TEAM_CSS = `
   color: var(--dsw-alias-label-tertiary, inherit);
   cursor: help;
 }
+[data-region="task-list"] [data-task-actions] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 12px 8px;
+}
+/* t2：单卡暂停/继续。与团队级按钮（页头 data-auto-team-pause）分开：
+   这里是行内小按钮，禁用时不靠 hover 才看得出，必须 cursor + 透明度双标记。 */
+[data-region="task-list"] [data-task-action] {
+  box-sizing: border-box;
+  min-height: 24px;
+  margin: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--dsw-alias-border-l2, currentColor);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  cursor: pointer;
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+}
+[data-region="task-list"] [data-task-action]:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
+}
+[data-region="task-list"] [data-task-action]:active:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-active, transparent);
+}
+[data-region="task-list"] [data-task-action]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+}
+/* 已暂停的单卡：行内琥珀（与顶部团队横幅同色但位置不同），一眼区分「团队冻」与「这张卡冻」。 */
+[data-region="task-list"] [data-task-action][data-paused="true"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, currentColor) 8%, transparent);
+  color: var(--dsw-alias-state-warn-primary, inherit);
+}
+[data-region="task-list"] [data-task-action]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* 单卡已暂停的整行提示：左侧 2px 琥珀条，行内徽标「已暂停」是主标识，这是辅助定位。 */
+[data-region="task-list"] [data-task-row][data-status="paused"] {
+  box-shadow: inset 2px 0 0 var(--dsw-alias-state-warn-primary, currentColor);
+}
 [data-region="task-list"] [data-task-line="title"] {
   display: flex;
   align-items: center;
@@ -5468,6 +5513,21 @@ export const AUTO_TEAM_CSS = `
   overflow-wrap: anywhere;
 }
 [data-region="tasks-tab"] [data-member-jump-notice][data-empty="true"] {
+  max-height: 0;
+  padding: 0;
+  border-left-width: 0;
+  overflow: hidden;
+}
+/* t2：单卡暂停/继续的结局（成功/拒绝都有一句人话；空态同样折叠为零高）。 */
+[data-region="tasks-tab"] [data-task-action-notice] {
+  margin: 0;
+  padding: 4px 12px;
+  border-left: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+  overflow-wrap: anywhere;
+}
+[data-region="tasks-tab"] [data-task-action-notice][data-empty="true"] {
   max-height: 0;
   padding: 0;
   border-left-width: 0;

@@ -28,9 +28,12 @@ import {
   planStatusView,
   progressOf,
   scopeLockRowOf,
+  TASK_PAUSE_TITLE,
   scopeLockRowsOf,
   statusBadge,
   taskActionsOf,
+  taskPauseCommandOf,
+  taskPauseLabelOf,
   waitReasonOf,
 } from '../src/client/viewmodel.ts'
 import { projectRunRowOf, runSummaryRowOf } from '../src/client/tabs/rows.ts'
@@ -279,13 +282,15 @@ test('头按钮：三分支 aria-label，opened 由真实页签态驱动（AC-11
 
 test('暂停按钮：paused 两态往返，文案与 action 严格配对', () => {
   const run = pauseButtonView({ paused: false, busy: false })
-  assert.equal(run.label, '暂停任务')
+  assert.equal(run.label, '暂停团队')
+  assert.match(run.title, /^暂停整个团队：/, '页头按钮必须写清作用域是整个团队')
   assert.equal(run.action, 'pause')
   assert.equal(run.tone, 'muted')
   assert.equal(run.disabled, false)
 
   const stopped = pauseButtonView({ paused: true, busy: false })
-  assert.equal(stopped.label, '继续任务')
+  assert.equal(stopped.label, '继续团队')
+  assert.match(stopped.title, /^继续整个团队：/, '继续态的作用域说明同样只讲团队')
   assert.equal(stopped.action, 'resumeTeam')
   assert.equal(stopped.tone, 'warn', '已暂停是琥珀（用户主动冻结），不是红')
   assert.equal(stopped.disabled, false)
@@ -431,33 +436,41 @@ test('任务行：状态标签唯一来自 progressOf（13 态全覆盖，组件
   assert.equal(statusBadge('interrupted').tone, 'danger')
 })
 
-/* ───────────────── ⑤b 三动作 disabled 矩阵（AC-27，13 × 3 = 39 格） ───────────────── */
+/* ───────────────── ⑤b 四动作 disabled 矩阵（AC-27，13 × 4 = 52 格） ───────────────── */
 
 const ACTION_TO_ALLOW_KEY = {
   cancel: 'cancel',
   skip: 'skip',
   'edit-acceptance': 'acceptance',
+  // t2：`pause` 已进任务卡；paused 行语义是「继续」（文案按状态切，动作名仍是 pause）。
+  pause: 'pause',
 } as const
 
-test('三动作：39 格 disabled 与 TASK_ACTION_ALLOW 逐格一致，禁用必须带原因（AC-27）', () => {
+test('四动作：52 格 disabled 与 TASK_ACTION_ALLOW 逐格一致，禁用必须带原因（AC-27）', () => {
   let cells = 0
   for (const status of ALL_TASK_STATUSES) {
     const actions = taskActionsOf(taskOf('t2', status))
     assert.deepEqual(
       actions.map((action) => action.action),
-      ['cancel', 'skip', 'edit-acceptance'],
-      `${status}：按钮顺序必须是 取消 → 跳过 → 验收`,
+      ['cancel', 'skip', 'edit-acceptance', 'pause'],
+      `${status}：按钮顺序必须是 取消 → 跳过 → 验收 → 暂停`,
     )
     assert.deepEqual(
       actions.map((action) => action.label),
-      ['取消', '跳过', '验收'],
-      `${status}：按钮文案逐字`,
+      ['取消', '跳过', '验收', status === 'paused' ? '继续此任务' : '暂停此任务'],
+      `${status}：按钮文案逐字（暂停/继续按状态切）`,
     )
     for (const action of actions) {
       cells += 1
       const allowed = TASK_ACTION_ALLOW[status][ACTION_TO_ALLOW_KEY[action.action]]
       assert.equal(action.disabled, !allowed, `${status}/${action.action}：disabled 必须与允许表一致`)
       assert.match(action.ariaLabel, /t2/, `${status}/${action.action}：可访问名必须带任务 id`)
+      if (action.action === 'pause') {
+        // 作用域说明只在可点时出现；禁用时让位给「任务已结束，不能暂停」。
+        assert.equal(action.title, allowed ? TASK_PAUSE_TITLE : undefined, `${status}/pause：title 只说明作用域`)
+        // r9vi3s/t1：可访问名以可见文案为前缀（「继续此任务/暂停此任务」），再补任务 id。
+        assert.match(action.ariaLabel, status === 'paused' ? /^继续此任务 t2$/ : /^暂停此任务 t2$/)
+      }
       if (allowed) {
         assert.equal(action.reason, undefined, `${status}/${action.action}：允许时不应有禁用原因`)
       } else {
@@ -466,7 +479,20 @@ test('三动作：39 格 disabled 与 TASK_ACTION_ALLOW 逐格一致，禁用必
       }
     }
   }
-  assert.equal(cells, 39, 'AC-27 判据：13 态 × 3 动作 = 39 格')
+  assert.equal(cells, 52, 'AC-27 判据：13 态 × 4 动作 = 52 格')
+})
+
+test('单卡暂停：命令按状态分派 pauseTask / resumeTask，且行视图带上同一颗按钮（t2）', () => {
+  assert.deepEqual(taskPauseCommandOf('t3', 'running'), { type: 'pauseTask', taskId: 't3' })
+  assert.deepEqual(taskPauseCommandOf('t3', 'paused'), { type: 'resumeTask', taskId: 't3' })
+  assert.equal(taskPauseLabelOf('paused'), '继续此任务')
+  assert.equal(taskPauseLabelOf('done'), '暂停此任务')
+  const pausedRow = taskRowView(taskOf('t3', 'paused'), ROLES)
+  assert.equal(pausedRow.statusLabel, TASK_STATUS_LABELS.paused, '单卡暂停的行内徽标仍是「已暂停」')
+  assert.equal(pausedRow.statusTone, 'warn', '单卡暂停是琥珀，不是红')
+  assert.equal(pausedRow.pauseAction.label, '继续此任务')
+  assert.equal(pausedRow.pauseAction.disabled, false, 'paused 行必须能继续')
+  assert.equal(taskRowView(taskOf('t3', 'done'), ROLES).pauseAction.disabled, true, '结束态不许再暂停')
 })
 
 /* ───────────────── ⑤c 等待原因：逐字取快照（AC-20，零拼装） ───────────────── */
@@ -774,7 +800,7 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
     /** aria 名里必须出现的片段（可见文本恒为「自动团队」，状态语义全在这里）。 */
     aria: RegExp
     state: 'off' | 'on' | 'paused' | 'busy'
-    pause: '暂停任务' | '继续任务'
+    pause: '暂停团队' | '继续团队'
   }
 
   const steps: Step[] = [
@@ -783,7 +809,7 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
       input: { enabled: false, busy: false, done: 0, total: 0 },
       aria: /^自动团队，未启用$/,
       state: 'off',
-      pause: '暂停任务',
+      pause: '暂停团队',
     },
     {
       name: '启用后计划就绪',
@@ -801,35 +827,35 @@ test('端到端（描述层）：未启用 → 计划就绪 → 派发中 → �
       },
       aria: /已启用，计划就绪 · 2 任务/,
       state: 'on',
-      pause: '暂停任务',
+      pause: '暂停团队',
     },
     {
       name: '派发中（1/2 完成）',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 1, total: 2 },
       aria: /派发中 · 1\/2/,
       state: 'on',
-      pause: '暂停任务',
+      pause: '暂停团队',
     },
     {
       name: '暂停',
       input: { enabled: true, busy: false, planStatus: 'paused', done: 1, total: 2 },
       aria: /已暂停/,
       state: 'paused',
-      pause: '继续任务',
+      pause: '继续团队',
     },
     {
       name: '继续（进度不丢，仍是 1/2）',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 1, total: 2 },
       aria: /派发中 · 1\/2/,
       state: 'on',
-      pause: '暂停任务',
+      pause: '暂停团队',
     },
     {
       name: '终态：全部完成',
       input: { enabled: true, busy: false, planStatus: 'dispatching', done: 2, total: 2 },
       aria: /完成 2\/2/,
       state: 'on',
-      pause: '暂停任务',
+      pause: '暂停团队',
     },
   ]
 
@@ -1033,6 +1059,10 @@ test('RunHeader：run 头钩子、暂停按钮、在途派发三态、降级行'
   assert.match(code, /data-plan-status/)
   assert.match(code, /data-auto-team-pause/)
   assert.match(code, /aria-pressed=/)
+  // t2：页头文案/作用域说明走描述层（组件里不再写「暂停/继续」两个字）
+  assert.match(code, /pauseButtonView\(/)
+  assert.match(code, /title=\{pause\.title\}/)
+  assert.match(code, /\{pause\.label\}/)
   assert.match(code, /data-inflight-dispatch=\{/)
   assert.match(code, /data-inflight-dot/)
   assert.match(code, /data-run-usage/)
@@ -1083,6 +1113,11 @@ test('TaskTable：两行式任务行、token/用时 data-cell、展开详情与�
   assert.match(code, /panel\.usageMetrics\.map/)
   assert.match(code, /data-gate-evidence/)
   assert.match(code, /data-gate-tail/)
+  // t2：单卡暂停按钮与展开按钮同构（兄弟节点 + data-task-action），命令由 viewmodel 派生
+  assert.match(code, /data-task-actions/)
+  assert.match(code, /data-task-action="pause"/)
+  assert.match(code, /data-paused=\{task\.status === 'paused'/)
+  assert.match(code, /taskPauseCommandOf\(task\.id, task\.status\)/)
   // 排序/筛选/格式化都归 viewmodel：组件只消费 TaskRowView（AC-7 的单点）
   assert.match(code, /taskRowOf\(/)
   assert.equal(code.includes('toLocaleString'), false, 'token 文案只能来自 viewmodel.tokenTextOf（动态单位）')

@@ -753,7 +753,7 @@ const TASK_PROGRESS: Record<TaskStatus, { tone: ProgressTone; percent: number }>
 }
 
 /** 单条任务的展示态：状态 / 中文标签 / 颜色 / 进度百分比（缺状态一律按 pending 兜底）。 */
-export function progressOf(task: PlanTask): TaskProgress {
+export function progressOf(task: { status?: unknown }): TaskProgress {
   const raw = (task as { status?: unknown } | null | undefined)?.status
   const status = typeof raw === 'string' && raw in TASK_PROGRESS ? (raw as TaskStatus) : 'pending'
   const row = TASK_PROGRESS[status]
@@ -1171,17 +1171,56 @@ export function closeRunPendingOf(runId: string, now: number = Date.now()): Pend
 /* ──────── r11：单任务干预 / 写域占用 / 执行痕迹（F4~F7，DESIGN §3.3~§3.6） ──────── */
 
 /**
- * 三个动作的按钮文案。**只允许出现在这里**：组件里再写一份「取消/跳过/验收」，
+ * 动作按钮文案。**只允许出现在这里**：组件里再写一份「取消/跳过/验收」，
  * aria-label 与按钮文字就会在第一次改文案时漂移。
+ *
+ * r37/t2：`pause` 的文案在这里只登记**不含状态的默认值**；暂停/继续是同一动作名的两种
+ * 语义（`paused` 行语义是「继续」），状态相关的文案由 `taskPauseLabelOf` 统一切。
  */
 const TASK_ACTION_LABEL: Record<TaskActionName, string> = {
   cancel: '取消',
   skip: '跳过',
   'edit-acceptance': '验收',
+  pause: '暂停',
 }
 
-/** 按钮顺序：取消 → 跳过 → 改验收（破坏性弱的靠右，验收最靠右最不易误点）。 */
-const TASK_ACTION_ORDER: readonly TaskActionName[] = ['cancel', 'skip', 'edit-acceptance']
+/** 按钮顺序：取消 → 跳过 → 改验收 → 暂停（破坏性弱的靠右，暂停是单卡冻结，最靠右）。 */
+const TASK_ACTION_ORDER: readonly TaskActionName[] = ['cancel', 'skip', 'edit-acceptance', 'pause']
+
+/**
+ * 单卡暂停的作用域说明（标题）：一行写清「只冻这一张卡」，
+ * 与页头的团队级「暂停团队」在文案上永不混用（用户看得出一级是团队、一级是单卡）。
+ */
+export const TASK_PAUSE_TITLE = '只冻结这一张任务卡：不派发、不接受回执，不影响其他任务'
+
+/** 单卡暂停/继续的可见文案：`paused` 行是「继续」（矩阵里 pause 对 paused 行放行）。 */
+export function taskPauseLabelOf(status: TaskStatus | string): string {
+  return status === 'paused' ? '继续此任务' : '暂停此任务'
+}
+
+/**
+ * 单卡暂停/继续的可访问名（带任务 id，读屏不会只听到「暂停此任务」）。
+ *
+ * r9vi3s/t1：读屏名必须以**可见文案**为前缀（`继续此任务` / `暂停此任务`），
+ * 再补任务 id。旧名的「继续任务 / 暂停任务」与可见文案不一致，同一个按钮会被
+ * 读屏叫成另一个名字，也与页头的团队级「暂停团队/继续团队」混淆。
+ */
+export function taskPauseAriaLabelOf(taskId: string, status: TaskStatus | string): string {
+  return `${taskPauseLabelOf(status)} ${taskId}`
+}
+
+/**
+ * 单卡暂停按钮要发的动作：`paused` → `resumeTask`，其余 → `pauseTask`。
+ *
+ * 两个动作名与 `PanelAction` 字面量严格一致，不合并成一个 toggle ——
+ * 恢复要读回原状态，语义不对称（宿主侧 t1 已完成这两个分支）。
+ */
+export function taskPauseCommandOf(
+  taskId: string,
+  status: TaskStatus | string,
+): Extract<PanelAction, { taskId: string }> {
+  return status === 'paused' ? { type: 'resumeTask', taskId } : { type: 'pauseTask', taskId }
+}
 
 /** 一行动作按钮的视图（disabled 与原因都从 shared 的允许表派生，客户端不再自己判状态）。 */
 export interface TaskActionView {
@@ -1190,25 +1229,53 @@ export interface TaskActionView {
   /** 带任务 id 的全意可访问名（DESIGN §6：不能只读「取消」）。 */
   ariaLabel: string
   disabled: boolean
-  /** 仅 disabled 时给：宿主同一张表的拒绝文案，渲染成 title。 */
+  /** disabled / 需要解释作用域时给：渲染成 title（悬停能看到完整原因）。 */
   reason?: string
+  /** 非 disabled 时的作用域说明（目前只有 pause 用；不与 reason 争同一个位置）。 */
+  title?: string
 }
 
-function actionAriaLabelOf(action: TaskActionName, taskId: string): string {
+function actionAriaLabelOf(action: TaskActionName, taskId: string, status: TaskStatus | string): string {
   if (action === 'cancel') return `取消任务 ${taskId}`
   if (action === 'skip') return `跳过任务 ${taskId}`
+  if (action === 'pause') return taskPauseAriaLabelOf(taskId, status)
   return `修改 ${taskId} 的验收命令`
 }
 
-/** 13 态 × 3 动作的 disabled 视图：**唯一来源是 `TASK_ACTION_ALLOW`**（AC-27）。 */
-export function taskActionsOf(task: PlanTask): TaskActionView[] {
+/** 动作视图只需要任务的 id + 状态（`TaskDetailView` 与 `PlanTask` 都满足）。 */
+export interface TaskActionSource {
+  id: string
+  status?: TaskStatus | string
+}
+
+/** 单卡暂停动作视图（任务行只渲染这一颗，矩阵之外的判断一概不做）。 */
+export function taskPauseActionOf(task: TaskActionSource): TaskActionView {
+  const { status } = progressOf(task)
+  const allowed = taskActionAllowed('pause', status)
+  const view: TaskActionView = {
+    action: 'pause',
+    label: taskPauseLabelOf(status),
+    ariaLabel: taskPauseAriaLabelOf(task.id, status),
+    disabled: !allowed,
+  }
+  if (allowed) view.title = TASK_PAUSE_TITLE
+  else {
+    const reason = taskActionDisabledReason('pause', status)
+    view.reason = reason === '' ? '当前状态不允许该动作' : reason
+  }
+  return view
+}
+
+/** 13 态 × 4 动作的 disabled 视图：**唯一来源是 `TASK_ACTION_ALLOW`**（AC-27）。 */
+export function taskActionsOf(task: TaskActionSource): TaskActionView[] {
   const { status } = progressOf(task)
   return TASK_ACTION_ORDER.map((action) => {
+    if (action === 'pause') return taskPauseActionOf(task)
     const allowed = taskActionAllowed(action, status)
     const view: TaskActionView = {
       action,
       label: TASK_ACTION_LABEL[action],
-      ariaLabel: actionAriaLabelOf(action, task.id),
+      ariaLabel: actionAriaLabelOf(action, task.id, status),
       disabled: !allowed,
     }
     if (!allowed) {
@@ -1738,6 +1805,13 @@ export interface TaskRowView {
    * 语义就是等写域锁，这里只**追加**一枚标记，不改 badge 文案（否则会与既有断言打架）。
    */
   waitScopeText?: string
+  /**
+   * t2：行内单卡暂停/继续动作（文案/可访问名/disabled 全从 shared 矩阵派生）。
+   *
+   * 与页头的团队级暂停按钮是两个独立入口：这里只冻结这一张卡，
+   * 团队级按钮在 RunHeader，文案是「暂停团队/继续团队」。
+   */
+  pauseAction: TaskActionView
   /** r33：附加标记「待回执」—— 状态徽标仍是任务状态，两者并存，不互相改写。 */
   awaitingReceipt?: AwaitingReceiptView
 }
@@ -1783,6 +1857,8 @@ export function taskRowOf(task: TaskCardSource, expanded: boolean): TaskRowView 
     durationState: task.duration.state,
     durationTitle: durationTitleOf(task.duration),
     expanded,
+    // 行视图从同一份矩阵取 pause：状态→文案/disabled 不会与 ops 面板分叉。
+    pauseAction: taskPauseActionOf(task),
   }
   // r21：只在宿主真的写了 `revisedAt` 时标「已修订」，不拿 revisionNote 反推。
   if (typeof task.revisedAt === 'number' && task.revisedAt > 0) {

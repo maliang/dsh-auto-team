@@ -22,7 +22,7 @@
  * 也不做确认判断（确认闸在宿主，客户端不得自行乐观放行）。
  */
 import * as React from 'react'
-import type { MemberView, TaskDetailView } from '../../shared/types.ts'
+import type { MemberView, PanelAction, TaskDetailView } from '../../shared/types.ts'
 import type { MemberJumpView, TaskRowView } from '../viewmodel.ts'
 import {
   TASK_TABLE_HEADER,
@@ -30,6 +30,7 @@ import {
   taskDetailOf,
   taskJumpLabelOf,
   taskOverviewOf,
+  taskPauseCommandOf,
   taskRowOf,
 } from '../viewmodel.ts'
 import { EmptyState } from './EmptyState.tsx'
@@ -44,6 +45,13 @@ export interface TaskTableProps {
   members?: MemberView[]
   /** r33：点任务行里的「子智能体」按钮 = 跳到该成员的宿主会话（判定来自 memberJumpOf）。 */
   onJump?: (jump: MemberJumpView) => void
+  /**
+   * t2：单卡暂停/继续。`paused` 行发 `resumeTask`，其余发 `pauseTask`（命令由 viewmodel 纯函数给）。
+   * 历史 run 不传 → 整颗按钮不渲染（只读快照不提供写入口）。
+   */
+  onTaskAction?: (action: Extract<PanelAction, { taskId: string }>) => void
+  /** 在飞的任务 id：只禁用那一行，避免同一张卡被连点两次。 */
+  taskActionBusyId?: string | null
 }
 
 /**
@@ -62,8 +70,10 @@ function TaskRow(props: {
   onToggleTask: (taskId: string) => void
   jump: MemberJumpView
   onJump?: (jump: MemberJumpView) => void
+  onTaskAction?: (action: Extract<PanelAction, { taskId: string }>) => void
+  taskActionBusy?: boolean
 }): React.ReactElement {
-  const { row, task, done, onToggleTask, jump, onJump } = props
+  const { row, task, done, onToggleTask, jump, onJump, onTaskAction, taskActionBusy } = props
   const panel = row.expanded ? taskDetailOf(task) : null
   const detailId = `auto-team-task-detail-${task.id}`
   return (
@@ -160,6 +170,26 @@ function TaskRow(props: {
           {jump.actionText}
         </button>
       ) : null}
+      {onTaskAction !== undefined ? (
+        // t2：单卡暂停/继续。与展开按钮是兄弟（不嵌进 button），
+        // data-task-action="pause" 与 cancel/skip/acceptance 同构；
+        // 状态徽标仍占标题行，窄宽下按钮独占一行，不会把徽标挤掉。
+        <div data-task-actions>
+          <button
+            type="button"
+            data-task-action="pause"
+            data-task-id={task.id}
+            data-paused={task.status === 'paused' ? 'true' : 'false'}
+            aria-pressed={task.status === 'paused'}
+            aria-label={row.pauseAction.ariaLabel}
+            title={row.pauseAction.title ?? row.pauseAction.reason}
+            disabled={row.pauseAction.disabled || taskActionBusy === true}
+            onClick={() => onTaskAction(taskPauseCommandOf(task.id, task.status))}
+          >
+            {row.pauseAction.label}
+          </button>
+        </div>
+      ) : null}
       {panel ? (
         <div id={detailId} data-task-detail>
           <dl data-task-detail-grid>
@@ -254,7 +284,7 @@ function TaskRow(props: {
 }
 
 export function TaskTable(props: TaskTableProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, grouped, members, onJump } = props
+  const { tasks, expandedTaskId, onToggleTask, grouped, members, onJump, onTaskAction, taskActionBusyId } = props
   if (tasks.length === 0) {
     return (
       <EmptyState
@@ -304,6 +334,8 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
                       { label: taskJumpLabelOf(task.id), taskTitle: task.title },
                     )}
                     onJump={onJump}
+                    onTaskAction={onTaskAction}
+                    taskActionBusy={taskActionBusyId === task.id}
                   />
                 )
               })}
@@ -335,6 +367,8 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
               { label: taskJumpLabelOf(task.id), taskTitle: task.title },
             )}
             onJump={onJump}
+            onTaskAction={onTaskAction}
+            taskActionBusy={taskActionBusyId === task.id}
           />
         ))}
       </ul>

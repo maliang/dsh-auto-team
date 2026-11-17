@@ -1,0 +1,18 @@
+# r44 真机修前证据（QA t6，2026-11-17 12:32:13 +0800）
+
+## 当前安装的插件版本（profile 里的 lib 仍是 t4 之前）
+package.json version: 0.2.6
+
+## 1) 我们的面板前缀路由：无 cookie
+$ curl -s -o /tmp/r44-body.txt -w '%{http_code}' 'http://127.0.0.1:56582/api/auto-team/snapshot?sessionId=x'
+200
+{"data":{"enabled":false,"tasks":[],"members":[],"messages":[],"routeAudits":[],"concurrency":{"limit":3,"running":0,"source":"default","requested":6,"clamped":
+
+## 2) 宿主自己的 GET /api/session：同机、无 cookie
+$ curl -s -o /tmp/r44-session.txt -w '%{http_code}' 'http://127.0.0.1:56582/api/session'
+401
+unauthorized
+
+## 结论
+同一宿主进程、同样不带 cookie：宿主路由 401，我们的前缀路由 200 —— 前缀路由绕过了宿主准入（t4 修复前的真机现象）。
+修后复验需要主 agent 把新 lib 安装进 profile 并重启宿主（QA 不开安装动作），见 QA-REPORT 的「未验证项」。

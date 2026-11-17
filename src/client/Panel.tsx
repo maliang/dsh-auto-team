@@ -285,7 +285,7 @@ export function Panel(props: PanelProps): React.ReactElement {
           <span data-paused-icon aria-hidden="true">
             ⏸
           </span>
-          <span data-paused-text>已暂停：派发与推进已停止，在跑成员不被打断</span>
+          <span data-paused-text>团队已暂停：不再派发新任务、不再推进回执与停滞判定；在跑成员不被打断</span>
           {typeof snapshot?.pausedAt === 'number' ? (
             <span data-paused-at>{formatClock(snapshot.pausedAt)}</span>
           ) : null}

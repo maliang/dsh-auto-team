@@ -116,6 +116,9 @@ function makeHarness(): Harness {
     },
     llm: { resolveCallConfig: (config: unknown) => config },
     agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) },
+    // r43：面板前缀路由每请求问一次宿主准入。真宿主（0.2.2-rc.2）有这个服务且放行本机请求，
+    // 假 ctx 不给它就会命中「服务缺失 → 一次性 warn」的降级分支，把装配用例的「零告警」断言染红。
+    connection: { requestRejection: () => undefined },
     effect: (dispose: () => void | Promise<void>) => void disposers.push(dispose),
     // 只收集 agent/created：它在用例里由测试**手动触发**来制造路由漂移。
     // 其余根作用域订阅（T2 的 tools/result + agent/status 推进信号）不该混进这个数组，

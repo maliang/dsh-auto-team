@@ -27,6 +27,7 @@ import type {
   TriggerKind,
   TriggerRecord,
 } from '../shared/types.ts'
+import { TASK_STATUS_LABELS } from '../shared/task-actions.ts'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT, TRIGGER_KINDS, TRIGGER_LOG_LIMIT } from './config.ts'
 
 /**
@@ -78,6 +79,20 @@ export interface PauseRecord {
 }
 
 /**
+ * r37：**单个任务**的暂停记账（与团队级 {@link PauseRecord} 同一纪律，粒度不同）。
+ *
+ * `from` 是暂停前的任务状态：`resumeTask` 必须按它还原，而不是一律变成 `ready` ——
+ * 从 `running` 暂停的任务恢复后仍是 `running`（成员若已不在，交给 watcher 下一 tick 判
+ * `interrupted`，本动作不直接判 failed）。
+ */
+export interface TaskPauseRecord {
+  /** 进入暂停的时刻（毫秒）。 */
+  at: number
+  /** 暂停前的任务状态。 */
+  from: TaskStatus
+}
+
+/**
  * 一次运行的完整落盘状态（v3）。
  *
  * 注意 `plannedAt` 必须早于首个 `bindings[].spawnedAt` —— 这是 AC-30「先计划、后派发」
@@ -120,6 +135,14 @@ export interface RunState {
   usage?: UsageRecord
   /** r13 AC-20：任务计时（key = taskId，起点由 dispatch 写入、终点由 receipt 写入）。 */
   taskTimes?: Record<string, TaskTimeRecord>
+  /**
+   * r37：**任务级**暂停记账（key = taskId，存在即该任务被用户显式暂停）。
+   *
+   * 为什么原状态记在 run 上而不写进 `PlanTask`：AC-10 冻结了 `PlanTask` 的字段集，且与
+   * 团队级 `pause.tasks` 同一纪律 —— 暂停是「可还原事务」，原状态与当前状态必须同时落盘，
+   * 拆两处就是两套真值。缺省 = 从未有任务被暂停过（旧 run 不补键、不补 0）。
+   */
+  taskPauses?: Record<string, TaskPauseRecord>
   /** r13 AC-13：未决确认（同一 run 只允许一条；不设 TTL，由用户显式确认/拒绝）。 */
   pendingConfirmation?: PendingConfirmation
   /**
@@ -254,6 +277,8 @@ export function lastActivityAtOf(state: RunState): number {
     bump(record?.startedAt)
     bump(record?.endedAt)
   }
+  // r37：任务级暂停也是一次真活动 —— 不计入的话「暂停着等用户」会被 30 分钟残留收口误杀。
+  for (const record of Object.values(state.taskPauses ?? {})) bump(record?.at)
   for (const message of state.messages ?? []) bump(message?.at)
   for (const revision of state.plan.revisions ?? []) bump(revision?.at)
   for (const task of state.plan.tasks) {
@@ -324,6 +349,9 @@ export function reconcileStalePlans(
     const state = store.load(summary.runId)
     if (state === null) continue
     if (!STALE_CANDIDATE_STATUSES.has(state.plan.status)) continue
+    // r37：**用户显式暂停的计划不许被自动收口推翻** —— 有 `pause` 记录的 paused 是「等用户继续」，
+    // 不是残留。只有「状态是 paused 但没有 pause 记录」的遗留账才仍可被收口（旧文件兼容）。
+    if (state.plan.status === 'paused' && state.pause !== undefined) continue
     if (state.finishedAt !== undefined) continue
     if (state.termination !== undefined) continue
     if (options.hasLiveMembers?.(state.plan.runId) === true) continue
@@ -483,6 +511,7 @@ export class RunsStore {
       finishedAt: finiteOptional(state.finishedAt),
       usage: normalizeUsage(state.usage),
       taskTimes: normalizeTaskTimes(state.taskTimes),
+      taskPauses: normalizeTaskPauses(state.taskPauses),
       pendingConfirmation: normalizePending(state.pendingConfirmation),
       forceParallel: normalizeIdList(state.forceParallel),
       termination: normalizeTermination(state.termination),
@@ -589,6 +618,8 @@ export function wrapLegacy(raw: unknown): RunState | null {
     finishedAt: finiteOptional(raw.finishedAt),
     usage: normalizeUsage(raw.usage),
     taskTimes: normalizeTaskTimes(raw.taskTimes),
+    // r37：旧 run 没有这个键 → undefined（不补空对象：undefined 才是「从未暂停过」）。
+    taskPauses: normalizeTaskPauses(raw.taskPauses),
     pendingConfirmation: normalizePending(raw.pendingConfirmation),
     forceParallel: normalizeIdList(raw.forceParallel),
     termination: normalizeTermination(raw.termination),
@@ -929,6 +960,27 @@ export function normalizeTaskTimes(raw: unknown): Record<string, TaskTimeRecord>
     if (startedAt !== undefined) record.startedAt = startedAt
     if (endedAt !== undefined) record.endedAt = endedAt
     out[taskId] = record
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
+ * r37：任务级暂停记账归一：只认「毫秒整数 at + 13 态之一的 from」的项。
+ *
+ * `from` 用 `TASK_STATUS_LABELS` 判成员资格（13 态的运行期唯一清单），坏数据整条丢弃 ——
+ * 恢复时读不到记录会回落 `ready`，好过还原成一个不存在的状态。
+ */
+export function normalizeTaskPauses(raw: unknown): Record<string, TaskPauseRecord> | undefined {
+  if (!isRecord(raw)) return undefined
+  const out: Record<string, TaskPauseRecord> = {}
+  for (const [taskId, value] of Object.entries(raw)) {
+    if (!isRecord(value)) continue
+    const at = finiteOptional(value.at)
+    const from = value.from
+    // 用 `hasOwnProperty` 而不是 `in`：`in` 会把 `toString`/`constructor` 这类原型键也算成员，
+    // 于是坏数据能混进来一个「看起来合法」的状态。
+    if (at === undefined || typeof from !== 'string' || !Object.hasOwn(TASK_STATUS_LABELS, from)) continue
+    out[taskId] = { at, from: from as TaskStatus }
   }
   return Object.keys(out).length > 0 ? out : undefined
 }

@@ -240,6 +240,14 @@ export const OPTIONAL_SERVICES = [
    * 见 `readWorkspaces()`。
    */
   'workspaceRegistry',
+  /**
+   * 宿主连接服务（r43）：只用它的 `requestRejection(request)` 做面板 HTTP 准入。
+   *
+   * 宿主源码语义：返回 `403`（Host/Origin 不可信）、`401`（无认证 Peer）、`undefined`（放行）。
+   * **不许**写进 entry 的 `inject`：非 web / 无连接服务的宿主会整条 entry 不激活；
+   * 缺失时本插件按旧行为放行（只 warn 一次）。
+   */
+  'connection',
 ] as const
 
 /** 可选服务名（从白名单派生，不许另写一份字面量）。 */
@@ -291,6 +299,14 @@ export interface OptionalServiceMap {
    * 只声明 `list`：本插件只读这一条，写入口不在这里。
    */
   workspaceRegistry: { list?(): unknown }
+  /**
+   * [已核，源码 `HostConnectionService.requestRejection(request)`] 宿主连接服务的准入判定。
+   *
+   * 只声明本插件用到的这一个方法，且**全部可选**：宿主换了实现或没有该服务时，
+   * `refusalOf` 读不到函数就按旧行为放行（不拦面板，只 warn 一次）。
+   * 返回值：`403` Host/Origin 不信任、`401` 无认证 Peer、`undefined` 放行。
+   */
+  connection: { requestRejection?: (req: unknown) => number | undefined }
 }
 
 /** 一个宿主工作区的最小投影（`readWorkspaces()` 的唯一输出形状）。 */
@@ -821,6 +837,53 @@ interface NodeLikeResponse {
 }
 
 /**
+ * 面板前缀路由的准入判定（r43 真机实证）。
+ *
+ * 背景：宿主自己的 `GET /api/session` 无 cookie 返回 401，而我们的前缀路由
+ * `/api/auto-team/*` 无 cookie 返回 200 —— `webServer.register({kind:'prefix'})`
+ * 绕过了宿主的访问检查。修法是每请求调一次宿主自己的判定，不自己发明鉴权。
+ *
+ * 三条纪律：
+ *  1. **每次现读**服务（`readServiceQuietly`），不在构造期快照：宿主可能在 `apply` 之后才激活。
+ *  2. 服务或方法读不到 / 调用抛错 → 返回 `undefined` 放行（旧行为），绝不让面板整体不可用。
+ *  3. 该降级只 warn **一次**（模块级去重），否则每个请求刷一行日志。
+ */
+let warnedNoConnection = false
+
+/** 该告警每次进程只打一次（模块级去重）。 */
+function warnNoConnectionOnce(ctx: HostContext, detail?: string): void {
+  if (warnedNoConnection) return
+  warnedNoConnection = true
+  const suffix = detail === undefined ? '' : `（${detail}）`
+  ctx.logger?.warn?.(
+    `[auto-team] 宿主未提供 connection.requestRejection${suffix}，面板接口按旧行为放行`,
+  )
+}
+
+/**
+ * 问宿主：这次请求该不该拒。返回 `403` / `401` / `undefined`（放行）三者之一。
+ *
+ * 语义来自宿主 `HostConnectionService.requestRejection(request)`：
+ *  `403` Host/Origin 不可信；`401` 无认证 Peer；`undefined` 通过。
+ * 非数字的返回值（宿主换了实现）一律按放行处理，不猜。
+ */
+function refusalOf(ctx: HostContext, req: unknown): number | undefined {
+  const connection = readServiceQuietly(ctx, 'connection')
+  const refuse = connection?.requestRejection
+  if (typeof refuse !== 'function') {
+    warnNoConnectionOnce(ctx)
+    return undefined
+  }
+  try {
+    const verdict = refuse.call(connection, req)
+    return typeof verdict === 'number' ? verdict : undefined
+  } catch (error) {
+    warnNoConnectionOnce(ctx, messageOf(error))
+    return undefined
+  }
+}
+
+/**
  * 把全部内部路由挂到宿主：单条 prefix 路由 + 自己写 res。
  * 任一路由抛错都必须转成 500 JSON，绝不能把异常抛回宿主 HTTP 栈。
  *
@@ -846,6 +909,16 @@ export function registerHttpRoutes(
           const url = typeof req.url === 'string' ? req.url : ''
           const pathname = url.includes('?') ? url.slice(0, url.indexOf('?')) : url
           const method = (req.method ?? 'GET').toUpperCase()
+
+          // 准入必须发生在查 route **之前**：GET 与 POST 同等过闸（写操作更需要），
+          // 且未注册路径也不能绕过——前缀路由本身就吞掉了宿主的准入。
+          const refusal = refusalOf(ctx, req)
+          if (refusal !== undefined) {
+            res.statusCode = refusal
+            res.end(refusal === 401 ? 'unauthorized' : 'forbidden')
+            return
+          }
+
           const route = routes.find((item) => item.method === method && item.path === pathname)
 
           const reply = (status: number, payload: unknown): void => {

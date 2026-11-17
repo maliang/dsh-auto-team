@@ -192,7 +192,22 @@ test('暂停期间 dispatch/resume/receipt 一律 PAUSED，端口计数全 0、a
   for (const action of blocked) {
     const result = await bridge.act(SESSION, action)
     assert.equal(result.rejected?.code, 'PAUSED', `${action.type} 在暂停期间必须被 PAUSED 拒绝`)
-    assert.match(result.rejected!.message, /继续任务/, '拒绝文案必须告诉用户点哪儿（否则只能盲点）')
+    // t8：文案必须分别点名两级入口的**真实按钮名**（页头「继续团队」/ 行内「继续此任务」）；
+    // 旧名「继续任务」在 UI 里已不存在，只匹配它会放过「照着文字找不到按钮」的缺陷。
+    assert.match(
+      result.rejected!.message,
+      /团队暂停.*「继续团队」/,
+      '拒绝文案必须点名页头的团队级入口「继续团队」（否则用户按旧名找按钮找不到）',
+    )
+    assert.match(
+      result.rejected!.message,
+      /单卡暂停.*「继续此任务」/,
+      '拒绝文案必须点名单卡入口「继续此任务」，两级入口不得混成一句',
+    )
+    assert.ok(
+      !/「继续任务」/.test(result.rejected!.message),
+      '不得再出现已不存在的按钮名「继续任务」',
+    )
   }
   assert.equal(calls.dispatch, 0, '暂停期间派发端口一次都不能被调用')
   assert.equal(calls.resume, 0, '暂停期间恢复端口一次都不能被调用')

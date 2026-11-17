@@ -100,6 +100,9 @@ export interface MemberWatcher {
  *  - 拿不到成员行（status 未知）→ **不动**：未知不等于死亡，误杀比漏报更伤。
  *
  * 只处理 running / gate / interrupted 三类任务：done / failed 是终态，rework 由回执链路负责。
+ *
+ * `paused`（团队级冻结 + r37 任务级暂停）天然不在这三类里 —— **这是有意的**：暂停不是死亡，
+ * 不能因为「成员静默」就把暂停的卡判成 interrupted/failed；解冻由 `resumeTeam` / `resumeTask` 负责。
  */
 export function reconcileMembers(
   state: RunState,

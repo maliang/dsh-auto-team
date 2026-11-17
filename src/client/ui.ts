@@ -32,6 +32,7 @@ import {
   type RunStageInput,
   scopeLockRowOf,
   taskActionsOf,
+  taskPauseActionOf,
   waitReasonOf,
   type DeviationRowView,
   type ScopeLockRowView,
@@ -171,12 +172,20 @@ export function headerButtonView(input: PlanPillInput & {
 
 export interface PauseView {
   hook: 'data-auto-team-pause'
-  label: '暂停任务' | '继续任务'
+  /** 团队级文案：与任务行里的「暂停此任务/继续此任务」严格区分（一级团队、一级单卡）。 */
+  label: '暂停团队' | '继续团队'
   action: 'pause' | 'resumeTeam'
   /** 已暂停态=琥珀（用户主动冻结，不是失败，永不用红）；非暂停态=中性。 */
   tone: 'warn' | 'muted'
+  /** 作用域说明：悬停能读清「冻的是整个团队，且在跑成员不被打断」。 */
+  title: string
   disabled: boolean
 }
+
+/** 团队级暂停/继续的作用域说明（单一来源；任务行用 `TASK_PAUSE_TITLE`，两者不共用）。 */
+export const TEAM_PAUSE_TITLE =
+  '暂停整个团队：不再派发新任务、不再推进回执与停滞判定，但不会打断正在跑的成员'
+export const TEAM_RESUME_TITLE = '继续整个团队：恢复派发新任务、回执与停滞判定'
 
 /**
  * 面板顶部唯一的暂停/继续按钮。
@@ -188,9 +197,10 @@ export function pauseButtonView(input: { paused: boolean; busy: boolean }): Paus
   const paused = input.paused === true
   return {
     hook: 'data-auto-team-pause',
-    label: paused ? '继续任务' : '暂停任务',
+    label: paused ? '继续团队' : '暂停团队',
     action: paused ? 'resumeTeam' : 'pause',
     tone: paused ? 'warn' : 'muted',
+    title: paused ? TEAM_RESUME_TITLE : TEAM_PAUSE_TITLE,
     disabled: input.busy === true,
   }
 }
@@ -215,8 +225,13 @@ export interface TaskRowView {
    * 组件只在 `status === 'waiting'` 且它非空时渲染 `[data-wait-reason]`。
    */
   waitReason: string
-  /** ⑥ 三个单任务动作（含 disabled 与原因，派生自 shared 的允许表，AC-27）。 */
+  /** ⑥ 单任务动作（含 disabled 与原因，派生自 shared 的允许表，AC-27）。 */
   actions: TaskActionView[]
+  /**
+   * ⑦ 单卡暂停/继续（t2）：与 `actions` 里的 pause 是同一份矩阵输出，
+   * 单独给一份是为了让「行内按钮」不必再从数组里找。
+   */
+  pauseAction: TaskActionView
 }
 
 /** 一条任务行的全部可核验文案。 */
@@ -232,6 +247,7 @@ export function taskRowView(task: PlanTask, roles: Role[]): TaskRowView {
     evidence: evidenceOf(task),
     waitReason: waitReasonOf(task),
     actions: taskActionsOf(task),
+    pauseAction: taskPauseActionOf(task),
   }
 }
 

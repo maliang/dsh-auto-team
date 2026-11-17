@@ -535,8 +535,13 @@ const GATE_FAILED = 'GATE_FAILED' as unknown as RejectionCode
 
 const NOT_ENABLED_TEXT = '自动团队未启用：请先在输入框内的「自动团队」选项处启用'
 
-/** PAUSED 文案（AC-16）：必须同时说清「为什么被拒」与「下一步点哪儿」。 */
-const PAUSED_TEXT = '任务已暂停：请先在面板顶部点「继续任务」再操作'
+/**
+ * PAUSED 文案（AC-16）：必须同时说清「为什么被拒」与「下一步点哪儿」。
+ *
+ * t8：两级暂停入口的按钮名不同（页头「继续团队」/ 行内「继续此任务」），旧文案点的
+ * 「继续任务」在 UI 里已不存在 —— 用户照着文字找不到按钮。这里分别点名两级入口。
+ */
+const PAUSED_TEXT = '任务已暂停：团队暂停请点面板顶部「继续团队」，单卡暂停请点该行「继续此任务」'
 
 /** 暂停期间被闸门拒绝的动作（三个都会推进状态机；其余动作照常放行）。 */
 const PAUSED_BLOCKED: ReadonlySet<PanelAction['type']> = new Set<PanelAction['type']>([
@@ -2119,6 +2124,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // PAUSED 闸门（r7 AC-16）：**只拦推进类动作**，一个判断点，不散落到各个 case 与组件里。
     // 放行的动作（toggle/cancel/message/saveRole/pause/resumeTeam/confirmPending/...）在暂停时仍然可用：
     // 用户暂停后还得能停用、能发消息问成员、能改角色、能继续、能处理已挂起的确认。见 TECHNICAL §2.3。
+    // r37：`pauseTask` / `resumeTask` 同样放行（**故意不在** PAUSED_BLOCKED 里）——团队暂停时
+    // 仍应能冻结/解冻单张卡；它们只改单个任务，不推进计划，不会绕过暂停语义。
     if (PAUSED_BLOCKED.has(action.type)) {
       // t3：暂停判据同样按目标 run 取（跨 run 收口时，活动 run 暂停不代表目标 run 暂停）。
       const paused = stateOf(sessionId, runId)
@@ -2336,6 +2343,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
           let restored = 0
           const tasks = state.plan.tasks.map((task) => {
             if (task.status !== 'paused') return task // done/failed/interrupted/gate 一律不动：done 永不回退
+            // r37：团队级 `pause` 没冻结过、但有**任务级**暂停记账的卡是「用户单独暂停的」，
+            // 团队继续不该顺手把它解冻（否则 taskPauses 变成永远清不掉的脏账）。
+            if (restore[task.id] === undefined && state.taskPauses?.[task.id] !== undefined) return task
             const target = restore[task.id]
             // 原状态缺失（旧账/被 normalizePause 丢掉）→ ready：让下一轮 dispatch 自然重新起人，
             // 而不是猜成 running（猜 running 会让面板永远显示一个不存在的成员在跑）。
@@ -2691,6 +2701,103 @@ export function createBridge(deps: BridgeDeps): Bridge {
         }
 
         /**
+         * r37：**任务级暂停**（面板任务卡上的按钮，与团队级 `pause` 分开）。
+         *
+         * 语义与团队级 `pause` 同一条纪律：只掐「派发 / 回执 / 停滞推进」，**不中断在跑成员**
+         * （杀成员是不可逆的，而暂停应当是随时可继续的）。原状态记在 `RunState.taskPauses`
+         * 而不是 `PlanTask` 上 —— AC-10 冻结了 `PlanTask` 的字段集，且原状态与当前状态必须
+         * 同一次落盘，否则就是两套真值与两条回滚路径。
+         *
+         * 幂等：已经是 `paused` 就原样返回 —— **不改 `at`、不重复写消息账本**，
+         * 否则面板每次点都显示「刚刚暂停」，而实际上冻结很久了。
+         */
+        case 'pauseTask': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可暂停的任务', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          if (!taskActionAllowed('pause', task.status)) {
+            // 「任务已结束，不能暂停」等文案逐字来自 shared 的同一张表（面板 disabled 的 title 也读它）。
+            return reject('BAD_REQUEST', taskActionDeniedText(task, 'pause'), sessionId)
+          }
+          if (task.status === 'paused') {
+            return accept(sessionId, [`任务 ${task.id} 已处于暂停状态：无需重复暂停`])
+          }
+
+          const at = now()
+          const from = task.status
+          // 一次 saveState 落盘「任务状态 + 原状态记录 + 账本消息」：任何一半失败都不会留下脏账。
+          let next = withTask(state, task.id, (item) => ({ ...item, status: 'paused' as TaskStatus }))
+          next = {
+            ...next,
+            taskPauses: { ...(next.taskPauses ?? {}), [task.id]: { at, from } },
+          }
+          next = withMessage(
+            next,
+            recordOf({
+              from: 'captain',
+              to: 'user',
+              at,
+              taskId: task.id,
+              body: `已暂停任务 ${task.id}`,
+            }),
+          )
+          saveState(next)
+          return accept(sessionId, [
+            `已暂停任务 ${task.id}（${TASK_STATUS_LABELS[from]} → ${TASK_STATUS_LABELS.paused}）：回执与推进已冻结，在跑成员不会被中断`,
+          ])
+        }
+
+        /**
+         * r37：**任务级继续**：按 `taskPauses[taskId].from` 还原原状态，并删除该条记账。
+         *
+         * 记录缺失 / 坏数据 / 原状态是终态或 `paused` → 回落 `ready`（与团队级 `resumeTeam` 同口径）：
+         * 猜成 `running` 会让面板永远显示一个不存在的成员在跑。
+         * 还原成 `running` 但成员已经不在了，交给 watcher 下一 tick 判 `interrupted` ——
+         * **本动作不直接判 failed**（成员不在 ≠ 任务失败，可能只是重启后还没重新起人）。
+         */
+        case 'resumeTask': {
+          const state = loadState(sessionId)
+          if (!state) return reject('NO_PLAN', '当前会话还没有执行计划：没有可继续的任务', sessionId)
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId)
+          if (task.status !== 'paused') {
+            const label = TASK_STATUS_LABELS[task.status] ?? task.status
+            return reject('BAD_REQUEST', `该任务没有处于暂停状态（任务 ${task.id} 当前为「${label}」）`, sessionId)
+          }
+
+          const candidate = state.taskPauses?.[task.id]?.from
+          const restored: TaskStatus =
+            candidate !== undefined && candidate !== 'paused' && !isTerminalTaskStatus(candidate)
+              ? candidate
+              : 'ready'
+          const at = now()
+          const { [task.id]: _resumed, ...restPauses } = state.taskPauses ?? {}
+          let next = withTask(state, task.id, (item) => ({ ...item, status: restored }))
+          next = {
+            ...next,
+            taskPauses: Object.keys(restPauses).length > 0 ? restPauses : undefined,
+          }
+          next = withMessage(
+            next,
+            recordOf({
+              from: 'captain',
+              to: 'user',
+              at,
+              taskId: task.id,
+              body: `已继续任务 ${task.id}`,
+            }),
+          )
+          saveState(next)
+          return accept(sessionId, [
+            `已继续任务 ${task.id}（${TASK_STATUS_LABELS.paused} → ${TASK_STATUS_LABELS[restored]}）`,
+            restored === 'running'
+              ? '已按原状态还原为运行中：成员若已不在，watcher 下一 tick 会判为已中断'
+              : '等待下一轮派发推进',
+          ])
+        }
+
+        /**
          * 改验收命令（r11 AC-26；r13 取代：允许面扩到 `done`）：空串拒绝并返回三条模板全文
          * （`emptyAcceptanceError` 单点生成，与工具入口 `tools.ts` 的整批拒绝是同一份文案）。
          *
@@ -2860,6 +2967,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
           }
           const task = state.plan.tasks.find((item) => item.id === action.taskId)
           if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId, undefined, runId)
+          // r37：任务级暂停 = 回执冻结。拒绝码复用 BAD_REQUEST（不新增码），文案必须说清「先点继续」。
+          if (task.status === 'paused') {
+            return reject(
+              'BAD_REQUEST',
+              `任务 ${action.taskId} 已暂停：先对该任务点「继续」再提交回执`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
           if (task.status === 'done') {
             return accept(sessionId, [`任务 ${action.taskId} 已完成，不重复跑门禁`], runId)
           }

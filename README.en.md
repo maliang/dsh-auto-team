@@ -4,7 +4,7 @@
 
 Turn the current DeepSeek Harness session into a team lead: the goal becomes a **dependency-aware task graph**, roles **dispatch in parallel** to resumable sub-agents, every completion must pass a **quality gate**, and the whole run stays visible and editable from the composer switch and the right-side panel.
 
-Current version `dsh-auto-team@0.2.6` (`package.json`), compatible with Node `>=22.18` and DSH `>=0.2.1-alpha.2 <0.3.0`, verified on host `0.2.2-rc.2`.
+Current version `dsh-auto-team@0.2.7` (`package.json`), compatible with Node `>=22.18` and DSH `>=0.2.1-alpha.2 <0.3.0`, verified on host `0.2.2-rc.2`.
 
 ## Features
 
@@ -112,6 +112,8 @@ License: MIT (see [LICENSE](LICENSE))
 | `~/.dsh/auto-team/memory/public/`, `<workspace>/.auto-team/memory/` | Public (cross-project) and project memory; the project `workspace` is resolved from the real run project and reports `degraded/degradeReason` when it cannot be resolved |
 | `<session workspace>/.auto-team/artifacts/<taskId>.log` | Full gate log (relative paths inside acceptance commands are usable) |
 
+Panel endpoints `GET/POST /api/auto-team/*` now go through the host's own admission first: an untrusted Host/Origin gets `403` and an unauthenticated peer gets `401`, and neither reaches the handlers. On hosts without `connection.requestRejection` the plugin degrades to the old behaviour (no check) and logs a single warning — this matches the host's own `/api/*` policy instead of adding a separate auth layer.
+
 Inspect what landed, and clean up historical data (backfill is idempotent; curation starts as a dry run):
 
 ```bash
@@ -163,7 +165,7 @@ Reproduce the whole chain in one line:
 export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" && pnpm typecheck && pnpm test && pnpm build && node --input-type=module -e "await import('./lib/index.js')" && node --input-type=module -e "await import('./lib/client.js')" && npm pack --dry-run --cache /tmp/npm-pack-cache
 ```
 
-- Baseline (measured 2026-11-17): `pnpm test` **1297 pass / 0 fail / 0 skipped**; `npm pack --dry-run` lists 9 files (`package.json`, `LICENSE`, both READMEs, `cordis.patch.yml`, both `lib/` bundles, `locale/en.json`, `locale/zh.json`), with `LICENSE` included automatically by npm.
+- Baseline (measured 2026-11-17): `pnpm test` **1322 pass / 0 fail / 0 skipped**; `npm pack --dry-run` lists 9 files (`package.json`, `LICENSE`, both READMEs, `cordis.patch.yml`, both `lib/` bundles, `locale/en.json`, `locale/zh.json`), with `LICENSE` included automatically by npm.
 - Do not bypass: `lib/` must be committed (it is the `pnpm add file:` install source); local imports carry the `.ts` extension; host and client never import each other and only talk over `GET/POST /api/auto-team`; host service access is concentrated in `src/host/adapters.ts`.
 
 ## Documentation

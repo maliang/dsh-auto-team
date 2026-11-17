@@ -14,6 +14,7 @@ import * as React from 'react'
 import type { RunDetailView } from '../../shared/types.ts'
 import type { InflightState, PlanGoalView, RunStageView } from '../viewmodel.ts'
 import { runHeadOf } from '../viewmodel.ts'
+import { pauseButtonView } from '../ui.ts'
 
 export interface RunHeaderProps {
   detail: RunDetailView
@@ -35,6 +36,9 @@ export interface RunHeaderProps {
 export function RunHeader(props: RunHeaderProps): React.ReactElement {
   const { detail, paused, inflight, onTogglePause, plan, stage } = props
   const head = runHeadOf(detail, inflight, stage)
+  // 团队级暂停的文案/作用域说明走描述层单点（`暂停团队` / `继续团队`），
+  // 组件里不再写「暂停/继续」两个字 —— 否则会和任务行的单卡按钮串味。
+  const pause = pauseButtonView({ paused: paused === true, busy: false })
   return (
     <header data-region="run-head" data-paused={paused === true ? 'true' : 'false'}>
       <div data-run-line="identity">
@@ -50,9 +54,10 @@ export function RunHeader(props: RunHeaderProps): React.ReactElement {
             data-auto-team-pause
             data-paused={paused === true ? 'true' : 'false'}
             aria-pressed={paused === true}
+            title={pause.title}
             onClick={onTogglePause}
           >
-            {paused === true ? '继续' : '暂停'}
+            {pause.label}
           </button>
         ) : null}
         <span data-run-spacer aria-hidden="true" />

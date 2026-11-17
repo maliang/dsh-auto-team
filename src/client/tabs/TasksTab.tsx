@@ -16,11 +16,13 @@
  * 且**不提供成员导航**（历史快照没有成员/消息，导过去只会是空页）。
  */
 import * as React from 'react'
-import type { PlanStatus, PanelSnapshot } from '../../shared/types.ts'
+import type { PanelAction, PlanStatus, PanelSnapshot } from '../../shared/types.ts'
 import type { TabProps } from '../Panel.tsx'
 import {
+  actFeedback,
   awaitingReceiptSummaryOf,
   buildRunDetail,
+  hintOf,
   memberJumpNoticeOf,
   planGoalOf,
   stageOfDetail,
@@ -117,6 +119,10 @@ export function TasksTab(props: TabProps): React.ReactElement {
   )
   // r33：三入口共用一份「点了没跳成」的原因；成功时清空（占位折叠为零高，不留空行）。
   const [jumpNotice, setJumpNotice] = React.useState<string | null>(null)
+  // t2：单卡暂停/继续的在飞态与结局。按钮固定渲染（disabled 由矩阵给），
+  // 失败/成功都往 live region 写一句人话 —— 不许「点了没反应」。
+  const [taskActionBusyId, setTaskActionBusyId] = React.useState<string | null>(null)
+  const [taskActionNotice, setTaskActionNotice] = React.useState<string | null>(null)
 
   /**
    * 角色卡 / 任务行 / 流程图节点的唯一落地动作：判定已由 `memberJumpOf` 做完，
@@ -131,6 +137,21 @@ export function TasksTab(props: TabProps): React.ReactElement {
   }
   // 历史 run 没有成员/消息，入口保持不可点（与 r17 的「历史不提供成员导航」一致）。
   const onJump = historicalRunId === null ? jumpToMember : undefined
+
+  /**
+   * 单卡暂停/继续：动作名与 taskId 由 viewmodel 纯函数给出（组件不拼动作字面量）。
+   * 解包走 `actFeedback` + `hintOf` —— `rejected` 也要有一句可读文案。
+   */
+  const runTaskAction = (action: Extract<PanelAction, { taskId: string }>): void => {
+    if (taskActionBusyId !== null) return
+    setTaskActionBusyId(action.taskId)
+    void actFeedback(props.act, action).then((feedback) => {
+      setTaskActionBusyId(null)
+      setTaskActionNotice(hintOf(feedback) ?? null)
+    })
+  }
+  // 历史 run 是只读快照：不提供单卡暂停入口（与 onJump 同一纪律）。
+  const onTaskAction = historicalRunId === null ? runTaskAction : undefined
 
   const selectRun = (runId: string): void => {
     if (runId === '') return
@@ -202,6 +223,15 @@ export function TasksTab(props: TabProps): React.ReactElement {
       >
         {jumpNotice ?? ''}
       </p>
+      {/* t2：单卡暂停/继续的结局（成功记一条账本文案，拒绝原样显示宿主原因）。 */}
+      <p
+        role="status"
+        aria-live="polite"
+        data-task-action-notice
+        data-empty={taskActionNotice === null ? 'true' : undefined}
+      >
+        {taskActionNotice ?? ''}
+      </p>
       <RoleGrid roles={detail.roles} members={members} tasks={detail.tasks} onJump={onJump} />
       <TaskOverview
         tasks={detail.tasks}
@@ -209,6 +239,8 @@ export function TasksTab(props: TabProps): React.ReactElement {
         onToggleTask={(taskId) => toggleTask(taskId)}
         members={members}
         onJump={onJump}
+        onTaskAction={onTaskAction}
+        taskActionBusyId={taskActionBusyId}
       />
       <FlowCanvas
         flow={detail.flow}

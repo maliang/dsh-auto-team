@@ -4,7 +4,7 @@
 
 把当前 DeepSeek Harness 会话变成队长：目标拆成**带依赖的任务图**，按角色**并行**派出可续聊的子 Agent，完成必须过**质量门禁**，全过程在输入框左侧开关与右栏面板里可见可改。
 
-当前版本 `dsh-auto-team@0.2.6`（`package.json`），兼容 Node `>=22.18` 与 DSH `>=0.2.1-alpha.2 <0.3.0`，本机真机验证宿主 `0.2.2-rc.2`。
+当前版本 `dsh-auto-team@0.2.7`（`package.json`），兼容 Node `>=22.18` 与 DSH `>=0.2.1-alpha.2 <0.3.0`，本机真机验证宿主 `0.2.2-rc.2`。
 
 ## 特色
 
@@ -112,6 +112,8 @@ node -e "const p=require('./package.json');console.log(p.version,p.engines.node,
 | `~/.dsh/auto-team/memory/public/`、`<workspace>/.auto-team/memory/` | 公共记忆（跨项目）与项目记忆；项目 `workspace` 按 run 的真实项目解析，解析不到时返回 `degraded/degradeReason` |
 | `<会话工作区>/.auto-team/artifacts/<taskId>.log` | 门禁全量日志（验收里的相对路径可直接用） |
 
+面板接口 `GET/POST /api/auto-team/*` 现在先过宿主自己的准入：Host/Origin 不可信返回 `403`、无认证 Peer 返回 `401`，未通过不进任何业务逻辑。旧宿主没有 `connection.requestRejection` 时退化为旧行为（不拦请求），宿主日志只告警一次——这与宿主自身 `/api/*` 的口径对齐，不是在插件里另加一层鉴权。
+
 落盘核对与历史数据整理（回填幂等，整理先 dry-run）：
 
 ```bash
@@ -163,7 +165,7 @@ npm pack --dry-run --cache /tmp/npm-pack-cache
 export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" && pnpm typecheck && pnpm test && pnpm build && node --input-type=module -e "await import('./lib/index.js')" && node --input-type=module -e "await import('./lib/client.js')" && npm pack --dry-run --cache /tmp/npm-pack-cache
 ```
 
-- 基线（2026-11-17 实测）：`pnpm test` **1297 通过 / 0 失败 / 0 skipped**；`npm pack --dry-run` 9 个文件（`package.json`、`LICENSE`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`），`LICENSE` 由 npm 自动收录。
+- 基线（2026-11-17 实测）：`pnpm test` **1322 通过 / 0 失败 / 0 skipped**；`npm pack --dry-run` 9 个文件（`package.json`、`LICENSE`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`），`LICENSE` 由 npm 自动收录。
 - 不要绕过：`lib/` 必须入库（`pnpm add file:` 的安装源）；本地 import 带 `.ts` 扩展名；host 与 client 零直接 import，只走 `GET/POST /api/auto-team`；宿主服务读取集中在 `src/host/adapters.ts`。
 
 ## 文档索引

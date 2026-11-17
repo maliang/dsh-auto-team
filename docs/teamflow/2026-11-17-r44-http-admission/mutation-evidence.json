@@ -1,0 +1,108 @@
+{
+  "generatedAt": "2026-11-17T04:32:50.727Z",
+  "testFiles": [
+    "test/r44-http-admission.test.ts",
+    "test/r44-http-admission-warn.test.ts"
+  ],
+  "baseline": {
+    "exitCode": 0,
+    "failed": [],
+    "counts": {
+      "tests": 10,
+      "pass": 10,
+      "fail": 0
+    },
+    "tail": "ℹ tests 10\nℹ suites 0\nℹ pass 10\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 150.677667"
+  },
+  "mutations": [
+    {
+      "id": "M1",
+      "name": "把准入挪到 route.handle 之后（读 body / 执行面板动作之后才拒绝）",
+      "target": "src/host/adapters.ts",
+      "replacements": [
+        {
+          "from": "          const refusal = refusalOf(ctx, req)\n          if (refusal !== undefined) {\n            res.statusCode = refusal\n            res.end(refusal === 401 ? 'unauthorized' : 'forbidden')\n            return\n          }\n\n",
+          "to": ""
+        },
+        {
+          "from": "            const result = await route.handle({ method, pathname, url, json: async () => body })\n",
+          "to": "            const result = await route.handle({ method, pathname, url, json: async () => body })\n            const refusal = refusalOf(ctx, req)\n            if (refusal !== undefined) {\n              res.statusCode = refusal\n              res.end(refusal === 401 ? 'unauthorized' : 'forbidden')\n              return\n            }\n"
+        }
+      ],
+      "sha256Before": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "sha256Mutated": "f57a2a89464349fb1ec092f1844018b7304e25f1b4a67e0f3838fbcf6abfb9aa",
+      "sha256Restored": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "restoredByteIdentical": true,
+      "expectedRedTest": "r44 准入：403 拒绝 → 403 / forbidden，且 route.handle 计数为 0",
+      "mutatedExitCode": 1,
+      "mutatedFailed": [
+        "r44 准入：403 拒绝 → 403 / forbidden，且 route.handle 计数为 0",
+        "r44 准入：401 未认证 → 401 / unauthorized，且 route.handle 计数为 0",
+        "r44 准入：403 发生在 readJson 之前（body 读口抛错也不变 500）",
+        "r44 准入：POST 与未知路径同等过闸（403 优先于 404）",
+        "r44 准入：connection 服务是每请求现读，不是注册期快照",
+        "r44 准入：同一连接的 401 → 403 → undefined 序列逐请求生效",
+        "failing tests:"
+      ],
+      "redAsExpected": true,
+      "postRestoreExitCode": 0,
+      "postRestoreFail": 0,
+      "postRestoreGreen": true
+    },
+    {
+      "id": "M2",
+      "name": "去掉模块级告警去重（connection 缺失时每请求都 warn）",
+      "target": "src/host/adapters.ts",
+      "replacements": [
+        {
+          "from": "  if (warnedNoConnection) return\n  warnedNoConnection = true\n",
+          "to": "  /* M2：去重被移除，每次请求都会 warn */\n"
+        }
+      ],
+      "sha256Before": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "sha256Mutated": "33fcfefd730e9ea81f8b0d07f986cab8d22b89c5b67176b6f3c49847eb15acfb",
+      "sha256Restored": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "restoredByteIdentical": true,
+      "expectedRedTest": "r44 准入降级：connection 缺失 → 放行，且整个进程只 warn 一条",
+      "mutatedExitCode": 1,
+      "mutatedFailed": [
+        "r44 准入降级：connection 缺失 → 放行，且整个进程只 warn 一条",
+        "r44 准入：requestRejection 抛错 → 放行并只 warn 一条",
+        "failing tests:"
+      ],
+      "redAsExpected": true,
+      "postRestoreExitCode": 0,
+      "postRestoreFail": 0,
+      "postRestoreGreen": true
+    },
+    {
+      "id": "M3",
+      "name": "把 401 / 403 的响应体写反",
+      "target": "src/host/adapters.ts",
+      "replacements": [
+        {
+          "from": "          res.end(refusal === 401 ? 'unauthorized' : 'forbidden')\n",
+          "to": "          res.end(refusal === 401 ? 'forbidden' : 'unauthorized')\n"
+        }
+      ],
+      "sha256Before": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "sha256Mutated": "6940c9f3b4bfa318d41861c7401a389a6a34e67d6ba38d9b93b0b32747be5f2d",
+      "sha256Restored": "fd041091519d18b3443427951345299016f847d305e8d85eb98fdcc2948c420a",
+      "restoredByteIdentical": true,
+      "expectedRedTest": "r44 准入：403 拒绝 → 403 / forbidden，且 route.handle 计数为 0",
+      "mutatedExitCode": 1,
+      "mutatedFailed": [
+        "r44 准入：403 拒绝 → 403 / forbidden，且 route.handle 计数为 0",
+        "r44 准入：401 未认证 → 401 / unauthorized，且 route.handle 计数为 0",
+        "r44 准入：403 发生在 readJson 之前（body 读口抛错也不变 500）",
+        "r44 准入：POST 与未知路径同等过闸（403 优先于 404）",
+        "r44 准入：同一连接的 401 → 403 → undefined 序列逐请求生效",
+        "failing tests:"
+      ],
+      "redAsExpected": true,
+      "postRestoreExitCode": 0,
+      "postRestoreFail": 0,
+      "postRestoreGreen": true
+    }
+  ]
+}

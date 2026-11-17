@@ -1259,7 +1259,7 @@ export interface ExpandPayload {
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
 
 /**
- * 面板动作全集（20 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 面板动作全集（25 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
  * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
  */
 export type PanelAction =
@@ -1310,6 +1310,16 @@ export type PanelAction =
   | { type: 'cancelTask'; taskId: string; reason?: string }
   /** r11 AC-26：单任务跳过（终态 → `skipped`，其依赖视为满足，释放写域）。 */
   | { type: 'skipTask'; taskId: string }
+  /**
+   * r37：**任务级暂停**（只冻结这一张卡：掐它的派发/回执/推进，**不中断在跑成员**）。
+   * 与团队级 `pause` 是两件事，各有按钮；原状态记在 `RunState.taskPauses`（不写进 `PlanTask`）。
+   */
+  | { type: 'pauseTask'; taskId: string }
+  /**
+   * r37：**任务级继续**：按 `RunState.taskPauses[taskId].from` 还原原状态。
+   * 与 `pauseTask` 分两个动作而不是一个 toggle —— 恢复要读回原状态，语义不对称。
+   */
+  | { type: 'resumeTask'; taskId: string }
   /** r11 AC-26：改验收命令（下次门禁生效；空串拒绝并回三条模板）。 */
   | { type: 'updateAcceptance'; taskId: string; acceptance: string }
   /**
