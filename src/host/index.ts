@@ -62,6 +62,7 @@ import {
   applyReceipt,
   dispatchReady,
   resumeRun,
+  taskLabelOf,
   type PromptInput,
   type SpawnPort,
 } from './team/dispatch.ts'
@@ -408,6 +409,9 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     const result = await spawnPorts.spawn({
       prompt: input.prompt,
       name: input.name,
+      // description = 任务名 = 宿主下拉可见的 label（adapters.ts 的 subagentLabelOf 优先取它，
+      // 缺了就退化成 taskId，下拉里只剩 `t1`/`t2`）。截断策略复用 taskLabelOf。
+      description: taskLabelOf(input.task),
       route: input.role?.model,
       sessionId: input.plan.sessionId,
       taskId: input.task.id,
