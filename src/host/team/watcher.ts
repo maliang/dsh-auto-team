@@ -12,7 +12,7 @@
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
 import { STALL_ALERTS_LIMIT } from '../store.ts'
-import type { ActivityEvent, PlanTask } from '../../shared/types.ts'
+import type { ActivityEvent, MemberListSource, PlanTask } from '../../shared/types.ts'
 import { MAX_ATTEMPTS, STALL_MS, STEP_BUDGET, STEP_REMINDER_AT, WATCHER_INTERVAL_MS } from '../config.ts'
 import { appendMessage, makeMessage } from './messages.ts'
 import { releaseScopes } from './scope-locks.ts'
@@ -84,6 +84,13 @@ export interface MemberWatcher {
   tick(): Promise<number>
   start(): void
   stop(): void
+  /**
+   * r40 D1：某个 root（= `plan.sessionId`）最近一次取成员名单的结果。
+   *
+   * 纯内存态，**不落盘**（重启后缺省 = 还没对账过，面板显示不可得而不是假装 ok）。
+   * `rootId` 缺省 = 最近一条记录（给「还不知道会话 id」的调用方兜底）。
+   */
+  memberListHealth(rootId?: string): MemberListSource | undefined
 }
 
 /**
@@ -390,17 +397,27 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
   let timer: ReturnType<typeof setInterval> | null = null
   let busy = false
   /**
-   * 上一次「名单不可得」的告警键（r36）：同一种错误只报一次，错误换了才再报。
-   * 成功取到名单即清空 —— 恢复后再次故障算一次新的状态变化。
+   * r40 D1：每个 root（= `plan.sessionId`）最近一次取名单的结果，面板降级的唯一来源。
+   * 只存内存、**不落盘**：它描述的是「这一刻宿主端口通不通」，写进 run 文件只会变成过期假象。
    */
-  let lastListError: string | null = null
+  const healthByRoot = new Map<string, MemberListSource>()
+  /**
+   * r40：按 root 去重的告警键（r36 的语义保留：同一种错误只报一次，错误换了才再报）。
+   * 用单键会被别的 root 的成功抹掉记录，于是同一个错误反复报——键必须跟 root 走。
+   */
+  const listErrorsByRoot = new Map<string, string>()
+  /** 最近一次取名单的 root（`memberListHealth()` 不带参数时的兜底）。 */
+  let lastHealthRoot: string | null = null
 
   async function tick(): Promise<number> {
     if (busy) return 0
     busy = true
     try {
       const runs = deps.store.list()
-      let members: HostMember[] | null = null
+      // r40：名单必须**按 root 分别取**。`deps.store.list()` 返回整个 dataRoot 的 run
+      // （跨工作区/跨会话），拿第一个 run 的 root 名单去对账后面的 run，只会把别人的成员
+      // 当成「不存在」→ 误判 interrupted 或静默跳过。键 = `state.plan.sessionId`，每个 root 各取一次。
+      const membersByRoot = new Map<string, HostMember[]>()
       let changed = 0
 
       for (const summary of runs) {
@@ -419,24 +436,35 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
         )
         if (!active) continue
 
-        if (members === null) {
+        const rootId = state.plan.sessionId
+        let members = membersByRoot.get(rootId)
+        if (members === undefined) {
           try {
             // r36：带 rootId —— 定时器回调没有 initiator 边界，按 caller 求 root 会每轮抛 NO_CALLER。
-            members = await deps.listMembers(state.plan.sessionId)
-            lastListError = null
+            members = await deps.listMembers(rootId)
+            membersByRoot.set(rootId, members)
+            listErrorsByRoot.delete(rootId)
+            lastHealthRoot = rootId
+            healthByRoot.set(rootId, { ok: true, at: now() })
           } catch (error) {
-            // 名单不可得：本轮什么都不改，等下一轮（宁可漏报一轮，也不误杀全部成员）。
-            // 但**不许静默**（r36）：喂给降级通道，同一种错误只在状态变化时报一次。
-            const text = `成员名单不可得（本轮跳过存活对账，不据此判定任何成员死亡）：${errorTextOf(error)}`
-            if (text !== lastListError) {
-              lastListError = text
+            // 名单不可得：本 root 本轮什么都不改，等下一轮（宁可漏报一轮，也不误杀全部成员）。
+            // 但**不许静默**（r36）：喂给降级通道，同一种错误只在状态变化时报一次；
+            // 同时记进内存态（r40 D1），让快照/面板看得见「本轮降级了」而不是一个像样的空名单。
+            const reason = errorTextOf(error)
+            const text = `成员名单不可得（本轮跳过存活对账，不据此判定任何成员死亡）：${reason}`
+            if (text !== listErrorsByRoot.get(rootId)) {
+              listErrorsByRoot.set(rootId, text)
               try {
                 deps.onWarn?.(text)
               } catch {
                 /* 告警出口自身失败不得打断对账循环 */
               }
             }
-            return changed
+            lastHealthRoot = rootId
+            healthByRoot.set(rootId, { ok: false, error: reason, at: now() })
+            // r40 取舍：**continue 而不是 return** —— 一次名单失败只让该 root 本轮降级，
+            // 其余 root 的对账照常进行（旧实现的 return 会让一个 root 的故障停掉全仓对账）。
+            continue
           }
         }
 
@@ -488,6 +516,10 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
 
   return {
     tick,
+    memberListHealth(rootId?: string) {
+      const key = rootId ?? lastHealthRoot
+      return key === null ? undefined : healthByRoot.get(key)
+    },
     start() {
       if (timer !== null) return
       timer = setInterval(() => {

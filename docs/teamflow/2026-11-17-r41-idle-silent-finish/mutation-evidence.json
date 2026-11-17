@@ -1,0 +1,63 @@
+{
+  "generatedAt": "2026-11-17T02:55:48.316Z",
+  "testFile": "test/r41-idle-silent-finish.test.ts",
+  "baseline": {
+    "exitCode": 0,
+    "failed": [],
+    "counts": {
+      "tests": 6,
+      "pass": 6,
+      "fail": 0
+    },
+    "tail": "ℹ tests 6\nℹ suites 0\nℹ pass 6\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 291.152875"
+  },
+  "mutations": [
+    {
+      "id": "M1",
+      "name": "去掉 idle 防误报护栏",
+      "target": "src/host/index.ts:377",
+      "replacement": {
+        "from": "if (!memberSawWork.has(info.memberId)) return",
+        "to": "if (!memberSawWork.has(info.memberId)) { /* M1：护栏被移除，刚 spawn 的 idle 也落标 */ }"
+      },
+      "sha256Before": "f6c6840c391ecfa98eabd9dad4ca1207b10066f1886b6810797b78470a87ff23",
+      "sha256Mutated": "14602b489a0b3ade69f80595f6a68b2e9f24e2a17e9d01d0d9b6a4c2b0f25108",
+      "sha256Restored": "f6c6840c391ecfa98eabd9dad4ca1207b10066f1886b6810797b78470a87ff23",
+      "restoredByteIdentical": true,
+      "expectedRedTest": "r41 误报护栏：刚 spawn 就收到 idle（本轮从未 running/推进）→ 不落 silentFinish、任务仍 running",
+      "mutatedExitCode": 1,
+      "mutatedFailed": [
+        "r41 误报护栏：刚 spawn 就收到 idle（本轮从未 running/推进）→ 不落 silentFinish、任务仍 running",
+        "failing tests:"
+      ],
+      "redAsExpected": true,
+      "postRestoreExitCode": 0,
+      "postRestoreFail": 0,
+      "postRestoreGreen": true
+    },
+    {
+      "id": "M2",
+      "name": "Map 换回单变量（第一个 root 的名单复用给所有 root）",
+      "target": "src/host/team/watcher.ts:440",
+      "replacement": {
+        "from": "let members = membersByRoot.get(rootId)",
+        "to": "let members = membersByRoot.get(rootId) ?? (membersByRoot.size === 0 ? undefined : [...membersByRoot.values()][0])"
+      },
+      "sha256Before": "96e6b3e18ea6c37a33d22582dc6e4fe334701dce218aed33a4d0f9da0d7ab360",
+      "sha256Mutated": "12e7dbefa6ee76d3b03d27d676767a50afefada58e7669b206433534f7c079ec",
+      "sha256Restored": "96e6b3e18ea6c37a33d22582dc6e4fe334701dce218aed33a4d0f9da0d7ab360",
+      "restoredByteIdentical": true,
+      "expectedRedTest": "r41 跨 root：两个 run 各取自己的名单（旧实现单变量 → 两次调用/第二个 run 失联断言必须红）",
+      "mutatedExitCode": 1,
+      "mutatedFailed": [
+        "r41 跨 root：两个 run 各取自己的名单（旧实现单变量 → 两次调用/第二个 run 失联断言必须红）",
+        "r41 降级可见：名单抛错 → ok:false+error 且进快照 membersSource；同一 tick 其余 root 继续对账；恢复后 ok:true",
+        "failing tests:"
+      ],
+      "redAsExpected": true,
+      "postRestoreExitCode": 0,
+      "postRestoreFail": 0,
+      "postRestoreGreen": true
+    }
+  ]
+}

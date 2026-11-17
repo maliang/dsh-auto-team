@@ -311,9 +311,73 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
    */
   const memberWatches = new Map<string, () => void>()
   const memberWatchWarned = new Set<string>()
+  /**
+   * idle 的**防误报护栏**（r41）：成员在本进程内先出现过 `running` 或至少一次 `tools/result`
+   * 推进，才承认后续的 `idle` 是「本轮结束」。spawn 瞬间宿主也可能立刻报一次 idle，那时新
+   * 派发的任务一步都没跑，把它当结束会把刚派出去的任务误标成「待回执」。
+   *
+   * 内存态、不落盘：进程重启后宁可漏报待回执（watcher 轮询路径仍会兜底判定），不要误报。
+   */
+  const memberSawWork = new Set<string>()
+
+  /**
+   * 成员结束本轮（`agent/status: idle`）→ 落「待回执」观察事实。
+   *
+   * 只做一件事：对**该成员**所有未退休绑定，用同一个 `isSilentFinish` 判定，命中就
+   * `recordSilentFinish`（幂等、不刷新 at）并落盘。不推总线、不改任务状态、不自动 rework、
+   * 不标 done/failed —— 那四件事只能由队长显式发起。
+   */
+  function recordMemberIdle(memberId: string, at: number): void {
+    try {
+      for (const summary of store.list()) {
+        const state = store.load(summary.runId)
+        if (!state) continue
+        let next = state
+        for (const binding of state.bindings) {
+          if (binding.retired === true || binding.memberId !== memberId) continue
+          const task = next.plan.tasks.find((item) => item.id === binding.taskId)
+          if (task === undefined) continue
+          if (!isSilentFinish({ task, binding, memberStopped: true })) continue
+          next = recordSilentFinish(next, {
+            taskId: task.id,
+            memberId: binding.memberId,
+            memberName: binding.name,
+            at,
+          })
+        }
+        if (next === state) continue
+        try {
+          store.save(next)
+        } catch (error) {
+          // 观察事实落盘失败不能连累既有推进链：退回轮询路径下一轮照样会判出来。
+          warn(ctx, `待回执落盘失败：${messageOf(error)}`)
+        }
+      }
+    } catch (error) {
+      warn(ctx, `待回执判定失败（成员 ${memberId}）：${messageOf(error)}`)
+    }
+  }
+
   function watchMember(memberId: string): void {
     if (typeof memberId !== 'string' || memberId === '' || memberWatches.has(memberId)) return
-    const watch = watchMemberProgress(ctx, memberId, (info) => recordProgress(info.memberId, info.at))
+    const watch = watchMemberProgress(
+      ctx,
+      memberId,
+      (info) => {
+        memberSawWork.add(info.memberId)
+        recordProgress(info.memberId, info.at)
+      },
+      (info) => {
+        if (info.status === 'running') {
+          memberSawWork.add(info.memberId)
+          return
+        }
+        if (info.status !== 'idle') return
+        // 护栏：没见过 running、也没见过一次 tools/result 推进 → 这不是「本轮结束」，是误报。
+        if (!memberSawWork.has(info.memberId)) return
+        recordMemberIdle(info.memberId, info.at)
+      },
+    )
     if (watch.ok) {
       memberWatches.set(memberId, watch.stop)
       return
@@ -595,6 +659,9 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     onUsagePersistError: (text) => warn(ctx, text),
     // r24：closeRun 的成员存活判据（宿主名单是唯一事实源）+ 残留计划对账的非致命告警出口。
     listMembers,
+    // r40 D1：成员名单取用状态透传给快照（`membersSource`）。读的是 watcher 重建后的最新句柄，
+    // 不在这里缓存一份 —— 设置保存会重建 watcher，缓存会让面板一直显示旧降级。
+    memberListHealth: (sessionId) => watcherRef?.memberListHealth(sessionId),
     onWarn: (text) => warn(ctx, text),
     captainModel: () => captainView,
     settingsRepo,

@@ -45,6 +45,7 @@ import type {
   ExpandPayload,
   GateEvidence,
   LibraryView,
+  MemberListSource,
   MemberStatus,
   MemberView,
   MemoryEntryView,
@@ -427,6 +428,13 @@ export interface BridgeDeps {
   listMembers?: () => Promise<HostMember[]>
   /** r24：非致命告警出口（残留计划对账失败等）。装配层接 `warn(ctx, …)`；缺省即静默。 */
   onWarn?: (message: string) => void
+  /**
+   * r40 D1：某个会话（root）最近一次取成员名单的结果，快照 `membersSource` 的唯一来源。
+   *
+   * 装配层接 watcher 的 `memberListHealth()`（纯内存态，不落盘）。缺省 = 未装配 / 本轮还没对账：
+   * 快照里**不出现**该字段，面板显示「未对账」，绝不补一个 `{ ok: true }` 假装健康。
+   */
+  memberListHealth?: (sessionId: string | undefined) => MemberListSource | undefined
 }
 
 export interface Bridge {
@@ -1912,6 +1920,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 事件源健康度与队长模型都由装配层注入（见 BridgeDeps 注释）：缺失就是「未投影」，
     // 不能在这里编一个默认值假装正常——面板的职责是把「我不知道」显示出来（anti-goal 5）。
     const health = deps.triggerHealth?.()
+    // r40 D1：成员名单取用状态（watcher 内存态，仅本会话）。undefined 就不写字段 ——
+    // 「还没对账」与「对账成功」不是一件事，给个默认 ok 会把降级藏起来。
+    const membersSource = deps.memberListHealth?.(state?.plan.sessionId ?? sessionId)
     const captain = deps.captainModel?.()
     // 系统技能只扫一次盘：投影与「为什么是空」必须来自同一次扫描，否则会出现
     // 「列表为空、reason 说库可用」这种自相矛盾的快照（同 settings 的理由）。
@@ -1937,6 +1948,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ...(state?.plan.revisions === undefined ? {} : { revisions: state.plan.revisions }),
       tasks: panelTasksOf(state),
       members: membersOf(state, roles, stallMs),
+      ...(membersSource === undefined ? {} : { membersSource }),
       ...(runCounts === undefined ? {} : { runCounts }),
       messages: state?.messages ?? [],
       routeAudits: state?.routeAudits ?? [],

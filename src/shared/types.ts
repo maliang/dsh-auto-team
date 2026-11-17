@@ -971,6 +971,20 @@ export interface PanelTaskView extends PlanTask {
   awaitingReceipt?: boolean
 }
 
+/**
+ * r40 D1：成员名单取用状态（watcher 的内存态，**不落盘**）。
+ *
+ * 名单不可得时 watcher 本轮跳过存活对账（宁可漏报一轮也不误杀），
+ * 这份状态是面板/快照唯一能看见「本轮降级了」的地方——只进日志的告警等于看不见。
+ * `at` 是最近一次取名单的时刻；缺省 = 调用方没记（客户端按不可得处理，不补 0）。
+ */
+export interface MemberListSource {
+  ok: boolean
+  /** `ok === false` 时的错误原文（可读英文/中文混排，直接展示）。 */
+  error?: string
+  at?: number
+}
+
 /** 面板快照：`GET {BRIDGE_ROUTE}/snapshot` 的载荷，也是每个动作返回的同一份形状。 */
 export interface PanelSnapshot {
   /** 本会话是否已启用（AC-12：默认关，按会话持久化）。 */
@@ -981,6 +995,14 @@ export interface PanelSnapshot {
   plannedAt?: number
   tasks: PanelTaskView[]
   members: MemberView[]
+  /**
+   * r40 D1：本会话成员名单的**取用状态**（watcher 内存态，不落盘）。
+   *
+   * 缺省 = 本会话还没跑过成员对账（或旧宿主未投影）——客户端显示「未对账」，不补猜 ok。
+   * `ok === false` 时服务端本轮跳过存活对账（名单不可得 ≠ 成员全死），错误原文带在这里，
+   * 否则面板只能看到一个「看起来正常」的空名单（r40 QA D1 的原始缺陷）。
+   */
+  membersSource?: MemberListSource
   /**
    * r26：当前 run 的阶段判定计数 —— 与 {@link RunSummary} 的四个同名字段同构，
    * 让「当前 run」与「历史 run」喂给同一套判定函数时输入形状一致。

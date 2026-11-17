@@ -1813,6 +1813,26 @@ export interface MemberProgressWatch {
   stop(): void
 }
 
+/** 成员 `agent/status` 的一次观测：`status` 原样透传宿主值（当前宿主只有 `idle` / `running`）。 */
+export interface MemberStatusInfo {
+  memberId: string
+  status: string
+  at: number
+}
+
+/**
+ * 从 `agent/status` 的参数里宽松取 `status`（宿主 emit 形状 `{ agent: { id }, status }`）。
+ *
+ * 参数可能以 `(payload)` 或 `(payload, ...)` 到达，和 {@link agentOfToolEvent} 用同一套宽松口径；
+ * 取不到就返回 `undefined`（调用方当「没有状态」处理）—— 形状变动绝不能把监听器打挂。
+ */
+function agentStatusOf(args: unknown[]): string | undefined {
+  const payload = args[0] ?? args
+  if (!payload || typeof payload !== 'object') return undefined
+  const status = (payload as { status?: unknown }).status
+  return typeof status === 'string' && status !== '' ? status : undefined
+}
+
 /** 按 SessionId 取宿主**活着的** agent（`agents.get` 已在本文件其他读口实测使用）。 */
 function liveAgentOf(ctx: HostContext, memberId: string): unknown {
   try {
@@ -1837,11 +1857,15 @@ function liveAgentOf(ctx: HostContext, memberId: string): unknown {
  *
  * @param memberId 宿主 SessionId（= spawn 返回的 `childId`，也是 `binding.memberId`）
  * @param handler  收到一次实质工具调用 / 状态变化时回调（由调用方做节流与落盘）
+ * @param onStatus 可选：`agent/status` 的原始状态（`idle` / `running`）。拿到 `idle` 时**不**再
+ *                 调用 `handler`（idle 不是推进，不能拿它刷新 lastProgress 掩盖停滞），
+ *                 由调用方自行决定「本轮结束」的语义与防误报护栏；不传则行为与旧实现一致。
  */
 export function watchMemberProgress(
   ctx: HostContext,
   memberId: string,
   handler: (info: { memberId: string; at: number }) => void,
+  onStatus?: (info: MemberStatusInfo) => void,
 ): MemberProgressWatch {
   const stops: Array<() => void> = []
   const stop = (): void => {
@@ -1883,10 +1907,26 @@ export function watchMemberProgress(
     const id = (owner as { id?: unknown }).id
     return typeof id !== 'string' || id === '' || id === memberId
   }
-  const install = (event: string, ownerOf: (args: unknown[]) => unknown): void => {
+  const install = (
+    event: string,
+    ownerOf: (args: unknown[]) => unknown,
+    statusOf?: (args: unknown[]) => string | undefined,
+  ): void => {
     try {
       const dispose = on(event, (...args: unknown[]) => {
         if (!accepts(ownerOf(args))) return
+        const status = statusOf?.(args)
+        if (status !== undefined) {
+          // 状态是「本轮结束」的权威信号（宿主文档：idle = 没有 driver 仍被调度或活跃）。
+          // 值原样交给调用方，这里不做任何判定 —— 判定与护栏留在装配层（宿主 API 只在本文件）。
+          try {
+            onStatus?.({ memberId, status, at: Date.now() })
+          } catch (error) {
+            ctx.logger?.warn?.(`[auto-team] 成员状态处理失败（${messageOf(error)}）`)
+          }
+          // idle 不刷新进度：倒计时该停下来，而不是被「成员刚说了句闲话」续命。
+          if (status === 'idle') return
+        }
         advance()
       })
       if (typeof dispose === 'function') stops.push(dispose)
@@ -1895,7 +1935,11 @@ export function watchMemberProgress(
     }
   }
   install('tools/result', (args) => agentOfToolEvent({ exec: args[0] }))
-  install('agent/status', (args) => agentOfToolEvent(args[0] ?? args))
+  install(
+    'agent/status',
+    (args) => agentOfToolEvent(args[0] ?? args),
+    (args) => agentStatusOf(args),
+  )
   return stops.length > 0
     ? { ok: true, stop }
     : { ok: false, reason: '成员 ctx 上两条订阅都没装上', stop }
