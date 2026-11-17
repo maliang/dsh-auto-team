@@ -264,6 +264,31 @@ function TaskRow(props: {
                 </dd>
               </>
             ) : null}
+            {panel.review ? (
+              // r42：门禁过了之后人点头了没。只认宿主写下的 `task.review`，旧快照没有就不显示。
+              // dt 用「结论」而不是「验收结论」：展开区 dt 列只有 36px，两字以内的标签才不会挤成两行。
+              // 顺序 = 结论 → 验人 → 理由（先回答「行不行」，再回答「谁说的」「凭什么」）。
+              <>
+                <dt>结论</dt>
+                <dd data-detail-review data-review-verdict={panel.review.verdict} title={panel.review.title}>
+                  <span data-review-verdict-text>{panel.review.verdictText}</span>
+                  {' · '}
+                  <span data-review-by>{panel.review.byText}</span>
+                  {' · '}
+                  <span data-review-reason title={panel.review.reasonText}>
+                    {panel.review.reasonText}
+                  </span>
+                </dd>
+              </>
+            ) : null}
+            {panel.autoReceipt ? (
+              <>
+                <dt>回执</dt>
+                <dd data-auto-receipt title={panel.autoReceipt.title}>
+                  {panel.autoReceipt.text}
+                </dd>
+              </>
+            ) : null}
             {panel.awaitingReceipt ? (
               <>
                 <dt>回执</dt>

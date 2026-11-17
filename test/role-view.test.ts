@@ -2,7 +2,7 @@
  * r14 AC-7 / AC-8 / AC-12 的算法侧证据：`src/shared/role-view.ts#roleStateOf`。
  *
  * 为什么单测锁在这里：宿主 `library.ts#rolesOf` 与客户端 `viewmodel.ts#roleUsageOf`
- * 现在都只是「喂任务列表 + 铺字段」，状态判定只有这一处。表驱动覆盖全部 13 种
+ * 现在都只是「喂任务列表 + 铺字段」，状态判定只有这一处。表驱动覆盖全部 14 种
  * `TaskStatus` —— 组件/DOM 断言抓不到「cancelled 被算成 done」这类口径错误，
  * 而口径错了会让右栏和抽屉一起撒谎。
  */
@@ -23,7 +23,7 @@ import { rolesOf } from '../src/host/library.ts'
 import { roleUsageOf } from '../src/client/viewmodel.ts'
 import type { DurationCell, Role, TaskDetailView, TaskStatus, UsageCell } from '../src/shared/types.ts'
 
-/** 全部 13 种任务状态（与 `src/shared/types.ts#TaskStatus` 逐字对齐）。 */
+/** 全部 14 种任务状态（与 `src/shared/types.ts#TaskStatus` 逐字对齐；r42 新增 review）。 */
 const ALL_STATUSES: readonly TaskStatus[] = [
   'pending',
   'blocked',
@@ -31,6 +31,7 @@ const ALL_STATUSES: readonly TaskStatus[] = [
   'running',
   'paused',
   'gate',
+  'review',
   'done',
   'rework',
   'failed',
@@ -48,6 +49,7 @@ const DONE_DURATION: DurationCell = { state: 'done', ms: 61_000, text: '1m 1s', 
 const STARTED_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   'running',
   'gate',
+  'review',
   'done',
   'rework',
   'failed',
@@ -68,6 +70,7 @@ const EXPECTED: Record<TaskStatus, RoleStateKind> = {
   running: 'running',
   paused: 'idle',
   gate: 'waiting_gate',
+  review: 'needs_attention',
   done: 'done',
   rework: 'needs_attention',
   failed: 'needs_attention',
@@ -77,8 +80,8 @@ const EXPECTED: Record<TaskStatus, RoleStateKind> = {
   skipped: 'idle',
 }
 
-test('roleStateOf：13 种 TaskStatus 逐一表驱动（状态 / 分子 / 当前任务）', () => {
-  assert.equal(ALL_STATUSES.length, 13, 'TaskStatus 必须是 13 种（AC-18 的形状普查）')
+test('roleStateOf：14 种 TaskStatus 逐一表驱动（状态 / 分子 / 当前任务）', () => {
+  assert.equal(ALL_STATUSES.length, 14, 'TaskStatus 必须是 14 种（AC-18 的形状普查；r42 加 review）')
   for (const status of ALL_STATUSES) {
     const started = STARTED_STATUSES.has(status)
     const cell = started ? (status === 'done' ? DONE_DURATION : DURATION) : undefined

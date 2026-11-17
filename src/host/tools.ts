@@ -1,5 +1,5 @@
 /**
- * 队长可用工具（ctx.tools.register），共 8 个（TECHNICAL §5.1）。
+ * 队长可用工具（ctx.tools.register），共 9 个（TECHNICAL §5.1）。
  *
  * 纪律：
  *  - 未启用时**不能静默不干活**：必须返回明确中文错误（AC-12），用户才知道是「没打开开关」而不是「插件坏了」；
@@ -911,6 +911,73 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
                 artifacts: task.evidence.artifacts,
               }
             : undefined,
+          notices: result.notices,
+        }
+      },
+    },
+    {
+      name: `${TOOL_PREFIX}review`,
+      description:
+        '人工验收结论：只下结论，不跑命令，不写代码。'
+        + 'verdict=pass 任务完成并写入验收记录；verdict=fail 打回返工（attempts+1，并把 reasons 逐条作为必改项发回原作者）。'
+        + '任务必须处于待验收（review）；评审人不得是原作者 —— 不能验自己写的任务。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '待验收任务 id' },
+          verdict: { type: 'string', enum: ['pass', 'fail'], description: 'pass=通过（完成）；fail=打回返工' },
+          reasons: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '结论理由；fail 时每条都作为返工必改项发回原作者',
+          },
+          runId: {
+            type: 'string',
+            description: '不传 = 当前会话的活动运行（最近一个未终止的 run）；跨 run 收口时传它',
+          },
+        },
+        required: ['taskId', 'verdict'],
+      },
+      async handler(args, meta) {
+        const sessionId = sessionOf(meta)
+        // 与 status / receipt 同一谓词：队长路径不变；成员只有在「启用中的成员的会话」里才放行。
+        const leaderMode = deps.bridge.enabled(sessionId)
+        const member = leaderMode ? null : memberSelfServiceOf(deps, meta)
+        if (!leaderMode && member === null) return { ok: false, error: NOT_ENABLED }
+
+        const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
+        if (taskId === '') return { ok: false, error: 'taskId 不能为空' }
+        // verdict 只接受 pass|fail：面板/脚本塞别的字符串时不能当成 pass 静默放行。
+        if (args.verdict !== 'pass' && args.verdict !== 'fail') {
+          return { ok: false, error: 'verdict 只接受 pass 或 fail' }
+        }
+        const verdict = args.verdict
+        const reasons = (Array.isArray(args.reasons) ? args.reasons : [])
+          .map((item) => (typeof item === 'string' ? item.trim() : ''))
+          .filter((item) => item !== '')
+
+        // 成员的动作必须落在 run 所属会话上（成员的 agent id 不是任何一份 run 的 sessionId）。
+        const targetSessionId = member === null ? sessionId : member.sessionId
+        const runId = runIdOf(args)
+        const targetError = runTargetError(deps.store, targetSessionId, runId)
+        if (targetError) return targetError
+
+        const result = await deps.bridge.act(
+          targetSessionId,
+          { type: 'reviewTask', taskId, verdict, reasons },
+          runId,
+          // 调用方成员身份只从这里进 bridge：「不能验自己写的任务」靠它区分谁在下结论。
+          member === null ? undefined : { memberId: member.binding.memberId },
+        )
+        const rejected = rejectedOf(result)
+        if (rejected) return rejected
+
+        const task = result.snapshot.tasks.find((item) => item.id === taskId)
+        return {
+          ok: true,
+          taskId,
+          status: task?.status,
+          review: task?.review,
           notices: result.notices,
         }
       },

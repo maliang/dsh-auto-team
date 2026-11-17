@@ -77,6 +77,22 @@ export function validateSettings(raw: unknown): SettingsValidation {
     settings[item.key] = value
   }
 
+  // 自动回执开关（t46）：布尔项，缺席 = 开启（判定口径见 `team/auto-receipt.ts`）。
+  const rawAutoReceipt = raw.autoReceipt
+  if (rawAutoReceipt !== undefined && rawAutoReceipt !== null) {
+    if (typeof rawAutoReceipt !== 'boolean') return { ok: false, reason: '自动回执开关必须是布尔值' }
+    settings.autoReceipt = rawAutoReceipt
+  }
+
+  // 人工验收策略（t6）：只认三值，缺席 = 不写该键（读取端按 `needsReviewOf` 的缺省 code 处理）。
+  const rawReviewPolicy = raw.reviewPolicy
+  if (rawReviewPolicy !== undefined && rawReviewPolicy !== null) {
+    if (rawReviewPolicy !== 'code' && rawReviewPolicy !== 'all' && rawReviewPolicy !== 'off') {
+      return { ok: false, reason: '验收策略只能是 code / all / off' }
+    }
+    settings.reviewPolicy = rawReviewPolicy
+  }
+
   const rawModel = raw.captainModel
   if (rawModel !== undefined && rawModel !== null) {
     if (isRecord(rawModel)) {
@@ -138,6 +154,22 @@ export function createSettingsRepo(deps: SettingsRepoDeps): SettingsRepo {
         const carried = readStepReminderAt(file)
         if (carried !== undefined) settings.stepReminderAt = carried
       }
+      // 同一条纪律适用于 t46 的 `autoReceipt`：面板表单里还没有这一项时，缺键要沿用磁盘旧值，
+      // 否则用户经 settings.json 关掉的自动回执会被一次「保存设置」悄悄打开。
+      const rawHasAutoReceipt =
+        isRecord(raw) && raw.autoReceipt !== undefined && raw.autoReceipt !== null
+      if (!rawHasAutoReceipt) {
+        const carried = readAutoReceipt(file)
+        if (carried !== undefined) settings.autoReceipt = carried
+      }
+      // t6：`reviewPolicy` 同理 —— 面板表单缺键时沿用磁盘旧值，否则用户手写在 settings.json
+      // 里的 all / off 会被一次「保存设置」抹回缺省 code（下拉框可见地弹回）。
+      const rawHasReviewPolicy =
+        isRecord(raw) && raw.reviewPolicy !== undefined && raw.reviewPolicy !== null
+      if (!rawHasReviewPolicy) {
+        const carried = readReviewPolicy(file)
+        if (carried !== undefined) settings.reviewPolicy = carried
+      }
       const body = `${JSON.stringify(settings, null, 2)}\n`
       const tmp = `${file}.tmp`
       try {
@@ -170,6 +202,38 @@ function readStepReminderAt(file: string): number | undefined {
     if (typeof value !== 'number' || !Number.isInteger(value)) return undefined
     const [min, max] = SETTINGS_LIMITS.stepReminderAt
     return value >= min && value <= max ? value : undefined
+  } catch {
+    // 首次保存（文件还不存在）或旧文件坏掉：都不是错误路径。
+    return undefined
+  }
+}
+
+/**
+ * 读磁盘上已有的 `autoReceipt`（t46）：面板保存时表单里还没有这一项，缺键要沿用旧值，
+ * 否则「显式关闭」会被缺省值（开启）覆盖。读不到 / 不是布尔一律返回 undefined（走缺省）。
+ */
+function readAutoReceipt(file: string): boolean | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (!isRecord(parsed)) return undefined
+    const value = parsed.autoReceipt
+    return typeof value === 'boolean' ? value : undefined
+  } catch {
+    // 首次保存（文件还不存在）或旧文件坏掉：都不是错误路径。
+    return undefined
+  }
+}
+
+/**
+ * 读磁盘上已有的 `reviewPolicy`（t6）：面板保存时缺键要沿用旧值，否则 all / off 被缺省覆盖。
+ * 读不到 / 不在三值域内一律返回 undefined（不猜，交给读取端的缺省 code）。
+ */
+function readReviewPolicy(file: string): AutoTeamSettings['reviewPolicy'] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (!isRecord(parsed)) return undefined
+    const value = parsed.reviewPolicy
+    return value === 'code' || value === 'all' || value === 'off' ? value : undefined
   } catch {
     // 首次保存（文件还不存在）或旧文件坏掉：都不是错误路径。
     return undefined

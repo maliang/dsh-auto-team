@@ -1320,7 +1320,9 @@ export const AUTO_TEAM_CSS = `
 }
 [data-auto-team-settings] [data-setting-label] { color: var(--dsw-alias-label-secondary, inherit); }
 [data-auto-team-settings] [data-setting-inputs] { display: flex; align-items: center; gap: 6px; min-width: 0; }
-[data-auto-team-settings] [data-setting-inputs] input { flex: 1 1 auto; }
+[data-auto-team-settings] [data-setting-inputs] input,
+/* r42：三选一策略行用原生 select —— 跟数字输入框同一套尺寸/描边/焦点环，只补一个 flex。 */
+[data-auto-team-settings] [data-setting-inputs] select { flex: 1 1 auto; }
 [data-auto-team-settings] input,
 [data-auto-team-settings] select,
 [data-auto-team-settings] textarea {
@@ -1353,6 +1355,34 @@ export const AUTO_TEAM_CSS = `
   font: var(--dsw-font-xxxs-11, 11px/16px sans-serif);
   text-align: right;
   overflow-wrap: anywhere;
+}
+/* t46：布尔开关行 —— 命中区含「已开启/已关闭」文案（≥24px），长提示横跨整行。 */
+[data-auto-team-settings] [data-setting-toggle-hit] {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 2px;
+  cursor: pointer;
+}
+[data-auto-team-settings] [data-setting-toggle-hit] input[type="checkbox"] {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--dsw-alias-state-business-primary, #2f6feb);
+}
+[data-auto-team-settings] [data-setting-toggle-hit]:has(input:disabled) {
+  cursor: default;
+}
+[data-auto-team-settings] [data-setting-toggle-state] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xxs-12, 12px/18px sans-serif);
+}
+[data-auto-team-settings] [data-setting-hint-full] {
+  grid-column: 1 / -1;
+  text-align: left;
 }
 [data-auto-team-settings] [data-settings-actions] { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 [data-auto-team-settings] button {
@@ -2717,6 +2747,11 @@ export const AUTO_TEAM_CSS = `
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, currentColor) 45%, transparent);
 }
 /* r17：六项用量指标（2 列 × 3 行，标签与数字同宽容器；不可得项用三级色区分） */
+/* t46：宿主代跑门禁 —— 紧跟在门禁证据后，字号与证据同档；用二级色，不与「待回执」蓝抢语义。 */
+[data-task-detail] [data-auto-receipt] {
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+}
 /* 展开区里的「回执」行：与门禁证据分开一行，读起来是「缺什么」而不是「结果如何」。 */
 [data-task-detail] [data-awaiting-receipt] {
   color: var(--dsw-alias-state-business-primary, currentColor);

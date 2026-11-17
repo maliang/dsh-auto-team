@@ -45,6 +45,7 @@ import type {
   RunDetailView,
   ScopeLockView,
   TaskDetailView,
+  TaskReview,
   TaskStatus,
   TokenTotals,
   UsageCell,
@@ -89,6 +90,10 @@ const TASK_BADGES: Record<string, Badge> = {
   pending: { icon: '·', text: TASK_STATUS_LABELS.pending, tone: 'neutral' },
   ready: { icon: '▸', text: TASK_STATUS_LABELS.ready, tone: 'business' },
   gate: { icon: '⚖', text: TASK_STATUS_LABELS.gate, tone: 'warn' },
+  // r42：门禁已过、等人工点头。tone 不能与「运行中」（business）或「待回执」（warn，见
+  // styles.ts 的 `[data-awaiting-receipt]`）撞色，否则三件事在窄宽下看起来一模一样；
+  // success 表达「机器那关已经过了」，图标用 ✎ 与「已通过」的 ✓ 区分开。
+  review: { icon: '✎', text: TASK_STATUS_LABELS.review, tone: 'success' },
   paused: { icon: '⏸', text: TASK_STATUS_LABELS.paused, tone: 'warn' },
   waiting: { icon: '⏳', text: TASK_STATUS_LABELS.waiting, tone: 'warn' },
   cancelled: { icon: '⊘', text: TASK_STATUS_LABELS.cancelled, tone: 'neutral' },
@@ -745,6 +750,8 @@ const TASK_PROGRESS: Record<TaskStatus, { tone: ProgressTone; percent: number }>
   running: { tone: 'ok', percent: 50 },
   paused: { tone: 'warn', percent: 50 },
   gate: { tone: 'warn', percent: 80 },
+  // r42：门禁已过、等人工验收 —— 进度停在 90（差最后一道人工关），色用 warn 提醒有人工活。
+  review: { tone: 'warn', percent: 90 },
   done: { tone: 'ok', percent: 100 },
   cancelled: { tone: 'muted', percent: 0 },
   skipped: { tone: 'muted', percent: 0 },
@@ -816,6 +823,7 @@ export type RunStageKey =
   | 'failed'
   | 'interrupted'
   | 'running'
+  | 'review'
   | 'closing'
   | 'dispatching'
   | 'ready'
@@ -830,6 +838,13 @@ export interface RunStageInput {
   total?: number
   done?: number
   running?: number
+  /**
+   * r42：门禁已通过、**等人工验收**的任务数。
+   *
+   * 宿主 `RunStageCounts` 还没有这个字段（当前 run 从 `snapshot.tasks` 精确数，
+   * 历史 run 从 `RunDetailView.tasks` 数）——所以这里缺省即「不可得」，绝不补 0。
+   */
+  reviewing?: number
   failed?: number
   interrupted?: number
   members?: number
@@ -854,6 +869,7 @@ const RUN_STAGE_ICON: Record<RunStageKey, string> = {
   failed: '✕',
   interrupted: '⚑',
   running: '▶',
+  review: '✎',
   closing: '◔',
   dispatching: '◐',
   ready: '·',
@@ -872,16 +888,21 @@ function stageCountOf(value: unknown): number | undefined {
  *
  * 优先级从高到低，先命中先返回：
  *  1 无计划 → 未启用；2 已取消；3 已终止（detail 取终止原因）；4 已暂停；
- *  5 有失败；6 已中断；7 执行中；8 任务全部结束但计划未收口 → 待收口；
- *  9 派发中；10 计划就绪（total>0 && 零成员 && done===0）；11 待派发。
+ *  5 有失败；6 已中断；7 执行中；8 有待验收（r42）；9 任务全部结束但计划未收口 → 待收口；
+ *  10 派发中；11 计划就绪（total>0 && 零成员 && done===0）；12 待派发。
  *
- * 「计划就绪」只允许在规则 10 命中时出现 —— 这是 `draft` 不再直接当徽标的机械保证。
+ * 「计划就绪」只允许在规则 11 命中时出现 —— 这是 `draft` 不再直接当徽标的机械保证。
+ *
+ * r42 为什么「待验收」排在「执行中」之后：「还有人正在跑」比「有人等你点头」
+ * 更能决定这一秒要不要干预；等最后一批任务跑完，阶段自然切到「待验收」。
+ * 位置也不能晚于「待收口」——被挡住的任务不算收口，否则待验收会被误报成流水线要关了。
  */
 export function runStageOf(input: RunStageInput): RunStageView {
   const planStatus = input.planStatus
   const total = stageCountOf(input.total)
   const done = stageCountOf(input.done)
   const running = stageCountOf(input.running)
+  const reviewing = stageCountOf(input.reviewing)
   const failed = stageCountOf(input.failed)
   const interrupted = stageCountOf(input.interrupted)
   const members = stageCountOf(input.members)
@@ -950,7 +971,17 @@ export function runStageOf(input: RunStageInput): RunStageView {
           : `${total} 个任务已完成 ${done ?? 0} 个，${running} 个正在执行`,
     }
   }
-  // 规则 8：任务全部结束，但计划没有收口（没有终止原因 / 没有结束时刻）。
+  // r42 规则 8：门禁已过、等人点头。排在「执行中」之后（还有人在跑时先看进展），
+  // 排在「待收口」之前（被人工关挡住的任务没有收口，不能报成流水线要关了）。
+  if (reviewing !== undefined && reviewing > 0) {
+    return {
+      key: 'review',
+      label: `待验收 · ${reviewing}`,
+      tone: 'warn',
+      detail: `${reviewing} 个任务门禁已通过，等待人工验收后才算完成`,
+    }
+  }
+  // 规则 9：任务全部结束，但计划没有收口（没有终止原因 / 没有结束时刻）。
   if (total !== undefined && total > 0 && done === total && !closed) {
     return {
       key: 'closing',
@@ -970,7 +1001,7 @@ export function runStageOf(input: RunStageInput): RunStageView {
           : `计划正在派发：${done ?? 0}/${total} 个任务已结束`,
     }
   }
-  // 规则 10：唯一合法的「计划就绪」。
+  // 规则 11：唯一合法的「计划就绪」。
   if (total !== undefined && total > 0 && members === 0 && done === 0) {
     return {
       key: 'ready',
@@ -1012,6 +1043,7 @@ export function stageOfDetail(
   const tasks = detail.tasks ?? []
   const done = tasks.filter((task) => task.status === 'done').length
   const running = tasks.filter((task) => task.status === 'running' || task.status === 'gate').length
+  const reviewing = tasks.filter((task) => task.status === 'review').length
   const failed = tasks.filter((task) => task.status === 'failed').length
   return runStageOf({
     ...counts,
@@ -1019,6 +1051,8 @@ export function stageOfDetail(
     total: counts.total ?? tasks.length,
     done: counts.done ?? done,
     running: counts.running ?? running,
+    // r42：宿主 `RunStageCounts` 还没投影这项，按任务态精确数（不是猜）。
+    reviewing: counts.reviewing ?? reviewing,
     failed: counts.failed ?? failed,
     ...(detail.terminationReason !== undefined
       ? { terminationReason: detail.terminationReason }
@@ -1045,6 +1079,8 @@ export function currentRunStageInputOf(snapshot: PanelSnapshot | null | undefine
     done,
     running:
       counts.running ?? tasks.filter((task) => task.status === 'running' || task.status === 'gate').length,
+    // r42：宿主计数投影里还没有 reviewing，从真实任务态数（旧快照没有 review 任务 → 0）。
+    reviewing: tasks.filter((task) => task.status === 'review').length,
     failed: counts.failed ?? tasks.filter((task) => task.status === 'failed').length,
     interrupted: counts.interrupted ?? members.filter((member) => member.status === 'interrupted').length,
     members: counts.members ?? members.length,
@@ -1694,6 +1730,131 @@ export interface TaskRevisionFacts {
   awaitingReceipt?: boolean
   /** r33：观察事实（成员结束本轮的成员与时刻）；只用于 title 里的时间，不参与整页布局。 */
   silentFinish?: { at: number; memberId: string }
+  /**
+   * t46：宿主代跑门禁的事实（`PlanTask.autoReceipt`）。
+   *
+   * 缺席 = 成员自己交的回执 / 历史 run / 旧快照 —— 此时**不显示**「宿主代跑」行，
+   * 也不拿 `silentFinish` 或 evidence 反推「应该是代跑的」。
+   */
+  autoReceipt?: { at: number; exitCode: number }
+  /**
+   * r42：最近一次人工验收结论。
+   *
+   * 当前 run 的快照任务（`PanelTaskView extends PlanTask`）直接带 `review`；
+   * 历史 run 的 `TaskDetailView` 宿主还没投影 → 缺席即「没记录」，不补、不反推。
+   */
+  review?: TaskReview
+}
+
+/* ─────────────────── t46：宿主代跑门禁（与「待回执」互斥） ─────────────────── */
+
+/** 任务详情里这行文案的前半句（唯一出处；只由宿主写下的 `autoReceipt` 触发）。 */
+export const AUTO_RECEIPT_TEXT_LEAD = '宿主代跑门禁'
+
+/**
+ * 退出码 → 人话。
+ *
+ * 宿主用 `exitCode = -1` 表示「门禁超时 / 被信号终止」（此时 `GateEvidence.exitCode` 是
+ * null）；照抄成 `exit -1` 会让人误以为门禁真的返回了 -1，因此单独翻译。
+ */
+export function autoReceiptTextOf(exitCode: number): string {
+  if (!Number.isFinite(exitCode)) return `${AUTO_RECEIPT_TEXT_LEAD} · 退出码未记录`
+  if (exitCode === -1) return `${AUTO_RECEIPT_TEXT_LEAD} · 门禁超时/被信号终止`
+  return `${AUTO_RECEIPT_TEXT_LEAD} · exit ${String(exitCode)}`
+}
+
+export interface AutoReceiptView {
+  text: string
+  title: string
+}
+
+/**
+ * `TaskRevisionFacts.autoReceipt` → 展开区一行。
+ *
+ * 只认形状完整的标记（`at`/`exitCode` 都是有限数字）；缺一半就当没记录，绝不补 0 ——
+ * 「exit 0」是「验收通过」，伪造一个 0 等于把旧快照说成已通过。
+ */
+export function autoReceiptViewOf(
+  mark: { at: number; exitCode: number } | undefined,
+): AutoReceiptView | undefined {
+  if (mark === undefined) return undefined
+  const at = mark.at
+  const exitCode = mark.exitCode
+  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return undefined
+  if (typeof exitCode !== 'number' || !Number.isFinite(exitCode)) return undefined
+  return {
+    text: autoReceiptTextOf(exitCode),
+    title: `${AUTO_RECEIPT_TEXT_LEAD}（${formatStamp(at)}）：这条回执由宿主在成员停手后自动提交，不是成员自己交的。`,
+  }
+}
+
+/* ─────────────────── r42：人工验收结论（验人 / 结论 / 理由） ─────────────────── */
+
+/**
+ * 结论 → 中文。宿主只写 `pass` / `fail` 两个值（`shared/types.ts#TaskReview`），
+ * 枚举不上屏；映射表放这里，组件与卡片不得各写一份。
+ */
+const REVIEW_VERDICT_TEXT: Record<TaskReview['verdict'], string> = {
+  pass: '通过',
+  fail: '打回',
+}
+
+/** 「验人」= `gate` 时的人话：这条结论不是人下的，是门禁通过后自动进待验收。 */
+export const REVIEW_BY_GATE_TEXT = '门禁放行'
+export const REVIEW_BY_UNKNOWN_TEXT = '判定者未记录'
+/** 理由为空时的兜底：如实说「没写」，不拿结论反推理由。 */
+export const REVIEW_REASON_EMPTY_TEXT = '未写理由'
+
+export interface TaskReviewView {
+  verdict: TaskReview['verdict']
+  /** 结论（通过 / 打回）。 */
+  verdictText: string
+  /** 验人（门禁放行 / 成员或队长标识 / 未记录）。 */
+  byText: string
+  /** 理由摘要（多条用「；」连接；没有则「未写理由」）。 */
+  reasonText: string
+  /** 结论时刻（本地时间，秒级；缺记录如实写「时间未记录」）。 */
+  atText: string
+  /** 展开区那一行的可见文本：`验收：通过 · 理由摘要`。 */
+  text: string
+  /** 悬停全文：谁、何时、完整理由。 */
+  title: string
+}
+
+/**
+ * 人工验收结论 → 展开区一行文案（r42）。
+ *
+ * **只认宿主写下的事实**：`task.review` 缺席（旧快照 / 还没验收）返回 `undefined`，
+ * 组件据此不渲染这一行 —— 绝不拿 `status === 'review'` 反推「应该有人看过」。
+ * `verdict` 不是 pass/fail 的脏数据同样当作「没记录」（宁可少一行，也不编结论）。
+ */
+export function taskReviewViewOf(
+  task: { review?: TaskReview } | null | undefined,
+): TaskReviewView | undefined {
+  const review = task?.review
+  if (review === null || review === undefined) return undefined
+  const verdict = review.verdict
+  if (verdict !== 'pass' && verdict !== 'fail') return undefined
+  const byRaw = typeof review.by === 'string' ? review.by.trim() : ''
+  const byText = byRaw === '' ? REVIEW_BY_UNKNOWN_TEXT : byRaw === 'gate' ? REVIEW_BY_GATE_TEXT : byRaw
+  const reasons = Array.isArray(review.reasons)
+    ? review.reasons.filter((reason): reason is string => typeof reason === 'string' && reason.trim() !== '')
+    : []
+  const joined = reasons.map((reason) => reason.trim()).join('；')
+  const reasonText = joined === '' ? REVIEW_REASON_EMPTY_TEXT : joined
+  const at = review.at
+  const atText =
+    typeof at === 'number' && Number.isFinite(at) && at > 0 ? formatStamp(at) : '时间未记录'
+  const verdictText = REVIEW_VERDICT_TEXT[verdict]
+  return {
+    verdict,
+    verdictText,
+    byText,
+    reasonText,
+    atText,
+    text: `验收：${verdictText} · ${reasonText}`,
+    title: `${byText} · ${atText}：${reasonText}`,
+  }
 }
 
 /* ─────────────────── r33：「待回执」（成员结束本轮却没交回执） ─────────────────── */
@@ -1911,8 +2072,12 @@ export interface TaskDetailPanelView {
   usageMetrics?: UsageMetric[]
   durationReason?: string
   evidence?: GateEvidenceView
+  /** t46：证据旁标「宿主代跑」—— 只有宿主写下了 `autoReceipt` 才出现。 */
+  autoReceipt?: AutoReceiptView
   /** r33：展开区里的回执行 —— 只有宿主判定待回执时才出现。 */
   awaitingReceipt?: AwaitingReceiptView
+  /** r42：展开区里的验收结论行 —— 只有 `task.review` 存在时才出现（旧快照不补）。 */
+  review?: TaskReviewView
 }
 
 /** 展开区的内容（键值行）。没有的东西给「未声明 / 无」，不留空行。 */
@@ -1946,10 +2111,16 @@ export function taskDetailOf(task: TaskCardSource): TaskDetailPanelView {
       atText: formatStamp(evidence.at),
     }
   }
+  // t46：宿主代跑标记紧跟在门禁证据之后（先回答「门禁结果」，再回答「谁跑的」）。
+  const autoReceipt = autoReceiptViewOf(task.autoReceipt)
+  if (autoReceipt !== undefined) panel.autoReceipt = autoReceipt
   // r33：回执行放在门禁之后（先看有没有证据，再看人是不是已经停了）。
   if (awaitingReceiptOf(task)) {
     panel.awaitingReceipt = { text: AWAITING_RECEIPT_TEXT, title: awaitingReceiptTitleOf(task) }
   }
+  // r42：验收结论紧跟门禁/回执（先给「机器过了没」，再给「人点头了没」）。
+  const review = taskReviewViewOf(task)
+  if (review !== undefined) panel.review = review
   return panel
 }
 
@@ -2854,6 +3025,10 @@ export function buildTaskDetail(task: PlanTask, parts: TaskDetailContext): TaskC
   const facts = task as PlanTask & AwaitingReceiptFact
   if (facts.awaitingReceipt !== undefined) detail.awaitingReceipt = facts.awaitingReceipt
   if (facts.silentFinish !== undefined) detail.silentFinish = { ...facts.silentFinish }
+  // t46：代跑事实同样原样带入（`PlanTask.autoReceipt`；旧数据缺席就不显示，不补 0）。
+  if (task.autoReceipt !== undefined) detail.autoReceipt = { ...task.autoReceipt }
+  // r42：人工验收结论原样带入（`PlanTask.review`；旧快照/历史 run 缺席就不显示）。
+  if (task.review !== undefined) detail.review = task.review
   return detail
 }
 

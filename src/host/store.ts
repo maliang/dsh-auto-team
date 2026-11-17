@@ -690,6 +690,8 @@ const TASK_STATUSES: readonly TaskStatus[] = [
   'waiting',
   'paused',
   'gate',
+  /** r42：门禁通过但等人工验收 —— 读盘归回 pending 会让它被重新派发、证据白跑一遍。 */
+  'review',
   'done',
   'rework',
   'failed',

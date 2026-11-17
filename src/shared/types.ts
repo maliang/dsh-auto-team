@@ -25,6 +25,14 @@ export type TaskStatus =
    */
   | 'paused'
   | 'gate'
+  /**
+   * 门禁已通过、等人工验收（r42）：状态机出口不再直接 `done`。
+   *
+   * 非终态 —— **写域保持占用、下游保持阻塞**（`isTerminalTaskStatus` 不含它，
+   * `depSatisfied` 只认 done/skipped）。出路只有两条：人工判定通过（写 `done` 收口）
+   * 或打回（`rework`）/取消（`cancelled`）。门禁在 review 态上不得重入。
+   */
+  | 'review'
   | 'done'
   | 'rework'
   | 'failed'
@@ -85,6 +93,24 @@ export interface RoleModelRoute {
   reasoningEffort?: 'low' | 'medium' | 'high'
 }
 
+/**
+ * 人工验收结论（r42）：`pass` 只由验收闸门/人工放行写出，`fail` 表示打回。
+ *
+ * 证据链仍以 `PlanTask.evidence` 为准，这里只记「谁在什么时候、因为什么下的结论」；
+ * `assertions` 留给人工补充的判断依据（可为空）。
+ */
+export interface TaskReview {
+  verdict: 'pass' | 'fail'
+  /** 结论时刻（毫秒）。 */
+  at: number
+  /** 判定者：`gate` = 门禁通过后自动进入待验收；其余为成员/队长标识。 */
+  by: string
+  /** 结论理由（中文，面板原样渲染）。 */
+  reasons: string[]
+  /** 人工补充的判断依据（可选）。 */
+  assertions?: string[]
+}
+
 /** 计划中的单个任务（依赖图的一个节点）。 */
 export interface PlanTask {
   id: string
@@ -100,6 +126,8 @@ export interface PlanTask {
   memberId?: string
   /** 最近一次门禁证据（AC-19：命令、退出码、输出尾部、全量日志路径）。 */
   evidence?: GateEvidence
+  /** r42：最近一次人工验收结论（门禁通过进入 `review` 时写 pass，打回时写 fail）。 */
+  review?: TaskReview
   /**
    * r33：**观察事实** —— 成员已结束本轮，却没有提交回执（任务仍卡在 `running`）。
    *
@@ -109,6 +137,14 @@ export interface PlanTask {
    * 也不替成员执行门禁。任务离开 `running`（receipt / rework / cancel / 计划收口）时清除。
    */
   silentFinish?: { at: number; memberId: string }
+  /**
+   * 宿主**代跑**门禁的事实（与 `silentFinish` 互斥）：成员静默收工后由宿主经
+   * `bridge.act('receipt')` 跑了验收。`at` = 代跑时刻，`exitCode` = 那次门禁的退出码。
+   *
+   * 只用于区分「成员自己交的回执」与「宿主代跑」；证据本身仍在 `evidence` 里，本字段不复制它。
+   * `exitCode = -1` = 门禁超时/被信号终止（`GateEvidence.exitCode` 是 null，不是「返回 0」）。
+   */
+  autoReceipt?: { at: number; exitCode: number }
   /** 已返工次数（AC-19）：达到 MAX_ATTEMPTS 后转 failed 并需人工处理。 */
   attempts?: number
   /** 上一次 resume 的时间（AC-17 幂等去抖，见 RESUME_DEBOUNCE_MS）。 */
@@ -336,8 +372,26 @@ export interface AutoTeamSettings {
    * 可选：缺席 = 取缺省值，老版本写下的 settings.json 与单测桩都不必补字段。
    */
   stepReminderAt?: number
+  /**
+   * 宿主自动回执开关（缺省 = **开启**；只有显式 `false` 才关闭）。
+   *
+   * 开启时：成员 idle、任务仍 `running`、且还没有门禁证据 → 宿主经 `bridge.act('receipt')`
+   * 代跑一次验收（不绕过任何闸门），成功后写 `PlanTask.autoReceipt`，失败回落「待回执」。
+   * 可选：缺席 = 开启，老版本写下的 settings.json 与单测桩都不必补字段。
+   */
+  autoReceipt?: boolean
   /** 队长默认模型（缺省 = 跟随会话默认）；settings.json 是唯一写入点。 */
   captainModel?: RoleModelRoute
+  /**
+   * 门禁通过后是否先转「待验收」（r42，缺省 = `'code'`）。
+   *
+   * - `code`：只有 `writeScopes` 命中 `src/`（含 `src` 本身）的任务需要人工验收；
+   * - `all`：一律需要；
+   * - `off`：一律不需要，门禁通过直接 `done`（旧行为）。
+   *
+   * 可选：缺席 = `code`，老版本 settings.json 与单测桩都不必补字段。
+   */
+  reviewPolicy?: 'code' | 'all' | 'off'
 }
 
 /** 面板上的成员行（由 RunState.bindings × Plan.tasks 组装，见 bridge.membersOf）。 */
@@ -1259,7 +1313,7 @@ export interface ExpandPayload {
 /* ───────────────────────────────── 动作与结果 ───────────────────────────────── */
 
 /**
- * 面板动作全集（25 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
+ * 面板动作全集（26 个）。**HTTP `/act` 与模型可见的 `auto_team_*` 工具共用同一套语义**，
  * 两条入口都走 `bridge.act`，不允许各写一套分支（历史高频缺陷：工具能用、面板不能用）。
  */
 export type PanelAction =
@@ -1282,6 +1336,14 @@ export type PanelAction =
   | { type: 'resume'; taskId?: string; memberId?: string }
   /** 成员自述完成 → 跑门禁 → 判定（AC-19）；note 写入证据说明。 */
   | { type: 'receipt'; taskId: string; note?: string }
+  /**
+   * t2：人工验收结论 —— `review` 态的唯一出口。
+   *
+   * 硬校验在 `bridge.act`：任务必须处于 `review`；评审人（调用方成员）**不得是原作者**
+   * （同一条任务未退休 binding 的 memberId）。`pass` → `done`；`fail` → 返工（attempts+1），
+   * 并把 `reasons` 作为必改项原样发回原作者。两种结论都写 `task.review`。
+   */
+  | { type: 'reviewTask'; taskId: string; verdict: 'pass' | 'fail'; reasons: string[] }
   | { type: 'saveMemory'; track: MemoryTrack; name: string; body: string }
   | { type: 'deleteMemory'; track: MemoryTrack; name: string }
   /**

@@ -77,6 +77,9 @@ import { createTriggerBus, type TriggerBus } from './team/trigger-bus.ts'
 import { readCaptainModel, captainModelView } from './team/captain.ts'
 import { triggerFromMemberExit } from './team/trigger.ts'
 import { isSilentFinish } from './team/silent-finish.ts'
+// t46：成员静默收工后的「宿主代跑门禁」——判定是纯函数，动作只经 bridge.act('receipt')。
+import { autoReceiptNoteOf, shouldAutoReceipt, withAutoReceipt } from './team/auto-receipt.ts'
+import { appendMessage, makeMessage } from './team/messages.ts'
 import { createExpander } from './memory/expand.ts'
 import { listMemoryItems } from './memory/repo.ts'
 import type { MemoryRoots } from './memory/repo.ts'
@@ -322,23 +325,158 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   const memberSawWork = new Set<string>()
 
   /**
+   * t46：自动回执的两条内存集合（都不落盘 —— 幂等只需要在**本进程**成立，
+   * 重启后宁可让队长手动点，也不要拿旧标记冒充「刚跑过」）。
+   *
+   *  - `autoReceiptInflight`：同一任务正在跑门禁，防同一次 idle 被两条信号各推一次；
+   *  - `autoReceiptRan`：同一 (run, task, 第几轮) 已经代跑过 —— 失败回落「待回执」后
+   *    不再反复重试（返工一次 `attempts` 会 +1，新的一轮才允许再代跑，
+   *    重试次数本身仍只由 `applyReceipt` 的 `maxAttempts` 决定）。
+   */
+  const autoReceiptInflight = new Set<string>()
+  const autoReceiptRan = new Set<string>()
+
+  /** 幂等键：「这一轮」= `attempts` 相同；任务被返工后 attempts 变化，视为新一轮。 */
+  function autoReceiptKeyOf(runId: string, taskId: string, attempts: number | undefined): string {
+    return `${runId}|${taskId}|${attempts ?? 0}`
+  }
+
+  /** 一次代跑的入参（判定在纯函数里，这里只装事实）。 */
+  interface AutoReceiptJob {
+    sessionId: string
+    runId: string
+    taskId: string
+    memberId: string
+    memberName: string
+    /** idle 事件到达时刻（「待回执」回落路径沿用它，保持 r41 的同源时刻）。 */
+    at: number
+    key: string
+  }
+
+  /**
+   * 宿主代跑门禁，并按结果落一个事实。
+   *
+   * **动作一律经 `bridge.act('receipt')`**：preflightGate（未启用/计划暂停/终态）、任务级
+   * 暂停拒绝、enqueueGate 排队、runGate 证据、applyReceipt 的 attempts 上限全部复用既有实现
+   * —— 这里绝不自己调 gate，否则同一件事会有两套语义。
+   *
+   * 成功（任务真的离开 running 且有 evidence）→ 写 `autoReceipt` + 一条 captain→user 账本
+   * 消息（带 taskId，面板活动流由 `activityOf` 从 messages 现算，因此「+activity」自动成立）；
+   * 失败/竞态（rejected、任务已完成、已被别人收口）→ 不写 autoReceipt，回落 r41 的
+   * 「待回执」观察事实（幂等：任务已离开 running 时它自己原样返回）。
+   */
+  async function runAutoReceipt(job: AutoReceiptJob): Promise<void> {
+    const { sessionId, runId, taskId, memberId, memberName, at, key } = job
+    try {
+      const result = await bridge.act(sessionId, { type: 'receipt', taskId }, runId)
+      // act 已经自己落盘；这里重新读一份真值再决定补什么，绝不拿 act 之前的 state 凑数。
+      const fresh = store.load(runId)
+      const task = fresh?.plan.tasks.find((item) => item.id === taskId)
+      const exitCode = task?.evidence?.exitCode ?? undefined
+      const succeeded =
+        result.rejected === undefined &&
+        task !== undefined &&
+        task.evidence !== undefined &&
+        task.status !== 'running'
+      if (fresh !== null && task !== undefined && succeeded) {
+        const marked = withAutoReceipt(task, { at: now(), exitCode: exitCode ?? -1 })
+        const next = appendMessage(
+          {
+            ...fresh,
+            plan: {
+              ...fresh.plan,
+              tasks: fresh.plan.tasks.map((item) => (item.id === taskId ? marked : item)),
+            },
+          },
+          makeMessage({
+            from: 'captain',
+            to: 'user',
+            taskId,
+            at: now(),
+            body: `任务 ${taskId}：${autoReceiptNoteOf({ rejected: undefined, exitCode })}`,
+          }),
+        )
+        try {
+          store.save(next)
+        } catch (error) {
+          warn(ctx, `自动回执落盘失败（任务 ${taskId}）：${messageOf(error)}`)
+        }
+        return
+      }
+      // 回落：act 被拒（暂停 / 已完成 / NOT_FOUND / PAUSED…）或发生竞态 —— 徽标照旧可见。
+      if (fresh === null) return
+      const fallback = recordSilentFinish(fresh, { taskId, memberId, memberName, at })
+      if (fallback === fresh) return
+      try {
+        store.save(fallback)
+      } catch (error) {
+        warn(ctx, `待回执落盘失败：${messageOf(error)}`)
+      }
+    } catch (error) {
+      // 代跑链自身抛异常（不是「act 返回拒绝」）：任务通常已被 bridge 还原成 running，
+      // 这里补一次「待回执」事实，让队长至少看得见「没人干了」，不要静默吞掉。
+      warn(ctx, `自动回执失败（任务 ${taskId}）：${messageOf(error)}`)
+      try {
+        const fresh = store.load(runId)
+        if (fresh !== null) {
+          const fallback = recordSilentFinish(fresh, { taskId, memberId, memberName, at })
+          if (fallback !== fresh) store.save(fallback)
+        }
+      } catch (inner) {
+        warn(ctx, `待回执落盘失败：${messageOf(inner)}`)
+      }
+    } finally {
+      autoReceiptInflight.delete(key)
+    }
+  }
+
+  /**
    * 成员结束本轮（`agent/status: idle`）→ 落「待回执」观察事实。
    *
-   * 只做一件事：对**该成员**所有未退休绑定，用同一个 `isSilentFinish` 判定，命中就
-   * `recordSilentFinish`（幂等、不刷新 at）并落盘。不推总线、不改任务状态、不自动 rework、
-   * 不标 done/failed —— 那四件事只能由队长显式发起。
+   * 每个候选先问 `shouldAutoReceipt`（t46）：开启自动回执、任务仍 running、任务与计划都没暂停、
+   * 没有证据、也没有在跑的代跑 → 交给 `runAutoReceipt`（走既有回执通路）；否则维持 r41 的行为，
+   * 用同一个 `isSilentFinish` 判定后 `recordSilentFinish`（幂等、不刷新 at）并落盘。
+   *
+   * 除「代跑门禁」这一条外不推总线、不改任务状态、不自动 rework —— 那条通路自己的
+   * `applyReceipt` 决定 done/rework。
    */
   function recordMemberIdle(memberId: string, at: number): void {
     try {
+      // 设置一次读：同一批 idle 判定不读到两个版本的开关。
+      const enabled = settingsRepo.read().autoReceipt !== false
       for (const summary of store.list()) {
         const state = store.load(summary.runId)
         if (!state) continue
         let next = state
+        const autoJobs: AutoReceiptJob[] = []
         for (const binding of state.bindings) {
           if (binding.retired === true || binding.memberId !== memberId) continue
           const task = next.plan.tasks.find((item) => item.id === binding.taskId)
           if (task === undefined) continue
           if (!isSilentFinish({ task, binding, memberStopped: true })) continue
+          const key = autoReceiptKeyOf(summary.runId, task.id, task.attempts)
+          const shouldAuto = shouldAutoReceipt({
+            status: task.status,
+            paused: state.taskPauses?.[task.id] !== undefined || task.status === 'paused',
+            planPaused: state.plan.status === 'paused',
+            hasEvidence: task.evidence !== undefined,
+            inflight: autoReceiptInflight.has(key) || autoReceiptRan.has(key),
+            enabled,
+          })
+          if (shouldAuto) {
+            autoReceiptInflight.add(key)
+            autoReceiptRan.add(key)
+            autoJobs.push({
+              sessionId: state.plan.sessionId,
+              runId: summary.runId,
+              taskId: task.id,
+              memberId: binding.memberId,
+              memberName: binding.name,
+              at,
+              key,
+            })
+            continue
+          }
           next = recordSilentFinish(next, {
             taskId: task.id,
             memberId: binding.memberId,
@@ -346,12 +484,17 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
             at,
           })
         }
-        if (next === state) continue
-        try {
-          store.save(next)
-        } catch (error) {
-          // 观察事实落盘失败不能连累既有推进链：退回轮询路径下一轮照样会判出来。
-          warn(ctx, `待回执落盘失败：${messageOf(error)}`)
+        if (next !== state) {
+          try {
+            store.save(next)
+          } catch (error) {
+            // 观察事实落盘失败不能连累既有推进链：退回轮询路径下一轮照样会判出来。
+            warn(ctx, `待回执落盘失败：${messageOf(error)}`)
+          }
+        }
+        // 代跑是异步的（门禁要真跑命令）：落完盘再发起，不阻塞事件回调。
+        for (const job of autoJobs) {
+          void runAutoReceipt(job)
         }
       }
     } catch (error) {

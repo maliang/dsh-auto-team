@@ -441,6 +441,7 @@ const SETTING_HINTS = {
   maxAttempts: '1–10',
   gateTimeoutMs: '1000–600000',
   captainModel: '缺省 = 跟随会话默认',
+  autoReceipt: '成员停手没交回执时由宿主代跑门禁；关掉则只标『待回执』等人处理',
 } as const
 
 /**
@@ -494,6 +495,94 @@ export function settingsKeysView(settings: AutoTeamSettings): {
   ]
 }
 
+/* ─────────────────────── 设置页布尔开关（t46 自动回执） ─────────────────────── */
+
+/**
+ * 「成员停手后自动验收」开关。
+ *
+ * 为什么不塞进上面 6 行：AC-16 把数字/模型参数区钉成 6 行（顺序与标签被单测锁死），
+ * 布尔开关是另一类字段（没有取值域、没有 `num()` 归一）。文案仍与参数行同源放在本文件，
+ * 渲染器只负责画，不要自己再写一遍中文。
+ */
+export const AUTO_RECEIPT_SETTING_KEY = 'autoReceipt'
+export const AUTO_RECEIPT_SETTING_LABEL = '成员停手后自动验收'
+
+export interface SettingsToggleView {
+  key: typeof AUTO_RECEIPT_SETTING_KEY
+  label: string
+  hint: string
+  /** 缺省 = 开启：只有显式 `false` 才算关闭（与宿主 `shouldAutoReceipt` 同口径）。 */
+  value: boolean
+}
+
+export function settingsToggleView(settings: AutoTeamSettings): SettingsToggleView {
+  const s = (settings ?? {}) as Partial<AutoTeamSettings>
+  return {
+    key: AUTO_RECEIPT_SETTING_KEY,
+    label: AUTO_RECEIPT_SETTING_LABEL,
+    hint: SETTING_HINTS.autoReceipt,
+    value: s.autoReceipt !== false,
+  }
+}
+
+/* ─────────────────── r42：人工验收策略（reviewPolicy 三选一） ─────────────────── */
+
+/**
+ * 门禁通过后要不要人工点头。
+ *
+ * 为什么不塞进上面 6 行参数区：AC-16 把数字/模型参数钉成 6 行（顺序与标签被单测锁死），
+ * 而这是枚举项（没有取值域、没有 `num()` 归一），与 t46 的 `autoReceipt` 同类 ——
+ * 渲染成独立一行，文案仍与参数行同源放在本文件里，组件不许自己再写一遍中文。
+ */
+export const REVIEW_POLICY_SETTING_KEY = 'reviewPolicy'
+
+export const REVIEW_POLICY_SETTING_LABEL = '人工验收策略'
+
+/** 与 `shared/types.ts#AutoTeamSettings.reviewPolicy` 同一取值域（client 不能 import host）。 */
+export type ReviewPolicy = 'code' | 'all' | 'off'
+
+export interface ReviewPolicyOptionView {
+  value: ReviewPolicy
+  /** 下拉框里那一行（短）。 */
+  label: string
+  /** 悬停补充（长），说明这一档到底验谁。 */
+  detail: string
+}
+
+/** 三档选项（顺序即下拉框顺序；`code` 是宿主缺省值）。 */
+export const REVIEW_POLICY_OPTIONS: readonly ReviewPolicyOptionView[] = [
+  { value: 'code', label: '只验改代码的任务', detail: '写域命中 src/ 的任务才停下来等人工验收（缺省）' },
+  { value: 'all', label: '所有任务都验', detail: '每个任务门禁通过后都停在「待验收」' },
+  { value: 'off', label: '不验，门禁通过即完成', detail: '门禁 exit 0 直接转「已通过」，不设人工关' },
+]
+
+export interface SettingsReviewPolicyView {
+  key: typeof REVIEW_POLICY_SETTING_KEY
+  label: string
+  hint: string
+  value: ReviewPolicy
+  options: readonly ReviewPolicyOptionView[]
+}
+
+/**
+ * 设置值 → 三档之一。缺失/脏值一律落回 `code`：
+ * 那是宿主缺省（`默认只对 src/ 有改动的任务要验收`），把它显示成「不验」会让用户以为关掉了。
+ */
+export function reviewPolicyOf(value: unknown): ReviewPolicy {
+  return value === 'all' || value === 'off' || value === 'code' ? value : 'code'
+}
+
+export function settingsReviewPolicyView(settings: AutoTeamSettings): SettingsReviewPolicyView {
+  const s = (settings ?? {}) as Partial<AutoTeamSettings>
+  return {
+    key: REVIEW_POLICY_SETTING_KEY,
+    label: REVIEW_POLICY_SETTING_LABEL,
+    hint: '默认只对 src/ 有改动的任务要验收；all=所有任务；off=不验',
+    value: reviewPolicyOf(s.reviewPolicy),
+    options: REVIEW_POLICY_OPTIONS,
+  }
+}
+
 /* ─────────────────────────────── 内部小工具 ─────────────────────────────── */
 
 /**
@@ -502,7 +591,7 @@ export function settingsKeysView(settings: AutoTeamSettings): {
  */
 export type PlanPillInput = Pick<
   RunStageInput,
-  'planStatus' | 'done' | 'total' | 'running' | 'failed' | 'interrupted' | 'members'
+  'planStatus' | 'done' | 'total' | 'running' | 'reviewing' | 'failed' | 'interrupted' | 'members'
 >
 
 /**

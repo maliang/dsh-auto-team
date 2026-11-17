@@ -28,8 +28,13 @@ export interface ScopeWait {
   path: string
 }
 
-/** 视为持锁的状态：running 与它的门禁子阶段 gate。 */
-const HOLDER_STATUSES: ReadonlySet<PlanTask['status']> = new Set<PlanTask['status']>(['running', 'gate'])
+/**
+ * 视为持锁的状态：running 与它的门禁子阶段 gate，以及 r42 的 review（待人工验收）。
+ *
+ * review 必须持锁：门禁已通过、代码已是待验收的那一版，验收前被别人拿去改同一批文件，
+ * 验收的就是另一份代码了 —— 写域在这里不是「谁在写」而是「谁拥有这一版」。
+ */
+const HOLDER_STATUSES: ReadonlySet<PlanTask['status']> = new Set<PlanTask['status']>(['running', 'gate', 'review'])
 
 function scopesOf(task: PlanTask): string[] {
   const seen = new Set<string>()

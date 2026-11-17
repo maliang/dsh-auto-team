@@ -1,5 +1,5 @@
 /**
- * 单任务干预（r11 F8）的**唯一允许集与唯一文案源**：13 态 × 4 动作。
+ * 单任务干预（r11 F8）的**唯一允许集与唯一文案源**：14 态 × 4 动作。
  *
  * 为什么放 `src/shared` 而不是 host/client 各写一份：宿主的拒绝文案与面板的 disabled 矩阵
  * 必须是同一张表派生的（AC-27）。两边各写一个 `switch`，第一次改允许集就会分叉，
@@ -8,7 +8,7 @@
  * 纪律：
  *  1. 允许集与禁用原因写在同一格（`Cell`）里，避免「布尔表」与「原因表」两张表漂移；
  *     对外的 `TASK_ACTION_ALLOW` 只是从它派生出的形状（蓝图要求的名字）。
- *  2. 13 态**逐格显式**写死，禁止 `default` 兜底：漏一族的状态必须让类型检查报错，
+ *  2. 14 态**逐格显式**写死，禁止 `default` 兜底：漏一族的状态必须让类型检查报错，
  *     而不是悄悄落到某个「默认允许/默认拒绝」上。
  *  3. 中文标签只此一份，`viewmodel` 的徽标文案也读它（状态中文不得出现第二份）。
  */
@@ -37,7 +37,7 @@ function deny(reason: string): Cell {
 }
 
 /**
- * 13 态 × 4 动作的裁决表（DESIGN §3.4 逐格照抄；`pause` 列见 r37）。
+ * 14 态 × 4 动作的裁决表（DESIGN §3.4 逐格照抄；`pause` 列见 r37，`review` 行见 r42）。
  *
  * 口径来源（PRD AC-26 + 技术方案 §7.1）：
  *  - `cancel`：pending/blocked/ready/waiting/running/rework/failed 允许；
@@ -69,6 +69,17 @@ const MATRIX: Record<TaskStatus, Record<TaskActionKey, Cell>> = {
     skip: deny('门禁执行中'),
     acceptance: ALLOW,
     pause: ALLOW,
+  },
+  /**
+   * r42：门禁已通过、等人工验收。取消/跳过（终态，释放写域）与改验收都允许；
+   * **暂停拒绝** —— 验收态不是可冻结的执行态，挡住它只会让写域被无意义地占着。
+   * 出路是「打回」或「取消」，文案必须点名，别让用户去找一个不存在的按钮。
+   */
+  review: {
+    cancel: ALLOW,
+    skip: ALLOW,
+    acceptance: ALLOW,
+    pause: deny('任务在验收中，先打回或取消'),
   },
   paused: {
     // D1：两级暂停入口的按钮名不同（页头「继续团队」/ 行内「继续此任务」），文案必须分别点名，
@@ -109,7 +120,7 @@ const KEY_OF: Record<TaskActionName, TaskActionKey> = {
 }
 
 /**
- * 13 态 × 4 动作的允许集（蓝图声明的形状）：面板的 `disabled` 与宿主的拒绝面都读它。
+ * 14 态 × 4 动作的允许集（蓝图声明的形状）：面板的 `disabled` 与宿主的拒绝面都读它。
  *
  * 从 `MATRIX` 派生而不是手写第二份布尔表——两份表是 AC-27「矩阵与允许集一致」的唯一风险点。
  */
@@ -153,7 +164,7 @@ export function taskActionDisabledReason(action: TaskActionName, status: TaskSta
 }
 
 /**
- * 13 条状态中文标签（互不重复）。徽标、任务行、宿主的拒绝文案都读这一张表。
+ * 14 条状态中文标签（互不重复）。徽标、任务行、宿主的拒绝文案都读这一张表。
  *
  * 红只给 `failed` / `interrupted`（tone 在 viewmodel 里）；取消与跳过是用户主动行为，用中性色。
  */
@@ -167,6 +178,7 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   failed: '失败',
   interrupted: '已中断',
   gate: '门禁中',
+  review: '待验收',
   paused: '已暂停',
   done: '已通过',
   cancelled: '已取消',

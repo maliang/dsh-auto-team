@@ -13,7 +13,8 @@
  */
 import * as React from 'react'
 import type { AutoTeamSettings, Result, Role, SkillInfo, SkillMutation } from '../shared/types.ts'
-import { settingsKeysView } from './ui.ts'
+import { reviewPolicyOf, settingsKeysView, settingsReviewPolicyView, settingsToggleView } from './ui.ts'
+import type { ReviewPolicy } from './ui.ts'
 import { actFeedback, hintOf } from './viewmodel.ts'
 import { panelApi } from './api.ts'
 import type { SkillBodyPayload } from './api.ts'
@@ -50,6 +51,10 @@ interface Draft {
   gateTimeoutMs: string
   captainProvider: string
   captainModel: string
+  /** t46：布尔开关，缺省开启（主机同样只在显式 false 时关闭）。 */
+  autoReceipt: boolean
+  /** r42：人工验收策略（三选一；缺省 code = 只验改代码的任务）。 */
+  reviewPolicy: ReviewPolicy
 }
 
 function draftOf(settings: AutoTeamSettings): Draft {
@@ -61,6 +66,8 @@ function draftOf(settings: AutoTeamSettings): Draft {
     gateTimeoutMs: String(settings.gateTimeoutMs),
     captainProvider: settings.captainModel?.provider ?? '',
     captainModel: settings.captainModel?.model ?? '',
+    autoReceipt: settings.autoReceipt !== false,
+    reviewPolicy: reviewPolicyOf(settings.reviewPolicy),
   }
 }
 
@@ -132,6 +139,8 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
       stallMs: Number(draft.stallMs.trim()),
       maxAttempts: Number(draft.maxAttempts.trim()),
       gateTimeoutMs: Number(draft.gateTimeoutMs.trim()),
+      autoReceipt: draft.autoReceipt,
+      reviewPolicy: draft.reviewPolicy,
     }
     const provider = draft.captainProvider.trim()
     const model = draft.captainModel.trim()
@@ -156,6 +165,15 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
     })
   }
 
+  function patchToggle(value: boolean): void {
+    setDraft((previous) => ({ ...previous, autoReceipt: value }))
+  }
+
+  /** r42：三选一没有「非法输入」可言（下拉框只能选到三档），因此不参与 validateDraft。 */
+  function patchReviewPolicy(value: string): void {
+    setDraft((previous) => ({ ...previous, reviewPolicy: reviewPolicyOf(value) }))
+  }
+
   async function roleAction(action: unknown, done: string): Promise<void> {
     setBusy(true)
     try {
@@ -176,6 +194,12 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
       : undefined
 
   const rows = settingsKeysView(settings)
+  const toggle = settingsToggleView(settings)
+  const policy = settingsReviewPolicyView(settings)
+  const policyId = `dsh-auto-team-setting-${policy.key}`
+  const policyHintId = `${policyId}-hint`
+  const toggleId = `dsh-auto-team-setting-${toggle.key}`
+  const toggleHintId = `${toggleId}-hint`
 
   return (
     <section data-auto-team-settings data-busy={busy ? 'true' : 'false'}>
@@ -243,6 +267,67 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
             </div>
           )
         })}
+        <div
+          key={toggle.key}
+          data-setting-row
+          data-setting-key={toggle.key}
+          data-setting-toggle-row
+          data-error-state="false"
+        >
+          <label data-setting-label htmlFor={toggleId}>
+            {toggle.label}
+          </label>
+          <span data-setting-inputs>
+            {/* 外层 label 把「已开启/已关闭」文案也变成命中区，窄宽下不必精确点中 16px 方框。 */}
+            <label data-setting-toggle-hit htmlFor={toggleId}>
+              <input
+                id={toggleId}
+                type="checkbox"
+                data-setting-input={toggle.key}
+                checked={draft.autoReceipt}
+                disabled={busy}
+                aria-describedby={toggleHintId}
+                onChange={(event) => patchToggle(event.target.checked)}
+              />
+              <span data-setting-toggle-state>{draft.autoReceipt ? '已开启' : '已关闭'}</span>
+            </label>
+          </span>
+          <span data-setting-hint data-setting-hint-full id={toggleHintId}>
+            {toggle.hint}
+          </span>
+        </div>
+        {/* r42：人工验收策略 —— 枚举项单独一行（6 行参数区被 AC-16 钉住，不往里塞）。 */}
+        <div
+          key={policy.key}
+          data-setting-row
+          data-setting-key={policy.key}
+          data-setting-policy-row
+          data-error-state="false"
+        >
+          <label data-setting-label htmlFor={policyId}>
+            {policy.label}
+          </label>
+          <span data-setting-inputs>
+            <select
+              id={policyId}
+              data-setting-input={policy.key}
+              data-setting-select
+              value={draft.reviewPolicy}
+              disabled={busy}
+              aria-describedby={policyHintId}
+              onChange={(event) => patchReviewPolicy(event.target.value)}
+            >
+              {policy.options.map((option) => (
+                <option key={option.value} value={option.value} title={option.detail}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </span>
+          <span data-setting-hint data-setting-hint-full id={policyHintId}>
+            {policy.hint}
+          </span>
+        </div>
       </div>
 
       <div data-settings-actions>

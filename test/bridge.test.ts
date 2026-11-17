@@ -532,11 +532,11 @@ test('http：四条路由 + GET /memory 校验 + {data} 包装', async () => {
   store.save(stateOf())
 })
 
-test('tools：8 个工具、未启用统一文案、dispatch 强制 runId（AC-30）', async () => {
+test('tools：9 个工具、未启用统一文案、dispatch 强制 runId（AC-30）', async () => {
   const { bridge, store, roles } = setup()
   const specs = buildToolSpecs({ store, roles, bridge, now: () => NOW })
 
-  assert.equal(specs.length, 8)
+  assert.equal(specs.length, 9)
   assert.deepEqual(
     specs.map((spec) => spec.name),
     [
@@ -545,6 +545,7 @@ test('tools：8 个工具、未启用统一文案、dispatch 强制 runId（AC-3
       'auto_team_status',
       'auto_team_message',
       'auto_team_receipt',
+      'auto_team_review',
       'auto_team_memory',
       'auto_team_role',
       'auto_team_add_tasks',

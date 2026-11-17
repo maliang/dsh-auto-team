@@ -12,7 +12,7 @@
  *  ② status 成员视图：字段白名单逐键断言，不含 members/memory/roles/plan/tasks 与其它任务
  *  ③ receipt：只允许自己的 taskId；他人 taskId → FORBIDDEN 且零写入、零门禁
  *  ④ 门禁失败 → rework，证据（退出码/输出尾部）回发给该成员，并落账本
- *  ⑤ 队长路径与开关关闭时的旧文案逐字不变（8 个工具 + leader status/receipt 仍走原分支）；
+ *  ⑤ 队长路径与开关关闭时的旧文案逐字不变（9 个工具 + leader status/receipt 仍走原分支）；
  *     开关关闭时成员的 status/receipt 同态回旧文案（不得一个放行、一个被桥拦成另一句）
  *  ⑥ 非成员会话（无绑定）仍回未启用
  *  ⑦ fake ctx 端到端：成员提交 → 宿主执行 acceptance → done
@@ -418,7 +418,7 @@ test('r30 ④ 门禁失败 → rework，证据（退出码/输出尾部）回发
 
 /* ─────────────────────── ⑤ 队长路径 / 旧文案不变 ─────────────────────── */
 
-test('r30 ⑤ 开关关闭且非成员：8 个工具都逐字返回未启用原文案', async () => {
+test('r30 ⑤ 开关关闭且非成员：9 个工具都逐字返回未启用原文案', async () => {
   const harness = createHarness({ enabled: false })
   assert.equal(NOT_ENABLED_MESSAGE, '自动团队未启用：请在输入框内的「自动团队」选项处启用后再试。')
 
@@ -429,6 +429,7 @@ test('r30 ⑤ 开关关闭且非成员：8 个工具都逐字返回未启用原�
     'auto_team_status',
     'auto_team_message',
     'auto_team_receipt',
+    'auto_team_review',
     'auto_team_memory',
     'auto_team_role',
     'auto_team_add_tasks',
@@ -540,7 +541,7 @@ test('r30 ⑦ fake ctx 端到端：成员提交 → 宿主执行 acceptance → 
   } as unknown as HostContext
 
   registerTools(ctx, harness.deps)
-  assert.equal(definitions.size, 8, 'fake ctx 必须收到全部 8 个工具')
+  assert.equal(definitions.size, 9, 'fake ctx 必须收到全部 9 个工具')
 
   const status = definitions.get('auto_team_status')
   assert.ok(status, 'auto_team_status 必须已注册')

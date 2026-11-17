@@ -107,6 +107,10 @@ export interface TaskLike extends GraphNode {
  * - cancelled 不满足：取消的语义是「这条做不了了」，下游留在 blocked 由人决定；
  * - done 满足；其余（pending/running/...）都不满足。
  *
+ * **锁死**：r42 的 `review`（门禁通过、待人工验收）**不算满足** —— 人工还没放行，
+ * 下游就不能基于这份「未验收的产出」开工。只有 done/skipped 两个值能返回 true，
+ * 新增状态一律默认不满足（新增状态若要满足，必须改这个函数并同步 readyTasks 的口径）。
+ *
  * 为什么必须是函数：dispatch 的下游解锁、readyTasks、blockedTasks 三处都要判，
  * 各写一遍 `status === 'done'` 的话，第一次改语义（加 skipped）就会分叉。
  */

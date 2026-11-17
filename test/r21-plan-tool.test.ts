@@ -252,9 +252,9 @@ test('revise 闸门：新建 run 的工具入口不因「有在跑 run」而并�
   assert.equal(fresh?.plan.sessionId, SESSION)
 })
 
-test('revise 闸门：工具面仍只有 8 个工具（不因 r21 新增入口）', async () => {
+test('revise 闸门：工具面为 9 个工具（r46 新增 review 入口）（不因 r21 新增入口）', async () => {
   const h = createHarness()
-  assert.equal(h.specs.length, 8)
+  assert.equal(h.specs.length, 9)
   assert.deepEqual(
     h.specs.map((spec) => spec.name).sort(),
     [
@@ -263,6 +263,7 @@ test('revise 闸门：工具面仍只有 8 个工具（不因 r21 新增入口�
       'auto_team_message',
       'auto_team_plan',
       'auto_team_receipt',
+      'auto_team_review',
       'auto_team_role',
       'auto_team_status',
       'auto_team_add_tasks',

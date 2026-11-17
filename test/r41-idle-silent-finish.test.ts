@@ -18,7 +18,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -236,9 +236,26 @@ const receiptNoticesOf = (state: RunState): RunState['messages'] =>
 const interruptedOf = (state: RunState): boolean =>
   state.plan.tasks[0].status === 'interrupted' || /已失联/.test(state.messages.map((m) => m.body).join('\n'))
 
-/* ───────────────────────────── 1) idle → 待回执 + 幂等 ───────────────────────────── */
+/** 等某个异步落盘结果出现（代跑门禁不是同步的；不 sleep 猜时序）。 */
+async function waitForTask(
+  store: RunsStore,
+  read: (task: PlanTask) => PlanTask | undefined,
+  what: string,
+  timeoutMs = 15_000,
+): Promise<PlanTask> {
+  const started = Date.now()
+  for (;;) {
+    const task = store.load(RUN)?.plan.tasks[0]
+    const value = task === undefined ? undefined : read(task)
+    if (value !== undefined) return value
+    if (Date.now() - started > timeoutMs) throw new Error(`等待超时：${what}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
 
-test('r41 idle→待回执：先 running 再 idle 落 silentFinish，通知恰一条且 taskId 正确；重复 idle 幂等', async () => {
+/* ───────────────────────────── 1) idle → 宿主代跑门禁（默认）+ 幂等 ───────────────────────────── */
+
+test('r41 idle→默认宿主代跑门禁：任务 running 无证据时 idle 真跑门禁并 done + autoReceipt，不落 silentFinish；重复 idle 幂等', async () => {
   const { h, home, store } = openHarness()
   try {
     await h.act(SESSION, { type: 'toggle', enabled: true })
@@ -253,29 +270,65 @@ test('r41 idle→待回执：先 running 再 idle 落 silentFinish，通知恰�
     // 工作推进信号：成员自己的 tools/result（宿主按 exec.agent keyed 派发）。
     h.emitMember(MEMBER_ID, 'tools/result', { agent: { id: MEMBER_ID, name: MEMBER_NAME }, name: 'read_file' })
 
+    h.emitMember(MEMBER_ID, 'agent/status', { agent: { id: MEMBER_ID }, status: 'idle' })
+
+    // t1 之后默认行为：宿主代跑任务自带的 acceptance（'exit 0'），而不是只记「待回执」。
+    const settled = await waitForTask(store, (task) => (task.autoReceipt === undefined ? undefined : task), '宿主代跑完成')
+    assert.equal(settled.status, 'done', 'exit 0 → 门禁通过，任务必须 done')
+    assert.equal(settled.autoReceipt?.exitCode, 0, 'autoReceipt.exitCode 必须取真实门禁退出码')
+    assert.equal(settled.evidence?.exitCode, 0, '证据必须由真 runGate 写入')
+    assert.equal(settled.silentFinish, undefined, '代跑成功不得同时标记「待回执」')
+
+    const settledState = store.load(RUN)
+    assert.ok(settledState)
+    const notices = receiptNoticesOf(settledState)
+    assert.equal(notices.length, 1, '必须恰一条 captain→user 通知')
+    assert.match(notices[0].body, /宿主代跑门禁：exit 0 → 已通过/)
+
+    // 幂等：任务已 done，再投递 idle 不得再跑门禁、不得追加第二条通知。
+    h.emitMember(MEMBER_ID, 'agent/status', { agent: { id: MEMBER_ID }, status: 'idle' })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const afterSecond = store.load(RUN)
+    assert.ok(afterSecond)
+    assert.equal(afterSecond.plan.tasks[0].status, 'done')
+    assert.equal(afterSecond.plan.tasks[0].autoReceipt?.at, settled.autoReceipt?.at, '重复 idle 不得刷新 autoReceipt.at')
+    assert.equal(receiptNoticesOf(afterSecond).length, 1, '重复 idle 不得追加第二条通知')
+  } finally {
+    await h.close()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+/* ───────────────── 1b) 保留 r41 分支：autoReceipt=false → 仍落「待回执」 ───────────────── */
+
+test('r41 保留分支：autoReceipt=false → idle 仍写 silentFinish、任务 running、不写宿主代跑账本', async () => {
+  const { h, home, store } = openHarness()
+  try {
+    mkdirSync(join(home, '.dsh/auto-team'), { recursive: true })
+    writeFileSync(join(home, '.dsh/auto-team/settings.json'), JSON.stringify({ autoReceipt: false }), 'utf8')
+    await h.act(SESSION, { type: 'toggle', enabled: true })
+    store.save(stateOf([taskOf()], [bindingOf()]))
+    const resumed = await h.act(SESSION, { type: 'resume' })
+    assert.equal((resumed.data as { rejected?: unknown } | undefined)?.rejected, undefined, 'resume 必须受理')
+    h.emitMember(MEMBER_ID, 'tools/result', { agent: { id: MEMBER_ID, name: MEMBER_NAME }, name: 'read_file' })
+
     const idleSentAt = Date.now()
     h.emitMember(MEMBER_ID, 'agent/status', { agent: { id: MEMBER_ID }, status: 'idle' })
 
-    const afterFirst = store.load(RUN)
-    assert.ok(afterFirst, 'run 必须仍在盘上')
-    const silent = afterFirst.plan.tasks[0].silentFinish
-    assert.ok(silent, '先 running/tools 再 idle 必须落 silentFinish（这是本轮结束事实）')
-    assert.ok(Math.abs(silent.at - idleSentAt) < 5_000, 'silentFinish.at 必须取 idle 到达时刻')
-    assert.equal(silent.memberId, MEMBER_ID)
+    const after = store.load(RUN)
+    assert.ok(after)
+    const task = after.plan.tasks[0]
+    assert.ok(task.silentFinish, '关掉自动回执后必须回落 r41 的「待回执」事实')
+    assert.ok(Math.abs(task.silentFinish.at - idleSentAt) < 5_000, 'silentFinish.at 必须取 idle 到达时刻')
+    assert.equal(task.silentFinish.memberId, MEMBER_ID)
+    assert.equal(task.status, 'running', '关掉自动回执后任务不得被 idle 改写状态')
+    assert.equal(task.autoReceipt, undefined)
+    assert.equal(task.evidence, undefined, '待回执不允许伪造 evidence')
 
-    const notices = receiptNoticesOf(afterFirst)
+    const notices = receiptNoticesOf(after)
     assert.equal(notices.length, 1, '必须恰一条 captain→user 通知')
     assert.match(notices[0].body, /已结束本轮但未提交回执/)
-    assert.equal(notices[0].at, silent.at, '消息时间必须与事实同一时刻')
-    assert.equal(afterFirst.plan.tasks[0].evidence, undefined, '待回执不允许伪造 evidence')
-    assert.equal(afterFirst.plan.tasks[0].status, 'running', 'idle 不得顺手把任务标 done/failed')
-
-    // 幂等：重复投递 idle，at 不变、消息仍 1 条。
-    h.emitMember(MEMBER_ID, 'agent/status', { agent: { id: MEMBER_ID }, status: 'idle' })
-    const afterSecond = store.load(RUN)
-    assert.ok(afterSecond)
-    assert.equal(afterSecond.plan.tasks[0].silentFinish?.at, silent.at, '重复 idle 不得刷新 at')
-    assert.equal(receiptNoticesOf(afterSecond).length, 1, '重复 idle 不得追加第二条通知')
+    assert.equal(notices.some((notice) => /宿主代跑门禁/.test(notice.body)), false, '关掉后不得写宿主代跑账本')
   } finally {
     await h.close()
     rmSync(home, { recursive: true, force: true })

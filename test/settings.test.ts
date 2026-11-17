@@ -250,3 +250,55 @@ test('repo.save() → repo.read() 往返：captainModel 与六个数字项都不
     assert.deepEqual(repo.read(), input)
   })
 })
+
+/* ───────────────────── t6：人工验收策略（reviewPolicy） ───────────────────── */
+
+test('reviewPolicy 三值往返：code / all / off 都能落盘并读回（t6）', () => {
+  for (const policy of ['code', 'all', 'off'] as const) {
+    withTempFile((file) => {
+      const repo = createSettingsRepo({ file })
+      const saved = repo.save({ reviewPolicy: policy })
+      assert.equal(saved.ok, true)
+      assert.equal(JSON.parse(readFileSync(file, 'utf8')).reviewPolicy, policy, '必须真的进文件')
+      assert.equal(createSettingsRepo({ file }).read().reviewPolicy, policy, '跨实例读回一致')
+    })
+  }
+
+  // 域外值必须在入口被拒（而不是静默丢键）。
+  const bad = validateSettings({ reviewPolicy: 'sometimes' })
+  assert.equal(bad.ok, false)
+  if (bad.ok) return
+  assert.equal(bad.reason, '验收策略只能是 code / all / off')
+})
+
+test('repo.save()：面板提交不带 reviewPolicy 时磁盘上的 all / off 被保留（t6）', () => {
+  withTempFile((file) => {
+    const repo = createSettingsRepo({ file })
+    for (const policy of ['all', 'off'] as const) {
+      assert.equal(repo.save({ reviewPolicy: policy }).ok, true)
+      // 面板保存 = 只有表单字段、没有 reviewPolicy 键
+      assert.equal(repo.save({ concurrencyLimit: 3 }).ok, true)
+      assert.equal(repo.read().reviewPolicy, policy, `磁盘上的 ${policy} 不能被面板保存抹掉`)
+      assert.equal(JSON.parse(readFileSync(file, 'utf8')).reviewPolicy, policy, '文件里也得还在')
+    }
+    // 面板显式提交时以提交为准（不是永远保留磁盘值）
+    assert.equal(repo.save({ reviewPolicy: 'code' }).ok, true)
+    assert.equal(repo.read().reviewPolicy, 'code')
+  })
+})
+
+test('repo.save()：磁盘上的非法 reviewPolicy 被忽略、不搬回文件（t6）', () => {
+  withTempFile((file) => {
+    writeFileSync(file, JSON.stringify({ reviewPolicy: 'sometimes' }), 'utf8')
+    const repo = createSettingsRepo({ file })
+    assert.equal(repo.read().reviewPolicy, undefined, '非法值读取端不猜，走缺省 code')
+
+    assert.equal(repo.save({ concurrencyLimit: 2 }).ok, true)
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(JSON.parse(readFileSync(file, 'utf8')), 'reviewPolicy'),
+      false,
+      '非法旧值不许被当旧值搬回来',
+    )
+    assert.equal(createSettingsRepo({ file }).read().concurrencyLimit, 2, '其余字段正常落盘')
+  })
+})

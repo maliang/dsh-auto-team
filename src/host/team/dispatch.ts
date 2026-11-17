@@ -12,7 +12,15 @@
  * 本文件纯依赖注入（store/spawn/roles/buildPrompt/listMembers 全由外部传入），
  * 因此不需要起宿主就能用 node --test 完全覆盖。
  */
-import type { MemberBinding, Plan, PlanTask, RejectionCode, Role, RoleModelRoute } from '../../shared/types.ts'
+import type {
+  AutoTeamSettings,
+  MemberBinding,
+  Plan,
+  PlanTask,
+  RejectionCode,
+  Role,
+  RoleModelRoute,
+} from '../../shared/types.ts'
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
 import type { TaskTimeRecord } from '../store.ts'
@@ -604,6 +612,23 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
     members = null
   }
 
+  // t2：出现待验收任务就自动召集验收成员。**必须在下面 `ready.length === 0` 的早退之前** ——
+  // 「只剩 review」的 run 恰好一个就绪任务都没有，晚一步就永远召集不到。
+  // 它只发消息、不改任务状态，失败也不会让本次派发报错（失败会写进消息账本，下一轮重试）。
+  const convened = await conveneReviewers(next, {
+    roles: deps.roles,
+    spawn: deps.spawn,
+    buildPrompt: deps.buildPrompt,
+    listMembers: deps.listMembers,
+    sendMessage: deps.sendMessage,
+    now,
+    hostMembers: members,
+  })
+  if (convened.state !== next) {
+    next = convened.state
+    changed = true
+  }
+
   const hostLimit = deps.hostConcurrency ? deps.hostConcurrency().limit : DEFAULT_MAX_CONCURRENT
   const planned = next.plan.maxConcurrent > 0 ? next.plan.maxConcurrent : DEFAULT_MAX_CONCURRENT
   const limit = Math.max(1, Math.min(planned, hostLimit, MAX_CONCURRENT_LIMIT))
@@ -1050,11 +1075,34 @@ export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<Resu
   return { state: next, resumed, skipped, unchanged: resumed === 0 && changedCount === 0 }
 }
 
+/**
+ * 门禁通过后是否要先转「待验收」（r42，`settings.reviewPolicy`）。
+ *
+ * - `off`：一律不要（旧行为，门禁通过直接 done）；
+ * - `all`：一律要；
+ * - `code`（缺省）：`writeScopes` 命中 `src/` 才算 —— 只有改产品代码的任务值得人工看一眼，
+ *   文档/日志类改动不占人工验收。
+ *
+ * 纯函数，宿主与单测共用；口径只此一处（bridge 与 applyReceipt 的调用方都读它）。
+ */
+export function needsReviewOf(task: PlanTask, policy: AutoTeamSettings['reviewPolicy']): boolean {
+  if (policy === 'off') return false
+  if (policy === 'all') return true
+  return (task.writeScopes ?? []).some((scope) => {
+    const normalized = scope.trim().replace(/^\.\//, '').replace(/\/+$/, '')
+    return normalized === 'src' || normalized.startsWith('src/')
+  })
+}
+
 /** 回执应用：`done` 是任务完成的**唯一**写点（AC-19 的机械保证）。 */
 export function applyReceipt(
   state: RunState,
   taskId: string,
-  receipt: { verdict: 'done' | 'rework' | 'failed'; note?: string; evidence?: import('../../shared/types.ts').GateEvidence },
+  receipt: {
+    verdict: 'done' | 'review' | 'rework' | 'failed'
+    note?: string
+    evidence?: import('../../shared/types.ts').GateEvidence
+  },
   now?: number,
   /**
    * 返工上限（r7 AC-13 的 settings 生效点）。缺省取 `config.MAX_ATTEMPTS` —— 常量的值不变，
@@ -1079,6 +1127,21 @@ export function applyReceipt(
   if (receipt.verdict === 'done') {
     next = patchTask(next, taskId, { status: 'done', evidence })
     body = gateSummary(task, evidence, '门禁通过')
+  } else if (receipt.verdict === 'review') {
+    // r42：门禁通过但等人工验收。**review 不是终态** —— isTerminalTaskStatus 不含它，
+    // 因此下面「进入终态才释放写域」与「done 才解锁下游」两段都不会碰它：
+    // 写域继续占着（别人拿不走）、下游继续 blocked。验收结论先记门禁这一票。
+    next = patchTask(next, taskId, {
+      status: 'review',
+      evidence,
+      review: {
+        verdict: 'pass',
+        at,
+        by: 'gate',
+        reasons: [`门禁通过（退出码 ${evidence?.exitCode ?? 'null'}），等待人工验收`],
+      },
+    })
+    body = gateSummary(task, evidence, '门禁通过，等待人工验收')
   } else if (receipt.verdict === 'failed') {
     next = patchTask(next, taskId, { status: 'failed', attempts: attempts + 1, evidence })
     body = gateSummary(task, evidence, '已被判定失败')
@@ -1281,6 +1344,221 @@ function stampTaskTime(state: RunState, taskId: string, patch: TaskTimeRecord): 
   if (next.startedAt === undefined && next.endedAt === undefined) return state
   if (next.startedAt === current.startedAt && next.endedAt === current.endedAt) return state
   return { ...state, taskTimes: { ...(state.taskTimes ?? {}), [taskId]: next } }
+}
+
+/**
+ * 自动召集验收成员（t2）：run 里出现 `review` 任务时，把全部待验任务一次性交给 QA。
+ *
+ * 四条设计约束：
+ *  1. **只发言、不改任务状态**：`task.status` 一个字都不碰 —— 验收结论只能由 `reviewTask`
+ *     动作 / `auto_team_review` 工具给出（状态机出口仍然只有 applyReceipt）；
+ *  2. **复用优先**：同一个 run 里已有 qa 角色且还活着的成员就发消息，绝不建第二个人；
+ *  3. **幂等 + 冷却**：同一批 taskId 只发一次；不同批次之间至少隔 `REVIEW_CONVENE_COOLDOWN_MS`，
+ *     否则每个派发 tick 都会重复吵一遍；
+ *  4. **可观测**：招募/发送失败不吞 —— 写一条「队长 → 用户」账本记录（面板可读），下一轮重试。
+ *
+ * 记录是**进程内**的（`store.ts` 不在 t2 的写域内），与 auto-dispatch「状态刻意不落盘」的先例一致：
+ * 宿主重启后最多重发一次，可接受。
+ */
+export const REVIEW_CONVENE_COOLDOWN_MS = 5 * 60 * 1000
+
+interface ReviewConveneRecord {
+  signature: string
+  at: number
+}
+
+const reviewConveneRecord = new Map<string, ReviewConveneRecord>()
+
+/** 测试钩子：清空进程内冷却表（跨用例隔离，避免上一例的签名把下一例判成 COOLDOWN）。 */
+export function resetReviewConveneState(): void {
+  reviewConveneRecord.clear()
+}
+
+export interface ReviewConveneDeps {
+  roles: RoleRepo
+  spawn: SpawnPort
+  buildPrompt(input: PromptInput): string
+  listMembers(): Promise<HostMember[]>
+  sendMessage?: SendPort
+  now?(): number
+  /**
+   * 已经取到的宿主成员名单（dispatchReady 刚取过就不再取一次）。
+   * `null` = 名单不可得 —— 与派发侧同口径：保守当作「成员都还活着」（宁可复用，不重复建人）。
+   */
+  hostMembers?: HostMember[] | null
+}
+
+export interface ReviewConveneResult {
+  state: RunState
+  convened?: { memberId: string; name: string; created: boolean; taskIds: string[] }
+  skipped?:
+    | 'NO_REVIEW'
+    | 'PAUSED'
+    | 'COOLDOWN'
+    | 'NO_QA_ROLE'
+    | 'NO_SEND_PORT'
+    | 'SPAWN_FAILED'
+    | 'SEND_FAILED'
+  error?: string
+}
+
+/**
+ * 批量验收消息：任务卡摘要 + 门禁退出码 + 改动文件清单。
+ *
+ * **刻意不贴整段 diff**：几个任务的 diff 就能把成员上下文塞满，而验收人只该在需要时自己读文件。
+ */
+export function reviewBatchTextOf(tasks: readonly PlanTask[]): string {
+  const lines = [
+    `待验收任务（${tasks.length} 个）。你只下结论，不跑命令、不写代码：用 auto_team_review 逐个给出 pass / fail 与理由（不能验自己写的任务）。`,
+  ]
+  for (const task of tasks) {
+    const exit = task.evidence?.exitCode
+    const scopes = task.writeScopes ?? []
+    const exitText = typeof exit === 'number' ? String(exit) : '无（超时/被杀）'
+    const scopeText = scopes.length > 0 ? scopes.join('、') : '（未声明）'
+    lines.push(`- ${task.id}「${taskLabelOf(task)}」：门禁退出码 ${exitText}；改动文件：${scopeText}`)
+  }
+  return lines.join('\n')
+}
+
+/** 失败可见性：不吞异常 —— 招募失败写一条「队长 → 用户」账本记录，下一轮派发会重试。 */
+function withConveneNote(state: RunState, at: number, body: string): RunState {
+  return appendMessage(state, makeMessage({ from: 'captain', to: 'user', at, body }))
+}
+
+/**
+ * 见上方说明。返回新 state（可能新增 binding + 账本消息），**绝不修改任务状态**。
+ */
+export async function conveneReviewers(
+  state: RunState,
+  deps: ReviewConveneDeps,
+): Promise<ReviewConveneResult> {
+  const now = deps.now ?? Date.now
+  const pending = state.plan.tasks.filter((task) => task.status === 'review')
+  if (pending.length === 0) return { state, skipped: 'NO_REVIEW' }
+  // 暂停 = 不推进状态机，也不该起人（与 dispatchReady 的 PAUSED 闸门同口径）。
+  if (state.plan.status === 'paused') return { state, skipped: 'PAUSED' }
+
+  const signature = pending
+    .map((task) => task.id)
+    .sort()
+    .join(',')
+  const at = now()
+  const record = reviewConveneRecord.get(state.plan.runId)
+  if (record !== undefined) {
+    // 同一批只发一次；不同批次之间冷却 ≥5 分钟（新批次等冷却过后整批发，不拆成两条消息）。
+    if (record.signature === signature) return { state, skipped: 'COOLDOWN' }
+    if (at - record.at < REVIEW_CONVENE_COOLDOWN_MS) return { state, skipped: 'COOLDOWN' }
+  }
+
+  const batchText = reviewBatchTextOf(pending)
+  // 名单：dispatchReady 已取过就直接用；否则自己取。抛错 → null（保守复用，不重复建人）。
+  let members: HostMember[] | null
+  if (deps.hostMembers !== undefined) {
+    members = deps.hostMembers
+  } else {
+    try {
+      members = await deps.listMembers()
+    } catch {
+      members = null
+    }
+  }
+  const alive = (binding: MemberBinding): boolean =>
+    members === null ||
+    members.some((member) => member.id === binding.memberId || member.name === binding.name)
+
+  // 复用：本 run 里最后一个 qa 角色成员。**人还活着就复用** —— 它的 binding 可能因为绑定的
+  // 任务收口而被 watcher 退休（自动召集的 QA 与作者共用一条 taskId 才能被身份解析），
+  // 但成员本人还在，就不该为下一批验收再造一个人。名单不可得时只认未退休的（保守）。
+  const reusable = [...state.bindings]
+    .reverse()
+    .find((binding) => binding.roleId === 'qa' && (binding.retired !== true || (members !== null && alive(binding))))
+
+  let next = state
+  let reviewer: { memberId: string; name: string } | undefined
+  let created = false
+  if (reusable !== undefined) {
+    reviewer = { memberId: reusable.memberId, name: reusable.name }
+  } else {
+    const role = deps.roles.get('qa')
+    if (role === undefined) return { state, skipped: 'NO_QA_ROLE' }
+    // 按角色新建：任务绑定取第一个待验任务（成员身份要靠 plan 里真实存在的 taskId 才能解析出来，
+    // 所以不能编一个假 id —— 那会让 `memberIdentityOf` 查不到、auto_team_review 直接 NOT_ENABLED）。
+    const task = pending[0]
+    const base = `qa-review-${shortIdentityHash(`${state.plan.runId}\u0000${signature}`, 6)}`
+    const taken = new Set(state.bindings.filter((binding) => binding.retired !== true).map((binding) => binding.name))
+    for (const member of members ?? []) taken.add(member.name)
+    let name = base
+    for (let index = 2; taken.has(name); index += 1) name = `${base}-${index}`
+    const prompt = deps.buildPrompt({ plan: state.plan, task, role, name, handoffs: [batchText] })
+    let spawned: Awaited<ReturnType<SpawnPort>>
+    try {
+      spawned = await deps.spawn({ plan: state.plan, task, role, name, prompt })
+    } catch (error) {
+      const reason = messageOf(error)
+      return {
+        state: withConveneNote(state, at, `自动召集验收成员失败（新建成员抛错）：${reason}。下一轮派发会重试。`),
+        skipped: 'SPAWN_FAILED',
+        error: reason,
+      }
+    }
+    if (!spawned.ok) {
+      return {
+        state: withConveneNote(state, at, `自动召集验收成员失败：${spawned.error}。下一轮派发会重试。`),
+        skipped: 'SPAWN_FAILED',
+        error: spawned.error,
+      }
+    }
+    reviewer = { memberId: spawned.memberId, name }
+    created = true
+    const binding: MemberBinding = {
+      taskId: task.id,
+      roleId: role.id,
+      memberId: spawned.memberId,
+      name,
+      spawnedAt: at,
+    }
+    next = { ...next, bindings: [...next.bindings, binding] }
+  }
+
+  if (deps.sendMessage === undefined) {
+    return {
+      state: withConveneNote(
+        next,
+        at,
+        `自动召集验收成员：没有可用的消息端口，${reviewer.name} 未收到待验收清单。`,
+      ),
+      skipped: 'NO_SEND_PORT',
+    }
+  }
+  let sent: { ok: boolean; error?: string }
+  try {
+    sent = await deps.sendMessage(reviewer.memberId, batchText)
+  } catch (error) {
+    sent = { ok: false, error: messageOf(error) }
+  }
+  if (!sent.ok) {
+    return {
+      state: withConveneNote(
+        next,
+        at,
+        `自动召集验收成员：发给 ${reviewer.name} 的验收清单发送失败（${sent.error ?? '未知原因'}）。下一轮派发会重试。`,
+      ),
+      skipped: 'SEND_FAILED',
+      error: sent.error,
+    }
+  }
+
+  next = appendMessage(
+    next,
+    makeMessage({ from: 'captain', to: reviewer.name, toMemberId: reviewer.memberId, at, body: batchText }),
+  )
+  // 只有「真的发出去了」才记签名：发送失败的那一轮，下次派发要能重试。
+  reviewConveneRecord.set(state.plan.runId, { signature, at })
+  return {
+    state: next,
+    convened: { memberId: reviewer.memberId, name: reviewer.name, created, taskIds: pending.map((task) => task.id) },
+  }
 }
 
 /**

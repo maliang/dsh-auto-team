@@ -115,10 +115,10 @@ function stateOf(over: Partial<RunState> = {}): RunState {
   }
 }
 
-test('AC-8/AC-2：工具面 8 个，plan description 明示单任务合法', () => {
+test('AC-8/AC-2：工具面 9 个，plan description 明示单任务合法', () => {
   const { specs, tools } = setup()
 
-  assert.equal(specs.length, 8, '工具面从 7 扩到 8（新增 auto_team_add_tasks）')
+  assert.equal(specs.length, 9, '工具面从 8 扩到 9（新增 auto_team_review）')
   assert.deepEqual(
     specs.map((spec) => spec.name),
     [
@@ -127,6 +127,7 @@ test('AC-8/AC-2：工具面 8 个，plan description 明示单任务合法', () 
       'auto_team_status',
       'auto_team_message',
       'auto_team_receipt',
+      'auto_team_review',
       'auto_team_memory',
       'auto_team_role',
       'auto_team_add_tasks',

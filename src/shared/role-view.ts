@@ -62,10 +62,20 @@ export interface RoleStateView {
  * 「已开始」的任务状态：这些状态下的任务一定有过执行区间，拿不到用时就是缺口。
  * 其余状态（排队/等写域/暂停/取消/跳过）允许没有用时 —— 贡献 0，不算缺口。
  */
-const STARTED_STATUSES: readonly TaskStatus[] = ['running', 'gate', 'done', 'rework', 'failed', 'interrupted']
+const STARTED_STATUSES: readonly TaskStatus[] = [
+  'running',
+  'gate',
+  // r42：待验收的任务已经跑过门禁（有执行区间），用时不能算「未开始」。
+  'review',
+  'done',
+  'rework',
+  'failed',
+  'interrupted',
+]
 
 /** 需要人介入的终态/返工态（AC-7 的 danger）。 */
-const ATTENTION_STATUSES: readonly TaskStatus[] = ['rework', 'failed', 'interrupted']
+// r42：review 也算「需要人介入」 —— 门禁过了但没人放行，活在等人，不是 idle。
+const ATTENTION_STATUSES: readonly TaskStatus[] = ['rework', 'failed', 'interrupted', 'review']
 
 function attentionOf(status: TaskStatus): boolean {
   return ATTENTION_STATUSES.includes(status)

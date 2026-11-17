@@ -69,6 +69,7 @@ import type {
   SkillInfo,
   SkillMutation,
   StallReason,
+  TaskReview,
   TaskStatus,
   TokenTotals,
   UsageCell,
@@ -137,7 +138,7 @@ import {
   type RunsStore,
 } from './store.ts'
 import type { DeviationRecorder } from './team/deviation.ts'
-import { isTerminalTaskStatus } from './team/dispatch.ts'
+import { isTerminalTaskStatus, needsReviewOf } from './team/dispatch.ts'
 import { normalizeHostStatus, type HostMember } from './team/watcher.ts'
 import { panelTaskViewOf } from './team/silent-finish.ts'
 import { isIrreversibleAction, pendingFor, pendingViewOf } from './team/confirm.ts'
@@ -160,7 +161,8 @@ const HISTORY_USAGE_REASON = '宿主未上报本 run 的用量'
 
 /** 回执：门禁判定结果（done 的唯一写点在 team/dispatch.ts 的 applyReceipt）。 */
 export interface ReceiptInput {
-  verdict: 'done' | 'rework' | 'failed'
+  /** r42：门禁通过且 `reviewPolicy` 要求人工验收时写 `review`（转「待验收」，不是 done）。 */
+  verdict: 'done' | 'review' | 'rework' | 'failed'
   note?: string
   evidence?: GateEvidence
 }
@@ -437,6 +439,17 @@ export interface BridgeDeps {
   memberListHealth?: (sessionId: string | undefined) => MemberListSource | undefined
 }
 
+/**
+ * 动作调用方（t2）：模型工具入口的调用方身份。
+ *
+ * 只为 `reviewTask` 的「评审人不得是原作者」而存在：`PanelAction` 是纯数据、不携带调用方，
+ * 面板/HTTP 入口（队长或人）**不传**本结构 —— 那不是成员，任何任务都不可能是他写的。
+ */
+export interface ActCaller {
+  /** 调用方的成员 id（宿主 `exec.agent.id`）；不传 = 队长/人。 */
+  memberId?: string
+}
+
 export interface Bridge {
   enabled(sessionId: string): boolean
   setEnabled(sessionId: string, enabled: boolean): void
@@ -445,8 +458,12 @@ export interface Bridge {
    * 执行一个面板动作。`runId`（t3，可选）只对 `message` / `receipt` 生效：
    * 缺省 = 现有「活动 run」逻辑；给了就只认那一份，不存在/不属于本会话回 NOT_FOUND，
    * **绝不回退到活动 run**（跨 run 收口时发错人的根因）。
+   *
+   * `caller`（t2，可选）：模型工具入口的**调用方成员**身份。面板 / HTTP 入口不传（= 队长或人），
+   * 成员自助入口传 `{ memberId: exec.agent.id }` —— `reviewTask` 的「不能验自己写的任务」
+   * 只能靠它区分「谁在下结论」，`PanelAction` 本身不携带调用方。
    */
-  act(sessionId: string, action: PanelAction, runId?: string): Promise<ActResult>
+  act(sessionId: string, action: PanelAction, runId?: string, caller?: ActCaller): Promise<ActResult>
   /**
    * r21：把「同一条需求的修改」并入既有 run（显式通道，队长判定后由 auto_team_plan 调用）。
    *
@@ -548,6 +565,8 @@ const PAUSED_BLOCKED: ReadonlySet<PanelAction['type']> = new Set<PanelAction['ty
   'dispatch',
   'resume',
   'receipt',
+  // t2：验收结论和回执一样会推进状态机（review → done / rework），暂停期间一律不放行。
+  'reviewTask',
 ])
 
 /**
@@ -2175,7 +2194,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 顺序是刻意的：前置闸（未启用/暂停）在挂 pending **之前**跑 —— 用户不该去确认一个
    * 注定被拒绝的动作。可逆动作（AC-12 的 7 类）在这里不产生任何 pending，直接执行。
    */
-  async function act(sessionId: string, action: PanelAction, runId?: string): Promise<ActResult> {
+  async function act(
+    sessionId: string,
+    action: PanelAction,
+    runId?: string,
+    caller?: ActCaller,
+  ): Promise<ActResult> {
     // t3：显式 runId 只认那一份 —— 不存在/不属于本会话直接 NOT_FOUND，绝不静默回退到活动 run。
     if (runId !== undefined && stateOf(sessionId, runId) === null) {
       return reject('NOT_FOUND', runNotFoundText(runId), sessionId, undefined, runId)
@@ -2185,7 +2209,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     }
     const blocked = preflightGate(sessionId, action, runId)
     if (blocked) return blocked
-    if (!isIrreversibleAction(action)) return executeAction(sessionId, action, runId)
+    if (!isIrreversibleAction(action)) return executeAction(sessionId, action, runId, caller)
 
     const state = loadState(sessionId)
     // 没有运行：交给执行体产出原来的 NO_PLAN / NOT_FOUND 语义（不在这里编第二套码）。
@@ -2269,6 +2293,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     sessionId: string,
     action: PanelAction,
     runId?: string,
+    caller?: ActCaller,
   ): Promise<ActResult> {
     try {
       const blocked = preflightGate(sessionId, action, runId)
@@ -2980,6 +3005,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (task.status === 'done') {
             return accept(sessionId, [`任务 ${action.taskId} 已完成，不重复跑门禁`], runId)
           }
+          // r42：验收态不是门禁重入点 —— 再跑一遍只会刷新证据，改不了「等人工验收」这件事。
+          if (task.status === 'review') {
+            return reject(
+              'BAD_REQUEST',
+              `任务 ${action.taskId} 在验收中：先打回（返工）或取消，不会重复跑门禁`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
 
           const empty = task.acceptance.trim() === ''
           // settings 一次读：门禁超时与返工上限来自同一次读（否则一次回执会用到两个版本的设置）。
@@ -3024,7 +3059,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
             ], runId)
           }
 
-          const verdict: ReceiptInput['verdict'] = outcome.ok ? 'done' : 'rework'
+          // r42：门禁通过不再直接 done —— 按 settings.reviewPolicy 决定是否先转「待验收」。
+          // 只有门禁 exit 0 才有资格进 review；失败照旧转返工。
+          const reviewRequired = outcome.ok && needsReviewOf(task, settings.reviewPolicy)
+          const verdict: ReceiptInput['verdict'] = outcome.ok ? (reviewRequired ? 'review' : 'done') : 'rework'
           let next = deps.applyReceipt(
             gateState,
             action.taskId,
@@ -3034,9 +3072,11 @@ export function createBridge(deps: BridgeDeps): Bridge {
             settings.maxAttempts,
           )
           const notices: string[] = [
-            outcome.ok
-              ? `门禁通过（退出码 ${evidence.exitCode}）：${action.taskId} 已完成`
-              : `门禁未通过（退出码 ${evidence.exitCode}）：${action.taskId} 转返工`,
+            !outcome.ok
+              ? `门禁未通过（退出码 ${evidence.exitCode}）：${action.taskId} 转返工`
+              : verdict === 'review'
+                ? `门禁通过（退出码 ${evidence.exitCode}）：${action.taskId} 转待验收（写域保持占用、下游保持阻塞，等人工验收）`
+                : `门禁通过（退出码 ${evidence.exitCode}）：${action.taskId} 已完成`,
           ]
 
           if (verdict === 'rework') {
@@ -3073,9 +3113,142 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (updated?.status === 'failed') {
             notices.push(`任务 ${action.taskId} 已返工 ${attemptsOf(updated)} 次仍未通过，转人工处理`)
           }
-          // receipt 是本任务的状态机出口（done / rework / failed）→ `task-terminal`，
+          // receipt 是本任务的状态机出口（done / review / rework / failed）→ `task-terminal`，
           // 下游被解锁后自动派发应立即补位（不必等 3s tick）。
-          saveState(next, 'task-terminal')
+          // r42：review 不是终态、不解锁下游，别推 `task-terminal`（推了也只是空扫一遍）。
+          if (verdict === 'review') {
+            saveState(next)
+            // t2：出现待验收任务 → 立即自动召集验收成员。为什么必须显式推这一把：
+            // auto-dispatch 的 kick 只在「有就绪任务」时才调 dispatchReady，而「只剩 review」
+            // 的 run 恰好没有就绪任务 —— 光靠 tick 永远走不到召集逻辑。
+            try {
+              await deps.dispatch(next)
+            } catch (error) {
+              notices.push(
+                `自动召集验收成员失败：${error instanceof Error ? error.message : String(error)}（下一轮派发会重试）`,
+              )
+            }
+          } else saveState(next, 'task-terminal')
+          return accept(sessionId, notices, runId)
+        }
+
+        /**
+         * t2：人工验收结论 —— `review` 状态的唯一出口（只下结论，不跑门禁、不写代码）。
+         *
+         * 三条硬校验，缺一条都会让「自己验自己」或在错误状态上下结论变成静默伤害：
+         *  ① 任务必须在 `review`：其它状态回 BAD_REQUEST，文案带上当前状态标签；
+         *  ② **评审人不得是原作者**：调用方成员 id 与该任务未退休 binding 的 memberId 比对；
+         *     面板/人入口不传 caller —— 那不是成员，任何任务都不可能是他写的；
+         *  ③ `verdict` 只接受 pass / fail（旧版前端/脚本可能塞别的字符串）。
+         * pass → `applyReceipt(verdict:'done')`（唯一状态写点）+ 写 `task.review`；
+         * fail → `rework`（attempts+1 由 applyReceipt 负责）+ 把 reasons 作为必改项发回原作者。
+         */
+        case 'reviewTask': {
+          const state = stateOf(sessionId, runId)
+          if (!state) {
+            return runId !== undefined
+              ? reject('NOT_FOUND', runNotFoundText(runId), sessionId, undefined, runId)
+              : reject('NO_PLAN', '当前会话还没有执行计划', sessionId)
+          }
+          const task = state.plan.tasks.find((item) => item.id === action.taskId)
+          if (!task) return reject('NOT_FOUND', `找不到任务 ${action.taskId}`, sessionId, undefined, runId)
+          if (task.status !== 'review') {
+            return reject(
+              'BAD_REQUEST',
+              `任务 ${action.taskId} 当前是「${TASK_STATUS_LABELS[task.status] ?? task.status}」，只有待验收（review）的任务能下验收结论`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
+          const verdict = action.verdict
+          if (verdict !== 'pass' && verdict !== 'fail') {
+            return reject('BAD_REQUEST', 'verdict 只接受 pass 或 fail', sessionId, undefined, runId)
+          }
+          const reasons = (Array.isArray(action.reasons) ? action.reasons : [])
+            .map((item) => (typeof item === 'string' ? item.trim() : ''))
+            .filter((item) => item !== '')
+          // 「评审人不得是原作者」：只能拿调用方成员 id 与该任务未退休的 binding 比对。
+          // 「评审人不得是原作者」：`task.memberId` 是派发时盖上的作者 id（最权威）；
+          // 缺它时退回该任务第一个未退休 binding。**不能只看 bindingFor**：自动召集的 QA
+          // 成员也绑在同一条任务上，作者 binding 若已退休就会把 QA 自己认成作者。
+          const author =
+            (task.memberId !== undefined
+              ? state.bindings.find((binding) => binding.memberId === task.memberId)
+              : undefined) ?? bindingFor(state, task.id)
+          const callerIsAuthor =
+            caller?.memberId !== undefined &&
+            (caller.memberId === task.memberId || (author !== undefined && author.memberId === caller.memberId))
+          if (callerIsAuthor) {
+            return reject(
+              'BAD_REQUEST',
+              `不能验自己写的任务：任务 ${action.taskId} 的成员就是调用方，请换一个角色/成员验收`,
+              sessionId,
+              undefined,
+              runId,
+            )
+          }
+          const at = now()
+          const reviewer =
+            caller?.memberId === undefined
+              ? undefined
+              : state.bindings.find(
+                  (binding) => binding.retired !== true && binding.memberId === caller.memberId,
+                )
+          const review: TaskReview = {
+            verdict,
+            at,
+            by: reviewer?.name ?? 'user',
+            reasons:
+              reasons.length > 0
+                ? reasons
+                : [verdict === 'pass' ? '人工验收通过' : '人工验收未通过（未填理由）'],
+          }
+          // 状态写入只走 applyReceipt（done/review/rework 的唯一写点），review 结论另挂 `task.review`。
+          let next = deps.applyReceipt(
+            state,
+            task.id,
+            { verdict: verdict === 'pass' ? 'done' : 'rework', note: reasons.join('；'), evidence: task.evidence },
+            at,
+            settingsOf().maxAttempts,
+          )
+          next = withTask(next, task.id, (item) => ({ ...item, review }))
+          const after = next.plan.tasks.find((item) => item.id === task.id) ?? task
+          const notices: string[] = [
+            verdict === 'pass'
+              ? `验收通过（${review.by}）：任务 ${task.id} 已完成`
+              : `验收未通过（${review.by}）：任务 ${task.id} 已打回返工（第 ${attemptsOf(after)} 次）`,
+          ]
+
+          if (verdict === 'fail') {
+            const title = (task.title.split('\n')[0] ?? task.id).slice(0, 60)
+            const text = [
+              `验收未通过（打回返工）：任务 ${task.id}「${title}」需按以下必改项修改后再回报`,
+              ...review.reasons.map((item, index) => `${index + 1}. ${item}`),
+              '',
+              '改完照常走 auto_team_receipt 提交回执；门禁通过后仍会回到待验收。',
+            ].join('\n')
+            if (author) {
+              const sent = await deps.sendMessage(author.memberId, text)
+              if (!sent.ok) notices.push(`返工要求回发失败：${sent.error ?? '未知原因'}`)
+              next = withMessage(
+                next,
+                recordOf({
+                  from: 'captain',
+                  to: author.name,
+                  toMemberId: author.memberId,
+                  taskId: task.id,
+                  body: text,
+                  at,
+                }),
+              )
+            } else {
+              notices.push('该任务没有成员：返工要求只落在面板与日志里')
+            }
+          }
+
+          if (verdict === 'pass') saveState(next, 'task-terminal')
+          else saveState(next)
           return accept(sessionId, notices, runId)
         }
 
