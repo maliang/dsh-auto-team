@@ -1279,6 +1279,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
       if (priorityOf(binding) >= priorityOf(current)) chosen.set(binding.memberId, binding)
     }
 
+    // r47 t3：「任务 → 成员」是一对多（同一成员可被多个任务复用），跳转判定需要全集。
+    // 按 binding 追加序去重收集，**含已退役 binding**：历史任务也要能跳回承接它的成员。
+    // taskId 仍是上面 chosen 选出的「当前/最近」那条，展示语义不变。
+    const taskIdsOf = new Map<string, string[]>()
+    for (const binding of state.bindings) {
+      const list = taskIdsOf.get(binding.memberId)
+      if (list === undefined) taskIdsOf.set(binding.memberId, [binding.taskId])
+      else if (!list.includes(binding.taskId)) list.push(binding.taskId)
+    }
+
     for (const memberId of order) {
       const binding = chosen.get(memberId)
       if (binding === undefined) continue
@@ -1296,6 +1306,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         name: binding.name,
         roleId: binding.roleId,
         taskId: binding.taskId,
+        taskIds: taskIdsOf.get(memberId) ?? [binding.taskId],
         status,
         // r21 AC-4：两个停止事实位只在 binding 上真的存在时才出现（缺席 = 没发生过，客户端不补 0）。
         ...(binding.stopping === true ? { stopping: true } : {}),
@@ -1318,6 +1329,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
         name: roleById.get(task.roleId)?.name ?? task.roleId,
         roleId: task.roleId,
         taskId: task.id,
+        // legacy 兜底（无 binding）：同一 task.memberId 可能挂着多条任务，全集照收。
+        taskIds: state.plan.tasks.filter((item) => item.memberId === task.memberId).map((item) => item.id),
         status,
         ...stallFieldsOf(state, task.memberId, status, stallMs),
         lastEventAt: lastEventAtOf(state, task.memberId, state.plannedAt),

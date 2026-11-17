@@ -127,7 +127,11 @@ test('memberForRole：没有绑定关系时 running 优先；同状态取最近�
   const idle = memberOf({ memberId: 'm-idle', status: 'idle', lastEventAt: AT, taskId: undefined })
   const runningOld = memberOf({ memberId: 'm-old', status: 'running', lastEventAt: AT - 60_000 })
   const runningNew = memberOf({ memberId: 'm-new', status: 'running', lastEventAt: AT })
-  assert.equal(memberForRole([idle, runningOld, runningNew], 'dev', 't9')?.memberId, 'm-new')
+  // r47（t4）：给了 taskId 但没有任何成员拥有它 → 没有可跳成员，不回退到同角色其它任务的成员。
+  assert.equal(memberForRole([idle, runningOld, runningNew], 'dev', 't9'), undefined)
+  // 不给 taskId（角色级旧入口）时才按 running → 最近活跃挑一个。
+  assert.equal(memberForRole([idle, runningOld, runningNew], 'dev', undefined)?.memberId, 'm-new')
+  assert.equal(memberForRole([idle, runningOld, runningNew], 'dev')?.memberId, 'm-new')
 })
 
 test('memberForRole：最近活跃时间相同时按 memberId 升序稳定取第一个', () => {

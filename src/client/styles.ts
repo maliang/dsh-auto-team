@@ -2648,6 +2648,25 @@ export const AUTO_TEAM_CSS = `
   white-space: nowrap;
   color: var(--dsw-alias-label-tertiary, inherit);
 }
+/* t5：角色标记是「该行成员」的第二个入口（嵌在展开按钮里，点它不展开）。
+   可点暗示用虚线下划线 + pointer —— 只靠 hover 变色，用户看不出这里能点（12px 说明级文字）。 */
+[data-region="task-list"] [data-task-role][data-member-jump] {
+  cursor: pointer;
+  /* 命中区撑到 ~20px（meta 行只有 18px）：上下各 2px padding 用负 margin 抵回，几何不变、不抢标题行的点击。 */
+  padding-block: 2px;
+  margin-block: -2px;
+  text-decoration: underline dotted var(--dsw-alias-border-l2, currentColor);
+  text-underline-offset: 2px;
+}
+[data-region="task-list"] [data-task-role][data-member-jump]:hover {
+  color: var(--dsw-alias-state-business-primary, inherit);
+}
+/* 键盘落到裸 span 上必须看得见（宿主 :focus-visible 只覆盖 button，这里补 outline）。 */
+[data-region="task-list"] [data-task-role][data-member-jump]:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary, currentColor);
+  outline-offset: 1px;
+  border-radius: var(--dsw-radius-xs, 4px);
+}
 [data-region="task-list"] [data-cell="token"],
 [data-region="task-list"] [data-cell="duration"] {
   overflow: hidden;

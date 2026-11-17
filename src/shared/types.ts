@@ -401,6 +401,14 @@ export interface MemberView {
   roleId: string
   /** 该成员正在执行的任务（无绑定任务的成员没有此字段）。 */
   taskId?: string
+  /**
+   * 该成员名下**全部**任务 id（r47 t3）：按 binding 追加序去重，**含已退役 binding**
+   * （历史任务仍应能跳回承接它的成员）。`taskId` 只表示「当前/最近」那条，
+   * 跳转判定必须认这张全集，不能只看单值。
+   *
+   * 可选：旧快照没有此字段，客户端按「[taskId]」回退即可。
+   */
+  taskIds?: string[]
   status: MemberStatus
   /**
    * 宿主已发出中断、但还没确认停下（r21 AC-4）。**只从 binding 透传**，客户端不自行推断：

@@ -72,6 +72,9 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   // r16 AC-16：只渲染、不排序 —— 顺序 = 计划顺序，数量 = role.tasks（空/缺省整行不渲染）。
   const refs = (role.taskRefs ?? []).map((ref) => roleTaskRefViewOf(ref))
   // r33：成员态 chip 与跳转判定看的是同一个成员（同一 taskId 绑定优先规则）。
+  // t5：该角色名下成员不止一个时**不跳**（卡片只有 roleId，点下去不知道开谁）——
+  // 规则与文案都在 viewmodel 的 `roleCardJumpOf`（`memberJumpOf` 的 role 分支转调它），
+  // 组件仍然只调 `memberJumpOf`，不在这里判成员数。
   const jump = memberJumpOf(
     { kind: 'role', roleId: role.roleId, taskId: role.activeTaskId },
     members,

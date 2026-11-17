@@ -4,7 +4,7 @@
 
 把当前 DeepSeek Harness 会话变成队长：目标拆成**带依赖的任务图**，按角色**并行**派出可续聊的子 Agent，完成必须过**质量门禁**，全过程在输入框左侧开关与右栏面板里可见可改。
 
-当前版本 `dsh-auto-team@0.2.8`（`package.json`），兼容 Node `>=22.18` 与 DSH `>=0.2.1-alpha.2 <0.3.0`，本机真机验证宿主 `0.2.2-rc.2`。
+当前版本 `dsh-auto-team@0.2.9`（`package.json`），兼容 Node `>=22.18` 与 DSH `>=0.2.1-alpha.2 <0.3.0`，本机真机验证宿主 `0.2.2-rc.2`。
 
 ## 特色
 
@@ -165,7 +165,7 @@ npm pack --dry-run --cache /tmp/npm-pack-cache
 export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" && pnpm typecheck && pnpm test && pnpm build && node --input-type=module -e "await import('./lib/index.js')" && node --input-type=module -e "await import('./lib/client.js')" && npm pack --dry-run --cache /tmp/npm-pack-cache
 ```
 
-- 基线（2026-11-17 实测）：`pnpm test` **1343 通过 / 0 失败 / 0 skipped**；`npm pack --dry-run` 9 个文件（`package.json`、`LICENSE`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`），`LICENSE` 由 npm 自动收录。
+- 基线（2026-11-17 实测）：`pnpm test` **1351 通过 / 0 失败 / 0 skipped**；`npm pack --dry-run` 9 个文件（`package.json`、`LICENSE`、中英两份 README、`cordis.patch.yml`、两份 `lib/`、`locale/en.json`、`locale/zh.json`），`LICENSE` 由 npm 自动收录。
 - 不要绕过：`lib/` 必须入库（`pnpm add file:` 的安装源）；本地 import 带 `.ts` 扩展名；host 与 client 零直接 import，只走 `GET/POST /api/auto-team`；宿主服务读取集中在 `src/host/adapters.ts`。
 
 ## 文档索引

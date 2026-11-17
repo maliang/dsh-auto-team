@@ -27,6 +27,7 @@ import type { MemberJumpView, TaskRowView } from '../viewmodel.ts'
 import {
   TASK_TABLE_HEADER,
   memberJumpOf,
+  roleJumpLabelOf,
   taskDetailOf,
   taskJumpLabelOf,
   taskOverviewOf,
@@ -69,11 +70,16 @@ function TaskRow(props: {
   done: boolean
   onToggleTask: (taskId: string) => void
   jump: MemberJumpView
+  /**
+   * t5：第二行第一列的角色标记也是入口（同一个成员，但文案按「角色」说）。
+   * 判定仍走 `memberJumpOf`（父组件用该行的 roleId+taskId 算好），组件只渲染。
+   */
+  roleJump: MemberJumpView
   onJump?: (jump: MemberJumpView) => void
   onTaskAction?: (action: Extract<PanelAction, { taskId: string }>) => void
   taskActionBusy?: boolean
 }): React.ReactElement {
-  const { row, task, done, onToggleTask, jump, onJump, onTaskAction, taskActionBusy } = props
+  const { row, task, done, onToggleTask, jump, roleJump, onJump, onTaskAction, taskActionBusy } = props
   const panel = row.expanded ? taskDetailOf(task) : null
   const detailId = `auto-team-task-detail-${task.id}`
   return (
@@ -131,7 +137,37 @@ function TaskRow(props: {
           ) : null}
         </span>
         <span data-task-line="meta">
-          <span data-task-role title={`角色：${row.roleName}`}>
+          {/* t5：角色标记本身是第二个入口 —— 该行 roleId+taskId 能唯一定位成员。
+              它在 data-task-toggle **内部**（几何上就是第二行第一列），所以点击与
+              Enter/Space 都必须 stopPropagation，否则会顺带把卡片展开/收起。
+              历史 run（onJump 缺省）保持纯展示：不给 role=button、不进 Tab 序列。 */}
+          <span
+            data-task-role
+            data-member-jump={onJump === undefined ? undefined : roleJump.available ? 'available' : 'unavailable'}
+            data-member-id={roleJump.memberId}
+            title={onJump === undefined ? `角色：${row.roleName}` : roleJump.title}
+            role={onJump === undefined ? undefined : 'button'}
+            tabIndex={onJump === undefined ? undefined : 0}
+            aria-label={onJump === undefined ? undefined : roleJump.label}
+            onClick={
+              onJump === undefined
+                ? undefined
+                : (event) => {
+                    event.stopPropagation()
+                    onJump(roleJump)
+                  }
+            }
+            onKeyDown={
+              onJump === undefined
+                ? undefined
+                : (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onJump(roleJump)
+                  }
+            }
+          >
             {row.roleName}
           </span>
           <span data-cell="token" data-usage-source={row.tokenSource} title={row.tokenTitle}>
@@ -358,6 +394,11 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
                       members,
                       { label: taskJumpLabelOf(task.id), taskTitle: task.title },
                     )}
+                    roleJump={memberJumpOf(
+                      { kind: 'task', roleId: task.roleId, taskId: task.id },
+                      members,
+                      { label: roleJumpLabelOf(task.roleName), taskTitle: task.title },
+                    )}
                     onJump={onJump}
                     onTaskAction={onTaskAction}
                     taskActionBusy={taskActionBusyId === task.id}
@@ -390,6 +431,11 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
               { kind: 'task', roleId: task.roleId, taskId: task.id },
               members,
               { label: taskJumpLabelOf(task.id), taskTitle: task.title },
+            )}
+            roleJump={memberJumpOf(
+              { kind: 'task', roleId: task.roleId, taskId: task.id },
+              members,
+              { label: roleJumpLabelOf(task.roleName), taskTitle: task.title },
             )}
             onJump={onJump}
             onTaskAction={onTaskAction}

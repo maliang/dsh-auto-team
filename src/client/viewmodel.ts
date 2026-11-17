@@ -3245,7 +3245,11 @@ export interface MemberJumpView {
   memberId?: string
   /** 不可跳转的原因（人话）：未派发 / 已回收 / 节点没记录角色。 */
   reason?: string
-  /** 命中的成员（可跳转时才有）：角色卡的成员态 chip 直接用它，避免第二次查找。 */
+  /**
+   * 命中的成员：角色卡的成员态 chip 直接用它，避免第二次查找。
+   * 不可跳转时通常为 undefined；唯一例外是角色卡「多人歧义」（t5）——
+   * 那时仍回填一个成员供 chip 显示，但不下发 `memberId`，即**不可跳**。
+   */
   member?: MemberView
   /** 任务行按钮上的可见文案（角色卡与流程图节点不渲染这句，只取 title/label）。 */
   actionText: string
@@ -3287,10 +3291,24 @@ function latestMemberOf(list: readonly MemberView[]): MemberView {
 }
 
 /**
+ * 成员名下是否包含该任务（r47）：一个成员可被多个任务复用，所以先看 `taskIds` 全集，
+ * 再兼容旧快照 / 单绑定形态的 `taskId`（t3 在宿主侧补 `taskIds`，字段缺席时按可选读）。
+ */
+function memberOwnsTask(member: MemberView, taskId: string): boolean {
+  if (member.taskId === taskId) return true
+  const ids = member.taskIds
+  return Array.isArray(ids) && ids.includes(taskId)
+}
+
+/**
  * 给一个计划任务找执行它的成员（三入口共用；原在 `nav.ts`，r33 移到纯投影层）。
  *
- * 优先级：**明确绑定了该 taskId 的成员** > 正在跑的成员 > 最近活跃的成员。
+ * 优先级：**名下包含该 taskId 的成员** > 正在跑的成员 > 最近活跃的成员。
  * 角色可能先后有多个成员（返工/续聊会新建），所以不能按 roleId 取第一个。
+ *
+ * r47 根因①：**给了 taskId 就只认这条任务的成员**。一个都没有 = 该任务没有可跳转的成员，
+ * 直接返回 undefined（上层给「未派发」人话原因），绝不回退到同角色其它任务的成员 ——
+ * 那种回退会让未派发任务显示为可跳转，点下去打开别人的会话。
  */
 export function memberForRole(
   members: readonly MemberView[] | null | undefined,
@@ -3300,12 +3318,23 @@ export function memberForRole(
   const list = Array.isArray(members) ? members.filter((member) => member.roleId === roleId) : []
   if (list.length === 0) return undefined
   if (typeof taskId === 'string' && taskId !== '') {
-    const bound = list.filter((member) => member.taskId === taskId)
-    if (bound.length > 0) return latestMemberOf(bound)
+    const owners = list.filter((member) => memberOwnsTask(member, taskId))
+    return owners.length > 0 ? latestMemberOf(owners) : undefined
   }
   const running = list.filter((member) => member.status === 'running')
   if (running.length > 0) return latestMemberOf(running)
   return latestMemberOf(list)
+}
+
+/**
+ * 同角色成员数（t5）：角色卡「名下成员不止一个就不跳」的唯一口径。
+ * 过滤条件与 `memberForRole` 完全一致，避免「判定说 1 个、查找却命中 2 个」。
+ */
+export function memberCountOfRole(
+  members: readonly MemberView[] | null | undefined,
+  roleId: string,
+): number {
+  return Array.isArray(members) ? members.filter((member) => member.roleId === roleId).length : 0
 }
 
 /* 跳转相关的可见文案（组件里禁止再拼一份，见文件头纪律 1）。 */
@@ -3318,20 +3347,19 @@ export const MEMBER_JUMP_REJECTED_TEXT = '没有跳转：宿主拒绝了这次�
 export const MEMBER_JUMP_NOT_READY_TEXT = '没有跳转：会话导航尚未就绪，请稍后重试'
 
 /**
- * 三入口的**唯一**跳转判定：有成员 → 可跳转并给 memberId；没成员 → 不可跳转并给人话原因。
- * 组件只调它，不许各处各写一套「找成员 + 拼原因」。
+ * 角色卡多人歧义的人话原因（t5，唯一出处）：卡片只有 roleId，点下去不知道开谁，
+ * 与其猜一个开错会话，不如把人导到能唯一定位成员的任务行。
  */
-export function memberJumpOf(
+export function roleCardMultiMemberReasonOf(count: number): string {
+  return `该角色有 ${count} 个子智能体，请从任务行进入`
+}
+
+/** 「有成员 / 没成员」的统一出参：三入口共用，文案与合并规则只在这里写一次。 */
+function memberJumpViewOf(
+  member: MemberView | undefined,
   source: MemberJumpSource,
-  members: readonly MemberView[] | null | undefined,
-  base: MemberJumpBase = {},
+  base: MemberJumpBase,
 ): MemberJumpView {
-  const member =
-    source.kind === 'node'
-      ? source.roleId === undefined
-        ? undefined
-        : memberForRole(members, source.roleId, source.taskId)
-      : memberForRole(members, source.roleId, source.taskId)
   if (member === undefined) {
     const reason =
       source.kind === 'role'
@@ -3356,6 +3384,56 @@ export function memberJumpOf(
     title: base.title === undefined ? open : `${base.title} · ${open}`,
     label: base.label === undefined ? open : `${base.label}，${open}`,
   }
+}
+
+/**
+ * 角色卡的跳转判定（t5）：**名下成员不止一个时不跳**。
+ *
+ * 一个角色返工/续聊后会留下多个成员，角色卡上只有 roleId —— 没有「点的是哪一个」的信息，
+ * 按「最近活跃 / running」猜一个就是乱跳（开错会话比不跳更糟，用户会以为成员串了）。
+ * 多成员时统一给人话原因，把人导到任务行：那里有 taskId，能唯一定位成员。
+ *
+ * 单成员 / 零成员与另外两个入口走**完全同一条**路径（`memberJumpViewOf`），不另写一套。
+ * 多成员时仍回填 `member` 供角色卡的成员态 chip 复用，但**不下发 memberId** = 不可跳。
+ */
+export function roleCardJumpOf(
+  source: Extract<MemberJumpSource, { kind: 'role' }>,
+  members: readonly MemberView[] | null | undefined,
+  base: MemberJumpBase = {},
+): MemberJumpView {
+  const count = memberCountOfRole(members, source.roleId)
+  if (count <= 1) {
+    return memberJumpViewOf(memberForRole(members, source.roleId, source.taskId), source, base)
+  }
+  const reason = roleCardMultiMemberReasonOf(count)
+  return {
+    available: false,
+    reason,
+    member: memberForRole(members, source.roleId, source.taskId),
+    actionText: `子智能体 · ${count} 个`,
+    title: base.title === undefined ? reason : `${base.title} · ${reason}`,
+    label: base.label === undefined ? reason : `${base.label}，${reason}`,
+  }
+}
+
+/**
+ * 三入口的**唯一**跳转判定：有成员 → 可跳转并给 memberId；没成员 → 不可跳转并给人话原因。
+ * 组件只调它，不许各处各写一套「找成员 + 拼原因」；
+ * 角色卡的「多人歧义」额外规则也在本文件（`roleCardJumpOf`），由 role 分支转调。
+ */
+export function memberJumpOf(
+  source: MemberJumpSource,
+  members: readonly MemberView[] | null | undefined,
+  base: MemberJumpBase = {},
+): MemberJumpView {
+  if (source.kind === 'role') return roleCardJumpOf(source, members, base)
+  const member =
+    source.kind === 'node'
+      ? source.roleId === undefined
+        ? undefined
+        : memberForRole(members, source.roleId, source.taskId)
+      : memberForRole(members, source.roleId, source.taskId)
+  return memberJumpViewOf(member, source, base)
 }
 
 /** 跳转入口的主信息：优先任务名（去掉首尾空白后非空才算），否则回退成员名。 */

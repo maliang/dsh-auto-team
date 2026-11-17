@@ -30,6 +30,8 @@ import {
   memberForRole,
   memberJumpNoticeOf,
   memberJumpOf,
+  roleCardJumpOf,
+  roleCardMultiMemberReasonOf,
   roleJumpLabelOf,
   taskJumpLabelOf,
 } from '../src/client/viewmodel.ts'
@@ -94,9 +96,14 @@ test('r33 ① 任务：明确绑定 taskId 的成员优先于同角色 running �
   )
   assert.equal(jump.available, true)
   assert.equal(jump.memberId, 'm-bound', 'taskId 绑定优先：不能按「最近活跃」跳到别的任务的成员')
-  // 没绑定关系的任务才回退到 running / 最近活跃。
-  const fallback = memberJumpOf({ kind: 'task', roleId: 'dev', taskId: 't9' }, [running, bound])
-  assert.equal(fallback.memberId, 'm-running')
+  // r47（t4）推翻了旧的「回退」语义：给了 taskId 但没有任何成员拥有它 → 不可跳，
+  // 绝不回退到同角色其它任务的成员（那会让未派发任务看起来可跳，点开是别人的会话）。
+  const unowned = memberJumpOf({ kind: 'task', roleId: 'dev', taskId: 't9' }, [running, bound])
+  assert.equal(unowned.available, false)
+  assert.equal(unowned.memberId, undefined)
+  assert.equal(unowned.reason, MEMBER_JUMP_NO_MEMBER_REASON)
+  // 没有 taskId 时（成员页/旧入口）才允许按 running → 最近活跃挑一个。
+  assert.equal(memberForRole([running, bound], 'dev', undefined)?.memberId, 'm-running')
 })
 
 test('r33 ① 任务无成员：available=false + 人话原因，title/label 都含原因', () => {
@@ -152,6 +159,37 @@ test('r33 ① 节点有角色：与角色卡/任务行走同一套绑定优先�
   const jump = memberJumpOf({ kind: 'node', roleId: 'qa', taskId: 't3' }, [bound, other])
   assert.equal(jump.available, true)
   assert.equal(jump.memberId, 'm-qa', '绑定该任务的成员优先，避免流程节点跳到相邻任务')
+})
+
+/* ─────────────────── t5：角色卡多人歧义 → 不跳，导到任务行 ─────────────────── */
+
+test('t5 角色卡：名下成员不止一个时不跳，给「N 个子智能体，请从任务行进入」', () => {
+  const a = memberOf({ memberId: 'm-a', roleId: 'dev', taskId: 't1', status: 'idle' })
+  const b = memberOf({ memberId: 'm-b', roleId: 'dev', taskId: 't2', status: 'running', lastEventAt: AT + 1 })
+  const jump = memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [a, b], { label: roleJumpLabelOf('开发') })
+  assert.equal(jump.available, false, '名下有两个成员时按 roleId 猜一个就是乱跳（开错会话比不跳更糟）')
+  assert.equal(jump.memberId, undefined, '不可跳时不得下发 memberId')
+  assert.equal(jump.reason, roleCardMultiMemberReasonOf(2))
+  assert.equal(jump.reason, '该角色有 2 个子智能体，请从任务行进入')
+  assert.match(jump.title, /该角色有 2 个子智能体，请从任务行进入/, '悬停必须说清为什么不跳')
+  assert.match(jump.label, /^角色：开发，该角色有 2 个子智能体，请从任务行进入$/, 'aria-label 与原因合并而不是互相覆盖')
+  assert.equal(jump.member?.memberId, 'm-a', '成员态 chip 仍要有个成员可显示（taskId 绑定优先）')
+  // 同一批成员下任务行依旧可跳：那里有 taskId，能唯一定位成员。
+  const viaTask = memberJumpOf({ kind: 'task', roleId: 'dev', taskId: 't2' }, [a, b])
+  assert.equal(viaTask.available, true)
+  assert.equal(viaTask.memberId, 'm-b')
+})
+
+test('t5 角色卡：单成员仍可跳，且与 roleCardJumpOf 是同一条路径（不分叉）', () => {
+  const only = memberOf({ memberId: 'm-only', roleId: 'dev', taskId: 't1' })
+  const viaEnum = memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [only], { label: roleJumpLabelOf('开发') })
+  assert.equal(viaEnum.available, true)
+  assert.equal(viaEnum.memberId, 'm-only')
+  assert.deepEqual(
+    roleCardJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [only]),
+    memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [only]),
+    'role 分支必须直接复用 roleCardJumpOf，否则两处规则会漂移',
+  )
 })
 
 /* ───────────────────────── ② 会话打开：服务缺失 / 抛错 / 空 id ───────────────────────── */
@@ -337,8 +375,22 @@ test('r33 ③ 任务行：独立 button 入口、不吞展开，title/aria-label
   assert.match(buttonRegion, /title=\{jump\.title\}/)
   assert.match(buttonRegion, /aria-label=\{jump\.label\}/)
   assert.match(buttonRegion, /data-member-jump=\{jump\.available \? 'available' : 'unavailable'\}/)
-  assert.equal(source.includes('stopPropagation'), false, '兄弟节点不冒泡到展开按钮，不需要 stopPropagation')
   assert.match(source, /onClick=\{\(\) => onJump\(jump\)\}/)
+  // t5：第二行第一列的角色标记是嵌在展开按钮**内部**的第二个入口，它必须自己吞事件，
+  // 否则点角色会顺带把卡片展开/收起；「子智能体」入口仍是兄弟原生 button，不吞事件。
+  assert.equal(buttonRegion.includes('stopPropagation'), false, '兄弟入口不吞事件')
+  assert.match(source, /role=\{onJump === undefined \? undefined : 'button'\}/, '角色标记可跳时必须是按钮语义')
+  assert.match(source, /tabIndex=\{onJump === undefined \? undefined : 0\}/, '角色标记必须进 Tab 序列')
+  assert.match(
+    source,
+    /aria-label=\{onJump === undefined \? undefined : roleJump\.label\}/,
+    '角色标记的 aria-label 必须来自 memberJumpOf（roleJump）',
+  )
+  assert.equal(
+    (source.match(/event\.stopPropagation\(\)/g) ?? []).length >= 2,
+    true,
+    '点击与 Enter/Space 两条路径都要吞掉冒泡',
+  )
 })
 
 test('r33 ③ 流程图节点：原生 button，可跳优先、不可跳给原因并保留选中回退', () => {
