@@ -635,7 +635,7 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
   const applyReceiptPort: ApplyReceiptPort = (state, taskId, receipt, at, maxAttempts) =>
     applyReceipt(state, taskId, receipt, at, maxAttempts)
 
-  const sendMessage: SendPort = (memberId, text) => spawnPorts.sendMessage(memberId, text)
+  const sendMessage: SendPort = (memberId, text, sessionId) => spawnPorts.sendMessage(memberId, text, sessionId)
 
   /**
    * 队长模型投影（AC-2 / AC-3）：**配置位与能力位分开**。
@@ -726,7 +726,7 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       stepReminderAt: settings.stepReminderAt,
       // r39：提醒的实发口 —— 与面板「直达消息」同一个宿主端口（按 SessionId 直发）。
       // 老宿主没有该能力时 adapters 的 sendMessage 返回 ok:false，提醒不落账、静默重试。
-      sendMemberMessage: (memberId, text) => spawnPorts.sendMessage(memberId, text),
+      sendMemberMessage: (memberId, text, sessionId) => spawnPorts.sendMessage(memberId, text, sessionId),
       // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
       // r13 AC-8 第五个触发点：每轮 tick 先驱动一次自动派发（补成员退出/漏 kick 的窗口），
       // 派发语义仍在 dispatcher 里，这里只是「顺手推一下」。

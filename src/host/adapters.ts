@@ -1173,14 +1173,24 @@ export interface SpawnPorts {
       }
     | { ok: false; error: string }
   >
-  sendMessage: (memberId: string, text: string) => Promise<{ ok: boolean; error?: string }>
+  /**
+   * @param sessionId 队长会话 id（run 的 `plan.sessionId`）：后台链路（回执 → 验收召集）
+   *   没有 initiator，必须靠它取宿主**活 agent 实例**当 caller，否则宿主引用相等检查会拒。
+   */
+  sendMessage: (
+    memberId: string,
+    text: string,
+    sessionId?: string,
+  ) => Promise<{ ok: boolean; error?: string }>
   /**
    * 尽力中断一个成员（r11 AC-26）：面板「取消任务」在任务 `running` 时调用。
    *
    * **可选**：宿主没有 `ctx.interrupt` 时不提供，调用方按「未装配」处理（只改任务状态）。
    * 返回形状归一在这一层（见 `normalizeInterruptResult`），bridge 只消费 `{ ok, error? }`。
+   *
+   * @param sessionId 同 `sendMessage`：拿得到队长会话 id 时用它取活 caller 实例。
    */
-  interruptMember?: (name: string) => Promise<{ ok: boolean; error?: string }>
+  interruptMember?: (name: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>
 }
 
 /**
@@ -1325,8 +1335,15 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
     return undefined
   }
 
-  /** 旧宿主专用：把名单刷进名字表（新宿主按 SessionId 直发，不需要名字）。 */
-  function refreshNames(caller: HostAgent): void {
+  /**
+   * 旧宿主专用：把名单刷进名字表（新宿主按 SessionId 直发，不需要名字）。
+   *
+   * `sessionId` 传队长会话 id 时取活 caller 实例；拿不到 caller 就什么都不刷（保持旧行为：
+   * 名字表缺失时按 memberId 直传）。
+   */
+  function refreshNames(sessionId?: string): void {
+    const caller = liveCallerOf(ctx, sessionId)
+    if (caller === undefined) return
     try {
       const rows = teams?.listMembers?.(caller)
       if (!Array.isArray(rows)) return
@@ -1389,8 +1406,14 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
           error: '宿主未提供 subagents.startActivation（旧宿主也没有 agentTeams.spawnTeammate），无法创建成员',
         }
       }
+      // 旧宿主回退路径仍优先用 resolveCaller（工具执行链上一定可用），没有 initiator 时才退回活实例。
       const caller = resolveCaller(ctx)
-      if (!caller) return { ok: false, error: NO_CALLER }
+      // 后台路径（auto-receipt → conveneReviewers → spawn）不在工具执行链上，没有 initiator，
+      // `resolveCaller` 取到的 agent 不保证是宿主 `agents.get` 里的**同一个实例**；宿主的
+      // 身份检查（`get(spec.parent.id) !== spec.parent` → UNAUTHORIZED）会直接拒。
+      // 因此按队长会话 id 取活 agent 实例作 parent，取不到才回退 resolveCaller（liveCallerOf）。
+      const parent = liveCallerOf(ctx, input.sessionId)
+      if (!parent) return { ok: false, error: NO_CALLER }
       // provider 必须是**已注册的 subagent provider 名**；LLM 模型走 agentOptions 带下去。
       const provider = subagentProviderName()
       const modelRoute = modelRouteOf(input)
@@ -1416,7 +1439,7 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
             label: subagentLabelOf(input),
             name: input.name,
             prompt,
-            parent: caller,
+            parent,
             signal: abort,
             // 完成时通知父会话模型（队长）；成员不是宿主队友，通知靠这条投递。
             delivery: 'parent',
@@ -1441,7 +1464,9 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
           return { ok: true, memberId: activation.childId, ...(actual === undefined ? {} : { actual }) }
         }
         // ── 旧宿主回退路径（agentTeams.spawnTeammate）────────────────────────────
-        const created = (await teams!.spawnTeammate!(caller, {
+        // 旧 API 的 caller 仍优先用 resolveCaller（它在工具执行链上一定可用）；
+        // 没有 initiator 时退回刚取到的活 agent 实例。
+        const created = (await teams!.spawnTeammate!(caller ?? parent, {
           name: input.name,
           description: input.description ?? `任务 ${input.taskId}`,
           prompt,
@@ -1468,7 +1493,7 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
       }
     },
 
-    async sendMessage(memberId, text) {
+    async sendMessage(memberId, text, sessionId) {
       const subagents = subagentsOf()
       const canNewSend = typeof subagents?.sendMessage === 'function'
       // 旧宿主兼容分支：新宿主已移除 agentTeams.sendMessage。
@@ -1476,7 +1501,9 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
       if (!canNewSend && !canOldSend) {
         return { ok: false, error: '宿主未提供 subagents.sendMessage（旧宿主也没有 agentTeams.sendMessage）' }
       }
-      const caller = resolveCaller(ctx)
+      // 后台链路（auto-receipt → conveneReviewers → 验收清单/派发通知）没有 initiator：
+      // 只走 resolveCaller 会拿到别的实例，宿主按引用相等检查 caller，会直接拒。
+      const caller = liveCallerOf(ctx, sessionId)
       if (!caller) return { ok: false, error: NO_CALLER }
       const content = [{ type: 'text', text }] satisfies HostTextBlock[]
       const abort = signal ?? new AbortController().signal
@@ -1486,7 +1513,7 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
           await subagents.sendMessage(caller, memberId, content, { signal: abort })
           return { ok: true }
         }
-        if (!names.has(memberId)) refreshNames(caller)
+        if (!names.has(memberId)) refreshNames(sessionId)
         const target = names.get(memberId) ?? memberId
         await teams!.sendMessage!(caller, { target, content, signal: abort })
         return { ok: true }
@@ -1504,14 +1531,15 @@ export function createSpawnPorts(ctx: HostContext, signal?: AbortSignal): SpawnP
      * 失败**不是**动作失败：bridge 把 `error` 折进一条 notice，任务状态照常落 `cancelled`
      * —— 否则用户点一次「取消」会得到红字而状态没变，比不中断更糟。
      */
-    async interruptMember(name) {
+    async interruptMember(name, sessionId) {
       const subagents = subagentsOf()
       const canNewInterrupt = typeof subagents?.interrupt === 'function' && typeof subagents?.resolveName === 'function'
       const oldInterrupt = teams?.interrupt
       if (!canNewInterrupt && typeof oldInterrupt !== 'function') {
         return { ok: false, error: '宿主未提供 interrupt 能力（成员不会被中断，任务状态照常取消）' }
       }
-      const caller = resolveCaller(ctx)
+      // 同 sendMessage：后台链路没有 initiator，有会话 id 时优先取活 agent 实例。
+      const caller = liveCallerOf(ctx, sessionId)
       if (!caller) return { ok: false, error: NO_CALLER }
       try {
         if (canNewInterrupt && subagents?.interrupt && subagents.resolveName) {
@@ -1627,7 +1655,7 @@ export async function listHostMembers(ctx: HostContext, rootId?: string): Promis
   if (typeof subagents?.listDescendants === 'function') {
     let targetRoot = requestedRoot
     if (targetRoot === undefined) {
-      const caller = resolveCaller(ctx)
+      const caller = liveCallerOf(ctx, requestedRoot)
       if (!caller) throw hostError(NO_CALLER, 'NO_CALLER')
       const root = subagents.rootOf?.(caller) as { id?: unknown } | string | undefined
       const id = typeof root === 'string' ? root : root?.id
@@ -1639,7 +1667,7 @@ export async function listHostMembers(ctx: HostContext, rootId?: string): Promis
     return normalizeDescendantRows(await subagents.listDescendants(targetRoot))
   }
   // 旧宿主只有 `agentTeams.listMembers(caller)`：仍然只能按当前 caller 查。
-  const caller = resolveCaller(ctx)
+  const caller = liveCallerOf(ctx, requestedRoot)
   if (!caller) throw hostError(NO_CALLER, 'NO_CALLER')
   if (typeof teams?.listMembers === 'function') {
     return normalizeMemberRows(await teams.listMembers(caller))
@@ -1914,6 +1942,40 @@ function liveAgentOf(ctx: HostContext, memberId: string): unknown {
     /* 已卸载 / 非会话 id：视为取不到，由调用方降级 */
     return undefined
   }
+}
+
+/**
+ * 按会话 id 取宿主**活 agent 实例**并收窄成 `HostAgent`，用作 `startActivation` 的 parent。
+ *
+ * 为什么不能只靠 `resolveCaller`：宿主身份检查是引用相等（`agents.get(id) !== parent` 即
+ * UNAUTHORIZED），而后台链路（auto-receipt → conveneReviewers → spawn）没有 initiator，
+ * `currentInitiator()` 给出的未必是同一个实例。拿不到 id / 不是对象时返回 `undefined`，
+ * 由调用方回退旧逻辑（保持 NO_CALLER 行为不变）。
+ */
+function liveParentOf(ctx: HostContext, sessionId: string): HostAgent | undefined {
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  const live = liveAgentOf(ctx, sessionId)
+  if (live === undefined || live === null || typeof live !== 'object') return undefined
+  if (typeof (live as { id?: unknown }).id !== 'string') return undefined
+  return live as HostAgent
+}
+
+/**
+ * 给宿主调用（spawn parent / sendMessage / interrupt / listMembers）挑一个**可接受的 caller**。
+ *
+ * 宿主身份检查是引用相等：`agents.get(id) !== caller` 即拒。后台链路（auto-receipt →
+ * conveneReviewers → 验收清单 / 派发通知 / stall 提醒）不在工具执行链上，没有 initiator，
+ * 只靠 `resolveCaller` 会拿到别的实例。所以有会话 id 时优先取活 agent（{@link liveParentOf}），
+ * 取不到才回退 `resolveCaller`（旧行为，保持 NO_CALLER 语义不变）。
+ *
+ * @param sessionId 队长会话 id（run 的 `plan.sessionId`，即 subagent 树的根）。
+ */
+function liveCallerOf(ctx: HostContext, sessionId?: string): HostAgent | undefined {
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    const live = liveParentOf(ctx, sessionId)
+    if (live !== undefined) return live
+  }
+  return resolveCaller(ctx)
 }
 
 /**

@@ -293,7 +293,9 @@ test('r16 左栏 glyph 与右栏内联库：32 条 / 28 返回键 / 11-500 提�
 
   const inline = '[data-auto-team-panel] [data-panel-library-inline]'
   expectDecl(inline, 'display: flex')
-  expectDecl(inline, 'flex: 1 1 auto')
+  // basis 0（r9）：auto 会让 basis 等于内容高度，面板溢出时页签条/头部被连带压缩；
+  // 语义不变 —— 内联库仍是该分支唯一的 flex-grow 项，照样填满面板。
+  expectDecl(inline, 'flex: 1 1 0')
   expectDecl(inline, 'flex-direction: column')
   expectDecl(inline, 'min-height: 0')
   expectDecl(inline, 'overflow: hidden')

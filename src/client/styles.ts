@@ -195,8 +195,22 @@ export const AUTO_TEAM_CSS = `
   font: var(--dsw-font-xs-13, 13px/20px sans-serif);
   color: var(--dsw-alias-label-primary, inherit);
 }
+/* 面板直接子元素的高度契约（r9「页签条被压扁」的根因修复）：
+ * body 若用 flex: 1 1 auto，flex-basis = 内容高度（可达数千 px）；容器一旦溢出，
+ * flex-shrink 就按 basis 加权把负空间分摊给**所有**子项，36px 的页签条会被压到十几 px。
+ * 所以固定高度外壳一律 flex: 0 0 auto（不 grow、不 shrink），
+ * 滚动主体（[data-panel-body] / [data-panel-library-inline]）用 flex: 1 1 0：
+ * basis 为 0，只吃剩余空间，不再把兄弟项拖下水。 */
+[data-auto-team-panel] > [data-panel-head],
+[data-auto-team-panel] > [data-panel-meta],
+[data-auto-team-panel] > [data-panel-paused-banner],
+[data-auto-team-panel] > [data-error] {
+  flex: 0 0 auto;
+}
 [data-auto-team-panel] [data-panel-head] {
   display: flex;
+  /* 固定高度外壳：不 grow、不 shrink（与上面的直接子元素契约同一条理由）。 */
+  flex: 0 0 auto;
   align-items: center;
   gap: 8px;
   box-sizing: border-box;
@@ -221,6 +235,7 @@ export const AUTO_TEAM_CSS = `
  * 禁止用 display:none 冒充分区（那是变异测试里必红的作弊）。 */
 [data-auto-team-panel] [data-panel-meta] {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
@@ -319,7 +334,8 @@ export const AUTO_TEAM_CSS = `
   color: var(--dsw-alias-label-primary, inherit);
   border-bottom-color: var(--dsw-alias-state-business-primary, #2f6feb);
 }
-[data-auto-team-panel] [data-panel-body] { flex: 1 1 auto; overflow: auto; min-height: 0; }
+/* basis 0（不是 auto）：auto 会让 basis 等于内容高度，容器溢出时页签条/头部一起被压缩。 */
+[data-auto-team-panel] [data-panel-body] { flex: 1 1 0; overflow: auto; min-height: 0; }
 /*
  * 页头控制条（DESIGN §0.2 / §2.3）：高 40、padding 8-12、底部 1px 分隔。
  * 「完成 x/N」用 tabular-nums（数字位宽固定，计数跳动时其它元素不抖）；320px 下限时
@@ -400,6 +416,7 @@ export const AUTO_TEAM_CSS = `
 /* 暂停横幅（DESIGN §0.2 / §0.4）：高 32、左 3px 琥珀竖条、无阴影 —— 琥珀不是红。 */
 [data-auto-team-panel] [data-panel-paused-banner] {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 6px;
   box-sizing: border-box;
@@ -426,7 +443,8 @@ export const AUTO_TEAM_CSS = `
   border-left: 2px solid var(--dsw-alias-border-l3, currentColor);
   padding-left: 8px;
 }
-[data-auto-team-panel] [data-error] { color: var(--dsw-alias-state-error-primary, #d33); padding: 4px 0; }
+/* 错误条是固定高度的一段文字，同样不许被压缩。 */
+[data-auto-team-panel] [data-error] { flex: 0 0 auto; color: var(--dsw-alias-state-error-primary, #d33); padding: 4px 0; }
 [data-auto-team-panel] [data-hint] {
   color: var(--dsw-alias-state-warn-primary, #b58900);
   padding: 2px 0;
@@ -2208,6 +2226,8 @@ export const AUTO_TEAM_CSS = `
   align-items: stretch;
   gap: 2px;
   box-sizing: border-box;
+  /* 固定 36px，绝不参与 grow/shrink —— 否则面板溢出时页签条会被压到十几 px。 */
+  flex: 0 0 auto;
   height: 36px;
   padding: 0 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor);
@@ -4376,7 +4396,8 @@ export const AUTO_TEAM_CSS = `
 }
 [data-auto-team-panel] [data-panel-library-inline] {
   display: flex;
-  flex: 1 1 auto;
+  /* 与 [data-panel-body] 同为滚动主体：basis 0，只吃剩余空间。 */
+  flex: 1 1 0;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;

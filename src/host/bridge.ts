@@ -242,6 +242,8 @@ export type ApplyReceiptPort = (
 export type SendPort = (
   memberId: string,
   text: string,
+  /** 队长会话 id（run 的 `plan.sessionId`）：后台链路靠它取宿主活 agent 实例当 caller。 */
+  sessionId?: string,
 ) => Promise<{ ok: boolean; error?: string; code?: RejectionCode }>
 
 export interface BridgeDeps {
@@ -363,7 +365,7 @@ export interface BridgeDeps {
    * 缺省 = 只改任务状态：`cancelled` 是权威，成员由 watcher 对账；中断失败只进 notice，
    * 绝不让「取消」这个动作失败（否则用户点一次取消得到红字，状态却没变）。
    */
-  interruptMember?: (name: string) => Promise<{ ok: boolean; error?: string }>
+  interruptMember?: (name: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>
   /**
    * 队长亲手写文件的留痕（r11 AC-22/AC-24）：快照 `deviations` 的**唯一**来源。
    *
@@ -976,7 +978,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         stopFailed.push({ name: binding.name, error: '宿主未装配成员中断端口' })
         continue
       }
-      const result = await interrupt(binding.name)
+      const result = await interrupt(binding.name, state.plan.sessionId)
       if (result.ok) {
         stopped.push(binding.name)
         retired.add(binding.memberId)
@@ -1009,7 +1011,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         changed: changedIds.has(task.id),
         cancelled: cancelledIds.has(task.id),
       })
-      const sent = await deps.sendMessage(binding.memberId, text)
+      const sent = await deps.sendMessage(binding.memberId, text, state.plan.sessionId)
       if (sent.ok) {
         notified.push(binding.name)
         messages.push(
@@ -1142,7 +1144,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       if (message.from !== 'peer' || message.toMemberId === undefined) continue
       const target = message.to
       try {
-        const sent = await deps.sendMessage(message.toMemberId, message.body)
+        const sent = await deps.sendMessage(message.toMemberId, message.body, after.plan.sessionId)
         notices.push(
           sent.ok
             ? `上游交接已直投给 ${target}${message.taskId === undefined ? '' : `（${message.taskId}）`}`
@@ -2639,7 +2641,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
             const memberName = binding.name
             const interrupt = deps.interruptMember
             if (typeof interrupt === 'function') {
-              const stopped = await interrupt(memberName)
+              const stopped = await interrupt(memberName, state.plan.sessionId)
               stoppedOk = stopped.ok
               notices.push(
                 stopped.ok
@@ -2953,7 +2955,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
               runId,
             )
           }
-          const sent = await deps.sendMessage(memberId, text)
+          const sent = await deps.sendMessage(memberId, text, state.plan.sessionId)
           if (!sent.ok) {
             return reject(sent.code ?? 'NOT_FOUND', sent.error ?? '直达消息发送失败', sessionId, undefined, runId)
           }
@@ -3096,7 +3098,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
             const binding = bindingFor(next, action.taskId)
             if (binding) {
               const text = `门禁未通过（退出码 ${evidence.exitCode}）：请按以下证据返工\n${evidence.tail}`
-              const sent = await deps.sendMessage(binding.memberId, text)
+              const sent = await deps.sendMessage(binding.memberId, text, next.plan.sessionId)
               if (!sent.ok) {
                 notices.push(`证据回发失败：${sent.error ?? '未知原因'}`)
               }
@@ -3242,7 +3244,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
               '改完照常走 auto_team_receipt 提交回执；门禁通过后仍会回到待验收。',
             ].join('\n')
             if (author) {
-              const sent = await deps.sendMessage(author.memberId, text)
+              const sent = await deps.sendMessage(author.memberId, text, next.plan.sessionId)
               if (!sent.ok) notices.push(`返工要求回发失败：${sent.error ?? '未知原因'}`)
               next = withMessage(
                 next,

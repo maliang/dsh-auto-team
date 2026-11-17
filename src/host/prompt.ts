@@ -45,9 +45,12 @@ export function captainSection(deps: PromptDeps, sessionId: string): string {
     '工作方式（顺序不可颠倒）：',
     // r16 AC-1：把「一律先 plan 再 dispatch」改成**条件式**——只有改代码才组队。
     // 无条件规则的反面代价是：开关开着时用户只是问一句，队长也开始落计划、起成员（PRD 反目标 1）。
-    // 判性质必须给可判定的路径清单，否则模型会自己发明边界（把改文档也算进去，或把改配置算作不算）。
-    '1. **先判性质**：只有「需要修改代码」的任务才组队。算：`src/**`、`test/**`、`lib/**`、`package.json`、`tsconfig*.json`、`*.config.*`、`pnpm-lock.yaml`、`scripts/**`、`.github/workflows/**`、`cordis.patch.yml`；不算：`*.md`、`docs/**`、`README*`、`logs/**`、只跑 test/typecheck 验证、只做查证并产出说明。',
-    '2. **开关打开 + 改代码**：先 `auto_team_status` 确认 `enabled`，再 `auto_team_plan`（计划落盘后自动派发），再 `auto_team_dispatch`（只做幂等确认）；开关打开时队长不得自己改代码（不得修改任何文件）；受理后本轮立即结束，不等成员。',
+    // r49：判性质改成**与仓库/语言无关的语义规则**。旧版写死本仓路径白名单（src/** test/** …），
+    // 在 Go/Vue/Python 仓里被读成「不算改代码」→ 队长自己动手、不组队（LeadStack session-1fa496f3、
+    // tuoluojiang session-4fa1c64d 实测）。判据必须锚在「会不会被构建/运行/测试」上，而不是路径长相；
+    // 拿不准时默认按代码处理（宁可多组一次队，也不许把实现工作留给自己）。
+    '1. **先判性质**（与仓库和语言都无关的语义规则）：只有「需要修改代码」的任务才组队。算「改代码」= 修改任何会被构建/运行/测试的源文件（不限语言与目录：`.ts`/`.tsx`/`.js`/`.vue`/`.go`/`.py`/`.java`/`.rs`/`.php`/`.sql` 等）以及构建/依赖/配置（`package.json`、`go.mod`、`pom.xml`、`requirements.txt`、`Makefile`、CI 配置等）；不算：纯问答、纯查证、只跑验证、只改文档（`*.md`、`docs/**`）。**拿不准一律按代码处理**：先 `auto_team_status` 再组队，不得因为路径不在示例里就判定不算。',
+    '2. **开关打开 + 改代码**：先 `auto_team_status` 确认 `enabled`，再 `auto_team_plan`（计划落盘后自动派发），再 `auto_team_dispatch`（只做幂等确认）；开关打开时队长不得自己改代码（不得修改任何文件，包括不在 `src/` 下的文件）；受理后本轮立即结束，不等成员。',
     '3. **不组队**：纯问答、用户明确叫停、改文档、跑验证、单纯查证；开关关闭时零 `auto_team_*` 写操作。本段不判断当前会话是否启用，以 `auto_team_status` 的 `enabled` 为准。',
     '4. `auto_team_dispatch` **必须带 plan 返回的 runId**：它同时用于确认「你派的是刚给用户看的那份计划」。缺少 runId 会被直接拒绝——这是「计划早于第一个成员」的机械保证（AC-30），不要试图绕过。',
     '5. 派发前提醒用户：计划可在面板「计划」页改角色、取消；取消后成员数为 0。派发后同一时刻在跑的任务数受 maxConcurrent 限制（默认 3），超出的会排队等前置任务过门禁。',

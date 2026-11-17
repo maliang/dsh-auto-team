@@ -72,7 +72,12 @@ export interface WatcherDeps {
    * 本来就不会产生候选；单测桩不传本端口时同样什么都不发生（与 progress 同一降级口径）。
    * 抛错/`ok:false` 时**不落账**，下一轮 tick 自然重试（提醒不是护栏，失败绝不打断对账）。
    */
-  sendMemberMessage?(memberId: string, text: string): Promise<{ ok: boolean; error?: string }>
+  sendMemberMessage?(
+    memberId: string,
+    text: string,
+    /** 队长会话 id（run 的 `plan.sessionId`）：定时器回调没有 initiator，靠它取活 caller。 */
+    sessionId?: string,
+  ): Promise<{ ok: boolean; error?: string }>
 }
 
 export interface ReconcileResult {
@@ -484,7 +489,7 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
         if (!paused && stepReminderAt > 0 && deps.sendMemberMessage !== undefined) {
           for (const reminder of stepRemindersOf(next, stepReminderAt)) {
             try {
-              const sent = await deps.sendMemberMessage(reminder.memberId, reminder.text)
+              const sent = await deps.sendMemberMessage(reminder.memberId, reminder.text, state.plan.sessionId)
               if (!sent.ok) continue
               next = recordStepReminder(next, reminder, at)
             } catch {

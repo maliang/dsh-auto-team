@@ -67,7 +67,12 @@ export type SpawnPort = (
   | { ok: false; error: string }
 >
 
-export type SendPort = (memberId: string, text: string) => Promise<{ ok: boolean; error?: string; code?: RejectionCode }>
+export type SendPort = (
+  memberId: string,
+  text: string,
+  /** 队长会话 id（run 的 `plan.sessionId`）：后台链路靠它取宿主活 agent 实例当 caller。 */
+  sessionId?: string,
+) => Promise<{ ok: boolean; error?: string; code?: RejectionCode }>
 
 export interface DispatchDeps {
   store: RunsStore
@@ -744,7 +749,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
         const text = resumeText(task)
         if (deps.sendMessage) {
           try {
-            await deps.sendMessage(binding.memberId, text)
+            await deps.sendMessage(binding.memberId, text, next.plan.sessionId)
           } catch {
             /* 发送失败不拦派发：成员仍活着，下一轮 watcher/resume 会再试 */
           }
@@ -821,7 +826,7 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
           }
           let sent = false
           try {
-            const result = await deps.sendMessage(reusable.memberId, card)
+            const result = await deps.sendMessage(reusable.memberId, card, next.plan.sessionId)
             sent = result.ok === true
           } catch {
             sent = false
@@ -1057,7 +1062,7 @@ export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<Resu
     const text = resumeText(task)
     if (deps.sendMessage) {
       try {
-        await deps.sendMessage(binding.memberId, text)
+        await deps.sendMessage(binding.memberId, text, next.plan.sessionId)
       } catch {
         /* 发送失败也要更新去抖时间戳，否则每次轮询都会重复发 */
       }
@@ -1533,7 +1538,7 @@ export async function conveneReviewers(
   }
   let sent: { ok: boolean; error?: string }
   try {
-    sent = await deps.sendMessage(reviewer.memberId, batchText)
+    sent = await deps.sendMessage(reviewer.memberId, batchText, next.plan.sessionId)
   } catch (error) {
     sent = { ok: false, error: messageOf(error) }
   }

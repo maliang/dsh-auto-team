@@ -95,10 +95,19 @@ test('r16 AC-1：条件式规则 —— 只有改代码才组队，先查 enable
     assert.ok(text.includes(token), `缺少条件式规则要素：${token}`)
   }
   // 可判定清单：算改代码 / 不算改代码都必须在常驻段里逐字可查（删掉任一侧即红）。
+  // r49：判据从「本仓路径白名单」改成**与仓库/语言无关的语义规则**，样本必须覆盖非 TS 仓，
+  // 否则规则又会退化成「只认 src/**」。多语言样本任何一个被删都红。
   for (const token of [
     '只有「需要修改代码」的任务才组队',
-    'src/**',
-    'docs/**',
+    '不限语言与目录',
+    '`.go`',
+    '`.vue`',
+    '`.py`',
+    '`go.mod`',
+    '`pom.xml`',
+    '`requirements.txt`',
+    '`Makefile`',
+    'CI 配置',
     '不得修改任何文件',
     '立即结束本轮',
     '纯问答',
@@ -108,12 +117,45 @@ test('r16 AC-1：条件式规则 —— 只有改代码才组队，先查 enable
   ]) {
     assert.ok(text.includes(token), `缺少条件式规则要素：${token}`)
   }
-  // 「文档任务也算组队」是最危险的退化：`*.md` 与 `docs/**` 必须明确落在「不算」一侧。
-  assert.match(text, /不算：`\*\.md`、`docs\/\*\*`/, '文档任务必须明确不算改代码')
+  // 「文档任务也算组队」是最危险的退化：`*.md` 与 `docs/**` 必须明确落在「不算」这一侧。
+  // r49：断言从「整段形状」收紧到「不算子句内部」——文档与纯问答/纯查证/只跑验证必须在同一句里。
+  const notCodeStart = text.indexOf('不算：')
+  assert.ok(notCodeStart > 0, '缺少「不算」子句')
+  const notCodeClause = text.slice(notCodeStart, text.indexOf('。', notCodeStart))
+  for (const token of ['*.md', 'docs/**', '纯问答', '纯查证', '只跑验证', '只改文档']) {
+    assert.ok(notCodeClause.includes(token), `「不算」子句缺少：${token}`)
+  }
+  // r49 反例守卫：旧版写死的本仓路径白名单不得回流（Go/Vue/Python 仓会被误判成「不算改代码」）。
+  assert.equal(text.includes('`src/**`'), false, '不得再写死本仓路径白名单')
+  assert.equal(text.includes('`test/**`'), false, '不得再写死本仓路径白名单')
   // 无条件断言必须不存在：开关状态只能由工具读取。
   assert.equal(/本会话已(开启|启用)/.test(text), false, '不得出现会话级无条件断言')
   // 旧的无条件派发规则（用户确认后才 dispatch）必须被条件式规则取代。
   assert.equal(text.includes('用户确认（或明确说「开干」）后才用'), false)
+  assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
+})
+
+test('r49：拿不准一律按代码处理；开关打开时队长不得自己改代码（与目录/语言无关）', () => {
+  const text = sectionOf(makeSnapshot())
+  const ruleStart = text.indexOf('1. **先判性质**')
+  assert.ok(ruleStart > 0, '缺少「先判性质」规则')
+  const ruleLine = text.slice(ruleStart, text.indexOf('\n', ruleStart))
+
+  // ③ 拿不准时不赌：必须按代码处理，且先去工具读开关再组队。
+  assert.ok(ruleLine.includes('拿不准一律按代码处理'), '缺少「拿不准按代码」兜底规则')
+  assert.ok(ruleLine.includes('不得因为路径不在示例里就判定不算'), '兜底规则必须显式否掉「示例外即不算」')
+  const fallbackAt = ruleLine.indexOf('拿不准一律按代码处理')
+  assert.ok(
+    ruleLine.indexOf('auto_team_status', fallbackAt) > fallbackAt &&
+      ruleLine.indexOf('auto_team_status', fallbackAt) < ruleLine.indexOf('再组队', fallbackAt),
+    '拿不准时必须先 auto_team_status 再组队',
+  )
+
+  // ④ 开关打开时队长不得自己改代码，且边界明确包括不在 src/ 下的文件（Go/Vue/Python 仓同理）。
+  assert.match(text, /开关打开时队长不得自己改代码/, '缺少「开关打开时队长不得自己改代码」')
+  const guardStart = text.indexOf('开关打开时队长不得自己改代码')
+  const guardLine = text.slice(guardStart, text.indexOf('\n', guardStart))
+  assert.ok(guardLine.includes('包括不在 `src/` 下的文件'), '守卫必须明说边界不限于 src/')
   assert.ok(text.length <= SECTION_MAX, `段落长度 ${text.length} 超过 ${SECTION_MAX}`)
 })
 
