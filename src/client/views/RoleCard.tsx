@@ -47,6 +47,8 @@ export interface RoleCardProps {
   tasks?: readonly TaskCardSource[]
   /** 缺省 = 卡片不可点（历史 run / 非任务页用法）。 */
   onJump?: (jump: MemberJumpView) => void
+  /** r53：所属 run 已结束（历史 / 已收口）—— 没成员时原因说「已结束」而不是「未派发」。 */
+  closedRun?: boolean
 }
 
 export interface RoleGridProps {
@@ -56,13 +58,15 @@ export interface RoleGridProps {
   /** r33：当前 run 的任务视图（逐卡片查「当前任务待回执」）。 */
   tasks?: readonly TaskCardSource[]
   onJump?: (jump: MemberJumpView) => void
+  /** r53：原样透传给每张卡片（判定只在 `memberJumpOf` 里做）。 */
+  closedRun?: boolean
 }
 
 /** 旧快照/旧夹具缺派生字段时的兜底（不改写统计，只保证界面不空）。 */
 const FALLBACK_STATE: RoleStateKind = 'idle'
 
 export function RoleCard(props: RoleCardProps): React.ReactElement {
-  const { role, members, tasks, onJump } = props
+  const { role, members, tasks, onJump, closedRun } = props
   const state = role.state ?? FALLBACK_STATE
   const stateText = role.stateText ?? ROLE_STATE_TEXT[state]
   const tone = ROLE_STATE_TONE[state] ?? 'neutral'
@@ -79,7 +83,7 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   const jump = memberJumpOf(
     { kind: 'role', roleId: role.roleId, taskId: role.activeTaskId },
     members,
-    { label: roleJumpLabelOf(role.name), taskTitle: role.activeTaskTitle },
+    { label: roleJumpLabelOf(role.name), taskTitle: role.activeTaskTitle, closedRun },
   )
   const member = jump.member
   // r21：角色的聚合状态看不出成员被中断/作废/等写域 —— 这类实况用一枚成员态 chip 补上。
@@ -208,6 +212,7 @@ export function RoleGrid(props: RoleGridProps): React.ReactElement {
             members={props.members}
             tasks={props.tasks}
             onJump={props.onJump}
+            closedRun={props.closedRun}
           />
         ))}
       </div>

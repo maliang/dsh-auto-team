@@ -46,6 +46,8 @@ export interface TaskTableProps {
   members?: MemberView[]
   /** r33：点任务行里的「子智能体」按钮 = 跳到该成员的宿主会话（判定来自 memberJumpOf）。 */
   onJump?: (jump: MemberJumpView) => void
+  /** r53：所属 run 已结束（历史 / 已收口）—— 没成员时原因说「已结束」而不是「未派发」。 */
+  closedRun?: boolean
   /**
    * t2：单卡暂停/继续。`paused` 行发 `resumeTask`，其余发 `pauseTask`（命令由 viewmodel 纯函数给）。
    * 历史 run 不传 → 整颗按钮不渲染（只读快照不提供写入口）。
@@ -345,7 +347,17 @@ function TaskRow(props: {
 }
 
 export function TaskTable(props: TaskTableProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, grouped, members, onJump, onTaskAction, taskActionBusyId } = props
+  const {
+    tasks,
+    expandedTaskId,
+    onToggleTask,
+    grouped,
+    members,
+    onJump,
+    closedRun,
+    onTaskAction,
+    taskActionBusyId,
+  } = props
   if (tasks.length === 0) {
     return (
       <EmptyState
@@ -392,12 +404,12 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
                     jump={memberJumpOf(
                       { kind: 'task', roleId: task.roleId, taskId: task.id },
                       members,
-                      { label: taskJumpLabelOf(task.id), taskTitle: task.title },
+                      { label: taskJumpLabelOf(task.id), taskTitle: task.title, closedRun },
                     )}
                     roleJump={memberJumpOf(
                       { kind: 'task', roleId: task.roleId, taskId: task.id },
                       members,
-                      { label: roleJumpLabelOf(task.roleName), taskTitle: task.title },
+                      { label: roleJumpLabelOf(task.roleName), taskTitle: task.title, closedRun },
                     )}
                     onJump={onJump}
                     onTaskAction={onTaskAction}
@@ -430,12 +442,12 @@ export function TaskTable(props: TaskTableProps): React.ReactElement {
             jump={memberJumpOf(
               { kind: 'task', roleId: task.roleId, taskId: task.id },
               members,
-              { label: taskJumpLabelOf(task.id), taskTitle: task.title },
+              { label: taskJumpLabelOf(task.id), taskTitle: task.title, closedRun },
             )}
             roleJump={memberJumpOf(
               { kind: 'task', roleId: task.roleId, taskId: task.id },
               members,
-              { label: roleJumpLabelOf(task.roleName), taskTitle: task.title },
+              { label: roleJumpLabelOf(task.roleName), taskTitle: task.title, closedRun },
             )}
             onJump={onJump}
             onTaskAction={onTaskAction}

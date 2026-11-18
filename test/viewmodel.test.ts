@@ -761,6 +761,7 @@ import {
   FLOW_ROW_STEP,
   FLOW_STAGE_LINK_Y,
   FLOW_STAGE_TOP,
+  FLOW_WRAP_LANE_OFFSET,
   GOAL_TITLE_MAX,
   LIB_LIST_DEFAULT,
   LIB_LIST_MAX,
@@ -1124,10 +1125,85 @@ test('flowLayoutOf：按角色分列（180×64、列距 208、行距 80），同
     },
   ])
   assert.equal(layout.edges.length, 1)
-  assert.match(layout.edges[0].d, /^M [\d.]+ [\d.]+ C /)
-  // 边的终点在目标节点左侧内缩 2px，起点在上游节点右边缘
-  assert.equal(layout.edges[0].d.startsWith(`M ${t1.x + FLOW_NODE_WIDTH} ${t1.y + FLOW_NODE_HEIGHT / 2} C `), true)
-  assert.equal(layout.edges[0].d.endsWith(` ${t2.x - 2} ${t2.y + FLOW_NODE_HEIGHT / 2}`), true)
+  // r34：跨列边改正交折线；同一行时中道竖移退化，仍是一条「出右 → 进左」的水平线
+  assert.equal(
+    layout.edges[0].d,
+    `M ${t1.x + FLOW_NODE_WIDTH} ${t1.y + FLOW_NODE_HEIGHT / 2} L ${t2.x - 2} ${t2.y + FLOW_NODE_HEIGHT / 2}`,
+  )
+  assert.equal(/NaN|Infinity/.test(layout.edges[0].d), false)
+})
+
+test('flowLayoutOf：列内行序按上游平均行号重排（barycenter 一遍，平局按计划下标）', () => {
+  const flow = buildFlow([
+    taskOf('q1', 'done', { roleId: 'qa' }),
+    taskOf('q2', 'done', { roleId: 'qa', dependsOn: ['q1'] }),
+    taskOf('d1', 'pending', { roleId: 'dev', dependsOn: ['q2'] }),
+    taskOf('d2', 'pending', { roleId: 'dev', dependsOn: ['q1'] }),
+  ])
+  const layout = flowLayoutOf(flow)
+  const byId = new Map(layout.nodes.map((entry) => [entry.node.id, entry]))
+  // qa 列：q2 的上游行号 0，与基准一致，计划顺序不变
+  assert.deepEqual([byId.get('q1')!.row, byId.get('q2')!.row], [0, 1])
+  // dev 列计划顺序 d1(上游 q2 行 1) 在 d2(上游 q1 行 0) 前 → 按平均行号重排成 d2 在前
+  assert.deepEqual([byId.get('d2')!.row, byId.get('d1')!.row], [0, 1])
+  assert.equal(byId.get('d2')!.y, FLOW_NODE_TOP)
+  assert.equal(byId.get('d1')!.y, FLOW_NODE_TOP + FLOW_ROW_STEP)
+  // 确定性：同一份快照重复派生，行序与坐标完全一致
+  assert.deepEqual(
+    flowLayoutOf(flow).nodes.map((entry) => [entry.node.id, entry.row, entry.y]),
+    layout.nodes.map((entry) => [entry.node.id, entry.row, entry.y]),
+  )
+})
+
+test('flowLayoutOf：同列依赖走列右侧固定 lane 回绕，不穿过同列节点', () => {
+  const flow = buildFlow([
+    taskOf('a', 'done', { roleId: 'dev' }),
+    taskOf('b', 'done', { roleId: 'dev' }),
+    taskOf('c', 'running', { roleId: 'dev', dependsOn: ['a'] }),
+  ])
+  const layout = flowLayoutOf(flow)
+  const byId = new Map(layout.nodes.map((entry) => [entry.node.id, entry]))
+  const a = byId.get('a')!
+  const c = byId.get('c')!
+  const edge = layout.edges.find((item) => item.key === 'a->c')!
+  const lane = a.x + FLOW_NODE_WIDTH + FLOW_WRAP_LANE_OFFSET
+  // 从源节点右边出，弯角落在列右侧 lane 上（lane 在列间空隙内，不压同列任何节点）
+  assert.equal(edge.d.startsWith(`M ${a.x + FLOW_NODE_WIDTH} ${a.y + FLOW_NODE_HEIGHT / 2} L `), true)
+  assert.equal(edge.d.includes(`Q ${lane} `), true)
+  assert.equal(lane > a.x + FLOW_NODE_WIDTH, true, 'lane 在节点右侧外')
+  assert.equal(lane < a.x + FLOW_COLUMN_STEP, true, 'lane 在列间空隙内')
+  // 从目标右边入（不是左边），且只有正交段 + 8px 圆角，没有三次贝塞尔
+  assert.equal(edge.d.endsWith(` L ${c.x + FLOW_NODE_WIDTH} ${c.y + FLOW_NODE_HEIGHT / 2}`), true)
+  assert.equal(edge.d.includes('C'), false)
+  assert.equal(/NaN|Infinity/.test(edge.d), false)
+})
+
+test('flowLayoutOf：同一空隙的多条跨列边按序号分配中道，间隔 ≥6px', () => {
+  const flow = buildFlow([
+    taskOf('s1', 'done', { roleId: 'dev' }),
+    taskOf('s2', 'done', { roleId: 'dev' }),
+    // 两个下游都挂两个上游 → 平均行号相同，行序按计划下标（t1 上、t2 下），
+    // 于是 s1→t2 与 s2→t1 各自需要竖移，共用源列右侧同一空隙。
+    taskOf('t1', 'pending', { roleId: 'qa', dependsOn: ['s1', 's2'] }),
+    taskOf('t2', 'pending', { roleId: 'qa', dependsOn: ['s1', 's2'] }),
+  ])
+  const layout = flowLayoutOf(flow)
+  const lanes = layout.edges
+    .filter((edge) => edge.d.includes(' Q '))
+    .map((edge) => {
+      const match = / Q ([\d.]+) [\d.]+ /.exec(edge.d)
+      return match === null ? Number.NaN : Number(match[1])
+    })
+  assert.equal(lanes.length, 2, '两条需要竖移的跨列边')
+  for (const lane of lanes) assert.equal(Number.isFinite(lane), true)
+  assert.equal(Math.abs(lanes[0]! - lanes[1]!) >= 6, true, '两条中道至少错开 6px')
+  // 中道必须落在两列节点的空隙里（不压节点）
+  const s1 = layout.nodes.find((entry) => entry.node.id === 's1')!
+  const t2 = layout.nodes.find((entry) => entry.node.id === 't2')!
+  for (const lane of lanes) {
+    assert.equal(lane > s1.x + FLOW_NODE_WIDTH, true)
+    assert.equal(lane < t2.x - 2, true)
+  }
 })
 
 test('flowLayoutOf：旧快照按 roleName 回退分列，同名不同 roleId 不合并、缺名落「角色未记录」', () => {

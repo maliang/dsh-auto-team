@@ -23,6 +23,7 @@ import {
   awaitingReceiptSummaryOf,
   buildRunDetail,
   hintOf,
+  isClosedRun,
   memberJumpNoticeOf,
   planGoalOf,
   stageOfDetail,
@@ -112,6 +113,11 @@ export function TasksTab(props: TabProps): React.ReactElement {
     [detail],
   )
   const members = historicalRunId === null && snapshot !== undefined ? snapshot.members : []
+  // r53：run 已结束（历史 run 一律算结束；当前 run 按宿主的「已收口」口径）——
+  // 结束的 run 里成员会话可能已被回收，判定要能区分「已结束」与「未派发」。
+  const closedRun =
+    historicalRunId !== null ||
+    (snapshot !== undefined && isClosedRun({ status: snapshot.planStatus ?? 'draft' }))
   // r33：待回执的聚合提示（只回答「有几件事」，是哪几行由任务行自己的标记回答）。
   const awaitingReceipt = React.useMemo(
     () => awaitingReceiptSummaryOf(detail === null ? [] : detail.tasks),
@@ -135,8 +141,10 @@ export function TasksTab(props: TabProps): React.ReactElement {
     }
     setJumpNotice(memberJumpNoticeOf(requestMemberSession(jump.memberId), jump) ?? null)
   }
-  // 历史 run 没有成员/消息，入口保持不可点（与 r17 的「历史不提供成员导航」一致）。
-  const onJump = historicalRunId === null ? jumpToMember : undefined
+  // r53：历史 run 也传 jumpToMember —— 结束的 run 不再整体置空，而是由 `closedRun` 语义
+  // 给「该运行已结束，子智能体会话已回收」；成员仍在当前快照里（还活着）时照常可跳。
+  // 写操作 onTaskAction 仍保持 undefined：只读快照不提供写入口。
+  const onJump = jumpToMember
 
   /**
    * 单卡暂停/继续：动作名与 taskId 由 viewmodel 纯函数给出（组件不拼动作字面量）。
@@ -232,13 +240,20 @@ export function TasksTab(props: TabProps): React.ReactElement {
       >
         {taskActionNotice ?? ''}
       </p>
-      <RoleGrid roles={detail.roles} members={members} tasks={detail.tasks} onJump={onJump} />
+      <RoleGrid
+        roles={detail.roles}
+        members={members}
+        tasks={detail.tasks}
+        onJump={onJump}
+        closedRun={closedRun}
+      />
       <TaskOverview
         tasks={detail.tasks}
         expandedTaskId={expanded}
         onToggleTask={(taskId) => toggleTask(taskId)}
         members={members}
         onJump={onJump}
+        closedRun={closedRun}
         onTaskAction={onTaskAction}
         taskActionBusyId={taskActionBusyId}
       />
@@ -246,6 +261,7 @@ export function TasksTab(props: TabProps): React.ReactElement {
         flow={detail.flow}
         members={members}
         onJump={onJump}
+        closedRun={closedRun}
         onSelectTask={(taskId) => {
           // 跳转由节点自己的 onJump 负责；这里只保留「选中并滚到任务行」的回退行为。
           expandTask(taskId)

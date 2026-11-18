@@ -2354,6 +2354,12 @@ export const FLOW_STAGE_HEIGHT = 32
 export const FLOW_NODE_TOP = 54
 export const FLOW_STAGE_LINK_Y = 28
 export const FLOW_STAGE_LINK_INSET = 4
+/** 正交折线的弯角半径（px）。 */
+export const FLOW_EDGE_RADIUS = 8
+/** 同列依赖回绕道相对列右缘的固定偏移（落在 28px 列间空隙内，不会碰到同列节点）。 */
+export const FLOW_WRAP_LANE_OFFSET = 10
+/** 同一列间空隙里多条中道的间距（≥6px，避免多条边叠在一条竖线上）。 */
+export const FLOW_EDGE_LANE_GAP = 6
 
 /** 缺角色名时的兜底文案（旧 run 的 `TaskDetailView.roleName` 恒有，这里只防脏数据）。 */
 export const FLOW_ROLE_FALLBACK = '角色未记录'
@@ -2478,6 +2484,64 @@ export interface FlowLayout {
   stageLinks: FlowStageLinkView[]
 }
 
+type FlowPoint = readonly [number, number]
+
+/**
+ * 正交折线 → 圆角 SVG path。
+ *
+ * 只处理轴对齐折线：相邻两点重合的去掉，三点共线的中间点去掉；弯角用二次贝塞尔
+ * 收弧，半径按相邻两段长度的一半夹取（短段不会被画出负半径），坐标全部先过
+ * `Number.isFinite`，脏输入得到一个空串而不是 `NaN` 路径。
+ */
+function orthoEdgePath(points: readonly FlowPoint[]): string {
+  const deduped: FlowPoint[] = []
+  for (const point of points) {
+    const x = point[0]
+    const y = point[1]
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+    const last = deduped[deduped.length - 1]
+    if (last !== undefined && last[0] === x && last[1] === y) continue
+    deduped.push([x, y])
+  }
+  const pts: FlowPoint[] = []
+  for (let i = 0; i < deduped.length; i += 1) {
+    const cur = deduped[i]!
+    const prev = pts[pts.length - 1]
+    const next = deduped[i + 1]
+    if (prev !== undefined && next !== undefined) {
+      const collinear =
+        (prev[1] === cur[1] && cur[1] === next[1]) || (prev[0] === cur[0] && cur[0] === next[0])
+      if (collinear) continue
+    }
+    pts.push(cur)
+  }
+  const first = pts[0]
+  if (first === undefined) return ''
+  let d = `M ${first[0]} ${first[1]}`
+  for (let i = 1; i < pts.length; i += 1) {
+    const prev = pts[i - 1]!
+    const cur = pts[i]!
+    const next = pts[i + 1]
+    if (next === undefined) {
+      d += ` L ${cur[0]} ${cur[1]}`
+      continue
+    }
+    const inLen = Math.abs(cur[0] - prev[0]) + Math.abs(cur[1] - prev[1])
+    const outLen = Math.abs(next[0] - cur[0]) + Math.abs(next[1] - cur[1])
+    const corner = Math.min(FLOW_EDGE_RADIUS, inLen / 2, outLen / 2)
+    if (!(corner > 0)) {
+      d += ` L ${cur[0]} ${cur[1]}`
+      continue
+    }
+    const inX = cur[0] - Math.sign(cur[0] - prev[0]) * corner
+    const inY = cur[1] - Math.sign(cur[1] - prev[1]) * corner
+    const outX = cur[0] + Math.sign(next[0] - cur[0]) * corner
+    const outY = cur[1] + Math.sign(next[1] - cur[1]) * corner
+    d += ` L ${inX} ${inY} Q ${cur[0]} ${cur[1]} ${outX} ${outY}`
+  }
+  return d
+}
+
 /**
  * 流转图布局（r16 AC-12/AC-13 的唯一派生点）。
  *
@@ -2486,7 +2550,12 @@ export interface FlowLayout {
  * 两者都没有才落单列。`node.column/node.row` 与 `flow.columns/flow.rows` 一律不读 ——
  * 同一个任务图在两个客户端版本里不能有两种列序。
  *
- * 节点边（依赖）仍是三次贝塞尔，端点缺失或环依赖直接跳过，绝不产生 NaN。
+ * 行序（r34）：先按计划顺序取基准行号，再按「上游平均行号」（barycenter）重排一遍 ——
+ * 无上游者以基准行号作排序键（彼此保持计划顺序），平局按计划下标，结果确定、不迭代。
+ *
+ * 边（r34）：一律正交圆角折线（弯角 8px）。同列依赖走列右侧固定 lane 回绕，绝不穿过
+ * 同列其它节点；跨列边走「出右 → 中道竖移 → 进左」，同一空隙里的多条边按出现顺序
+ * 分配中道 x 偏移（间距 ≥6px）。端点缺失或自环直接跳过，绝不产生 NaN。
  */
 export function flowLayoutOf(flow: FlowView): FlowLayout {
   // 1. 分组：key 与展示名分离（同 roleName 不同 roleId 恰好同名时不能合并）。
@@ -2522,14 +2591,57 @@ export function flowLayoutOf(flow: FlowView): FlowLayout {
   let maxCount = 0
   for (const stage of stages) maxCount = Math.max(maxCount, stage.count)
 
-  // 3. 行：组内保持原数组顺序（一次遍历 + 游标，O(n)）。
+  // 3. 基准行号：仍按计划顺序取列内行号（后面 barycenter 重排要用它当参照）。
+  const baseRowOf = new Map<FlowNodeView, number>()
+  const baseRowById = new Map<string, number>()
+  const planIndexOf = new Map<FlowNodeView, number>()
+  const baseCursors = new Map<string, number>()
+  flow.nodes.forEach((node, index) => {
+    planIndexOf.set(node, index)
+    const key = node.roleId ?? node.roleName ?? FLOW_ROLE_FALLBACK
+    const row = baseCursors.get(key) ?? 0
+    baseCursors.set(key, row + 1)
+    baseRowOf.set(node, row)
+    // 边按 id 找端点：重复 id 只认第一次出现（与 byId 同口径），脏数据不会让行号摇摆。
+    if (!baseRowById.has(node.id)) baseRowById.set(node.id, row)
+  })
+  // 上游行号：`edge.from`（上游）→ `edge.to`（下游）；自环没有「上游行」可言，不参与。
+  const upstreamRows = new Map<string, number[]>()
+  for (const edge of flow.edges as readonly FlowEdgeView[]) {
+    if (edge.from === edge.to) continue
+    const row = baseRowById.get(edge.from)
+    if (row === undefined) continue
+    const list = upstreamRows.get(edge.to)
+    if (list === undefined) upstreamRows.set(edge.to, [row])
+    else list.push(row)
+  }
+  // 4. 行序：按上游平均行号（barycenter）重排，一遍；无上游者用基准行号当排序键
+  //    （彼此仍是计划顺序），平局按计划下标 —— 同一份快照永远得到同一行序。
+  const rowOf = new Map<FlowNodeView, number>()
+  for (const key of keys) {
+    const list = groups.get(key) ?? []
+    const ordered = list
+      .map((node, index) => {
+        const rows = upstreamRows.get(node.id)
+        const sortKey =
+          rows === undefined || rows.length === 0
+            ? baseRowOf.get(node) ?? index
+            : rows.reduce((sum, row) => sum + row, 0) / rows.length
+        return { node, sortKey }
+      })
+      .sort((a, b) => {
+        if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey
+        return (planIndexOf.get(a.node) ?? 0) - (planIndexOf.get(b.node) ?? 0)
+      })
+    ordered.forEach((entry, index) => rowOf.set(entry.node, index))
+  }
+
+  // 5. 节点坐标：列 × 行。
   const stageIndex = new Map(stages.map((stage) => [stage.key, stage]))
-  const cursors = new Map<string, number>()
   const nodes: FlowLayoutNode[] = flow.nodes.map((node) => {
     const key = node.roleId ?? node.roleName ?? FLOW_ROLE_FALLBACK
     const column = stageIndex.get(key)?.index ?? 0
-    const row = cursors.get(key) ?? 0
-    cursors.set(key, row + 1)
+    const row = rowOf.get(node) ?? 0
     return {
       node,
       cell: flowNodeViewOf(node),
@@ -2540,25 +2652,90 @@ export function flowLayoutOf(flow: FlowView): FlowLayout {
     }
   })
 
+  // 6. 边：端点缺失（含自环）直接跳过，再按同列/跨列分派走线。
   const byId = new Map(nodes.map((entry) => [entry.node.id, entry]))
-  const edges: FlowLayoutEdge[] = []
+  const pending: { edge: FlowEdgeView; from: FlowLayoutNode; to: FlowLayoutNode }[] = []
   for (const edge of flow.edges as readonly FlowEdgeView[]) {
+    if (edge.from === edge.to) continue
     const from = byId.get(edge.from)
     const to = byId.get(edge.to)
-    if (!from || !to) continue
-    const x1 = from.x + FLOW_NODE_WIDTH
-    const y1 = from.y + FLOW_NODE_HEIGHT / 2
-    const x2 = to.x - 2
-    const y2 = to.y + FLOW_NODE_HEIGHT / 2
-    const bend = Math.max(24, Math.abs(x2 - x1) / 2)
-    edges.push({
-      key: `${edge.from}->${edge.to}`,
-      d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
-      upstreamDone: edge.upstreamDone,
+    if (from === undefined || to === undefined) continue
+    pending.push({ edge, from, to })
+  }
+  const nodeRight = (entry: FlowLayoutNode): number => entry.x + FLOW_NODE_WIDTH
+  const nodeCenterY = (entry: FlowLayoutNode): number => entry.y + FLOW_NODE_HEIGHT / 2
+  // 中道 lane：同一列间空隙里**需要竖移**的跨列边按出现顺序居中均分，间距固定 ≥6px。
+  // 正向（左→右）竖移落在源列右侧空隙，逆向（右→左）落在目标列右侧空隙（从目标右边入）。
+  // 同一行的跨列边没有竖段，不占 lane（否则会把中道推得离节点太近）。
+  const gapCenter = (FLOW_COLUMN_STEP - FLOW_NODE_WIDTH) / 2
+  const laneBases = pending.map(({ from, to }) => {
+    if (from.column === to.column) return undefined
+    if (nodeCenterY(from) === nodeCenterY(to)) return undefined
+    const forward = to.column > from.column
+    return {
+      forward,
+      base: forward
+        ? from.x + FLOW_NODE_WIDTH + gapCenter
+        : to.x + FLOW_NODE_WIDTH + FLOW_WRAP_LANE_OFFSET,
+      group: forward ? `fwd:${from.column}` : `bwd:${to.column}`,
+    }
+  })
+  const laneMembers = new Map<string, number[]>()
+  laneBases.forEach((info, index) => {
+    if (info === undefined) return
+    const list = laneMembers.get(info.group)
+    if (list === undefined) laneMembers.set(info.group, [index])
+    else list.push(index)
+  })
+  const laneX = new Map<number, number>()
+  for (const indexes of laneMembers.values()) {
+    const count = indexes.length
+    indexes.forEach((index, order) => {
+      const info = laneBases[index]
+      if (info === undefined) return
+      laneX.set(index, info.base + (order - (count - 1) / 2) * FLOW_EDGE_LANE_GAP)
     })
   }
+  const edges: FlowLayoutEdge[] = pending.map(({ edge, from, to }, index) => {
+    const y1 = nodeCenterY(from)
+    const y2 = nodeCenterY(to)
+    let d: string
+    if (from.column === to.column) {
+      // 同列依赖：从源节点右边出 → 列右侧固定 lane 竖移 → 从目标右边入。
+      const lane = from.x + FLOW_NODE_WIDTH + FLOW_WRAP_LANE_OFFSET
+      d = orthoEdgePath([
+        [nodeRight(from), y1],
+        [lane, y1],
+        [lane, y2],
+        [nodeRight(to), y2],
+      ])
+    } else {
+      const forward = to.column > from.column
+      if (forward) {
+        const lane = laneX.get(index) ?? from.x + FLOW_NODE_WIDTH + gapCenter
+        // 正向：出右 → 中道竖移 → 进左（保留 2px 内缩给箭头）。
+        d = orthoEdgePath([
+          [nodeRight(from), y1],
+          [lane, y1],
+          [lane, y2],
+          [to.x - 2, y2],
+        ])
+      } else {
+        // 逆向（只有环依赖会走到）：从源节点**左边**出，竖移落在目标列右侧空隙，
+        // 再从目标右边入 —— 这样既不会横穿源节点自身，也不会从左侧穿过目标节点。
+        const lane = laneX.get(index) ?? nodeRight(to) + FLOW_WRAP_LANE_OFFSET
+        d = orthoEdgePath([
+          [from.x, y1],
+          [lane, y1],
+          [lane, y2],
+          [nodeRight(to), y2],
+        ])
+      }
+    }
+    return { key: `${edge.from}->${edge.to}`, d, upstreamDone: edge.upstreamDone }
+  })
 
-  // 4. 列间箭头：从上游列头右缘到下游列头左缘。
+  // 7. 列间箭头：从上游列头右缘到下游列头左缘。
   const stageLinks: FlowStageLinkView[] = []
   for (let i = 1; i < stages.length; i += 1) {
     const prev = stages[i - 1]
@@ -2575,7 +2752,7 @@ export function flowLayoutOf(flow: FlowView): FlowLayout {
     })
   }
 
-  // 5. 画布尺寸：空计划给最小 24×24（= 两侧 padding），不得 NaN。
+  // 8. 画布尺寸：空计划给最小 24×24（= 两侧 padding），不得 NaN。
   const width =
     stages.length === 0
       ? FLOW_PADDING * 2
@@ -3270,6 +3447,15 @@ export interface MemberJumpBase {
    * 没给（或给空串）时回退成员名 —— **绝不显示空串**。
    */
   taskTitle?: string
+  /**
+   * 入口所属 run 是否**已结束**（历史 run / 已收口的 run，r53）。
+   *
+   * 结束的 run 里成员会话可能已被宿主回收：此时快照 `members` 也找不到这个成员，
+   * 就不能再说「未派发」（那是还在跑的计划的说法），必须说「已结束、会话已回收」。
+   * 成员仍然活着（在当前快照 `members` 里找得到）时照常可跳 —— 判据始终是「有没有成员」，
+   * 本标记只决定**没有成员时**说哪句人话。
+   */
+  closedRun?: boolean
 }
 
 /** 入口前缀（组件只传数据，中文拼装留在本文件，见文件头「文案集中」纪律）。 */
@@ -3342,6 +3528,14 @@ export const MEMBER_JUMP_NO_MEMBER_TEXT = '子智能体 · 未派发'
 export const MEMBER_JUMP_NO_ROLE_REASON = '该节点没有记录角色，无法定位成员'
 export const MEMBER_JUMP_NO_MEMBER_REASON = '该任务还没有可跳转的成员：可能尚未派发，或成员已回收'
 export const MEMBER_JUMP_NO_MEMBER_ROLE_REASON = '该角色还没有可跳转的成员：任务可能尚未派发，或成员已回收'
+/**
+ * r53：run 已结束、且该成员已不在当前快照 `members` 里 → 不可跳转。
+ *
+ * 与「未派发」分开说，是因为两者的补救动作完全不同：未派发要等宿主起成员，
+ * 已结束的 run 再怎么等也不会有会话，只能去历史里看。
+ */
+export const MEMBER_JUMP_CLOSED_RUN_TEXT = '子智能体 · 不可跳转'
+export const MEMBER_JUMP_CLOSED_RUN_REASON = '该运行已结束，子智能体会话已回收'
 export const MEMBER_JUMP_SERVICE_MISSING_TEXT = '没有跳转：宿主未提供会话导航服务，无法打开成员会话'
 export const MEMBER_JUMP_REJECTED_TEXT = '没有跳转：宿主拒绝了这次会话切换，请再点一次'
 export const MEMBER_JUMP_NOT_READY_TEXT = '没有跳转：会话导航尚未就绪，请稍后重试'
@@ -3361,8 +3555,12 @@ function memberJumpViewOf(
   base: MemberJumpBase,
 ): MemberJumpView {
   if (member === undefined) {
-    const reason =
-      source.kind === 'role'
+    // r53：结束的 run 里成员会话多半已回收 —— 说「已结束」而不是「未派发」。
+    // 唯一的例外是「节点连角色都没记录」：那是数据缺失，与 run 是否结束无关，原因照旧更准确。
+    const closed = base.closedRun === true && !(source.kind === 'node' && source.roleId === undefined)
+    const reason = closed
+      ? MEMBER_JUMP_CLOSED_RUN_REASON
+      : source.kind === 'role'
         ? MEMBER_JUMP_NO_MEMBER_ROLE_REASON
         : source.kind === 'node' && source.roleId === undefined
           ? MEMBER_JUMP_NO_ROLE_REASON
@@ -3370,7 +3568,7 @@ function memberJumpViewOf(
     return {
       available: false,
       reason,
-      actionText: MEMBER_JUMP_NO_MEMBER_TEXT,
+      actionText: closed ? MEMBER_JUMP_CLOSED_RUN_TEXT : MEMBER_JUMP_NO_MEMBER_TEXT,
       title: base.title === undefined ? reason : `${base.title} · ${reason}`,
       label: base.label === undefined ? reason : `${base.label}，${reason}`,
     }
@@ -3483,6 +3681,9 @@ function runningMemberJumpViewOf(
  *
  * **没有运行中成员**时保持 t5 原语义：单成员直接跳（与另外两个入口同走 `memberJumpViewOf`），
  * 多成员给人话原因把人导到任务行（那里有 taskId，能唯一定位成员）。
+ *
+ * r53：`base.closedRun` 只改「一个成员都没有」时的那句人话（已结束 / 未派发），
+ * 不改变能否跳 —— 成员还活着就照常跳。
  */
 export function roleCardJumpOf(
   source: Extract<MemberJumpSource, { kind: 'role' }>,
@@ -3512,6 +3713,7 @@ export function roleCardJumpOf(
  * 三入口的**唯一**跳转判定：有成员 → 可跳转并给 memberId；没成员 → 不可跳转并给人话原因。
  * 组件只调它，不许各处各写一套「找成员 + 拼原因」；
  * 角色卡的「运行中优先 / 多人歧义」规则也在本文件（`roleCardJumpOf`），由 role 分支转调。
+ * r53：`base.closedRun` 让「没成员」的原因区分「已结束/已回收」与「未派发」（三入口同源）。
  */
 export function memberJumpOf(
   source: MemberJumpSource,

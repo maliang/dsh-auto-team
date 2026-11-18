@@ -2908,6 +2908,22 @@ export const AUTO_TEAM_CSS = `
 [data-region="task-flow"] [data-flow-edge] {
   stroke: var(--dsw-alias-border-l3, currentColor);
   stroke-width: 1;
+  /* 默认降噪：任务边是背景信息，节点才是主体；--dsw 系列没有透明度 token，用固定档位。 */
+  stroke-opacity: 0.45;
+  opacity: 1;
+  transition: stroke-opacity 160ms ease, opacity 160ms ease, stroke-width 160ms ease;
+}
+/* 悬停/键盘聚焦某节点：其余边退到 0.12（元素级 opacity 连箭头一起压暗），
+   该节点的入边/出边回到 1 并加粗到 1.75；档位由 FlowCanvas 的 data-edge-focus 决定。 */
+[data-region="task-flow"] [data-flow-edge][data-edge-focus="off"] {
+  stroke-opacity: 1;
+  opacity: 0.12;
+  stroke-width: 1;
+}
+[data-region="task-flow"] [data-flow-edge][data-edge-focus="on"] {
+  stroke-opacity: 1;
+  opacity: 1;
+  stroke-width: 1.75;
 }
 [data-region="task-flow"] [data-flow-edge][data-upstream-done="false"] {
   stroke: var(--dsw-alias-label-tertiary, currentColor);

@@ -32,6 +32,8 @@ export interface FlowCanvasProps {
   /** r17/r33：点节点 = 跳到执行它的子智能体会话；没有成员时退回选中任务。 */
   members?: MemberView[]
   onJump?: (jump: MemberJumpView) => void
+  /** r53：所属 run 已结束（历史 / 已收口）—— 节点没成员时原因说「已结束」而不是「未派发」。 */
+  closedRun?: boolean
 }
 
 /** 平移上限（±）：与 DESIGN §2.4 一致，够远但不会迷失。 */
@@ -52,8 +54,22 @@ function stageNumberText(index: number): string {
   return String(index + 1).padStart(2, '0')
 }
 
+/**
+ * 任务边的端点：`key` 契约是 `<from>-><to>`（t1 的 `flowLayoutOf` 产出），
+ * 组件不重新推导依赖，只按契约切开，供 `data-from` / `data-to` 与悬停高亮关联。
+ * 切不开（脏 key）返回空串，宁可不高亮也不猜错关联。
+ */
+export function edgeEndpointsOf(key: string): { from: string; to: string } {
+  const split = key.indexOf('->')
+  if (split <= 0) return { from: '', to: '' }
+  const from = key.slice(0, split)
+  const to = key.slice(split + 2)
+  if (to === '') return { from: '', to: '' }
+  return { from, to }
+}
+
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { flow, onSelectTask, members, onJump } = props
+  const { flow, onSelectTask, members, onJump, closedRun } = props
   const layout = React.useMemo(() => flowLayoutOf(flow), [flow])
   const instanceId = React.useId().replace(/[^a-zA-Z0-9_-]/g, '')
   const markerId = `auto-team-flow-arrow-${instanceId}`
@@ -76,6 +92,16 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const resetTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const [dragging, setDragging] = React.useState(false)
   const [resetting, setResetting] = React.useState(false)
+  /** 当前被鼠标悬停/键盘聚焦的节点：只影响边的明暗，不改布局。 */
+  const [hoverNodeId, setHoverNodeId] = React.useState<string | null>(null)
+  /**
+   * 悬停高亮的有效值：轮询刷新可能把悬停中的节点删掉，而节点消失后不会再有
+   * pointerleave —— 不在这里收口，就会留下「全部边永久降噪」的幽灵状态。
+   */
+  const focusNodeId = React.useMemo(() => {
+    if (hoverNodeId === null) return null
+    return layout.nodes.some(({ node }) => node.id === hoverNodeId) ? hoverNodeId : null
+  }, [hoverNodeId, layout])
 
   const paint = React.useCallback((x: number, y: number) => {
     const viewport = viewportRef.current
@@ -302,16 +328,26 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 markerEnd={`url(#${link.upstreamDone ? solidMarkerId : dashedMarkerId})`}
               />
             ))}
-            {layout.edges.map((edge) => (
-              <path
-                key={edge.key}
-                data-flow-edge={edge.key}
-                data-upstream-done={edge.upstreamDone ? 'true' : 'false'}
-                d={edge.d}
-                fill="none"
-                markerEnd={`url(#${markerId})`}
-              />
-            ))}
+            {layout.edges.map((edge) => {
+              const ends = edgeEndpointsOf(edge.key)
+              // 悬停/聚焦某个节点：它的入边与出边保持高亮，其余边降噪（具体数值在 styles.ts）。
+              const related =
+                focusNodeId !== null &&
+                (ends.from === focusNodeId || ends.to === focusNodeId)
+              return (
+                <path
+                  key={edge.key}
+                  data-flow-edge={edge.key}
+                  data-from={ends.from}
+                  data-to={ends.to}
+                  data-edge-focus={focusNodeId === null ? undefined : related ? 'on' : 'off'}
+                  data-upstream-done={edge.upstreamDone ? 'true' : 'false'}
+                  d={edge.d}
+                  fill="none"
+                  markerEnd={`url(#${markerId})`}
+                />
+              )
+            })}
           </svg>
           {layout.stages.map((stage) => (
             <div
@@ -335,7 +371,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             const jump = memberJumpOf(
               { kind: 'node', roleId: node.roleId, taskId: node.id },
               members,
-              { title: cell.title, label: cell.label, taskTitle: cell.taskTitle },
+              { title: cell.title, label: cell.label, taskTitle: cell.taskTitle, closedRun },
             )
             return (
               <button
@@ -350,6 +386,14 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 style={{ left: `${x}px`, top: `${y}px` }}
                 title={jump.title}
                 aria-label={jump.label}
+                onPointerEnter={() => setHoverNodeId(node.id)}
+                onPointerLeave={() =>
+                  setHoverNodeId((current) => (current === node.id ? null : current))
+                }
+                onFocus={() => setHoverNodeId(node.id)}
+                onBlur={() =>
+                  setHoverNodeId((current) => (current === node.id ? null : current))
+                }
                 onClick={() => {
                   // 可跳转：有 onJump 就打开成员会话；不可跳转：先把原因交上去（禁止静默），
                   // 两种情况都保留原有的「选中任务并定位」行为作为回退。

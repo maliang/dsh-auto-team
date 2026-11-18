@@ -27,6 +27,8 @@ export interface TaskOverviewProps {
   /** r17/r33：任务行 → 子智能体会话（历史 run 不传）。 */
   members?: MemberView[]
   onJump?: (jump: MemberJumpView) => void
+  /** r53：所属 run 已结束（历史 / 已收口）—— 原样交给任务行判定用。 */
+  closedRun?: boolean
   /** t2：单卡暂停/继续（历史 run 不传）；动作由行组件按状态派生。 */
   onTaskAction?: (action: Extract<PanelAction, { taskId: string }>) => void
   /** 在飞的任务 id：只禁用那一行，不锁整张表。 */
@@ -34,7 +36,16 @@ export interface TaskOverviewProps {
 }
 
 export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
-  const { tasks, expandedTaskId, onToggleTask, members, onJump, onTaskAction, taskActionBusyId } = props
+  const {
+    tasks,
+    expandedTaskId,
+    onToggleTask,
+    members,
+    onJump,
+    closedRun,
+    onTaskAction,
+    taskActionBusyId,
+  } = props
   const overview = taskOverviewOf(tasks, expandedTaskId)
   return (
     <section data-task-overview aria-label="任务总览">
@@ -53,6 +64,7 @@ export function TaskOverview(props: TaskOverviewProps): React.ReactElement {
           onToggleTask={onToggleTask}
           members={members}
           onJump={onJump}
+          closedRun={closedRun}
           onTaskAction={onTaskAction}
           taskActionBusyId={taskActionBusyId}
           grouped

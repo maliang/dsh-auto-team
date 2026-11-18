@@ -382,9 +382,23 @@ test('r33 ③ 落地动作只在任务页：requestMemberSession + 统一结局�
   assert.equal(source.includes('openSession('), false, '组件不得直接摸宿主服务（注册/调用集中在 session.ts）')
 })
 
-test('r33 ③ 历史 run 不提供跳转（onJump 只在当前 run 传入）', () => {
+test('r53 ③ 历史 run 也传同一 onJump：可跳性交给 closedRun，写操作仍只在当前 run', () => {
   const source = codeOf('src/client/tabs/TasksTab.tsx')
-  assert.match(source, /historicalRunId === null \? jumpToMember : undefined/)
+  // r53：不再整体置空 —— 历史 run 也走 jumpToMember，由 closedRun 决定「已结束/已回收」的文案。
+  assert.match(source, /const onJump = jumpToMember/)
+  assert.equal(
+    source.includes('historicalRunId === null ? jumpToMember : undefined'),
+    false,
+    '不得回退成「历史 run 不传 onJump」',
+  )
+  assert.match(source, /const closedRun =/)
+  assert.equal(
+    (source.match(/closedRun=\{closedRun\}/g) ?? []).length,
+    3,
+    'closedRun 必须透传给角色卡 / 任务行 / 流程图三个入口',
+  )
+  // 写操作仍只属于当前 run：历史 run 的 onTaskAction 保持 undefined。
+  assert.match(source, /const onTaskAction = historicalRunId === null \? runTaskAction : undefined/)
   assert.match(source, /historicalRunId === null && snapshot !== undefined \? snapshot\.members : \[\]/)
   assert.equal(/snapshot\.members\?\.filter/.test(source), false, '不得按状态二次过滤成员（已停止位要保留）')
 })

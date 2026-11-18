@@ -174,7 +174,7 @@ test('AC-12：单列不画列间箭头；空计划不产生任何几何', () => 
   assert.equal(Number.isNaN(empty.width) || Number.isNaN(empty.height), false, '空计划不得 NaN')
 })
 
-test('AC-14：任务边保留 r14 语义（贝塞尔 + upstreamDone），缺端点/成环直接跳过', () => {
+test('AC-14（r34）：任务边正交圆角折线，缺端点/自环跳过，同列依赖从右边回绕', () => {
   const layout = flowLayoutOf({
     nodes: flowOf([
       nodeOf('t1', 'done', { roleId: 'dev', roleName: '开发' }),
@@ -183,16 +183,18 @@ test('AC-14：任务边保留 r14 语义（贝塞尔 + upstreamDone），缺端�
     edges: [
       { from: 't1', to: 't2', upstreamDone: true },
       { from: 't1', to: 't404', upstreamDone: false },
+      { from: 't2', to: 't2', upstreamDone: false },
     ],
     columns: 1,
     rows: 1,
   })
-  assert.equal(layout.edges.length, 1, '缺端点的边被跳过')
+  assert.equal(layout.edges.length, 1, '缺端点与自环的边都跳过')
   const edge = layout.edges[0]
   assert.ok(edge !== undefined)
   assert.equal(edge.upstreamDone, true)
-  // 同列回边时控制点可以落在负坐标（贝塞尔外推），这是合法 SVG，不能当 NaN 处理
-  assert.match(edge.d, /^M -?[\d.]+ -?[\d.]+ C -?[\d.]+ -?[\d.]+, -?[\d.]+ -?[\d.]+, -?[\d.]+ -?[\d.]+$/)
+  // 同列依赖：出右 → 列右侧 lane 竖移 → 从目标右边入，弯角用二次贝塞尔收弧（半径 8px 内）
+  assert.match(edge.d, /^M [\d.]+ [\d.]+ L [\d.]+ [\d.]+ Q [\d.]+ [\d.]+ [\d.]+ [\d.]+ L /)
+  assert.equal(edge.d.includes('C'), false, '不再用三次贝塞尔')
   assert.equal(/NaN|Infinity/.test(edge.d), false)
 })
 
