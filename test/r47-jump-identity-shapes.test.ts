@@ -105,7 +105,7 @@ function assertJumpTo(members: readonly MemberView[], taskId: string, roleId: st
 
 /* ───────────────── ① 同角色多任务：各跳各的，不按「最近活跃」串 ───────────────── */
 
-test('r47 t2 ① 同角色多任务：两个 dev 成员各接一任务，任务行各跳各的，角色卡因歧义不跳', () => {
+test('r47 t2 ① 同角色多任务：两个 dev 成员各接一任务，任务行各跳各的，角色卡跳运行中的那个', () => {
   const { store, bridge } = setup()
   store.save(
     stateOf({
@@ -130,14 +130,20 @@ test('r47 t2 ① 同角色多任务：两个 dev 成员各接一任务，任务�
   assertJumpTo(members, 't1', 'dev', 'm1')
   assertJumpTo(members, 't2', 'dev', 'm2')
 
-  // 角色卡只有 roleId，名下两个成员时猜谁都是乱跳 —— 必须给「请从任务行进入」的人话原因。
+  // t2：m1（t1 已完成）不运行、m2 正在跑 —— 角色卡跳唯一在运行的 m2。
   const roleJump = memberJumpOf({ kind: 'role', roleId: 'dev' }, members, { label: '角色：开发' })
-  assert.equal(roleJump.available, false, '同角色多成员时角色卡不得按最近活跃猜一个')
-  assert.equal(roleJump.memberId, undefined, '不可跳时不得下发 memberId')
-  assert.equal(roleJump.reason, roleCardMultiMemberReasonOf(2))
-  assert.equal(roleJump.reason, '该角色有 2 个子智能体，请从任务行进入')
-  assert.match(roleJump.title, /请从任务行进入/, '悬停要说明该往哪走')
-  assert.match(roleJump.label, /^角色：开发，该角色有 2 个子智能体，请从任务行进入$/)
+  assert.equal(roleJump.available, true, '有运行中成员时角色卡应可直接跳（t2 改语义）')
+  assert.equal(roleJump.memberId, 'm2', '运行中的 m2 才是活会话；已完成的 m1 不是落点')
+  assert.equal(roleJump.member?.memberId, 'm2')
+  assert.match(roleJump.actionText, /正在运行/)
+  assert.match(roleJump.title, /正在运行/)
+  assert.match(roleJump.label, /^角色：开发，.*正在运行$/)
+
+  // 一个运行中成员都没有时，才回到 t5 的「多人歧义不跳」。
+  const idle = members.map((member) => ({ ...member, status: 'idle' as const }))
+  const noRunning = memberJumpOf({ kind: 'role', roleId: 'dev' }, idle, { label: '角色：开发' })
+  assert.equal(noRunning.available, false, '没有活人可开时仍不得按 roleId 猜一个')
+  assert.equal(noRunning.reason, roleCardMultiMemberReasonOf(2))
 })
 
 /* ───────────────── ② 成员复用：一个 memberId 挂两条 binding ───────────────── */
@@ -334,11 +340,19 @@ test('r47 t2 总回归：四种形态同在一张快照，逐任务断言落点�
   assert.equal(c1.reason, MEMBER_JUMP_NO_MEMBER_REASON)
   assert.equal(c1.memberId, undefined)
 
-  // dev 名下还有 ma/mb/mc 三个成员：角色卡一律不跳，原因里的数字要跟成员数一致。
+  // dev 名下还有 ma/mb/mc 三个成员：mb、mc 在运行，mc 的 b2（NOW+2000）比 mb 后开启 —— 跳 mc。
+  // t2：角色卡只在「一个运行中成员都没有」时才按歧义不跳。
   const roleJump = memberJumpOf({ kind: 'role', roleId: 'dev' }, members)
-  assert.equal(roleJump.available, false)
-  assert.equal(roleJump.reason, roleCardMultiMemberReasonOf(3))
-  assert.equal(roleJump.reason, '该角色有 3 个子智能体，请从任务行进入')
+  assert.equal(roleJump.available, true)
+  assert.equal(roleJump.memberId, 'mc', '多个运行中成员取 spawnedAt 最大的那个')
+  assert.equal(roleJump.member?.memberId, 'mc')
+  assert.match(roleJump.title, /正在运行/)
+
+  const idle = members.map((member) => ({ ...member, status: 'idle' as const }))
+  const noRunning = memberJumpOf({ kind: 'role', roleId: 'dev' }, idle)
+  assert.equal(noRunning.available, false)
+  assert.equal(noRunning.reason, roleCardMultiMemberReasonOf(3))
+  assert.equal(noRunning.reason, '该角色有 3 个子智能体，请从任务行进入')
 
   // 机械不变量：任何「可跳」的任务行，落点成员的 taskIds 必须包含该任务。
   for (const task of ['a1', 'a2', 'b1', 'b2', 'c1', 'd1']) {

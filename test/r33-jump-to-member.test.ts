@@ -81,9 +81,11 @@ test('r33 ① 角色有成员：可跳、带 memberId，title/label 由同一判
   assert.equal(jump.available, true)
   assert.equal(jump.memberId, 'm-dev', 'memberId 必须与宿主会话 id 同源，直接交给 uiWorkspace')
   assert.equal(jump.member?.memberId, 'm-dev', '成员态 chip 复用同一次查找结果，不再二次检索')
-  assert.equal(jump.title, '打开子智能体会话：开发-1')
-  assert.equal(jump.label, '角色：开发，打开子智能体会话：开发-1', 'base.label 必须与跳转结果合并，不能覆盖')
+  // t2：运行中成员可跳，但文案必须先说清「正在运行」，否则多成员角色卡看起来还是在猜。
+  assert.equal(jump.title, '打开子智能体会话：开发-1 · 正在运行')
+  assert.equal(jump.label, '角色：开发，打开子智能体会话：开发-1 · 正在运行', 'base.label 必须与跳转结果合并，不能覆盖')
   assert.match(jump.actionText, /开发-1/)
+  assert.match(jump.actionText, /正在运行/)
 })
 
 test('r33 ① 任务：明确绑定 taskId 的成员优先于同角色 running 成员', () => {
@@ -161,13 +163,13 @@ test('r33 ① 节点有角色：与角色卡/任务行走同一套绑定优先�
   assert.equal(jump.memberId, 'm-qa', '绑定该任务的成员优先，避免流程节点跳到相邻任务')
 })
 
-/* ─────────────────── t5：角色卡多人歧义 → 不跳，导到任务行 ─────────────────── */
+/* ─────────────────── t5：无运行成员的角色卡多人歧义 → 不跳，导到任务行 ─────────────────── */
 
-test('t5 角色卡：名下成员不止一个时不跳，给「N 个子智能体，请从任务行进入」', () => {
+test('t5 角色卡：没有运行中成员且名下不止一个 → 不跳，给「N 个子智能体，请从任务行进入」', () => {
   const a = memberOf({ memberId: 'm-a', roleId: 'dev', taskId: 't1', status: 'idle' })
-  const b = memberOf({ memberId: 'm-b', roleId: 'dev', taskId: 't2', status: 'running', lastEventAt: AT + 1 })
+  const b = memberOf({ memberId: 'm-b', roleId: 'dev', taskId: 't2', status: 'done', stoppedAt: AT + 1, lastEventAt: AT + 1 })
   const jump = memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [a, b], { label: roleJumpLabelOf('开发') })
-  assert.equal(jump.available, false, '名下有两个成员时按 roleId 猜一个就是乱跳（开错会话比不跳更糟）')
+  assert.equal(jump.available, false, '没有活人可开时按 roleId 猜一个就是乱跳（开错会话比不跳更糟）')
   assert.equal(jump.memberId, undefined, '不可跳时不得下发 memberId')
   assert.equal(jump.reason, roleCardMultiMemberReasonOf(2))
   assert.equal(jump.reason, '该角色有 2 个子智能体，请从任务行进入')
@@ -180,8 +182,52 @@ test('t5 角色卡：名下成员不止一个时不跳，给「N 个子智能体
   assert.equal(viaTask.memberId, 'm-b')
 })
 
-test('t5 角色卡：单成员仍可跳，且与 roleCardJumpOf 是同一条路径（不分叉）', () => {
-  const only = memberOf({ memberId: 'm-only', roleId: 'dev', taskId: 't1' })
+/* ─────────────────── t2：有运行中成员 → 跳「最后开启」的那个 ─────────────────── */
+
+test('t2 角色卡：运行中成员直接可跳；多个时按 spawnedAt 取最大，不被 lastEventAt 前移带走', () => {
+  const older = memberOf({ memberId: 'm-old', name: '开发-1', taskId: 't1', status: 'running', spawnedAt: AT + 1000, lastEventAt: AT + 9000 })
+  const newer = memberOf({ memberId: 'm-new', name: '开发-2', taskId: 't2', status: 'running', spawnedAt: AT + 2000, lastEventAt: AT + 2000 })
+  const jump = memberJumpOf(
+    { kind: 'role', roleId: 'dev', taskId: 't2' },
+    [older, newer],
+    { label: roleJumpLabelOf('开发'), taskTitle: '登录页开发' },
+  )
+  assert.equal(jump.available, true, '有运行中成员时角色卡必须可跳（不再按成员数一刀切）')
+  assert.equal(jump.memberId, 'm-new', '最后开启 = spawnedAt 最大，不能按 lastEventAt 挑')
+  assert.match(jump.actionText, /正在运行/, '按钮文案要说清点开的是正在运行的成员')
+  assert.match(jump.actionText, /登录页开发/, '按钮文案要带任务名，不只成员名')
+  assert.match(jump.title, /正在运行/)
+  assert.match(jump.title, /登录页开发/)
+  assert.match(jump.label, /^角色：开发，.*正在运行$/)
+})
+
+test('t2 角色卡：缺 spawnedAt 回退 lastEventAt；时间相等按 memberId 字典序保证确定性', () => {
+  const legacy = memberOf({ memberId: 'm-legacy', taskId: 't1', status: 'running', lastEventAt: AT + 5000 })
+  const spawned = memberOf({ memberId: 'm-spawned', taskId: 't2', status: 'running', spawnedAt: AT + 1000, lastEventAt: AT })
+  assert.equal(
+    roleCardJumpOf({ kind: 'role', roleId: 'dev' }, [legacy, spawned]).memberId,
+    'm-legacy',
+    '旧快照没有 spawnedAt 时用 lastEventAt 当「最后开启」的近似',
+  )
+  const x = memberOf({ memberId: 'm-b', taskId: 't1', status: 'running', spawnedAt: AT })
+  const y = memberOf({ memberId: 'm-a', taskId: 't2', status: 'running', spawnedAt: AT })
+  assert.equal(
+    roleCardJumpOf({ kind: 'role', roleId: 'dev' }, [x, y]).memberId,
+    'm-a',
+    '时间相等时必须每次打开同一个会话（字典序最小）',
+  )
+})
+
+test('t2 角色卡：status=running 但已有 stoppedAt 不算运行中，不跳', () => {
+  const ghost = memberOf({ memberId: 'm-ghost', roleId: 'dev', taskId: 't1', status: 'running', stoppedAt: AT })
+  const other = memberOf({ memberId: 'm-other', roleId: 'dev', taskId: 't2', status: 'idle' })
+  const jump = memberJumpOf({ kind: 'role', roleId: 'dev' }, [ghost, other])
+  assert.equal(jump.available, false, '停止事实位优先于状态字符串，不能把已停成员当活人')
+  assert.equal(jump.reason, roleCardMultiMemberReasonOf(2))
+})
+
+test('t5 角色卡：单个非运行成员仍可跳，且与 roleCardJumpOf 是同一条路径（不分叉）', () => {
+  const only = memberOf({ memberId: 'm-only', roleId: 'dev', taskId: 't1', status: 'idle' })
   const viaEnum = memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [only], { label: roleJumpLabelOf('开发') })
   assert.equal(viaEnum.available, true)
   assert.equal(viaEnum.memberId, 'm-only')

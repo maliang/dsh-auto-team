@@ -1313,6 +1313,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
         // r21 AC-4：两个停止事实位只在 binding 上真的存在时才出现（缺席 = 没发生过，客户端不补 0）。
         ...(binding.stopping === true ? { stopping: true } : {}),
         ...(binding.stoppedAt !== undefined ? { stoppedAt: binding.stoppedAt } : {}),
+        // 任命时刻逐字透传，「最后开启」判定取成员间最大值（不拿 lastEventAt 冒充）。
+        spawnedAt: binding.spawnedAt,
         ...stallFieldsOf(state, binding.memberId, status, stallMs),
         lastEventAt: lastEventAtOf(state, binding.memberId, binding.spawnedAt),
         modelRoute: describeRoute(roleById.get(binding.roleId)),

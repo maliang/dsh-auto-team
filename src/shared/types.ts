@@ -420,6 +420,12 @@ export interface MemberView {
    * 缺席 = 没有停止事实（运行中 / 中断失败 / 旧快照），客户端不得补 0。
    */
   stoppedAt?: number
+  /**
+   * 成员被宿主任命的时刻（逐字透传 `binding.spawnedAt`），用于「最后开启」判定
+   * （取成员间最大值即可，客户端不得用 `lastEventAt` 代替——那是活动时间，会被消息/证据前移）。
+   * 可选：旧快照与 legacy 兜底（只有 `task.memberId`、没有 binding）没有这个事实，客户端按「无」处理。
+   */
+  spawnedAt?: number
   /** 最近一次活动时间（消息 / 证据 / 派发时间取最大），用于「多久没动静」。 */
   lastEventAt: number
   /**
