@@ -9,6 +9,7 @@
  *
  * 覆盖：
  *  ① 成员身份：命中 / 无 agent id / 无绑定 / retired 不算 / 多 run 取最新（plannedAt→createdAt→runId）
+ *     / 复用成员有多条绑定时按请求 taskId 命中「本次那张卡」，不给 taskId 才退化取最新
  *  ② status 成员视图：字段白名单逐键断言，不含 members/memory/roles/plan/tasks 与其它任务
  *  ③ receipt：只允许自己的 taskId；他人 taskId → FORBIDDEN 且零写入、零门禁
  *  ④ 门禁失败 → rework，证据（退出码/输出尾部）回发给该成员，并落账本
@@ -249,6 +250,90 @@ test('r30 ① 成员身份：多个 run 取最新（plannedAt → createdAt → 
   assert.equal(memberIdentityOf(identityDeps(byRunId), MEMBER_META)?.runId, 'run-r30-z')
 })
 
+/* ─────────────────────── ①-b 复用成员按请求 taskId 命中绑定 ─────────────────────── */
+
+test('r30 ①-b 成员身份：给了 taskId 就命中「本次那张卡」，不给则退化取最新绑定', () => {
+  const store = identityStore()
+  seed(
+    store,
+    runStateOf({
+      plan: planOf({
+        tasks: [
+          taskOf('t1', 'done', { memberId: MEMBER }),
+          taskOf('t2', 'running', { memberId: MEMBER }),
+          taskOf('t3', 'running', { memberId: 'member-t3' }),
+        ],
+      }),
+      // 同一个成员名下两张卡：t1 是先派的那张，t2 是复用后追加的那张。
+      bindings: [
+        bindingOf('t1', '开发-1', { memberId: MEMBER, spawnedAt: NOW - 20_000 }),
+        bindingOf('t2', '开发-1', { memberId: MEMBER, spawnedAt: NOW - 1_000 }),
+        bindingOf('t3', '开发-3'),
+      ],
+    }),
+  )
+  const deps = identityDeps(store)
+
+  assert.equal(memberIdentityOf(deps, MEMBER_META, 't1')?.binding.taskId, 't1', '给 t1 必须命中第一张卡')
+  assert.equal(memberIdentityOf(deps, MEMBER_META, 't1')?.task.id, 't1')
+  assert.equal(memberIdentityOf(deps, MEMBER_META, 't2')?.binding.taskId, 't2', '给 t2 必须命中复用后的那张卡')
+  assert.equal(memberIdentityOf(deps, MEMBER_META, 't2')?.task.id, 't2')
+  assert.equal(memberIdentityOf(deps, MEMBER_META)?.binding.taskId, 't2', '不给 taskId 退化取最新绑定')
+  assert.equal(memberIdentityOf(deps, MEMBER_META, '  ')?.binding.taskId, 't2', '空白 taskId 等同于没给')
+  // 别人名下的任务 id 解析不到本成员身份：精确命中失败后退化，仍只能是自己的卡。
+  assert.equal(memberIdentityOf(deps, MEMBER_META, 't3')?.binding.taskId, 't2', '精确命中不到时退化为最新绑定')
+  assert.notEqual(memberIdentityOf(deps, MEMBER_META, 't3')?.binding.memberId, 'member-t3', '绝不能命中别人的绑定')
+})
+
+test('r30 ①-b 复用成员：receipt 能提交第二张卡，别人的任务 id 仍 FORBIDDEN 且文案带名下任务列表', async () => {
+  const harness = createHarness({ enabled: true })
+  seed(
+    harness.store,
+    runStateOf({
+      plan: planOf({
+        tasks: [
+          taskOf('t1', 'running', { memberId: MEMBER, acceptance: 'printf reuse-t1' }),
+          taskOf('t2', 'running', { memberId: MEMBER, acceptance: 'printf reuse-t2' }),
+          taskOf('t3', 'running', { memberId: 'member-t3', acceptance: 'printf reuse-t3' }),
+        ],
+      }),
+      bindings: [
+        bindingOf('t1', '开发-1', { memberId: MEMBER, spawnedAt: NOW - 20_000 }),
+        bindingOf('t2', '开发-1', { memberId: MEMBER, spawnedAt: NOW - 1_000 }),
+        bindingOf('t3', '开发-3'),
+      ],
+    }),
+  )
+
+  // 第二张卡：r30 旧实现按「最新 run 的第一条 binding」解析成 t1，这里会 FORBIDDEN。
+  const second = await harness.call('auto_team_receipt', { taskId: 't2', note: '复用成员交第二张卡' }, MEMBER_META)
+  assert.equal(second.ok, true, JSON.stringify(second))
+  assert.equal(second.taskId, 't2')
+  assert.equal(second.status, 'done')
+  assert.equal((second.evidence as Record<string, unknown>).command, 'printf reuse-t2')
+
+  // 第一张卡仍可提交（两条绑定都在，精确命中各自那张）。
+  const first = await harness.call('auto_team_receipt', { taskId: 't1' }, MEMBER_META)
+  assert.equal(first.ok, true, JSON.stringify(first))
+  assert.equal(first.status, 'done')
+
+  // 别人的任务 id 照旧 FORBIDDEN：文案必须同时给出「本次请求的 taskId」与「名下任务列表」。
+  const forbidden = await harness.call('auto_team_receipt', { taskId: 't3' }, MEMBER_META)
+  assert.equal(forbidden.ok, false)
+  assert.equal(forbidden.code, 'FORBIDDEN')
+  const text = String(forbidden.error)
+  assert.match(text, /本次请求的 taskId 为「t3」/, `文案必须带本次请求的 taskId：${text}`)
+  assert.match(text, /你名下任务为 t1、t2/, `文案必须带成员名下任务列表：${text}`)
+  assert.match(text, /t3 不是你被派发的任务/, `文案必须指出 t3 不是自己名下任务：${text}`)
+  assert.equal(harness.state().plan.tasks.find((item) => item.id === 't3')?.status, 'running', '他人任务状态不变')
+  assert.equal(existsSync(join(harness.dir, 'artifacts', 't3.log')), false, '不得为他人任务跑门禁')
+
+  // 没有 taskId 参数时 status 退化取最新绑定（复用后的第二张卡），不再永远显示首张卡。
+  const status = await harness.call('auto_team_status', {}, MEMBER_META)
+  assert.equal(status.view, 'member')
+  assert.equal((status.task as Record<string, unknown>).id, 't2', 'status 应显示成员最新一张卡')
+})
+
 /* ─────────────────────── ② 成员只读视图 ─────────────────────── */
 
 test('r30 ② status 成员视图：字段白名单，绝不返回 members/memory/roles/plan/tasks', async () => {
@@ -285,9 +370,12 @@ test('r30 ② status 成员视图：字段白名单，绝不返回 members/memor
   assert.equal(status.runId, RUN)
   assert.deepEqual(
     Object.keys(status).sort(),
-    ['notice', 'ok', 'runId', 'task', 'view'],
+    // `taskId` 是 r56 为「跨 run 同名 taskId 归属确认」而加的（与 `runId` 一起回应
+    // 「这份任务属于哪份 run」），不是新的泄露面：仍是本成员自己的那一张卡。
+    ['notice', 'ok', 'runId', 'task', 'taskId', 'view'],
     '成员视图顶层字段必须恰为白名单（多一个字段就是泄露）',
   )
+  assert.equal(status.taskId, 't1', '顶层 taskId 必须等于被解析到的任务 id，不能只加键名')
   for (const forbidden of [
     'members',
     'memory',
@@ -333,8 +421,8 @@ test('r30 ③ receipt：他人 taskId → FORBIDDEN，零门禁零写入', async
   assert.equal(result.code, 'FORBIDDEN')
   assert.match(
     String(result.error),
-    /只能提交自己被派发任务（t1）的回执，t2 不是你被派发的任务/,
-    '拒绝文案必须同时指出自己的 taskId 与被拒绝的 taskId',
+    /本次请求的 taskId 为「t2」，你名下任务为 t1；t2 不是你被派发的任务/,
+    '拒绝文案必须同时指出本次请求的 taskId 与成员名下任务列表',
   )
 
   const state = harness.state()

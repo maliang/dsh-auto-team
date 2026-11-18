@@ -172,12 +172,25 @@ test('shouldAutoDispatch：只有 dispatching/draft + 未暂停 + 有未被派�
   const retired = makeState([makeTask('t1')], { bindings: [{ ...bindingOf('t1', 'dev-t1'), retired: true }] })
   assert.equal(shouldAutoDispatch(retired).ok, true)
 
-  // 写域闸挡下的 waiting：没放行前不算可动，用户确认「强制并行」后必须被判成可派发（否则 tick 永远不复活它）。
-  const waiting = makeState([makeTask('t1', { status: 'waiting', waitingOn: ['t0'] })])
+  // 写域闸挡下的 waiting：持有人必须**真的还在计划里**（t1 running 且占着同一路径），
+  // 否则「持有人已释放」这条判定会先把 waiting 复活掉，测的就不是写域闸了。
+  const waiting = makeState([
+    makeTask('t1', { status: 'running', writeScopes: ['src/host/team/auto-dispatch.ts'] }),
+    makeTask('t2', { status: 'waiting', waitingOn: ['t1'], writeScopes: ['src/host/team/auto-dispatch.ts'] }),
+  ])
   assert.equal(shouldAutoDispatch(waiting).ok, false)
-  assert.equal(shouldAutoDispatch({ ...waiting, forceParallel: ['t1'] }).ok, true)
+  assert.equal(shouldAutoDispatch({ ...waiting, forceParallel: ['t2'] }).ok, true)
   // 放行的是别的任务时，不得顺带复活被挡的这一个。
-  assert.equal(shouldAutoDispatch({ ...waiting, forceParallel: ['t2'] }).ok, false)
+  assert.equal(shouldAutoDispatch({ ...waiting, forceParallel: ['t9'] }).ok, false)
+  // 最后一个持锁者已释放（t1 done）→ waiting 纯投影成 pending，必须可派发（复活通路的唯一入口）。
+  const released = makeState([
+    makeTask('t1', { status: 'done', writeScopes: ['src/host/team/auto-dispatch.ts'] }),
+    makeTask('t2', { status: 'waiting', waitingOn: ['t1'], writeScopes: ['src/host/team/auto-dispatch.ts'] }),
+  ])
+  assert.equal(shouldAutoDispatch(released).ok, true)
+  // 判定必须幂等且不改入参：连判两次结论一致，原 state 里的等待者仍是 waiting。
+  assert.equal(shouldAutoDispatch(released).ok, true)
+  assert.equal(released.plan.tasks[1].status, 'waiting')
 })
 
 /* ───────────────────────────── 2. 派发器：5 触发 / 单飞 / 幂等 / 退避 ───────────────────────────── */

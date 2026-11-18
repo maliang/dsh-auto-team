@@ -33,10 +33,13 @@ import {
   clampListWidth,
   formatStamp,
   goalTitleOf,
+  isClosedRun,
   nextListWidth,
   tokenTextOf,
   tokenTitleOf,
 } from './viewmodel.ts'
+import { jumpToMemberSession } from './member-nav.ts'
+import type { MemberJumpView } from './viewmodel.ts'
 import { EmptyState } from './views/EmptyState.tsx'
 import { FlowCanvas } from './views/FlowCanvas.tsx'
 import { MemberPage } from './views/MemberPage.tsx'
@@ -186,6 +189,15 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
     () => (detailView === null ? [] : detailView.tasks.map((task) => task.id)),
     [detailView],
   )
+  // t2：抽屉内三个入口（角色卡 / 任务行 / 流程图节点）共用一份「点了没跳成」的原因；
+  // 落地动作走 `member-nav.ts` 的同一函数，与任务页行为/文案一致。成功时清空，不留空行。
+  const [jumpNotice, setJumpNotice] = React.useState<string | null>(null)
+  const jumpToMember = React.useCallback((jump: MemberJumpView): void => {
+    setJumpNotice(jumpToMemberSession(jump))
+  }, [])
+  // t2：抽屉是只读快照 —— 结束的 run 只影响「不可跳」的原因文案，不提供写入口。
+  const drawerMembers = detailView === null ? [] : (detailView.members ?? [])
+  const drawerClosedRun = detailView !== null && isClosedRun({ status: detailView.planStatus })
 
   // r17 成员页：成员、角色与任务都从**当前 run** 的快照装配；历史 run 没有成员，导航也不提供入口。
   const memberId = nav.kind === 'member' ? nav.memberId : ''
@@ -315,6 +327,7 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
 
   function closeDrawer(): void {
     setOpenRunId(null)
+    setJumpNotice(null)
     view.closeRun()
     const focus = pendingFocusRef.current
     pendingFocusRef.current = null
@@ -526,9 +539,36 @@ function LibraryContent(props: LibraryPageProps & { root: 'library' | 'panellist
         ) : (
           <>
             <RunHeader detail={detailView} inflight="idle" />
-            <RoleGrid roles={detailView.roles} />
-            <TaskOverview tasks={detailView.tasks} expandedTaskId={expanded} onToggleTask={toggleTask} />
-            <FlowCanvas flow={detailView.flow} onSelectTask={selectDrawerTask} />
+            {/* 常驻 live region：空态折叠为零高（不占位），换文案时读屏才会播报。 */}
+            <p
+              role="status"
+              aria-live="polite"
+              data-member-jump-notice
+              data-empty={jumpNotice === null ? 'true' : undefined}
+            >
+              {jumpNotice ?? ''}
+            </p>
+            <RoleGrid
+              roles={detailView.roles}
+              members={drawerMembers}
+              onJump={jumpToMember}
+              closedRun={drawerClosedRun}
+            />
+            <TaskOverview
+              tasks={detailView.tasks}
+              expandedTaskId={expanded}
+              onToggleTask={toggleTask}
+              members={drawerMembers}
+              onJump={jumpToMember}
+              closedRun={drawerClosedRun}
+            />
+            <FlowCanvas
+              flow={detailView.flow}
+              onSelectTask={selectDrawerTask}
+              members={drawerMembers}
+              onJump={jumpToMember}
+              closedRun={drawerClosedRun}
+            />
           </>
         )}
       </RunDrawer>

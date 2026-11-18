@@ -4754,6 +4754,24 @@ export const AUTO_TEAM_CSS = `
   padding: 0 0 12px;
   overflow: auto;
 }
+/* t2：抽屉内成员跳转结局 —— 与任务页 [data-member-jump-notice] 同一语义，
+   作用域落在 [data-run-drawer]（任务页那条只认 [data-region="tasks-tab"]）。
+   空态折叠为零高：常驻只为让读屏播报新文案，不占版面。 */
+[data-run-drawer] [data-member-jump-notice] {
+  margin: 0;
+  padding: 4px 12px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, currentColor);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: var(--dsw-font-xs-11, 11px/16px sans-serif);
+  overflow-wrap: anywhere;
+}
+[data-run-drawer] [data-member-jump-notice][data-empty="true"] {
+  max-height: 0;
+  padding: 0;
+  border-left-width: 0;
+  overflow: hidden;
+}
 @keyframes auto-team-drawer-in {
   from { opacity: 0; transform: translateX(16px); }
   to { opacity: 1; transform: translateX(0); }

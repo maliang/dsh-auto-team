@@ -24,13 +24,12 @@ import {
   buildRunDetail,
   hintOf,
   isClosedRun,
-  memberJumpNoticeOf,
   planGoalOf,
   stageOfDetail,
 } from '../viewmodel.ts'
 import type { InflightState, MemberJumpView, RunStageView } from '../viewmodel.ts'
 import { activeRunRowsOf, tasksEmptyStateOf } from '../nav.ts'
-import { requestMemberSession } from '../session.ts'
+import { jumpToMemberSession } from '../member-nav.ts'
 import { RunHeader } from '../views/RunHeader.tsx'
 import { RunSwitcher } from '../views/RunSwitcher.tsx'
 import { RunCloseAction } from '../views/RunCloseAction.tsx'
@@ -135,11 +134,7 @@ export function TasksTab(props: TabProps): React.ReactElement {
    * 这里只负责「调宿主会话服务 + 把结局翻成人话」。任何没跳成的情况都要留一行原因。
    */
   const jumpToMember = (jump: MemberJumpView): void => {
-    if (!jump.available || jump.memberId === undefined) {
-      setJumpNotice(memberJumpNoticeOf('no-member', jump) ?? null)
-      return
-    }
-    setJumpNotice(memberJumpNoticeOf(requestMemberSession(jump.memberId), jump) ?? null)
+    setJumpNotice(jumpToMemberSession(jump))
   }
   // r53：历史 run 也传 jumpToMember —— 结束的 run 不再整体置空，而是由 `closedRun` 语义
   // 给「该运行已结束，子智能体会话已回收」；成员仍在当前快照里（还活着）时照常可跳。

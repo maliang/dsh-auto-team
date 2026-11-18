@@ -21,6 +21,7 @@
 import { AUTO_DISPATCH_RETRY_LIMIT } from '../../shared/const.ts'
 import { readyTasks } from '../plan/graph.ts'
 import { advancePlanToDispatching, type RunState, type RunsStore } from '../store.ts'
+import { applyScopeWaits } from './scope-locks.ts'
 
 /**
  * 6 个触发点（缺一个 AC-8 的变异用例就会红）。
@@ -113,14 +114,21 @@ export function shouldAutoDispatch(state: RunState): { ok: boolean; reason?: str
   if (state.pause !== undefined || state.plan.tasks.some((task) => task.status === 'paused')) {
     return { ok: false, reason: '已暂停，恢复后再自动补齐' }
   }
-  // 写域闸挡下的 waiting 任务不在 readyTasks 口径里；用户确认「强制并行」后由 dispatchReady 的
-  // `reviveForcedWaits` 把它们放回 pending。这里必须用同一投影判，否则 waiting 是唯一可动对象时
-  // shouldAutoDispatch 会先判「没有就绪任务」，复活逻辑永远等不到调用（AC-11 的 forceParallel 死路）。
-  const forced = new Set(state.forceParallel ?? [])
+  // 写域闸挡下的 waiting 任务不在 readyTasks 口径里（graph.ts:122 只认 pending/ready/rework），
+  // 所以先做一次**纯投影**，把「最后一个持锁者已释放 / 写域已被清空」的 waiting 视作 pending：
+  // 直接复用 `applyScopeWaits`（scope-locks.ts:108）的同一判定，不在这里另写一套冲突算法。
+  // 投影不改入参、不走 IO、幂等（无变化时返回同一个 state 对象）；`now` 是历史参数（内部 void 掉）。
+  //
+  // 这里是 waiting 复活的**唯一入口**：本模块只判「值不值得调一次派发」，真正的状态迁移仍由
+  // dispatchReady 里的 `applyScopeWaits` 落盘。少了它，「释放已发生、只剩 waiting」时
+  // shouldAutoDispatch 会先判「没有就绪任务」，复活逻辑永远等不到调用（AC-15）；
+  // 下面的 forceParallel 投影与它同构（同一条 waiting → pending 的放行语义，只是判据不同）。
+  const settled = applyScopeWaits(state, 0)
+  const forced = new Set(settled.forceParallel ?? [])
   const projected =
     forced.size === 0
-      ? state.plan.tasks
-      : state.plan.tasks.map((task) => (task.status === 'waiting' && forced.has(task.id) ? { ...task, status: 'pending' as const } : task))
+      ? settled.plan.tasks
+      : settled.plan.tasks.map((task) => (task.status === 'waiting' && forced.has(task.id) ? { ...task, status: 'pending' as const } : task))
   const ready = readyTasks(projected)
   if (ready.length === 0) return { ok: false, reason: '没有就绪任务' }
   const liveBound = new Set(state.bindings.filter((binding) => binding.retired !== true).map((binding) => binding.taskId))

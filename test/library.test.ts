@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -241,6 +241,36 @@ test('runId → detail：任务/角色/流转图/用时/token 全部由宿主算
   assert.deepEqual(
     detail?.flow.edges.map((edge) => `${edge.from}->${edge.to}:${edge.upstreamDone}`),
     ['t1->t2:true', 't1->t3:true'],
+  )
+})
+
+test('r54：角色投影带 model 时成员行 modelRoute 取角色声明，而不是「会话默认」', () => {
+  const state = stateOf({
+    bindings: [
+      { taskId: 't1', roleId: 'dev', memberId: 'member-1', name: '开发-1', spawnedAt: 1_200 },
+    ],
+    plan: { tasks: [taskOf('t1', { status: 'running' })] },
+  })
+  const roles = [
+    {
+      id: 'dev',
+      name: '开发',
+      model: { provider: 'anthropic', model: 'claude-sonnet-4', reasoningEffort: 'high' as const },
+    },
+  ]
+  const member = runDetailOf(state, 10_000, undefined, roles).members?.[0]
+  assert.equal(member?.modelRoute, 'anthropic/claude-sonnet-4 #high', '路由必须取角色声明的 provider/model')
+  assert.notEqual(member?.modelRoute, '会话默认', '配了路由的角色不得显示成随会话默认')
+  // 对照：同一份 binding、角色不配 model → 仍是「会话默认」（证明上一条断言不是恒真）。
+  const plain = runDetailOf(state, 10_000, undefined, [{ id: 'dev', name: '开发' }])
+  assert.equal(plain.members?.[0]?.modelRoute, '会话默认')
+  // 装配层契约：index.ts 的角色投影必须带 model —— describeRoute 只认 role.model，
+  // 投影只留 id/name 时上面这层行为再对，真机成员行仍恒显示「会话默认」（本测试的回归点）。
+  const source = readFileSync(new URL('../src/host/index.ts', import.meta.url), 'utf8')
+  assert.match(
+    source,
+    /roles:\s*\(\)\s*=>\s*roles\.list\(\)\.map\(\(role\)\s*=>\s*\(\{[^}]*model:\s*role\.model/,
+    'index.ts 的 roles 投影丢了 model，成员行路由会失真',
   )
 })
 

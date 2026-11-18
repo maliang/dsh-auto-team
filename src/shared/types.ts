@@ -895,6 +895,14 @@ export interface RunDetailView {
   usage: UsageCell
   duration: DurationCell
   roles: RoleUsageView[]
+  /**
+   * 该 run 的成员行（r54）：与快照 `PanelSnapshot.members` **同一口径** ——
+   * 未退休 binding（已确认停止的留一个「已停止」位）+ legacy `task.memberId` 兜底，含 `taskIds` 全集。
+   *
+   * 缺省 = 宿主拿不到成员名单（旧 run 没落 binding / 只落盘了计划还没派发），
+   * 客户端**不得**把缺省读成「确实没有成员」，也不许补 `[]` 当事实。
+   */
+  members?: MemberView[]
   tasks: TaskDetailView[]
   flow: FlowView
   pendingConfirmation?: PendingConfirmationView

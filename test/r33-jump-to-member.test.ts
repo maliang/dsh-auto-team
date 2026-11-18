@@ -372,14 +372,43 @@ test('r33 ③ 三个入口都只调 memberJumpOf，不各自 find/filter 成员'
   }
 })
 
-test('r33 ③ 落地动作只在任务页：requestMemberSession + 统一结局翻译', () => {
-  const source = codeOf('src/client/tabs/TasksTab.tsx')
-  assert.match(source, /if \(!jump\.available \|\| jump\.memberId === undefined\)/, '不可跳分支必须先于调用服务')
-  assert.match(source, /memberJumpNoticeOf\('no-member', jump\)/, '不可跳也要留一行原因（禁止静默）')
-  assert.match(source, /requestMemberSession\(jump\.memberId\)/, '唯一落地动作：调用会话服务')
-  assert.match(source, /memberJumpNoticeOf\(requestMemberSession\(jump\.memberId\), jump\)/, '结局必须经同一处翻译')
-  assert.equal(source.includes('memberForRole('), false, '任务页只消费判定，不得再查一次成员')
-  assert.equal(source.includes('openSession('), false, '组件不得直接摸宿主服务（注册/调用集中在 session.ts）')
+test('r33 ③ 落地动作唯一：member-nav 的 jumpToMemberSession，任务页与左栏抽屉共用', () => {
+  // t2：逻辑从 TasksTab 抽到 member-nav.ts，两个入口共用，禁止任何一处复制一份。
+  const nav = codeOf('src/client/member-nav.ts')
+  assert.match(nav, /if \(!jump\.available \|\| jump\.memberId === undefined\)/, '不可跳分支必须先于调用服务')
+  assert.match(nav, /memberJumpNoticeOf\('no-member', jump\)/, '不可跳也要留一行原因（禁止静默）')
+  assert.match(nav, /requestMemberSession\(jump\.memberId\)/, '唯一落地动作：调用会话服务')
+  assert.match(nav, /memberJumpNoticeOf\(requestMemberSession\(jump\.memberId\), jump\)/, '结局必须经同一处翻译')
+  for (const file of ['src/client/tabs/TasksTab.tsx', 'src/client/LibraryPage.tsx']) {
+    const source = codeOf(file)
+    assert.match(source, /jumpToMemberSession\(/, `${file} 必须复用 member-nav 的唯一落地函数`)
+    assert.equal(source.includes('memberForRole('), false, `${file} 只消费判定，不得再查一次成员`)
+    assert.equal(source.includes('openSession('), false, `${file} 不得直接摸宿主服务（注册/调用集中在 session.ts）`)
+  }
+})
+
+test('t2 左栏抽屉入口与任务页同一套：members / onJump / closedRun + live region，写操作仍只读', () => {
+  const source = codeOf('src/client/LibraryPage.tsx')
+  assert.equal(
+    (source.match(/onJump=\{jumpToMember\}/g) ?? []).length,
+    3,
+    '角色卡 / 任务行 / 流程图三个入口必须都接上 onJump',
+  )
+  assert.equal(
+    (source.match(/members=\{drawerMembers\}/g) ?? []).length,
+    3,
+    '三个入口都必须拿到同一份成员列表',
+  )
+  assert.equal(
+    (source.match(/closedRun=\{drawerClosedRun\}/g) ?? []).length,
+    3,
+    'closedRun 必须透传给三个入口（判定只在下游做）',
+  )
+  assert.match(source, /isClosedRun\(\{ status: detailView\.planStatus \}\)/, '已结束判定复用任务页同一函数')
+  assert.match(source, /detailView\.members \?\? \[\]/, '成员列表按任务卡约定取 detailView.members')
+  assert.match(source, /data-member-jump-notice/, '抽屉内必须有跳转结局的 live region')
+  assert.match(source, /role="status"/, 'live region 必须是 status')
+  assert.equal(source.includes('onTaskAction'), false, '抽屉是只读快照：不传写操作入口')
 })
 
 test('r53 ③ 历史 run 也传同一 onJump：可跳性交给 closedRun，写操作仍只在当前 run', () => {

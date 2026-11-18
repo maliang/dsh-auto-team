@@ -230,18 +230,48 @@ export interface MemberIdentityView {
  * 取 `plannedAt` 最大的那份（计划越新越相关），同一时刻再用 `createdAt`、`runId` 兜底，
  * 保证结果确定而不是依赖目录遍历顺序。
  *
+ * **按请求 taskId 命中 binding（复用成员的修正）**：同一个 memberId 名下可能有多张卡
+ * （`bindings` 追加多条），只按「最新一条」解析会让成员拿第二张卡后，receipt 仍被当成
+ * 首张卡的身份而回 FORBIDDEN、status 也永远显示首张卡。所以调用方给了 `taskId` 时先精确
+ * 找 `memberId` 相同、`!retired`、`binding.taskId === taskId` 的那条绑定；找不到（或没给
+ * taskId）才退化成「该成员最新一条未退休绑定」的旧行为。**只按绑定归属命中**，不因为
+ * 「run 里有这个 taskId」就放行——别人名下的任务 id 仍然解析不到本成员身份。
+ *
  * **只判身份，不判开关**：这里刻意不看 `settings.enabled`——身份解析与准入是两件事。
  * 成员自助（status/receipt）的准入必须再叠一层 `memberSelfServiceOf`：开关关闭时
  * 两个工具都要回 tools.ts 的 `NOT_ENABLED` 原文案，不能一个放行一个被桥拦。
  */
-export function memberIdentityOf(deps: ToolsDeps, meta: unknown): MemberIdentityView | null {
+export function memberIdentityOf(deps: ToolsDeps, meta: unknown, taskId?: string): MemberIdentityView | null {
   const agentId = agentIdOf(meta)
   if (agentId === undefined) return null
+  const wanted = typeof taskId === 'string' && taskId.trim() !== '' ? taskId.trim() : undefined
+  // ① 请求带了 taskId：先只认「本成员 + 未退休 + 绑定任务正是它」的那条，命中即返回。
+  const exact = wanted === undefined ? null : memberIdentityAcrossRuns(deps, agentId, wanted)
+  // ② 没给 taskId 或精确命中不到：退化为旧行为（该成员最新一条未退休绑定）。
+  const hit = exact ?? memberIdentityAcrossRuns(deps, agentId, undefined)
+  if (hit === null) return null
+  return {
+    runId: hit.state.plan.runId,
+    sessionId: hit.state.plan.sessionId,
+    binding: hit.binding,
+    task: hit.task,
+  }
+}
+
+/**
+ * 跨 run 找成员的绑定身份；`taskId` 非空时只考虑绑定到该任务的（找不到返回 null，
+ * **不**退化成该 run 的其它绑定——否则精确命中的语义会被别的 run 悄悄放回旧行为）。
+ */
+function memberIdentityAcrossRuns(
+  deps: ToolsDeps,
+  agentId: string,
+  taskId: string | undefined,
+): { state: RunState; binding: MemberBinding; task: PlanTask } | null {
   let best: { state: RunState; binding: MemberBinding; task: PlanTask } | null = null
   for (const summary of deps.store.list()) {
     const state = deps.store.load(summary.runId)
     if (state === null) continue
-    const binding = state.bindings.find((item) => item.memberId === agentId && item.retired !== true)
+    const binding = latestBindingFor(state, agentId, taskId)
     if (binding === undefined) continue
     const task = state.plan.tasks.find((item) => item.id === binding.taskId)
     if (task === undefined) continue
@@ -249,13 +279,18 @@ export function memberIdentityOf(deps: ToolsDeps, meta: unknown): MemberIdentity
       best = { state, binding, task }
     }
   }
-  if (best === null) return null
-  return {
-    runId: best.state.plan.runId,
-    sessionId: best.state.plan.sessionId,
-    binding: best.binding,
-    task: best.task,
+  return best
+}
+
+/** 一份 run 里该成员最新的未退休绑定；给了 `taskId` 时只匹配绑定到该任务的那条。 */
+function latestBindingFor(state: RunState, agentId: string, taskId: string | undefined): MemberBinding | undefined {
+  let found: MemberBinding | undefined
+  for (const binding of state.bindings) {
+    if (binding.memberId !== agentId || binding.retired === true) continue
+    if (taskId !== undefined && binding.taskId !== taskId) continue
+    if (found === undefined || binding.spawnedAt >= found.spawnedAt) found = binding
   }
+  return found
 }
 
 /**
@@ -267,10 +302,81 @@ export function memberIdentityOf(deps: ToolsDeps, meta: unknown): MemberIdentity
  * 「一个放行一个拒绝 + 两处文案」对用户是纯噪音。现在两个工具共用这一个谓词，
  * 关闭时都回本文件的 `NOT_ENABLED` 原文案；开启时都放行，receipt 仍走 `bridge.act` 同一道门禁。
  */
-function memberSelfServiceOf(deps: ToolsDeps, meta: unknown): MemberIdentityView | null {
-  const member = memberIdentityOf(deps, meta)
+function memberSelfServiceOf(deps: ToolsDeps, meta: unknown, taskId?: string): MemberIdentityView | null {
+  const member = memberIdentityOf(deps, meta, taskId)
   if (member === null) return null
   return deps.bridge.enabled(member.sessionId) ? member : null
+}
+
+/**
+ * 成员名下（同一份 run 里）的任务 id 列表：绑定归属 + 任务上的 memberId，去重保序。
+ *
+ * 只用于 FORBIDDEN 文案：复用成员时「你以为自己只有一张卡」是最常见的误判，把名下全部
+ * 任务直接列出来，比再说一遍规则更能让调用方一眼对上号。
+ */
+function memberTaskIdsOf(deps: ToolsDeps, member: MemberIdentityView): string[] {
+  const state = deps.store.load(member.runId)
+  if (state === null) return []
+  const ids: string[] = []
+  const add = (id: string): void => {
+    if (!ids.includes(id)) ids.push(id)
+  }
+  const known = new Set(state.plan.tasks.map((task) => task.id))
+  for (const binding of state.bindings) {
+    if (binding.memberId !== member.binding.memberId || binding.retired === true) continue
+    // 只列真实存在的任务：绑定可能指向已被清理的任务卡，那种 id 报出来只会误导。
+    if (known.has(binding.taskId)) add(binding.taskId)
+  }
+  for (const task of state.plan.tasks) {
+    if (task.memberId === member.binding.memberId) add(task.id)
+  }
+  return ids
+}
+
+/**
+ * t3：成员自助请求（status / review）的身份解析 —— 解析到身份后**锁死到 binding 所属的 runId**。
+ *
+ * 现场证据（r54）：自动验收成员 `qa-review-4xln27` 两次读 `t1` 得到互相矛盾的状态
+ * （先「已通过」再「运行中」）——它没带 runId 时落到了当时的活动 run（r56 的 `t1` 正在跑）。
+ * `taskId`（如 `t1`）在每个 run 里都存在，靠「活动 run」猜必然串，所以这里：
+ *  - 请求给了 `taskId`：必须命中**本成员未退休绑定上的那个任务**。命中不到**不回落**到
+ *    「最新绑定」去猜（`memberIdentityOf` 那里为了 receipt 的兼容会退化，这里不行），
+ *    直接回 FORBIDDEN 并带本次 taskId + 名下任务列表；
+ *  - 请求给了 `runId`：必须等于该 binding 所在的 run，不等就拒绝，绝不改投活动 run；
+ *  - 通过了就只返回这一个身份，调用方（status/review）用它返回/执行，不再自己解析 run。
+ *
+ * 返回 `null` = 「根本不是成员」：调用方照旧回 `NOT_ENABLED`，与既有文案一致。
+ */
+function memberForRequest(
+  deps: ToolsDeps,
+  meta: unknown,
+  requestedTaskId: string | undefined,
+  requestedRunId: string | undefined,
+): { ok: true; member: MemberIdentityView } | { ok: false; code: 'FORBIDDEN'; error: string } | null {
+  const member = memberSelfServiceOf(deps, meta, requestedTaskId)
+  if (member === null) return null
+  if (requestedTaskId !== undefined && member.binding.taskId !== requestedTaskId) {
+    const owned = memberTaskIdsOf(deps, member)
+    const ownedText = owned.length === 0 ? '（无）' : owned.join('、')
+    return {
+      ok: false,
+      code: 'FORBIDDEN',
+      error:
+        `只能操作被派发给自己的任务：本次请求的 taskId 为「${requestedTaskId}」，`
+        + `你名下任务为 ${ownedText}；${requestedTaskId} 不是你被派发的任务`,
+    }
+  }
+  if (requestedRunId !== undefined && requestedRunId !== member.runId) {
+    return {
+      ok: false,
+      code: 'FORBIDDEN',
+      error:
+        `只能操作自己所属 run 的任务：本次请求的 runId 为「${requestedRunId}」，`
+        + `你的任务绑定在 run「${member.runId}」（taskId「${member.binding.taskId}」）；`
+        + '不同 run 里可能有同名 taskId，不会替你猜',
+    }
+  }
+  return { ok: true, member }
 }
 
 /** 两条命中的优先级：plannedAt 大的胜；再按 createdAt；最后按 runId 字典序（确定性）。 */
@@ -727,25 +833,36 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             type: 'string',
             description: '不传 = 当前会话的活动运行（最近一个未终止的 run）；跨 run 收口时传它',
           },
+          taskId: {
+            type: 'string',
+            description: '成员会话：指定自己名下的任务卡（不同 run 可能有同名 taskId，配合 runId 锁定）',
+          },
         },
         required: [],
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
-        const runId = runIdOf(args)
-        const targetError = runTargetError(deps.store, sessionId, runId)
-        if (targetError) return targetError
-        // 队长路径完全不变：开关打开时先走原分支。成员的「查看自己任务」只在 run 所属队长会话
-        // 的开关仍开着时成立（memberSelfServiceOf 身份 + 开关一次判定）；关闭时与其它工具同回旧文案。
+        const requestedRunId = runIdOf(args)
+        const requestedTaskId =
+          typeof args.taskId === 'string' && args.taskId.trim() !== '' ? args.taskId.trim() : undefined
+        // 成员路径（t3）：先按本次请求把身份锁到 binding 所在的 run，再只读那一份 run；
+        // 锁不到（taskId 不是自己的 / runId 不是绑定的那份）直接回明确原因，不猜活动 run。
         if (!deps.bridge.enabled(sessionId)) {
-          const member = memberSelfServiceOf(deps, meta)
-          if (member === null) return { ok: false, error: NOT_ENABLED }
+          const resolved = memberForRequest(deps, meta, requestedTaskId, requestedRunId)
+          if (resolved === null) {
+            // 非成员：保持既有先后（先报 run 不存在，再报未启用），文案一字不改。
+            const targetError = runTargetError(deps.store, sessionId, requestedRunId)
+            return targetError ?? { ok: false, error: NOT_ENABLED }
+          }
+          if (!resolved.ok) return resolved
+          const member = resolved.member
           // 成员视图**只**回自己的任务：不回 members / memory / roles / 其它任务 / plan 全量。
           const evidence = member.task.evidence
           return {
             ok: true,
             view: 'member',
             runId: member.runId,
+            taskId: member.task.id,
             task: {
               id: member.task.id,
               title: member.task.title,
@@ -757,7 +874,9 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
             notice: '成员视角：只显示你自己被派发的任务；完成后用 auto_team_receipt 提交回执（门禁由宿主执行）。其它工具在成员会话不可用。',
           }
         }
-        const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId, runId)
+        const targetError = runTargetError(deps.store, sessionId, requestedRunId)
+        if (targetError) return targetError
+        const snapshot: PanelSnapshot = deps.bridge.snapshot(sessionId, requestedRunId)
         // 默认精简：不传即 compact；只有显式 full 才回正文全文（默认值写死在实现里，schema 只是提示）。
         const detail = args?.detail === 'full' ? 'full' : 'compact'
         const limit = detail === 'full' ? STATUS_MESSAGES_FULL_LIMIT : STATUS_MESSAGES_COMPACT_LIMIT
@@ -870,20 +989,27 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
+        const requestedTaskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
         // 队长路径完全不变；未启用时才尝试成员身份 —— 且开关关闭的 run 里成员也不放行
         // （memberSelfServiceOf 与 status 同一谓词）。放行后仍由 bridge.act 走同一道门禁。
+        // 身份解析带上本次请求的 taskId：复用成员有多条绑定时，命中「本请求那张卡」而不是首张。
         const leaderMode = deps.bridge.enabled(sessionId)
-        const member = leaderMode ? null : memberSelfServiceOf(deps, meta)
+        const member = leaderMode ? null : memberSelfServiceOf(deps, meta, requestedTaskId)
         if (!leaderMode && member === null) return { ok: false, error: NOT_ENABLED }
 
-        const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
+        const taskId = requestedTaskId
         if (taskId === '') return { ok: false, error: 'taskId 不能为空' }
         // 成员只能提交自己被派发任务的回执：传别人的任务一律 FORBIDDEN（不跑门禁、不碰账本）。
+        // 文案直接带「本次请求的 taskId + 名下任务列表」：复用成员拿第二张卡时能一眼对上号。
         if (member !== null && taskId !== member.binding.taskId) {
+          const owned = memberTaskIdsOf(deps, member)
+          const ownedText = owned.length === 0 ? '（无）' : owned.join('、')
           return {
             ok: false,
             code: 'FORBIDDEN',
-            error: `只能提交自己被派发任务（${member.binding.taskId}）的回执，${taskId} 不是你被派发的任务`,
+            error:
+              `只能提交被派发给自己的任务回执：本次请求的 taskId 为「${taskId}」，`
+              + `你名下任务为 ${ownedText}；${taskId} 不是你被派发的任务`,
           }
         }
         const note = typeof args.note === 'string' && args.note.trim() !== '' ? args.note : undefined
@@ -940,11 +1066,11 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
       },
       async handler(args, meta) {
         const sessionId = sessionOf(meta)
-        // 与 status / receipt 同一谓词：队长路径不变；成员只有在「启用中的成员的会话」里才放行。
+        const requestedRunId = runIdOf(args)
         const leaderMode = deps.bridge.enabled(sessionId)
-        const member = leaderMode ? null : memberSelfServiceOf(deps, meta)
-        if (!leaderMode && member === null) return { ok: false, error: NOT_ENABLED }
-
+        // 旧优先级先保住：非成员（开关关闭 / 无绑定）一律先回 NOT_ENABLED，不能因为参数
+        // 缺失就换一句「taskId 不能为空」——r30 ⑤ 逐字钉着这条文案。
+        if (!leaderMode && memberSelfServiceOf(deps, meta) === null) return { ok: false, error: NOT_ENABLED }
         const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
         if (taskId === '') return { ok: false, error: 'taskId 不能为空' }
         // verdict 只接受 pass|fail：面板/脚本塞别的字符串时不能当成 pass 静默放行。
@@ -956,9 +1082,20 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
           .map((item) => (typeof item === 'string' ? item.trim() : ''))
           .filter((item) => item !== '')
 
-        // 成员的动作必须落在 run 所属会话上（成员的 agent id 不是任何一份 run 的 sessionId）。
+        // t3：成员路径先把身份锁到「本次 taskId 所在的那份 run」。解析不到归属（taskId 不是
+        // 自己名下的 / runId 不是绑定的那份）就回明确原因，绝不落到活动 run 去操作同名的 t1。
+        let member: MemberIdentityView | null = null
+        if (!leaderMode) {
+          const resolved = memberForRequest(deps, meta, taskId, requestedRunId)
+          if (resolved === null) return { ok: false, error: NOT_ENABLED }
+          if (!resolved.ok) return resolved
+          member = resolved.member
+        }
+
+        // 成员的动作必须落在 run 所属会话上（成员的 agent id 不是任何一份 run 的 sessionId），
+        // 且 runId 锁死在 binding 所在的那份；队长/面板路径沿用「不传 = 活动 run」。
         const targetSessionId = member === null ? sessionId : member.sessionId
-        const runId = runIdOf(args)
+        const runId = member === null ? requestedRunId : member.runId
         const targetError = runTargetError(deps.store, targetSessionId, runId)
         if (targetError) return targetError
 
@@ -975,6 +1112,7 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         const task = result.snapshot.tasks.find((item) => item.id === taskId)
         return {
           ok: true,
+          runId: result.snapshot.runId ?? runId,
           taskId,
           status: task?.status,
           review: task?.review,

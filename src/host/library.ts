@@ -22,6 +22,7 @@ import type {
   FlowNodeView,
   FlowView,
   LibraryView,
+  MemberView,
   MemoryItemView,
   PlanTask,
   ProjectRunSummaryView,
@@ -38,10 +39,16 @@ import { roleStateOf, roleUsageCellOf } from '../shared/role-view.ts'
 // 只 import **类型**：adapters 是宿主 API 的唯一入口，library 不该在装配层之外碰 ctx。
 // host→host 的类型 import 不产生运行期依赖，也不会成环（adapters 不 import library）。
 import type { HostWorkspaceEntry } from './adapters.ts'
+// r54：成员行的状态映射与模型路由文案**复用 bridge 的同一份实现**（`toMemberStatus` /
+// `describeRoute` 都是 bridge 导出的纯函数），否则历史详情与快照会各写一套映射而漂移。
+// bridge 不 import library（库是经 `BridgeDeps.libraryView` 端口注入的），不存在运行期回环。
+import { describeRoute, toMemberStatus } from './bridge.ts'
 import { durationCellOf, taskDurationCellOf, usageCellOf } from './format.ts'
+import { defaultSettings } from './settings.ts'
 import { finishedAtOf, type RunState } from './store.ts'
 import { isTerminalTaskStatus } from './team/dispatch.ts'
 import { pendingViewOf } from './team/confirm.ts'
+import { secondsText, stallNoteOf, stallOf } from './team/stall.ts'
 import { runUsageOf, taskUsageOf } from './team/usage.ts'
 
 /** 历史桶的固定 id：不是真实路径，客户端据此给末位与灰态。 */
@@ -58,6 +65,17 @@ export interface LibraryQuery {
   runId?: string
 }
 
+/**
+ * 库能拿到的角色投影（r54）：`id`/`name` 用于任务 `roleName` 与 legacy 成员名，
+ * `model` 给成员行的 `modelRoute`（唯一输入是 `bridge.describeRoute`，不另写一份格式）。
+ *
+ * `model` 类型上可选（旧装配可以不投影），但**装配层必须带上 model**：路由文案只在
+ * `membersOfState` 里由 `role.model` 推导，丢了这个字段，角色明明配了 provider/model
+ * 也会被渲染成「会话默认」——成员行路由失真且没有任何报错。可选的唯一用途是让
+ * 不接角色仓的单测/旧宿主仍能装配出成员行。
+ */
+type LibraryRole = Pick<Role, 'id' | 'name'> & { model?: Role['model'] }
+
 /** 装配依赖：全部由 `index.ts` 注入，本模块自己不读环境、不碰 ctx（可单测的前提）。 */
 export interface LibraryDeps {
   store: RunsStorePort
@@ -72,7 +90,7 @@ export interface LibraryDeps {
    * 角色名表（可选）：历史 run 详情里的 `roleName` 只能从角色仓读，
    * 装配层没接时退化成 roleId（可读但不友好，绝不假装是别的名字）。
    */
-  roles?: () => ReadonlyArray<Pick<Role, 'id' | 'name'>>
+  roles?: () => ReadonlyArray<LibraryRole>
   /**
    * runs 目录（可选）：给缓存键提供 mtime + 文件数。
    * 不传也能用（退化为 5s TTL 缓存），但 100 run 时冷/热判据靠它（AC-23）。
@@ -166,7 +184,7 @@ export function buildLibrary(deps: LibraryDeps, query: LibraryQuery = {}): Libra
   if (runId !== '') {
     const state = deps.store.load(runId)
     // 非法 / 不存在的 runId 不报错：返回不带 detail 的库，客户端显示「这次运行已不存在」。
-    if (state !== null) view.detail = runDetailOf(state, at, roleNameOf(deps))
+    if (state !== null) view.detail = runDetailOf(state, at, roleNameOf(deps), roleListOf(deps))
   }
   return view
 }
@@ -217,11 +235,14 @@ function cacheKeyOf(deps: LibraryDeps, query: LibraryQuery): string {
  *
  * 当前 run 由客户端 `buildRunDetail` 从快照装配、历史 run 由这里装配 —— 两边字段口径
  * 必须逐字一致（TECHNICAL §2.4）：口算规则只抄一次在这里，客户端不得二次计算。
+ *
+ * r54：`members` 与快照的 `membersOf` 同口径（见 `membersOfState`），拿不到名单时**省略**该字段。
  */
 export function runDetailOf(
   state: RunState,
   at: number,
   roleNames?: ReadonlyMap<string, string>,
+  roles: ReadonlyArray<LibraryRole> = [],
 ): RunDetailView {
   const tasks: TaskDetailView[] = state.plan.tasks.map((task) =>
     taskDetailOf(state, task, at, roleNames),
@@ -237,6 +258,8 @@ export function runDetailOf(
     tasks,
     flow: flowOf(tasks),
   }
+  const members = membersOfState(state, at, roles, roleNames)
+  if (members !== undefined) detail.members = members
   if (state.project !== undefined) detail.project = state.project
   // r21：终止原因与结束时刻同源落盘（旧 run 文件没有该字段 → 字段缺席，客户端显示不可得）。
   if (state.termination !== undefined) detail.terminationReason = state.termination.reason
@@ -245,6 +268,151 @@ export function runDetailOf(
   const pending = pendingViewOf(state.pendingConfirmation, at)
   if (pending !== undefined) detail.pendingConfirmation = pending
   return detail
+}
+
+/**
+ * 一个 run 的成员行（r54）：与快照的 `bridge.membersOf` **同一口径**。
+ *
+ * 为什么在 library 里再装一次：历史详情的唯一装配点是 `runDetailOf`，而 bridge 的
+ * `membersOf` 是 `createBridge` 里的闭包、拿不到；但「哪些 binding 算成员 / 状态怎么归并 /
+ * taskIds 收全集」的判定必须逐条一致（否则同一个 run 在快照与历史抽屉里显示成两副样子）：
+ * 状态映射与路由文案直接复用 bridge 导出的纯函数（`toMemberStatus` / `describeRoute`），
+ * 只有停滞/最后活动这两块判定在这里按同样规则重写（bridge 未导出它们的实现）。
+ *
+ * **拿不到名单**（旧 run 没落 binding，任务也没记 legacy `task.memberId`）→ 返回 `undefined`，
+ * 由 `runDetailOf` 省略该字段；绝不返回 `[]` 把「不知道」冒充成「确实没有成员」。
+ */
+function membersOfState(
+  state: RunState,
+  at: number,
+  roles: ReadonlyArray<LibraryRole>,
+  roleNames: ReadonlyMap<string, string> | undefined,
+): MemberView[] | undefined {
+  const hasLegacy = state.plan.tasks.some((task) => task.memberId !== undefined)
+  if (state.bindings.length === 0 && !hasLegacy) return undefined
+
+  const roleById = new Map(roles.map((role) => [role.id, role]))
+  const taskById = new Map(state.plan.tasks.map((task) => [task.id, task]))
+  const nameOf = (roleId: string): string => {
+    const name = (roleById.get(roleId)?.name ?? roleNames?.get(roleId) ?? '').trim()
+    return name === '' ? roleId : name
+  }
+  // `describeRoute` 只读 `.model`：把库侧的窄投影按 Role 形状喂进去，不复制它的格式串。
+  const routeOf = (roleId: string): string => {
+    const role = roleById.get(roleId)
+    return describeRoute(role === undefined ? undefined : ({ model: role.model } as unknown as Role))
+  }
+  const stallMs = defaultSettings().stallMs
+  const stallFields = (
+    memberId: string,
+    status: MemberView['status'],
+  ): Pick<MemberView, 'stalled' | 'stalledForMs' | 'stalledSecondsText' | 'stallReason' | 'stallNote'> => {
+    // 只有「在跑」的成员才有停滞语义：停下来的成员静默是应该的，不是停滞。
+    if (status !== 'running') {
+      return { stalled: false, stalledForMs: 0, stalledSecondsText: '', stallReason: 'none', stallNote: '' }
+    }
+    // r32：只看 `progress`，绝不拿 spawnedAt 当基线（没信号 = `unreported` 证据不足）。
+    const judge = stallOf(state.progress?.[memberId]?.at, at, stallMs)
+    return {
+      stalled: judge.stalled,
+      stalledForMs: judge.stalledForMs,
+      stalledSecondsText: judge.stalled ? secondsText(judge.stalledForMs) : '',
+      stallReason: judge.reason,
+      stallNote: stallNoteOf(judge.reason),
+    }
+  }
+  const lastEventAtOf = (memberId: string, fallback: number): number => {
+    let last = fallback
+    const progressAt = state.progress?.[memberId]?.at
+    if (typeof progressAt === 'number' && Number.isFinite(progressAt)) last = Math.max(last, progressAt)
+    for (const message of state.messages) {
+      if (message.toMemberId === memberId || message.from === memberId) last = Math.max(last, message.at)
+    }
+    for (const task of state.plan.tasks) {
+      if (task.memberId !== memberId || !task.evidence) continue
+      last = Math.max(last, task.evidence.at)
+    }
+    return last
+  }
+
+  const priorityOf = (binding: RunState['bindings'][number]): number => {
+    if (binding.stopping === true) return 3
+    if (binding.stoppedAt !== undefined) return 2
+    const task = taskById.get(binding.taskId)
+    if (task && (task.status === 'running' || task.status === 'gate' || task.status === 'interrupted')) return 1
+    return 0
+  }
+  // 已退役的历史成员默认不再展示；唯独「确认停止」的成员留一个「已停止」位。
+  const chosen = new Map<string, RunState['bindings'][number]>()
+  const order: string[] = []
+  for (const binding of state.bindings) {
+    if (binding.retired === true && binding.stoppedAt === undefined) continue
+    const current = chosen.get(binding.memberId)
+    if (current === undefined) {
+      chosen.set(binding.memberId, binding)
+      order.push(binding.memberId)
+      continue
+    }
+    if (priorityOf(binding) >= priorityOf(current)) chosen.set(binding.memberId, binding)
+  }
+  // 成员复用后「任务 → 成员」是一对多：跳转判定要全集，按 binding 追加序去重、含已退役 binding。
+  const taskIdsOf = new Map<string, string[]>()
+  for (const binding of state.bindings) {
+    const list = taskIdsOf.get(binding.memberId)
+    if (list === undefined) taskIdsOf.set(binding.memberId, [binding.taskId])
+    else if (!list.includes(binding.taskId)) list.push(binding.taskId)
+  }
+
+  const views: MemberView[] = []
+  for (const memberId of order) {
+    const binding = chosen.get(memberId)
+    if (binding === undefined) continue
+    const stopped = binding.stoppedAt !== undefined
+    const task = taskById.get(binding.taskId)
+    const status: MemberView['status'] =
+      binding.stopping === true && task?.status !== 'done'
+        ? 'stopping'
+        : stopped
+          ? 'stopped'
+          : toMemberStatus(task?.status ?? 'pending')
+    views.push({
+      memberId: binding.memberId,
+      name: binding.name,
+      roleId: binding.roleId,
+      taskId: binding.taskId,
+      taskIds: taskIdsOf.get(memberId) ?? [binding.taskId],
+      status,
+      ...(binding.stopping === true ? { stopping: true } : {}),
+      ...(binding.stoppedAt !== undefined ? { stoppedAt: binding.stoppedAt } : {}),
+      spawnedAt: binding.spawnedAt,
+      ...stallFields(binding.memberId, status),
+      lastEventAt: lastEventAtOf(binding.memberId, binding.spawnedAt),
+      modelRoute: routeOf(binding.roleId),
+      canResume: status !== 'done',
+    })
+  }
+
+  // 兼容 v1 落盘的裸 Plan：`task.memberId` 有值但没有 binding（与 bridge 的兜底一致）。
+  const seen = new Set(order)
+  for (const task of state.plan.tasks) {
+    const memberId = task.memberId
+    if (memberId === undefined || seen.has(memberId)) continue
+    seen.add(memberId)
+    const status = toMemberStatus(task.status)
+    views.push({
+      memberId,
+      name: nameOf(task.roleId),
+      roleId: task.roleId,
+      taskId: task.id,
+      taskIds: state.plan.tasks.filter((item) => item.memberId === memberId).map((item) => item.id),
+      status,
+      ...stallFields(memberId, status),
+      lastEventAt: lastEventAtOf(memberId, state.plannedAt),
+      modelRoute: routeOf(task.roleId),
+      canResume: status !== 'done',
+    })
+  }
+  return views
 }
 
 /** run 级用时：`plannedAt → finishedAt`；进行中用 now，终态却缺结束时刻记「不可得」。 */
@@ -564,6 +732,11 @@ function durationOfSummary(summary: RunSummary, at: number): DurationCell {
     state: ended ? 'done' : 'running',
     now: at,
   })
+}
+
+/** 角色投影表（r54）：装配层没接时给空表（成员名回退 roleId、路由回「会话默认」）。 */
+function roleListOf(deps: LibraryDeps): ReadonlyArray<LibraryRole> {
+  return deps.roles?.() ?? []
 }
 
 function roleNameOf(deps: LibraryDeps): ReadonlyMap<string, string> {
