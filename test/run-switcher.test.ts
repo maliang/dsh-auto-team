@@ -398,6 +398,9 @@ test('TasksTab.tsx：顶部渲染 run 行，切历史 run 仍走既有 openRun �
   // D3：空态文案由纯函数统一决定（历史详情丢失时不许再说「正在读取」）
   assert.match(source, /tasksEmptyStateOf\(\{/)
   assert.match(source, /busy=\{detailLoading\}/)
-  // 历史 run 不能拿当前快照冒充自己的成员
-  assert.match(source, /historicalRunId === null && snapshot !== undefined \? snapshot\.members : \[\]/)
+  // 历史 run 不能拿当前快照冒充自己的成员：当前 run 取快照，历史 run 取该 run 自己的详情。
+  assert.match(
+    source,
+    /historicalRunId === null \? \(snapshot\?\.members \?\? \[\]\) : \(detail\?\.members \?\? \[\]\)/,
+  )
 })

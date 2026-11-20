@@ -111,12 +111,18 @@ export function TasksTab(props: TabProps): React.ReactElement {
     () => (detail === null ? [] : detail.tasks.map((task) => task.id)),
     [detail],
   )
-  const members = historicalRunId === null && snapshot !== undefined ? snapshot.members : []
-  // r53：run 已结束（历史 run 一律算结束；当前 run 按宿主的「已收口」口径）——
-  // 结束的 run 里成员会话可能已被回收，判定要能区分「已结束」与「未派发」。
+  // r9：成员名单要跟着**正在看的那个 run** 走。当前 run 用快照（宿主已过滤 retired），
+  // 历史 run 用它自己的详情（r54 起 `RunDetailView.members` 与快照同口径）。
+  // 旧实现历史 run 一律拿空数组 → 角色卡/任务行/流程节点三处全判「不可跳」，
+  // 而卡片本身还写着「派发中」，用户看到的就是「点了没反应」。
+  const members = historicalRunId === null ? (snapshot?.members ?? []) : (detail?.members ?? [])
+  // r53/r9：结束判定同样只看**这个 run 自己**的计划态 —— 不再 `historicalRunId !== null ||`
+  // 一律算结束（那会把还在派发中的旧 run 说成「该运行已结束，子智能体会话已回收」）。
+  // 宿主没给 members 时列表保持空，原因落回「未派发」，不伪造成员。
   const closedRun =
-    historicalRunId !== null ||
-    (snapshot !== undefined && isClosedRun({ status: snapshot.planStatus ?? 'draft' }))
+    historicalRunId === null
+      ? snapshot !== undefined && isClosedRun({ status: snapshot.planStatus ?? 'draft' })
+      : detail !== null && isClosedRun({ status: detail.planStatus })
   // r33：待回执的聚合提示（只回答「有几件事」，是哪几行由任务行自己的标记回答）。
   const awaitingReceipt = React.useMemo(
     () => awaitingReceiptSummaryOf(detail === null ? [] : detail.tasks),

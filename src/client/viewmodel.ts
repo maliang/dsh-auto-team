@@ -3513,8 +3513,8 @@ export function memberForRole(
 }
 
 /**
- * 同角色成员数（t5）：角色卡「名下成员不止一个就不跳」的唯一口径。
- * 过滤条件与 `memberForRole` 完全一致，避免「判定说 1 个、查找却命中 2 个」。
+ * 同角色成员数（t5）：过滤条件与 `memberForRole` 完全一致，避免「判定说 1 个、查找却命中 2 个」。
+ * r9：`roleCardJumpOf` 不再按人数分支（≥1 就跳最后开启者），本函数保留导出供其它判定/测试复用。
  */
 export function memberCountOfRole(
   members: readonly MemberView[] | null | undefined,
@@ -3541,8 +3541,10 @@ export const MEMBER_JUMP_REJECTED_TEXT = '没有跳转：宿主拒绝了这次�
 export const MEMBER_JUMP_NOT_READY_TEXT = '没有跳转：会话导航尚未就绪，请稍后重试'
 
 /**
- * 角色卡多人歧义的人话原因（t5，唯一出处）：卡片只有 roleId，点下去不知道开谁，
- * 与其猜一个开错会话，不如把人导到能唯一定位成员的任务行。
+ * 角色卡多人歧义的人话原因（t5，唯一出处）。
+ *
+ * r9：`roleCardJumpOf` 已不再调用它（无运行成员时改跳「最后开启者」），此函数保留导出
+ * 以免其它引用断掉，但不要再在新代码里用它当角色卡的兜底文案。
  */
 export function roleCardMultiMemberReasonOf(count: number): string {
   return `该角色有 ${count} 个子智能体，请从任务行进入`
@@ -3672,15 +3674,15 @@ function runningMemberJumpViewOf(
 }
 
 /**
- * 角色卡的跳转判定（t5，t2 改语义）：**有运行中的成员就跳那个「最后开启」的**。
+ * 角色卡的跳转判定（t5，r50 t2 改语义，r9 再改）：**只要能唯一落点就跳**。
  *
- * 一个角色返工/续聊后会留下多个成员，但角色卡只有 roleId —— 只有「当前正在跑」这一个成员
- * 是无需再问「点的是谁」的：运行中成员有唯一的活动会话，点开就是它。
- * 多个运行中成员按 spawnedAt 取最大（缺省回退 lastEventAt，再相等取 memberId 字典序），
- * 不让「最近活跃」这种会被消息/证据前移的时间影响落点。
- *
- * **没有运行中成员**时保持 t5 原语义：单成员直接跳（与另外两个入口同走 `memberJumpViewOf`），
- * 多成员给人话原因把人导到任务行（那里有 taskId，能唯一定位成员）。
+ * ① 有运行中成员 → 跳「最后开启」的那个（文案带「正在运行」）：运行中成员有唯一的活动会话，
+ *    点开就是它。多个运行中成员按三级比较键（`latestOpenedMemberOf`）取最大。
+ * ② 没有运行中成员、但该角色名下有 ≥1 个成员 → 用**同一三级键**取「最后开启」的那个直接跳，
+ *    文案走通用 `memberJumpViewOf`（不带「正在运行」）。
+ *    r9 的动机：任务 done 后成员 status 变 done、会话其实还在，旧逻辑会退回「多人歧义不跳」，
+ *    用户频繁点到一条死路；而「最后开启者」在同一批数据上是确定的，落点不会漂。
+ * ③ 一个成员都没有 → 原因照旧：`closedRun` 用已结束文案，否则 `MEMBER_JUMP_NO_MEMBER_ROLE_REASON`。
  *
  * r53：`base.closedRun` 只改「一个成员都没有」时的那句人话（已结束 / 未派发），
  * 不改变能否跳 —— 成员还活着就照常跳。
@@ -3694,19 +3696,11 @@ export function roleCardJumpOf(
   if (running.length > 0) {
     return runningMemberJumpViewOf(latestOpenedMemberOf(running), source, base)
   }
-  const count = memberCountOfRole(members, source.roleId)
-  if (count <= 1) {
-    return memberJumpViewOf(memberForRole(members, source.roleId, source.taskId), source, base)
+  const all = Array.isArray(members) ? members.filter((member) => member.roleId === source.roleId) : []
+  if (all.length > 0) {
+    return memberJumpViewOf(latestOpenedMemberOf(all), source, base)
   }
-  const reason = roleCardMultiMemberReasonOf(count)
-  return {
-    available: false,
-    reason,
-    member: memberForRole(members, source.roleId, source.taskId),
-    actionText: `子智能体 · ${count} 个`,
-    title: base.title === undefined ? reason : `${base.title} · ${reason}`,
-    label: base.label === undefined ? reason : `${base.label}，${reason}`,
-  }
+  return memberJumpViewOf(undefined, source, base)
 }
 
 /**

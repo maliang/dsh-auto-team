@@ -46,7 +46,7 @@ test('revise 闸门：首次 plan → mode=created、无 activeRunId、落盘 1 
   void clock
 })
 
-test('revise 闸门：不传 revise 的第二个 plan 永远新建 —— run 数 2、回 activeRunId 提示、旧 run 字节不变', async () => {
+test('revise 闸门：不传 revise 的第二个 plan 永远新建 —— run 数 2、旧 run 字节不变（并行推进，不收口）', async () => {
   const { h, clock } = makeClockHarness()
   const first = await h.call('auto_team_plan', {
     goal: '第一个需求',
@@ -63,12 +63,20 @@ test('revise 闸门：不传 revise 的第二个 plan 永远新建 —— run �
   assert.equal(second.ok, true)
   assert.equal(second.mode, 'created')
   assert.notEqual(second.runId, firstId)
-  assert.equal(second.activeRunId, firstId)
-  assert.match(String(second.note), /还有在跑的 run/)
-  assert.match(String(second.note), /revise=true/)
   assert.equal(Object.keys(h.snapshotRuns()).length, 2)
-  // 关键判据：第一个 run 一个字节都没变（没有被「顺手并入」）。
+  // t4（用户裁决）：新旧计划并行 —— 旧 run 只要还有未完成任务就继续跑，新建计划一个字节都不改它。
+  assert.equal('supersededRunIds' in second, false)
+  assert.equal('activeRunId' in second, true)
+  assert.equal(second.activeRunId, firstId)
+  assert.match(String(second.note), /当前会话还有在跑的 run/)
+  assert.doesNotMatch(String(second.note), /收口/)
+  // 关键判据：旧 run 逐字节不变（既没被顺手并入，也没被收口），任务仍是待派发。
   assert.equal(h.snapshotRuns()[`${firstId}.json`], firstBytes)
+  const stillRunning = h.store.load(firstId)
+  assert.equal(stillRunning?.plan.status, 'draft', '旧 run 仍是未收口计划（harness 的自动派发是桩，不推进它）')
+  assert.equal(stillRunning?.termination, undefined)
+  assert.equal(stillRunning?.finishedAt, undefined)
+  assert.deepEqual(stillRunning?.plan.tasks.map((task) => task.status), ['pending'])
 })
 
 test('revise 闸门：revise=true 缺省并入最近非终态 run（不新建，runId 不变）', async () => {
@@ -111,18 +119,23 @@ test('revise 闸门：revise=true 缺省并入最近非终态 run（不新建，
   void tasksOf(second)
 })
 
-test('revise 闸门：显式 runId 可并入较旧的在跑 run（不强制最新）', async () => {
+test('revise 闸门：显式 runId 可并入较旧的在跑 run（不强制最新；升级前的多开盘面）', async () => {
   const { h, clock } = makeClockHarness()
   const first = await h.call('auto_team_plan', {
     goal: '旧需求',
     tasks: [{ title: '任务 A', roleId: 'dev', acceptance: 'pnpm typecheck' }],
   })
-  advance(clock)
-  await h.call('auto_team_plan', {
-    goal: '新需求',
-    tasks: [{ title: '任务 B', roleId: 'qa', acceptance: 'pnpm test' }],
-  })
-  advance(clock)
+  // t4（用户裁决）：同会话本来就可以有多条在跑 run（新旧计划并行），这里直接种第二条：
+  // r21 契约「显式 runId 不强制最新」仍要服务多开盘面。
+  seed(
+    h.store,
+    runStateOf({
+      plan: planOf({ runId: 'run-legacy-newer', status: 'dispatching', createdAt: NOW + 60_000 }),
+    }),
+  )
+  const legacyBytes = h.snapshotRuns()['run-legacy-newer.json']
+
+  clock.at = NOW + 120_000
   const revised = await h.call('auto_team_plan', {
     revise: true,
     runId: String(first.runId),
@@ -134,8 +147,9 @@ test('revise 闸门：显式 runId 可并入较旧的在跑 run（不强制最�
   const stored = h.store.load(String(first.runId))
   assert.match(stored?.plan.goal ?? '', /旧需求\n\n## 需求修订（/)
   assert.equal(stored?.plan.tasks.length, 2)
-  // 另一个 run 没被动过。
+  // 另一个 run 没被动过（并入不会顺手改写/收口别的 run）。
   assert.equal(Object.keys(h.snapshotRuns()).length, 2)
+  assert.equal(h.snapshotRuns()['run-legacy-newer.json'], legacyBytes)
 })
 
 test('revise 闸门：显式 revise 指向终态 run → ok:false + BAD_REQUEST，runs 目录逐字不变', async () => {

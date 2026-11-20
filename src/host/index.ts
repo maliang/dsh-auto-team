@@ -727,15 +727,21 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
       // r39：提醒的实发口 —— 与面板「直达消息」同一个宿主端口（按 SessionId 直发）。
       // 老宿主没有该能力时 adapters 的 sendMessage 返回 ok:false，提醒不落账、静默重试。
       sendMemberMessage: (memberId, text, sessionId) => spawnPorts.sendMessage(memberId, text, sessionId),
-      // Trigger 轮询兜底（AC-18/AC-20）：挂在既有 1500ms tick 上，不新增 setInterval。
-      // r13 AC-8 第五个触发点：每轮 tick 先驱动一次自动派发（补成员退出/漏 kick 的窗口），
-      // 派发语义仍在 dispatcher 里，这里只是「顺手推一下」。
-      onPoll: async (state) => {
+      // r13 AC-8 第五个触发点 / t4 病因修复：自动派发挂在 tick **开头、无条件**执行 ——
+      // 不能再挂在下面的 onPoll 上：`onPoll` 只对 active run（有 running/gate/interrupted/paused 任务）
+      // 调，而「只剩 pending」的旧 run 恰恰不满足 active ⇒ 旧 run 永远拿不到下一次派发，
+      // 新建计划不收口它之后就是永久的僵尸卡（用户 2026-11-20 裁决：新旧计划并行）。
+      // 派发语义仍在 dispatcher 里（inflightRuns 按 runId 单飞，tick 自己遍历 store.list()），这里只是「顺手推一下」。
+      onDispatchTick: async () => {
         try {
           await autoDispatcher.tick()
         } catch (error) {
           warn(ctx, `自动派发 tick 失败（下一轮重试）：${messageOf(error)}`)
         }
+      },
+      // Trigger 轮询兜底（AC-18/AC-20）：仍然只对 active run 跑 —— 它的每个动作都是「推进」，
+      // 没有在跑任务的 run 没有可轮询的 Trigger。
+      onPoll: async (state) => {
         if (bus === null) return
         await bus.poll(state)
       },

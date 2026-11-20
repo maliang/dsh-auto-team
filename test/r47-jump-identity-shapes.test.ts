@@ -28,7 +28,6 @@ import {
   MEMBER_JUMP_NO_MEMBER_TEXT,
   MEMBER_JUMP_NO_ROLE_REASON,
   memberJumpOf,
-  roleCardMultiMemberReasonOf,
   taskJumpLabelOf,
 } from '../src/client/viewmodel.ts'
 
@@ -139,11 +138,13 @@ test('r47 t2 ① 同角色多任务：两个 dev 成员各接一任务，任务�
   assert.match(roleJump.title, /正在运行/)
   assert.match(roleJump.label, /^角色：开发，.*正在运行$/)
 
-  // 一个运行中成员都没有时，才回到 t5 的「多人歧义不跳」。
+  // 一个运行中成员都没有时（r9）：仍按同一三级键跳「最后开启者」，不再退回「多人歧义不跳」。
   const idle = members.map((member) => ({ ...member, status: 'idle' as const }))
   const noRunning = memberJumpOf({ kind: 'role', roleId: 'dev' }, idle, { label: '角色：开发' })
-  assert.equal(noRunning.available, false, '没有活人可开时仍不得按 roleId 猜一个')
-  assert.equal(noRunning.reason, roleCardMultiMemberReasonOf(2))
+  assert.equal(noRunning.available, true, 'r9：任务 done 后成员会话仍在，角色卡必须还能打开最后开启者')
+  assert.equal(noRunning.memberId, 'm2', '落点与运行中路径同一三级键：m2 的 spawnedAt 更晚')
+  assert.equal(noRunning.reason, undefined, '可跳时不得再给「N 个子智能体，请从任务行进入」')
+  assert.equal(noRunning.actionText.includes('正在运行'), false, '非运行成员不能复用运行中的文案')
 })
 
 /* ───────────────── ② 成员复用：一个 memberId 挂两条 binding ───────────────── */
@@ -296,7 +297,7 @@ test('r47 t2 ④ 任务无成员：未派发任务不可跳，绝不回退同角
 
 /* ───────── 全局不混：四种形态混在一张快照里，逐任务/逐角色都不串 ───────── */
 
-test('r47 t2 总回归：四种形态同在一张快照，逐任务断言落点归属，逐角色断言歧义不跳', () => {
+test('r47 t2 总回归：四种形态同在一张快照，逐任务断言落点归属，逐角色断言跳最后开启者', () => {
   const { store, bridge } = setup()
   store.save(
     stateOf({
@@ -350,9 +351,10 @@ test('r47 t2 总回归：四种形态同在一张快照，逐任务断言落点�
 
   const idle = members.map((member) => ({ ...member, status: 'idle' as const }))
   const noRunning = memberJumpOf({ kind: 'role', roleId: 'dev' }, idle)
-  assert.equal(noRunning.available, false)
-  assert.equal(noRunning.reason, roleCardMultiMemberReasonOf(3))
-  assert.equal(noRunning.reason, '该角色有 3 个子智能体，请从任务行进入')
+  assert.equal(noRunning.available, true, 'r9：无运行成员也按同一三级键跳最后开启者')
+  assert.equal(noRunning.memberId, 'mc', '多个非运行成员取 openedAt 最大的 mc（与运行中路径同一键）')
+  assert.equal(noRunning.reason, undefined, '可跳时不得再给「N 个子智能体，请从任务行进入」')
+  assert.equal(noRunning.actionText.includes('正在运行'), false, '非运行成员不能复用运行中的文案')
 
   // 机械不变量：任何「可跳」的任务行，落点成员的 taskIds 必须包含该任务。
   for (const task of ['a1', 'a2', 'b1', 'b2', 'c1', 'd1']) {

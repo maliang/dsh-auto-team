@@ -668,6 +668,8 @@ export function buildToolSpecs(deps: ToolsDeps): ToolSpec[] {
         }
 
         // 新建 run 前先看一眼：会话里还有在跑的 run 时给队长提示（不自动并入！）。
+        // t4（用户裁决 2026-11-20）：同会话的多个非终态 run **并行推进** —— 新建计划不收口旧 run，
+        // 旧 run 只要还有未完成任务就继续跑（watcher 每轮 tick 都会给每条 run 一次自动派发）。
         const activeOther = openRuns[0]?.runId
 
         const draft = buildPlan(

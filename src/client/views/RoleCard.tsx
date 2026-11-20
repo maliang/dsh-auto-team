@@ -76,8 +76,8 @@ export function RoleCard(props: RoleCardProps): React.ReactElement {
   // r16 AC-16：只渲染、不排序 —— 顺序 = 计划顺序，数量 = role.tasks（空/缺省整行不渲染）。
   const refs = (role.taskRefs ?? []).map((ref) => roleTaskRefViewOf(ref))
   // r33：成员态 chip 与跳转判定看的是同一个成员（同一 taskId 绑定优先规则）。
-  // t2：有运行中成员时跳「最后开启」的那个；没有运行时才按 t5 的多人歧义不跳
-  // （卡片只有 roleId，点下去不知道开谁）——
+  // t2：有运行中成员时跳「最后开启」的那个；r9：没有运行中成员时同样跳「最后开启」的成员
+  // （任务 done 后会话仍在，不再退回「多人歧义不跳」）；一个成员都没有才不可跳。
   // 规则与文案都在 viewmodel 的 `roleCardJumpOf`（`memberJumpOf` 的 role 分支转调它），
   // 组件仍然只调 `memberJumpOf`，不在这里判成员数 / 运行态。
   const jump = memberJumpOf(

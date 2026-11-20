@@ -31,7 +31,6 @@ import {
   memberJumpNoticeOf,
   memberJumpOf,
   roleCardJumpOf,
-  roleCardMultiMemberReasonOf,
   roleJumpLabelOf,
   taskJumpLabelOf,
 } from '../src/client/viewmodel.ts'
@@ -163,19 +162,32 @@ test('r33 ① 节点有角色：与角色卡/任务行走同一套绑定优先�
   assert.equal(jump.memberId, 'm-qa', '绑定该任务的成员优先，避免流程节点跳到相邻任务')
 })
 
-/* ─────────────────── t5：无运行成员的角色卡多人歧义 → 不跳，导到任务行 ─────────────────── */
+/* ────────── t5：无运行成员的角色卡多人 → r9 起改跳「最后开启者」，不再导到任务行 ────────── */
 
-test('t5 角色卡：没有运行中成员且名下不止一个 → 不跳，给「N 个子智能体，请从任务行进入」', () => {
+test('t5 角色卡：没有运行中成员且名下不止一个 → 可跳，落点是同一三级键的「最后开启者」', () => {
   const a = memberOf({ memberId: 'm-a', roleId: 'dev', taskId: 't1', status: 'idle' })
-  const b = memberOf({ memberId: 'm-b', roleId: 'dev', taskId: 't2', status: 'done', stoppedAt: AT + 1, lastEventAt: AT + 1 })
+  const b = memberOf({
+    memberId: 'm-b',
+    name: '开发-2',
+    roleId: 'dev',
+    taskId: 't2',
+    status: 'done',
+    stoppedAt: AT + 1,
+    lastEventAt: AT + 1,
+  })
   const jump = memberJumpOf({ kind: 'role', roleId: 'dev', taskId: 't1' }, [a, b], { label: roleJumpLabelOf('开发') })
-  assert.equal(jump.available, false, '没有活人可开时按 roleId 猜一个就是乱跳（开错会话比不跳更糟）')
-  assert.equal(jump.memberId, undefined, '不可跳时不得下发 memberId')
-  assert.equal(jump.reason, roleCardMultiMemberReasonOf(2))
-  assert.equal(jump.reason, '该角色有 2 个子智能体，请从任务行进入')
-  assert.match(jump.title, /该角色有 2 个子智能体，请从任务行进入/, '悬停必须说清为什么不跳')
-  assert.match(jump.label, /^角色：开发，该角色有 2 个子智能体，请从任务行进入$/, 'aria-label 与原因合并而不是互相覆盖')
-  assert.equal(jump.member?.memberId, 'm-a', '成员态 chip 仍要有个成员可显示（taskId 绑定优先）')
+  assert.equal(
+    jump.available,
+    true,
+    'r9：任务 done 后成员会话其实还在，角色卡必须还能直接打开最后开启者，不再退回「请从任务行进入」',
+  )
+  assert.equal(jump.memberId, 'm-b', '落点按三级键：openedAt 更大（b 缺 spawnedAt → lastEventAt=AT+1 > a 的 AT）')
+  assert.equal(jump.member?.memberId, 'm-b', '成员态 chip 与落点必须是同一个成员')
+  assert.equal(jump.reason, undefined, '可跳时不得再给「N 个子智能体，请从任务行进入」')
+  assert.equal(jump.actionText.includes('正在运行'), false, '非运行成员不能复用运行中的文案')
+  assert.match(jump.actionText, /开发-2/, '按钮文案要点名将要打开的那个成员')
+  assert.equal(jump.title, '打开子智能体会话：开发-2', '走 memberJumpViewOf 的通用口径')
+  assert.equal(jump.label, '角色：开发，打开子智能体会话：开发-2', 'aria-label 与打开文案合并而不是互相覆盖')
   // 同一批成员下任务行依旧可跳：那里有 taskId，能唯一定位成员。
   const viaTask = memberJumpOf({ kind: 'task', roleId: 'dev', taskId: 't2' }, [a, b])
   assert.equal(viaTask.available, true)
@@ -218,12 +230,14 @@ test('t2 角色卡：缺 spawnedAt 回退 lastEventAt；时间相等按 memberId
   )
 })
 
-test('t2 角色卡：status=running 但已有 stoppedAt 不算运行中，不跳', () => {
+test('t2 角色卡：status=running 但已有 stoppedAt 不算运行中，文案不得冒充「正在运行」', () => {
   const ghost = memberOf({ memberId: 'm-ghost', roleId: 'dev', taskId: 't1', status: 'running', stoppedAt: AT })
   const other = memberOf({ memberId: 'm-other', roleId: 'dev', taskId: 't2', status: 'idle' })
   const jump = memberJumpOf({ kind: 'role', roleId: 'dev' }, [ghost, other])
-  assert.equal(jump.available, false, '停止事实位优先于状态字符串，不能把已停成员当活人')
-  assert.equal(jump.reason, roleCardMultiMemberReasonOf(2))
+  assert.equal(jump.available, true, 'r9：无真运行成员但名下有成员，仍要能打开最后开启者')
+  assert.equal(jump.memberId, 'm-ghost', '前两级并列（lastEventAt 都等于 AT）时按 memberId 升序，落点确定')
+  assert.equal(jump.actionText.includes('正在运行'), false, '停止事实位优先于状态字符串，不能把已停成员当活人宣传')
+  assert.equal(jump.title.includes('正在运行'), false)
 })
 
 test('t5 角色卡：单个非运行成员仍可跳，且与 roleCardJumpOf 是同一条路径（不分叉）', () => {
@@ -428,7 +442,24 @@ test('r53 ③ 历史 run 也传同一 onJump：可跳性交给 closedRun，写�
   )
   // 写操作仍只属于当前 run：历史 run 的 onTaskAction 保持 undefined。
   assert.match(source, /const onTaskAction = historicalRunId === null \? runTaskAction : undefined/)
-  assert.match(source, /historicalRunId === null && snapshot !== undefined \? snapshot\.members : \[\]/)
+  // r9：成员名单按「正在看的那个 run」取 —— 当前 run 用快照，历史 run 用该 run 自己的详情
+  // （`RunDetailView.members`），不得再一律给空数组（旧行会让三入口全判「不可跳」，而卡片还写着派发中）。
+  assert.match(
+    source,
+    /historicalRunId === null \? \(snapshot\?\.members \?\? \[\]\) : \(detail\?\.members \?\? \[\]\)/,
+    '历史 run 的成员必须来自该 run 的详情，不能恒为空数组',
+  )
+  // r9：结束判定只看该 run 自己的计划态，不得再把历史 run 一律当已结束。
+  assert.equal(
+    /const closedRun =[\s\S]{0,120}?historicalRunId !== null \|\|/.test(source),
+    false,
+    '不得把历史 run 一律判成已结束',
+  )
+  assert.match(
+    source,
+    /detail !== null && isClosedRun\(\{ status: detail\.planStatus \}\)/,
+    '历史 run 的已结束判定必须按它自己的 planStatus（未派发的旧 run 不能误报「会话已回收」）',
+  )
   assert.equal(/snapshot\.members\?\.filter/.test(source), false, '不得按状态二次过滤成员（已停止位要保留）')
 })
 

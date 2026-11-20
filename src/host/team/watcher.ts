@@ -61,6 +61,18 @@ export interface WatcherDeps {
    */
   onPoll?(state: RunState): Promise<void>
   /**
+   * 每轮 tick **开头无条件**驱动一次自动派发（t4 病因修复）。
+   *
+   * 为什么不能只挂在 `onPoll` 上：下面的循环对「只剩 pending、没有 running/gate/interrupted/paused
+   * 任务」的 run 直接 `continue`（本 tick 对它无事可做），而 `onPoll` 只在 active 分支里调 ——
+   * 于是一个「从没派出去过」或「上一拍派发失败」的 run 永远拿不到下一次自动派发，残留 pending
+   * 卡片永远挂着。派发判定仍全在 `autoDispatcher.tick()` 里，这里只是「每 1500ms 叫它一次」，
+   * 不新增定时器（AC-20：定时器仍只有本文件一处）。
+   *
+   * 抛错必须被吞掉：派发失败不能打断成员存活对账（那会让「成员死了」永远报不出来）。
+   */
+  onDispatchTick?(): Promise<void>
+  /**
    * r39：步数提醒阈值（成员本次任务累计工具调用数）。缺省 `config.STEP_REMINDER_AT`；
    * **0 = 关闭**。判定实现只有一个，阈值只做参数（与 `stallMs` / `maxAttempts` 同一纪律）。
    */
@@ -421,6 +433,16 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
     if (busy) return 0
     busy = true
     try {
+      // t4：自动派发**不受 active 过滤** —— 只剩 pending 的 run 也必须每轮被尝试一次，
+      // 否则「新建计划不再收口旧 run」之后，旧 run 会永远停在 pending（没人再 kick 它）。
+      // 放在 store.list() 之前：派发会写盘（binding、任务 running），随后的对账读到的才是新状态。
+      if (deps.onDispatchTick !== undefined) {
+        try {
+          await deps.onDispatchTick()
+        } catch {
+          // 派发失败只影响本轮少一次推进，绝不能连累存活对账（下一轮 tick 会补上）。
+        }
+      }
       const runs = deps.store.list()
       // r40：名单必须**按 root 分别取**。`deps.store.list()` 返回整个 dataRoot 的 run
       // （跨工作区/跨会话），拿第一个 run 的 root 名单去对账后面的 run，只会把别人的成员

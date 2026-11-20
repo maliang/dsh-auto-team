@@ -4,7 +4,7 @@
 
 Turn the current DeepSeek Harness session into a team lead: the goal becomes a **dependency-aware task graph**, roles **dispatch in parallel** to resumable sub-agents, every completion must pass a **quality gate**, and the whole run stays visible and editable from the composer switch and the right-side panel.
 
-Current version `dsh-auto-team@0.2.13` (`package.json`), compatible with Node `>=22.18` and DSH `>=0.2.1-alpha.2 <0.3.0`, verified on host `0.2.2-rc.2`.
+Current version `dsh-auto-team@0.2.14` (`package.json`), compatible with Node `>=22.18` and DSH `>=0.2.1-alpha.2 <0.3.0`, verified on host `0.2.2-rc.2`.
 
 ## Features
 
@@ -165,7 +165,7 @@ Reproduce the whole chain in one line:
 export REPO="$(git rev-parse --show-toplevel)" && cd "$REPO" && pnpm typecheck && pnpm test && pnpm build && node --input-type=module -e "await import('./lib/index.js')" && node --input-type=module -e "await import('./lib/client.js')" && npm pack --dry-run --cache /tmp/npm-pack-cache
 ```
 
-- Baseline (measured 2026-11-17): `pnpm test` **1430 pass / 0 fail / 0 skipped**; `npm pack --dry-run` lists 9 files (`package.json`, `LICENSE`, both READMEs, `cordis.patch.yml`, both `lib/` bundles, `locale/en.json`, `locale/zh.json`), with `LICENSE` included automatically by npm.
+- Baseline (measured 2026-11-20): `pnpm test` **1451 pass / 0 fail / 0 skipped**; `npm pack --dry-run` lists 9 files (`package.json`, `LICENSE`, both READMEs, `cordis.patch.yml`, both `lib/` bundles, `locale/en.json`, `locale/zh.json`), with `LICENSE` included automatically by npm.
 - Do not bypass: `lib/` must be committed (it is the `pnpm add file:` install source); local imports carry the `.ts` extension; host and client never import each other and only talk over `GET/POST /api/auto-team`; host service access is concentrated in `src/host/adapters.ts`.
 
 ## Documentation
