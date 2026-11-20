@@ -1295,6 +1295,25 @@ test('重启：waiting 与写域字段原样存活，按计划顺序重算后可
   }
 })
 
+
+test('r59 D2：dispatchReady 锁内重读盘上状态 —— 盘上已解锁的下游不会被旧快照压回 blocked', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const stale = makeState([makeTask('t1'), makeTask('t2', { status: 'blocked', dependsOn: ['t1'] })])
+    store.save(stale) // 盘上：t1 pending、t2 blocked（rev=1）
+    const disk = store.load('run-1')
+    assert.ok(disk)
+    // 锁外写者先收口 t1、解锁 t2（模拟另一条推进路径/宿主回调），盘上 rev 更高
+    store.save(applyReceipt(disk, 't1', { verdict: 'done' }, now))
+    const { deps } = makeDeps(store)
+    // 传入**拿锁前**的旧快照：锁内必须换成盘上那份，否则会派 t1 并把 t2 压回 blocked
+    const result = await dispatchReady(stale, deps)
+    assert.deepEqual(result.started, ['t2'], '锁内重读后应按盘上的就绪任务派发')
+  } finally {
+    cleanup()
+  }
+})
+
 test('applyScopeWaits：无变化时返回同一引用（幂等），解除后清空等待字段（AC-14）', () => {
   const base = waitingPair()
   assert.equal(applyScopeWaits(base, now), base, '没有变化必须返回同一引用，不制造无谓落盘')

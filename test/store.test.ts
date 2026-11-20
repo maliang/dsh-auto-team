@@ -7,12 +7,18 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_MAX_CONCURRENT, MAX_CONCURRENT_LIMIT } from '../src/host/config.ts'
+import type { MemberBinding, MessageRecord, PlanTask } from '../src/shared/types.ts'
+import type { RunState } from '../src/host/store.ts'
 import {
   MESSAGES_LIMIT,
   RUN_STATE_VERSION,
   RunsStore,
   STALL_ALERTS_LIMIT,
+  StaleWriteError,
   finishedAtOf,
+  lockedSnapshot,
+  mergeRunState,
+  saveWithCas,
   makeRunId,
   uniqueRunId,
   wrapLegacy,
@@ -609,4 +615,425 @@ test('finishedAtOf：都拿不到 / 进行中 → undefined，绝不拿 now 冒�
     undefined,
     '进行中的 run 没有结束时刻，不做回退',
   )
+})
+
+/* ─────────── r59 遗留 D1/D2：严格 CAS 真的接上了，且锁内重读有明确判据 ─────────── */
+
+test('r59 D1：saveWithCas 显式 CAS 撞上锁外写者后重基重试，不静默覆盖', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy(legacyPlan({ runId: 'r-cas' }))
+    assert.ok(seeded)
+    store.save(seeded) // rev=1
+    const stale = store.load('r-cas')
+    assert.ok(stale)
+    // 锁外写者先落一版（模拟用量投影 / 宿主端口回调）：盘上 rev=2
+    const other = store.load('r-cas')
+    assert.ok(other)
+    store.save({ ...other, project: '其他写者' })
+    // 拿着 rev=1 的旧快照写：首次 CAS 必失败，helper 必须在锁内重读并重基后成功
+    const applied = saveWithCas(store, { ...stale, project: '本次改动' })
+    assert.equal(store.load('r-cas')?.project, '本次改动')
+    assert.equal(store.load('r-cas')?.rev, applied.rev)
+    assert.ok((applied.rev ?? 0) > 2, '重基后版本必须高于锁外写者那一版')
+  })
+})
+
+test('r59 D1：重试次数用尽必须抛 StaleWriteError（最多 2 次重试 = 3 次尝试）', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy(legacyPlan({ runId: 'r-cas' }))
+    assert.ok(seeded)
+    store.save(seeded)
+    const stale = store.load('r-cas')
+    assert.ok(stale)
+    // 桩：盘上版本永远比手里的新 → 每次 CAS 都失败
+    let attempts = 0
+    const foreverStale = {
+      save: () => {
+        attempts += 1
+        throw new StaleWriteError('r-cas', 0, attempts + 1)
+      },
+      load: () => ({ ...stale, rev: attempts + 1 }),
+    }
+    assert.throws(
+      () => saveWithCas(foreverStale, stale),
+      (error: unknown) => error instanceof StaleWriteError,
+      '重试耗尽必须原样抛出，不许吞掉或无限重试',
+    )
+    assert.equal(attempts, 3, 'maxRetries=2 → 最多 3 次写盘尝试')
+  })
+})
+
+test('r59 D2：lockedSnapshot 只在盘上版本严格更新时改用盘上状态', () => {
+  withTempDir((dir) => {
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy(legacyPlan({ runId: 'r-snap' }))
+    assert.ok(seeded)
+    store.save(seeded) // rev=1
+    const mine = store.load('r-snap')
+    assert.ok(mine)
+    // 同版本：调用方手里可能带着尚未落盘的纯函数结果，必须保留
+    assert.equal(lockedSnapshot(store, mine), mine, '同版本不得替换调用方快照')
+    // 盘上更新：说明拿锁前有锁外写者落过盘，必须以盘为准
+    const other = store.load('r-snap')
+    assert.ok(other)
+    store.save({ ...other, project: '锁外写者' })
+    const fresh = lockedSnapshot(store, mine)
+    assert.notEqual(fresh, mine)
+    assert.equal(fresh.project, '锁外写者')
+    // 从没落过盘的快照（无 rev）即使与盘上同名 run 相撞也不被替换
+    const unsaved = { ...mine, rev: undefined, project: '未落盘' }
+    assert.equal(lockedSnapshot(store, unsaved), unsaved, '无 rev 的未落盘快照必须原样保留')
+    // 盘上没有这个 run：退回传入快照（行为与加锁前一致）
+    assert.equal(lockedSnapshot(store, { ...mine, plan: { ...mine.plan, runId: 'r-missing' } }).plan.runId, 'r-missing')
+  })
+})
+
+/* ─────────── r60 D3：CAS 撞车必须三方合并，不得抹掉锁外写者刚写的内容 ─────────── */
+
+/** 三方合并的公共夹具：`runId` 每个用例不同，避免冲突告警的去重表串场。 */
+function mergeState(runId: string, over: Partial<RunState> = {}): RunState {
+  const seeded = wrapLegacy({ ...legacyPlan({ runId }), plannedAt: now })
+  assert.ok(seeded)
+  return { ...seeded, ...over }
+}
+
+function messageOf(at: number, body: string, extra: Partial<MessageRecord> = {}): MessageRecord {
+  return { at, from: 'captain', to: 'dev-t1', body, ...extra }
+}
+
+function taskOf(id: string, over: Partial<PlanTask> = {}): PlanTask {
+  return { id, title: `任务 ${id}`, roleId: 'dev', dependsOn: [], acceptance: 'exit 0', status: 'pending', ...over }
+}
+
+function bindingOf(memberId: string, taskId: string): MemberBinding {
+  return { taskId, roleId: 'dev', memberId, name: `dev-${taskId}`, spawnedAt: now }
+}
+
+test('r60 D3：mergeRunState 逐字段三方合并（对方改的留下、我方改的留下）', () => {
+  const base = mergeState('r-merge-3way')
+  const ours: RunState = {
+    ...base,
+    project: '本次动作的项目',
+    plan: { ...base.plan, status: 'paused' },
+  }
+  const theirs: RunState = {
+    ...base,
+    finishedAt: now + 5,
+    plan: { ...base.plan, goal: '锁外写者改的目标' },
+  }
+  const merged = mergeRunState(base, ours, theirs)
+  assert.equal(merged.project, '本次动作的项目', 'ours 改、theirs 未改 → 取 ours')
+  assert.equal(merged.finishedAt, now + 5, 'ours 未改、theirs 改 → 取 theirs（锁外写者刚写的内容必须存活）')
+  assert.equal(merged.plan.status, 'paused', 'ours 改 plan.status → 保留')
+  assert.equal(merged.plan.goal, '锁外写者改的目标', 'theirs 改 plan 的另一个字段 → 保留（不是整块替换）')
+  assert.equal(merged.rev, theirs.rev, 'rev 一律取 theirs（CAS 基准只能是盘上那一版）')
+})
+
+test('r60 D3：两边改同一字段冲突 → 取我方，并写一条含 runId 与字段名的去重 warn', () => {
+  const runId = 'r-merge-conflict'
+  const seeded = mergeState(runId)
+  const ancestor: RunState = { ...seeded, plan: { ...seeded.plan, maxConcurrent: 3 } }
+  const ours: RunState = { ...ancestor, plan: { ...ancestor.plan, maxConcurrent: 2 } }
+  const theirs: RunState = { ...ancestor, plan: { ...ancestor.plan, maxConcurrent: 4 } }
+  const warns: string[] = []
+  const original = console.warn
+  console.warn = (...args: unknown[]) => {
+    warns.push(args.map((value) => String(value)).join(' '))
+  }
+  try {
+    const merged = mergeRunState(ancestor, ours, theirs)
+    assert.equal(merged.plan.maxConcurrent, 2, '冲突取值规则：两边都改且不同 → 取 ours')
+    const again = mergeRunState(ancestor, ours, theirs)
+    assert.equal(again.plan.maxConcurrent, 2)
+  } finally {
+    console.warn = original
+  }
+  const conflicts = warns.filter((line) => line.includes(runId) && line.includes('plan.maxConcurrent'))
+  assert.equal(conflicts.length, 1, `同一处冲突必须只报一次，实际 ${JSON.stringify(warns)}`)
+})
+
+test('r60 D3：messages 按 (at,from,toMemberId,body) 去重并按时升序，两边新写的都保留', () => {
+  const runId = 'r-merge-messages'
+  const oldest = messageOf(now, '开局')
+  const base = mergeState(runId, { messages: [oldest] })
+  const oursMsg = messageOf(now + 200, '本次动作写入的账本', { taskId: 't1' })
+  const theirsMsg = messageOf(now + 100, '锁外写者写入的账本', { toMemberId: 'm-t2' })
+  const ours: RunState = { ...base, messages: [oldest, oursMsg] }
+  const theirs: RunState = { ...base, messages: [oldest, theirsMsg, { ...theirsMsg }] }
+  const merged = mergeRunState(base, ours, theirs)
+  assert.deepEqual(
+    merged.messages.map((message) => message.body),
+    ['开局', '锁外写者写入的账本', '本次动作写入的账本'],
+    '两边新写的消息都要在，且按 at 升序',
+  )
+  assert.equal(merged.messages.length, 3, '重复身份（同一 at/from/toMemberId/body）必须去重')
+})
+
+test('r60 D3：plan.tasks 先按 id 对齐再逐字段合并（两边各改不同字段都保留）', () => {
+  const runId = 'r-merge-tasks'
+  const base = mergeState(runId, {
+    plan: { runId, sessionId: 's-legacy', createdAt: now, status: 'dispatching', maxConcurrent: 3, tasks: [taskOf('t1'), taskOf('t2')] },
+  })
+  const evidence = { taskId: 't1', command: 'pnpm test', exitCode: 0, tail: 'ok', artifacts: [], at: now }
+  const ours: RunState = {
+    ...base,
+    plan: {
+      ...base.plan,
+      tasks: [
+        { ...base.plan.tasks[0], status: 'running', memberId: 'm-t1' },
+        base.plan.tasks[1],
+        taskOf('t3'),
+      ],
+    },
+  }
+  const theirs: RunState = {
+    ...base,
+    plan: {
+      ...base.plan,
+      tasks: [
+        { ...base.plan.tasks[0], title: '锁外改的标题', evidence },
+        { ...base.plan.tasks[1], status: 'gate' },
+      ],
+    },
+  }
+  const merged = mergeRunState(base, ours, theirs)
+  const t1 = merged.plan.tasks.find((task) => task.id === 't1')
+  const t2 = merged.plan.tasks.find((task) => task.id === 't2')
+  assert.equal(t1?.status, 'running', 'ours 改的 status 保留')
+  assert.equal(t1?.memberId, 'm-t1', 'ours 改的 memberId 保留')
+  assert.equal(t1?.title, '锁外改的标题', 'theirs 改的另一个字段保留')
+  assert.deepEqual(t1?.evidence, evidence, 'theirs 写的门禁证据保留（锁外写者刚写的内容不能被抹掉）')
+  assert.equal(t2?.status, 'gate', 'theirs 改的 t2 状态保留')
+  assert.equal(merged.plan.tasks.some((task) => task.id === 't3'), true, 'ours 新增的任务保留')
+  assert.equal(merged.plan.tasks.length, 3)
+})
+
+test('r60 D3：bindings / taskTimes / progress / usage.byMember 按键三方合并', () => {
+  const runId = 'r-merge-keyed'
+  const base = mergeState(runId, {
+    bindings: [bindingOf('m-t1', 't1')],
+    taskTimes: { t1: { startedAt: now } },
+    progress: { 'm-t1': { at: now, calls: 1 } },
+    usage: { attribution: 'per-member', byMember: { 'm-t1': { total: 10 } }, byTask: { t1: { total: 10 } }, updatedAt: now },
+  })
+  const ours: RunState = {
+    ...base,
+    bindings: [{ ...bindingOf('m-t1', 't1'), retired: true }, bindingOf('m-t2', 't2')],
+    taskTimes: { t1: { startedAt: now, endedAt: now + 10 } },
+    progress: { 'm-t1': { at: now + 10, calls: 3 } },
+    usage: { ...base.usage!, byMember: { 'm-t1': { total: 20 } }, updatedAt: now + 10 },
+  }
+  const theirs: RunState = {
+    ...base,
+    bindings: [bindingOf('m-t1', 't1'), bindingOf('m-t3', 't3')],
+    taskTimes: { t1: { startedAt: now }, t2: { startedAt: now + 5 } },
+    progress: { 'm-t1': { at: now, calls: 1 }, 'm-t3': { at: now + 5, calls: 2 } },
+    usage: {
+      ...base.usage!,
+      byMember: { 'm-t1': { total: 10 }, 'm-t3': { total: 5 } },
+      byTask: { t1: { total: 10 }, t3: { total: 5 } },
+      updatedAt: now + 5,
+    },
+  }
+  const merged = mergeRunState(base, ours, theirs)
+  assert.deepEqual(
+    merged.bindings.map((binding) => binding.memberId).sort(),
+    ['m-t1', 'm-t2', 'm-t3'],
+    'bindings 按 memberId 对齐：两边各自新增的绑定都要在',
+  )
+  assert.equal(merged.bindings.find((binding) => binding.memberId === 'm-t1')?.retired, true, 'ours 改的 retired 保留')
+  assert.equal(merged.taskTimes?.t1.endedAt, now + 10, 'ours 写的结束时刻保留')
+  assert.equal(merged.taskTimes?.t2.startedAt, now + 5, 'theirs 新增的任务计时保留')
+  assert.equal(merged.progress?.['m-t1'].calls, 3, 'ours 推进的步数保留')
+  assert.equal(merged.progress?.['m-t3'].calls, 2, 'theirs 新增的推进记录保留')
+  assert.equal(merged.usage?.byMember['m-t1'].total, 20, 'ours 累加的用量保留')
+  assert.equal(merged.usage?.byMember['m-t3'].total, 5, 'theirs 新增成员的用量保留')
+  assert.equal(merged.usage?.byTask.t3.total, 5, 'theirs 新增任务的用量保留')
+})
+
+test('r60 D3：saveWithCas 撞车后三方合并，锁外写者的账本必须活到落盘（丢更新判定）', () => {
+  withTempDir((dir) => {
+    const runId = 'r-merge-cas'
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy({ ...legacyPlan({ runId }), plannedAt: now })
+    assert.ok(seeded)
+    store.save(seeded) // rev=1
+    const mine = store.load(runId)
+    assert.ok(mine)
+
+    const marker = messageOf(now + 50, '锁外写者写入的账本标记')
+    let injected = false
+    // 代理：在桥内第一次 save 之前插一次外部写盘（锁内 load 之后、save 之前的窗口）。
+    const proxy = {
+      load: (id: string) => store.load(id),
+      save: (state: RunState, options?: { expectRev?: number }) => {
+        if (!injected) {
+          injected = true
+          const disk = store.load(runId)
+          assert.ok(disk)
+          store.save({ ...disk, messages: [...disk.messages, marker] })
+        }
+        store.save(state, options)
+      },
+    }
+    const applied = saveWithCas(proxy, { ...mine, plan: { ...mine.plan, status: 'paused' } })
+
+    const disk = store.load(runId)
+    assert.ok(disk)
+    assert.equal(injected, true, '外部写盘必须真的发生过（否则没测到 CAS 窗口）')
+    assert.equal(disk.plan.status, 'paused', '本次动作必须真的落盘')
+    assert.equal(
+      disk.messages.some((message) => message.body === marker.body),
+      true,
+      '锁外写者刚写的账本被 CAS 重试抹掉了 —— 只重基版本号就是丢更新',
+    )
+    assert.equal(disk.rev, applied.rev, '落盘版本号必须与返回的快照一致')
+  })
+})
+
+test('r60 D3 边界：ours 没动 messages 时整段取 theirs（锁外账本一条都不能少）', () => {
+  const runId = 'r-merge-only-theirs'
+  const oldest = messageOf(now, '开局')
+  const base = mergeState(runId, { messages: [oldest] })
+  const marker = messageOf(now + 30, '锁外写者的账本')
+  const ours: RunState = { ...base, plan: { ...base.plan, status: 'paused' } }
+  const theirs: RunState = { ...base, messages: [oldest, marker], finishedAt: now + 40 }
+  const merged = mergeRunState(base, ours, theirs)
+  assert.deepEqual(
+    merged.messages.map((message) => message.body),
+    ['开局', '锁外写者的账本'],
+    'ours 未动 messages → 必须整段取 theirs',
+  )
+  assert.equal(merged.finishedAt, now + 40, 'theirs 改的标量字段存活')
+  assert.equal(merged.plan.status, 'paused', 'ours 改的字段同时存活')
+})
+
+test('r60 D3 边界：两边各追加同一条账本 → 合并只留一条；各自独有的都保留', () => {
+  const runId = 'r-merge-messages-same'
+  const oldest = messageOf(now, '开局')
+  const shared = messageOf(now + 10, '两边都会写的那条')
+  const mine = messageOf(now + 20, '我方独有')
+  const other = messageOf(now + 30, '对方独有')
+  const base = mergeState(runId, { messages: [oldest] })
+  const merged = mergeRunState(
+    base,
+    { ...base, messages: [oldest, shared, mine] },
+    { ...base, messages: [oldest, shared, other] },
+  )
+  assert.deepEqual(
+    merged.messages.map((message) => message.body),
+    ['开局', '两边都会写的那条', '我方独有', '对方独有'],
+    '同身份去重、不同身份都要保留、按时升序',
+  )
+})
+
+test('r60 D3 边界：两边改同一 task 的同一字段到不同值 → 取 ours 且写一条含 runId 与字段路径的 warn', () => {
+  const runId = 'r-merge-task-conflict'
+  const base = mergeState(runId, {
+    plan: { runId, sessionId: 's-legacy', createdAt: now, status: 'dispatching', maxConcurrent: 3, tasks: [taskOf('t1'), taskOf('t2')] },
+  })
+  const ours: RunState = {
+    ...base,
+    plan: { ...base.plan, tasks: [base.plan.tasks[0], { ...base.plan.tasks[1], status: 'running' }] },
+  }
+  const theirs: RunState = {
+    ...base,
+    plan: { ...base.plan, tasks: [base.plan.tasks[0], { ...base.plan.tasks[1], status: 'gate', evidence: { taskId: 't2', command: 'x', exitCode: 0, tail: '', artifacts: [], at: now } }] },
+  }
+  const warns: string[] = []
+  const original = console.warn
+  console.warn = (...args: unknown[]) => {
+    warns.push(args.map((value) => String(value)).join(' '))
+  }
+  let merged: RunState
+  try {
+    merged = mergeRunState(base, ours, theirs)
+  } finally {
+    console.warn = original
+  }
+  const t2 = merged.plan.tasks.find((task) => task.id === 't2')
+  assert.equal(t2?.status, 'running', '同一 task 同一字段冲突 → 取 ours')
+  assert.deepEqual(t2?.evidence, (theirs.plan.tasks[1] as PlanTask).evidence, 'theirs 在同一条上的其它字段仍保留')
+  const conflicts = warns.filter((line) => line.includes(runId) && line.includes('status'))
+  assert.equal(conflicts.length, 1, `冲突必须只报一次且带字段路径，实际 ${JSON.stringify(warns)}`)
+})
+
+test('r60 D3 边界：三方合并路径重试耗尽仍抛 StaleWriteError，盘上不留半成品', () => {
+  withTempDir((dir) => {
+    const runId = 'r-merge-exhaust'
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy({ ...legacyPlan({ runId }), plannedAt: now })
+    assert.ok(seeded)
+    store.save(seeded)
+    const mine = store.load(runId)
+    assert.ok(mine)
+    const before = store.load(runId)
+    assert.ok(before)
+
+    let attempts = 0
+    let loads = 0
+    const foreverStale = {
+      load: (id: string) => {
+        loads += 1
+        const current = store.load(id)
+        if (current === null) return null
+        // 每次重读都像是刚被别的写者推进过：rev 递增 → 每次都必陈旧
+        return {
+          ...current,
+          rev: (current.rev ?? 0) + 1000,
+          messages: [...current.messages, messageOf(now + loads, `锁外写者第 ${loads} 次`)],
+        }
+      },
+      save: (state: RunState) => {
+        attempts += 1
+        throw new StaleWriteError(state.plan.runId, 1, 2)
+      },
+    }
+    assert.throws(
+      () => saveWithCas(foreverStale, { ...mine, plan: { ...mine.plan, status: 'paused' } }),
+      (error: unknown) => error instanceof StaleWriteError,
+      '重试耗尽必须原样抛出，不许吞掉或无限重试',
+    )
+    assert.equal(attempts, 3, 'maxRetries=2 → 最多 3 次写盘尝试')
+    assert.equal(store.load(runId)?.plan.status, before.plan.status, '失败不得落任何半成品')
+  })
+})
+
+test('r60 D3 边界：外部写盘发生在动作 load 之后、helper 内部 load 之前（base 必须取拿锁时的快照）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-team-store-early-'))
+  try {
+    const runId = 'r-merge-early'
+    const store = new RunsStore(dir)
+    const seeded = wrapLegacy({ ...legacyPlan({ runId }), plannedAt: now })
+    assert.ok(seeded)
+    store.save(seeded)
+
+    const marker = messageOf(now + 60, '早窗口锁外写者写入的账本')
+    const applied = await store.withRunLock(runId, () => {
+      // 动作开始：锁内 load 出 rev=1 的快照
+      const actionStart = store.load(runId)
+      assert.ok(actionStart)
+      // 动作 await 期间：锁外写者（另一个 store 实例，完全不经锁）落盘 rev=2 + 一条账本标记
+      const outsider = new RunsStore(dir)
+      const disk = outsider.load(runId)
+      assert.ok(disk)
+      outsider.save({ ...disk, messages: [...disk.messages, marker] })
+      // 动作拿着 rev=1 的结果写盘：base 必须用「拿锁时」的快照，而不是此刻的盘上态
+      return saveWithCas(store, { ...actionStart, plan: { ...actionStart.plan, status: 'paused' } })
+    })
+
+    const after = store.load(runId)
+    assert.ok(after)
+    assert.equal(after.plan.status, 'paused', '本次动作必须落盘')
+    assert.equal(
+      after.messages.some((message) => message.body === marker.body),
+      true,
+      'base 必须取「动作开始时」的锁内快照；取写盘前一刻的盘上态会让 theirs===base 分支把锁外写者的字段整段丢掉',
+    )
+    assert.equal(after.rev, applied.rev)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

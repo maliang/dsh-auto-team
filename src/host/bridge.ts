@@ -134,6 +134,7 @@ import {
   MESSAGES_LIMIT,
   reconcileStalePlans,
   repairClosedRuns,
+  saveWithCas,
   type RunState,
   type RunsStore,
 } from './store.ts'
@@ -819,7 +820,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
   function saveState(state: RunState, cause: AutoDispatchCause = 'plan-saved'): RunState {
     recordRunMemory(state)
-    deps.store.save(state)
+    // r59 遗留 D1：锁内写盘必须带显式 `expectRev`，否则严格 CAS 名存实亡（save() 的重基会
+    // 把「锁外有人写过盘」咽下去）。`saveWithCas` 在锁内重读并重基、最多重试 2 次后向上抛。
+    saveWithCas(deps.store, state)
     // r13 AC-8：状态变了就通知装配层（自动派发的触发点之一）。回调由装配层提供，
     // 这里只负责「说一声」——派发语义不进入 bridge，否则就是第二条派发路径。
     //

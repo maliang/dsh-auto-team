@@ -1945,3 +1945,39 @@ test('t2：同一 run 的其它动作必须等门禁回执释放锁（锁内重�
   assert.equal(receipt.rejected, undefined)
   assert.equal(h.store.load('run-t4')?.plan.tasks[0]?.status, 'done')
 })
+
+/**
+ * r59 遗留 D1：`bridge.saveState` 必须走显式 CAS。
+ *
+ * 断言口径是「生产写盘带期望版本」，不是「save 被调用几次」：
+ * 只要有一处写盘不带 `expectRev`，`save()` 就会退回静默重基，锁外并发写永远不可见。
+ */
+test('r59 D1：bridge 锁内写盘带显式 expectRev（严格 CAS 在 act/executeAction/reviseRun 上生效）', async () => {
+  const h = setup()
+  const seen: Array<{ expectRev?: number } | undefined> = []
+  const spy: RunsStore = new Proxy(h.store, {
+    get(target, prop) {
+      if (prop === 'save') {
+        return (state: RunState, options?: { expectRev?: number }) => {
+          seen.push(options)
+          target.save(state, options)
+        }
+      }
+      const value = Reflect.get(target, prop, target) as unknown
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
+    },
+  })
+  const bridge = createBridge({ ...h.deps, store: spy })
+  h.store.save(stateOf())
+  await enable(bridge)
+
+  const result = await bridge.act(SESSION, { type: 'pause' })
+  assert.equal(result.rejected, undefined, '暂停动作不应被拒')
+  assert.ok(seen.length > 0, '暂停至少要落一次盘')
+  assert.ok(
+    seen.every((options) => typeof options?.expectRev === 'number'),
+    `每次锁内写盘都必须显式带 expectRev，实际：${JSON.stringify(seen)}`,
+  )
+  assert.equal(h.store.load('run-t4')?.plan.status, 'paused', '写盘必须真的落盘')
+  assert.ok((h.store.load('run-t4')?.rev ?? 0) > 1, '落盘后版本号必须前进')
+})

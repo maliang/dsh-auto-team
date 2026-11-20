@@ -12,6 +12,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { isDeepStrictEqual } from 'node:util'
 import type {
   ActivityEvent,
   MemberBinding,
@@ -491,12 +492,218 @@ export class StaleWriteError extends Error {
   }
 }
 
+/**
+ * 持锁改写前的快照选择：**盘上版本严格更新时以盘为准**，否则保留调用方手里那份。
+ *
+ * `dispatchReadyLocked` / `resumeRunLocked` 的约定是「传入的 state 只用来取锁键，锁内重新 load」：
+ * 拿锁之前的 await 里可能有锁外写者落过盘（用量投影、宿主端口回调）。盘上 `rev` 严格更大就说明
+ * 真的发生过这种写，必须用盘上那份重算，否则会覆盖掉别人写的字段。
+ *
+ * 同版本（或盘上更旧）时保留传入快照：调用方手里可能带着**尚未落盘**的纯函数结果
+ * （`applyReceipt` / `revisePlan` 这类），同版本说明盘上没有一个更晚的写，丢了就是丢写。
+ * 读不到（文件被删/损坏）同样退回传入快照，行为与加锁前一致。
+ */
+export function lockedSnapshot(store: Pick<RunsStore, 'load'>, state: RunState): RunState {
+  const disk = store.load(state.plan.runId)
+  if (disk === null) return state
+  // 从没落过盘的快照（没有 rev）不是「某个旧版本」：它本身就是调用方要的内容，
+  // 即使盘上恰好有同名 run（单测里换一份 plan 复用同一个 runId 就是这样），也不能拿盘替换掉。
+  if (state.rev === undefined) return state
+  return normalizeRev(disk.rev) > normalizeRev(state.rev) ? disk : state
+}
+
+/* ─────────── 三方合并：CAS 重试不得抹掉锁外写者刚写的内容（r60 D3） ─────────── */
+
+/** 冲突告警去重表（key = runId + 字段路径）：同一处冲突只报一次，避免每个轮询帧刷屏。 */
+const mergeConflictWarned = new Set<string>()
+/** 去重表上限：越界时整体清空（最多让极少数旧冲突再报一次，不会无限增长）。 */
+const MERGE_CONFLICT_WARN_LIMIT = 512
+
+function warnMergeConflict(runId: string, path: string): void {
+  const key = `${runId}\u0000${path}`
+  if (mergeConflictWarned.has(key)) return
+  if (mergeConflictWarned.size >= MERGE_CONFLICT_WARN_LIMIT) mergeConflictWarned.clear()
+  mergeConflictWarned.add(key)
+  console.warn(
+    `[auto-team] CAS 三方合并冲突（run ${runId}）：字段 ${path} 两边都改过且值不同，取本次写入的值（锁外写者的这次改动被覆盖）`,
+  )
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 消息账本的身份：按 (at, from, toMemberId, body) 去重（不看 taskId / messageId）。 */
+function messageIdentity(record: unknown): string {
+  if (!isPlainRecord(record)) return JSON.stringify(record) ?? String(record)
+  const toMemberId = typeof record.toMemberId === 'string' ? record.toMemberId : ''
+  return `${String(record.at ?? '')}\u0000${String(record.from ?? '')}\u0000${toMemberId}\u0000${String(record.body ?? '')}`
+}
+
+/** 集合类字段的身份函数：按身份对齐合并，而不是整块替换。 */
+function arrayIdentity(path: string, record: unknown): string {
+  if (!isPlainRecord(record)) return JSON.stringify(record) ?? String(record)
+  if (path === 'messages') return messageIdentity(record)
+  if (path === 'bindings') return String(record.memberId ?? '')
+  // `plan.tasks`：先按 id 对齐、再逐字段三方合并。
+  if (path === 'tasks' || path.endsWith('.tasks')) return String(record.id ?? '')
+  if (path === 'routeAudits') return `${String(record.taskId ?? '')}|${String(record.roleId ?? '')}|${String(record.at ?? '')}`
+  return JSON.stringify(record) ?? String(record)
+}
+
+function indexBy(list: unknown[], path: string): Map<string, unknown> {
+  const indexed = new Map<string, unknown>()
+  for (const item of list) {
+    const key = arrayIdentity(path, item)
+    if (!indexed.has(key)) indexed.set(key, item)
+  }
+  return indexed
+}
+
+function messageAt(record: unknown): number {
+  if (!isPlainRecord(record)) return 0
+  const at = record.at
+  return typeof at === 'number' && Number.isFinite(at) ? at : 0
+}
+
+/** 按身份对齐的三方数组合并：ours 的顺序在前，theirs 新增的追加在后。 */
+function mergeArray(base: unknown, ours: unknown[], theirs: unknown[], path: string, scope: MergeContext): unknown[] {
+  const baseIndex = indexBy(Array.isArray(base) ? base : [], path)
+  const oursIndex = indexBy(ours, path)
+  const theirsIndex = indexBy(theirs, path)
+  const merged: unknown[] = []
+  for (const [key, value] of oursIndex) {
+    const ancestor = baseIndex.get(key)
+    const other = theirsIndex.get(key)
+    merged.push(other === undefined ? value : mergeValue(ancestor, value, other, `${path}[${key}]`, scope))
+  }
+  for (const [key, value] of theirsIndex) {
+    if (!oursIndex.has(key)) merged.push(value)
+  }
+  // 账本按时间升序落盘：合并后的顺序不能依赖遍历顺序（面板按序渲染）。
+  if (path === 'messages') merged.sort((a, b) => messageAt(a) - messageAt(b))
+  return merged
+}
+
+function mergeRecords(
+  base: Record<string, unknown>,
+  ours: Record<string, unknown>,
+  theirs: Record<string, unknown>,
+  path: string,
+  scope: MergeContext,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = {}
+  for (const key of new Set([...Object.keys(ours), ...Object.keys(theirs), ...Object.keys(base)])) {
+    const value = mergeValue(base[key], ours[key], theirs[key], path === '' ? key : `${path}.${key}`, scope)
+    if (value !== undefined) merged[key] = value
+  }
+  return merged
+}
+
+function mergeValue(base: unknown, ours: unknown, theirs: unknown, path: string, scope: MergeContext): unknown {
+  if (isDeepStrictEqual(ours, theirs)) return ours
+  if (isDeepStrictEqual(ours, base)) return theirs
+  if (isDeepStrictEqual(theirs, base)) return ours
+  // 两边都改了且值不同：集合/对象继续往下逐项/逐字段合并，标量才判冲突。
+  if (Array.isArray(ours) && Array.isArray(theirs)) return mergeArray(base, ours, theirs, path, scope)
+  if (isPlainRecord(ours) && isPlainRecord(theirs)) {
+    return mergeRecords(isPlainRecord(base) ? base : {}, ours, theirs, path, scope)
+  }
+  warnMergeConflict(scope.runId, path)
+  return ours
+}
+
+/** 三方合并的上下文：只带 runId（告警去重与可诊断性都要它）。 */
+interface MergeContext {
+  runId: string
+}
+
+/**
+ * `RunState` 的三方合并：`base` = 本次动作开始时锁内盘上的原始态（公共祖先），
+ * `ours` = 本次要写的结果，`theirs` = CAS 撞车后重新 load 的盘上态。
+ *
+ * 逐字段（递归到子字段）的三方语义：
+ *  - `ours` 未改、`theirs` 改了 → 取 `theirs`（锁外写者刚写的内容必须存活）；
+ *  - `ours` 改了、`theirs` 未改 → 取 `ours`（本次动作不被别人抹掉）；
+ *  - 两边都改且值不同 → 取 `ours`，并写一条按 (runId, 字段路径) 去重后的 warn。
+ *
+ * 集合类字段按**身份**对齐合并，而不是整块替换：
+ *  - `messages` 按 (at, from, toMemberId, body) 去重、按时升序；
+ *  - `plan.tasks` 按 `id` 对齐、逐字段三方合并（两边各改不同字段时都要保留）；
+ *  - `bindings` 按 `memberId`，`taskTimes` / `progress` / `usage.byMember` 等键控记录逐键三方合并。
+ *
+ * `rev` 一律取 `theirs.rev`：合并结果本身还没有落盘版本，CAS 基准只能是盘上那一版。
+ */
+export function mergeRunState(base: RunState, ours: RunState, theirs: RunState): RunState {
+  const scope: MergeContext = { runId: ours.plan.runId }
+  const merged = mergeRecords(
+    base as unknown as Record<string, unknown>,
+    ours as unknown as Record<string, unknown>,
+    theirs as unknown as Record<string, unknown>,
+    '',
+    scope,
+  )
+  return { ...(merged as unknown as RunState), version: RUN_STATE_VERSION, rev: theirs.rev }
+}
+
+/**
+ * 持锁写盘的严格 CAS：`save(state, { expectRev })` → 陈旧则锁内重读、三方合并、重试。
+ *
+ * 为什么需要它：`save()` 的锁内自动 CAS 是**重基**语义（见 `save` 的注释）——发现盘上版本更高时
+ * 悄悄按新版本写下去，因此「锁外有人写过盘」这件事对调用方不可见。要真正启用 CAS，调用方必须
+ * 显式给出期望版本（自己 load 到的那份 `state.rev`）。
+ *
+ * 显式 CAS 一旦失败说明 await 期间有锁外写者插进来（用量投影、宿主端口回调、测试直接写盘）。
+ * 这时只把版本号重基是**丢更新**：我方整份旧快照写回去，会把对方刚写的 messages 账本、
+ * usage/progress、task.evidence 抹掉。所以锁内 `load` 一次盘上真值后走 {@link mergeRunState}
+ * 做三方合并（base = 本次动作开始时的锁内快照），最多 `maxRetries` 次；超过次数或盘上已无该 run 时
+ * 原样抛出 {@link StaleWriteError}，绝不无限重试、绝不吞掉。
+ *
+ * base 拿不到（文件被删/损坏）时退回旧语义（只重基版本号）：宁可保守也不能把 `ours` 当 base
+ * —— 那等于整份让位给 `theirs`，本次动作就白做了。
+ *
+ * 注意：必须在 {@link RunsStore.withRunLock} 内调用 —— 重读只有在锁内才是真值。
+ */
+export function saveWithCas(
+  store: Pick<RunsStore, 'save' | 'load'> & Partial<Pick<RunsStore, 'baseline'>>,
+  state: RunState,
+  maxRetries = 2,
+): RunState {
+  const runId = state.plan.runId
+  // 基线取「本次动作拿锁那一刻」的盘上快照（`withRunLock` 记录）；不在锁内（或该 run
+  // 不在本链的锁域里）才退回写盘前 load —— 后者会把「动作 await 期间」的外部写盘算进 base，
+  // 让三方合并判成「theirs 未改」而整段丢掉（d4）。
+  const recorded = store.baseline === undefined ? undefined : store.baseline(runId)
+  const base = recorded === undefined ? store.load(runId) : recorded
+  let current = state
+  let attempt = 0
+  for (;;) {
+    try {
+      store.save(current, { expectRev: current.rev })
+      return current
+    } catch (error) {
+      if (!(error instanceof StaleWriteError) || attempt >= maxRetries) throw error
+      attempt += 1
+      const fresh = store.load(runId)
+      if (fresh === null) throw error
+      current = base === null ? { ...current, rev: fresh.rev } : mergeRunState(base, current, fresh)
+    }
+  }
+}
+
 /** 异步链上的锁上下文（{@link RunsStore.withRunLock} 的可重入判据与写盘基准）。 */
 interface RunLockFrame {
   /** 当前异步链**已持有**的 runId：同一链再次申请直接放行（可重入）。 */
   held: Set<string>
   /** 当前异步链在每个 run 上**已写**的最新版本号：同一次动作里多次 save 的 CAS 基准。 */
   revs: Map<string, number>
+  /**
+   * 当前异步链在每个 run 上**拿锁时**的盘上快照：三方合并的公共祖先。
+   *
+   * 不能在 `saveWithCas` 里现 load：那会把「动作 await 期间」的锁外写盘算进 base，
+   * 于是 `theirs === base` → 取 ours，对方的字段被静默丢弃。
+   */
+  bases: Map<string, RunState | null>
 }
 
 export class RunsStore {
@@ -541,6 +748,18 @@ export class RunsStore {
     }
   }
 
+  /**
+   * 本次动作（锁内异步链）在该 run 上的基线快照：`withRunLock` 拿到锁时记下的盘上原始态。
+   *
+   * 不在锁内、或该 run 不在本链锁域里 → `undefined`（调用方自行 load 兜底）；
+   * 拿锁时盘上就没有这个 run → `null`（新建 run 的正常情形）。
+   */
+  baseline(runId: string): RunState | null | undefined {
+    const frame = this.lockContext.getStore()
+    if (frame === undefined || !frame.bases.has(runId)) return undefined
+    return frame.bases.get(runId) ?? null
+  }
+
   /** 盘中当前版本号（盘为唯一真值：多实例/外部写盘都能被 CAS 看到；缺失或非法按 0）。 */
   private revOf(runId: string): number {
     const path = this.fileFor(runId)
@@ -577,7 +796,10 @@ export class RunsStore {
     await previous
     const held = new Set(frame?.held ?? [])
     held.add(runId)
-    const child: RunLockFrame = { held, revs: new Map(frame?.revs ?? []) }
+    const bases = new Map(frame?.bases ?? [])
+    // 最早那次拿锁的快照才是公共祖先：可重入/嵌套时不许刷新。
+    if (!bases.has(runId)) bases.set(runId, this.load(runId))
+    const child: RunLockFrame = { held, revs: new Map(frame?.revs ?? []), bases }
     try {
       return await this.lockContext.run(child, fn)
     } finally {

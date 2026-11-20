@@ -24,6 +24,7 @@ import type {
 import type { RunState } from '../store.ts'
 import type { RunsStore } from '../store.ts'
 import type { TaskTimeRecord } from '../store.ts'
+import { lockedSnapshot, saveWithCas } from '../store.ts'
 import type { RoleRepo } from '../roles/repo.ts'
 import type { HostMember } from '../adapters.ts'
 import {
@@ -584,7 +585,11 @@ async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise
   const skipped: DispatchResult['skipped'] = []
   const errors: DispatchResult['errors'] = []
   const renamed: RenameRecord[] = []
-  let next = state
+  // r59 遗留 D2：调用方传进来的 `state` 只用来取锁键，**锁内必须重读一次盘上真值**再改 ——
+  // 它可能在拿到锁之前的 await 里就过期了（与下面 withRunLock 的注释承诺一致）。
+  // 读不到（文件被删/损坏）时退回传入快照，行为与加锁前一致。
+  const snapshot = lockedSnapshot(deps.store, state)
+  let next = snapshot
   let changed = false
 
   const planStatus = next.plan.status
@@ -664,14 +669,14 @@ async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise
     .map((task) => task.id)
   const ready = [...new Set([...readyTasks(next.plan.tasks), ...recoverable])]
   if (ready.length === 0) {
-    if (changed) deps.store.save(next)
+    if (changed) saveWithCas(deps.store, next)
     return { state: next, started, skipped, errors, renamed }
   }
 
   if (slots <= 0) {
     for (const taskId of ready) skipped.push({ taskId, reason: 'CONCURRENCY_FULL' })
     // 等待关系可能刚被重算过（waiting → pending），必须落盘，否则下一轮又要算一遍。
-    if (changed) deps.store.save(next)
+    if (changed) saveWithCas(deps.store, next)
     return { state: next, started, skipped, errors, renamed }
   }
 
@@ -882,7 +887,7 @@ async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise
               }),
             )
             // r31 D1：复用时同样要给「任务卡缺 path:line」软提示；判据与 spawn 分支共用。
-            next = appendMissingPointerHint(next, state, task, at)
+            next = appendMissingPointerHint(next, snapshot, task, at)
             started.push(taskId)
             claimedMembers.add(reusable.memberId)
             changed = true
@@ -983,7 +988,7 @@ async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise
         }),
       )
       // r29/r31：任务卡行号指针的软提示（与复用路径共用 appendMissingPointerHint）。
-      next = appendMissingPointerHint(next, state, task, at)
+      next = appendMissingPointerHint(next, snapshot, task, at)
       started.push(taskId)
       // 只在 spawn 成功后记录消歧（失败侧不产生 notice），且只记录**真消歧**：
       // 本名不算（suffix=0）、沿用自己老 binding 的同名也不算（重试/重建不重复提示）。
@@ -997,7 +1002,7 @@ async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise
     }
   }
 
-  if (changed) deps.store.save(next)
+  if (changed) saveWithCas(deps.store, next)
   return { state: next, started, skipped, errors, renamed }
 }
 
@@ -1015,7 +1020,9 @@ export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<Resu
 
 async function resumeRunLocked(state: RunState, deps: ResumeDeps): Promise<ResumeResult> {
   const now = deps.now ?? Date.now
-  let next = state
+  // r59 遗留 D2：与 dispatchReadyLocked 同一纪律 —— 锁内重读盘上真值，传入的 state 只用来取锁键。
+  const snapshot = lockedSnapshot(deps.store, state)
+  let next = snapshot
   let resumed = 0
   let skipped = 0
   let changedCount = 0
@@ -1092,7 +1099,7 @@ async function resumeRunLocked(state: RunState, deps: ResumeDeps): Promise<Resum
     changedCount += 1
   }
 
-  if (changedCount > 0) deps.store.save(next)
+  if (changedCount > 0) saveWithCas(deps.store, next)
   return { state: next, resumed, skipped, unchanged: resumed === 0 && changedCount === 0 }
 }
 
