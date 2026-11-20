@@ -451,8 +451,11 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
       let changed = 0
 
       for (const summary of runs) {
-        const state = deps.store.load(summary.runId)
-        if (!state) continue
+        // 对账是「load → await 名单/发提醒 → 改 → save」的读改写：整段在 runId 锁内跑，
+        // 锁内重新 load（上面的 `runs` 列表只是待办清单，不是写盘判据）。
+        changed += await deps.store.withRunLock(summary.runId, async (): Promise<number> => {
+          const state = deps.store.load(summary.runId)
+          if (!state) return 0
         // r7 AC-9：暂停只掐「推进」，不掐「看清事实」——本 tick 仍做存活对账（成员死了要看得见），
         // 只跳过停滞判定与 Trigger 轮询兜底。反过来（暂停连对账也停）会让面板在暂停期间
         // 一直显示「运行中」，恢复后才发现成员早就没了。
@@ -464,7 +467,7 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
             task.status === 'interrupted' ||
             task.status === 'paused',
         )
-        if (!active) continue
+        if (!active) return 0
 
         const rootId = state.plan.sessionId
         let members = membersByRoot.get(rootId)
@@ -492,9 +495,9 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
             }
             lastHealthRoot = rootId
             healthByRoot.set(rootId, { ok: false, error: reason, at: now() })
-            // r40 取舍：**continue 而不是 return** —— 一次名单失败只让该 root 本轮降级，
+            // r40 取舍：**跳过本轮而不是中断整个 tick** —— 一次名单失败只让该 root 本轮降级，
             // 其余 root 的对账照常进行（旧实现的 return 会让一个 root 的故障停掉全仓对账）。
-            continue
+            return 0
           }
         }
 
@@ -508,6 +511,8 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
         // interrupted 时成员已不在跑，不该再发提醒。发送成功才落账；失败/无端口静默跳过，
         // 下一轮 tick 自然重试（提醒不是护栏，绝不能连累存活对账）。
         let next = judged.state
+        /** 本 run 本轮实际推进数（锁内累计，出锁后并入 tick 总数）。 */
+        let delta = 0
         if (!paused && stepReminderAt > 0 && deps.sendMemberMessage !== undefined) {
           for (const reminder of stepRemindersOf(next, stepReminderAt)) {
             try {
@@ -522,7 +527,7 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
         if (reconciled.changed > 0 || next !== reconciled.state) {
           deps.store.save(next)
           deps.onReconciled?.(next)
-          changed += reconciled.changed + judged.raised.length
+          delta += reconciled.changed + judged.raised.length
         }
 
         // Trigger 轮询兜底（AC-18）：紧跟在「对账 → 停滞判定」之后，喂的是同一份已落盘状态，
@@ -536,6 +541,8 @@ export function createMemberWatcher(deps: WatcherDeps): MemberWatcher {  const n
             // 兜底失败只影响本轮少一次推进，绝不能连累存活对账（下一轮 tick 会补上）。
           }
         }
+          return delta
+        })
       }
 
       return changed

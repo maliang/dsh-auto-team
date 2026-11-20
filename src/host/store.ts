@@ -10,6 +10,7 @@
  * 写盘纪律：先写 `<file>.tmp` 再 rename（同目录 rename 是原子的），避免面板在写到一半时
  * 读到半个 JSON 而整块显示空白——这类「偶发空白」在用户侧表现为「面板有时候不显示」。
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import type {
   ActivityEvent,
@@ -100,6 +101,15 @@ export interface TaskPauseRecord {
  */
 export interface RunState {
   version: typeof RUN_STATE_VERSION
+  /**
+   * 落盘版本号（单调递增，CAS 的判据）：`save()` 每次都写成 `盘中当前值 + 1`。
+   *
+   * 为什么需要它：`计划落盘 / 派发 / watcher 对账 / 回执` 都是「load → 改 → save」的异步
+   * 读改写，await 之间另一条路径可能已经写过盘；没有版本号时后写者会把前一次写盘**整份覆盖**，
+   * 表现为「成员刚建好又消失」「回执被对账抹掉」这类只能靠复现的丢写。
+   * 旧文件没有这个字段 → 归一成 undefined，首次写盘按 0 → 1 递增，不需要迁移脚本。
+   */
+  rev?: number
   plan: Plan
   plannedAt: number
   messages: MessageRecord[]
@@ -450,6 +460,43 @@ export interface SaveOptions {
    * 状态 / 终止原因 / 任务状态等真正决定历史行的写一律**不得**走这个豁免。
    */
   historyNeutral?: boolean
+  /**
+   * 乐观并发控制（CAS）：**只有盘中版本号等于这个值才允许写**，否则抛
+   * {@link StaleWriteError}（`code='STALE_WRITE'`）。
+   *
+   * 调用方用「自己 load 到的那份 state.rev」作为期望值——不匹配说明 await 期间已经有人
+   * 写过盘，手里这份是旧快照，覆盖下去就是丢写。锁内（{@link RunsStore.withRunLock}）
+   * 的写盘不需要手工传：`save()` 会自动按「锁内已写的最新版本」做 CAS。
+   */
+  expectRev?: number
+}
+
+/**
+ * 陈旧写盘：`expectRev` 与盘中版本号不一致。
+ *
+ * `code` 是稳定标识（调用方可按码做重读重试），`message` 只用于日志/诊断。
+ */
+export class StaleWriteError extends Error {
+  readonly code = 'STALE_WRITE'
+  readonly runId: string
+  readonly expectRev: number
+  readonly actualRev: number
+
+  constructor(runId: string, expectRev: number, actualRev: number) {
+    super(`陈旧写盘（run ${runId}）：期望 rev=${expectRev}，盘中 rev=${actualRev}`)
+    this.name = 'StaleWriteError'
+    this.runId = runId
+    this.expectRev = expectRev
+    this.actualRev = actualRev
+  }
+}
+
+/** 异步链上的锁上下文（{@link RunsStore.withRunLock} 的可重入判据与写盘基准）。 */
+interface RunLockFrame {
+  /** 当前异步链**已持有**的 runId：同一链再次申请直接放行（可重入）。 */
+  held: Set<string>
+  /** 当前异步链在每个 run 上**已写**的最新版本号：同一次动作里多次 save 的 CAS 基准。 */
+  revs: Map<string, number>
 }
 
 export class RunsStore {
@@ -463,10 +510,16 @@ export class RunsStore {
    * 才都能让历史缓存失效，而不必在每个调用点手工补一次 `historyMemo = null`。
    */
   private writeCount: number
+  /** 按 runId 串行的锁尾巴：新来的调用排在上一次释放之后。 */
+  private readonly tails: Map<string, Promise<void>>
+  /** 可重入判据：同一异步链（一次动作的 await 上下文）内重复申请同一把锁不排队。 */
+  private readonly lockContext: AsyncLocalStorage<RunLockFrame>
 
   constructor(dir: string) {
     this.dir = dir
     this.writeCount = 0
+    this.tails = new Map()
+    this.lockContext = new AsyncLocalStorage()
   }
 
   /**
@@ -488,14 +541,94 @@ export class RunsStore {
     }
   }
 
-  /** 整体原子写（tmp + rename）；消息账本 / 停滞记录 / 告警都按上限裁剪后再落盘。 */
+  /** 盘中当前版本号（盘为唯一真值：多实例/外部写盘都能被 CAS 看到；缺失或非法按 0）。 */
+  private revOf(runId: string): number {
+    const path = this.fileFor(runId)
+    if (path === null || !existsSync(path)) return 0
+    try {
+      const raw: unknown = JSON.parse(readFileSync(path, 'utf8'))
+      return isRecord(raw) ? normalizeRev(raw.rev) : 0
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 按 runId 串行的异步锁（可重入）。
+   *
+   * 同一 run 的「读状态 → 改 → 写回」必须串起来：`receipt`（跑门禁）、`dispatch`（起成员）、
+   * watcher 对账都有 await 窗口，两条路径交叉时后写者会把前者的写盘整份覆盖。
+   *
+   * 可重入：锁内再调 `act` / `dispatchReady` 不会自锁死（AsyncLocalStorage 记住本链已持有的
+   * runId）。不同 run 互不阻塞；`runId` 为空时退化成直接执行（新建 run 之前没有可锁的键）。
+   */
+  async withRunLock<T>(runId: string, fn: () => Promise<T> | T): Promise<T> {
+    if (runId === '') return await fn()
+    const frame = this.lockContext.getStore()
+    if (frame !== undefined && frame.held.has(runId)) return await fn()
+    const previous = this.tails.get(runId) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    // 尾巴 = 上一次释放后才轮到本次；排队者看到的是这条链，因此天然 FIFO。
+    const tail = previous.then(() => current)
+    this.tails.set(runId, tail)
+    await previous
+    const held = new Set(frame?.held ?? [])
+    held.add(runId)
+    const child: RunLockFrame = { held, revs: new Map(frame?.revs ?? []) }
+    try {
+      return await this.lockContext.run(child, fn)
+    } finally {
+      release()
+      // 队尾清理：只有自己还是尾巴时才删，避免把后来者的链断掉。
+      if (this.tails.get(runId) === tail) this.tails.delete(runId)
+    }
+  }
+
+  /**
+   * 整体原子写（tmp + rename）；消息账本 / 停滞记录 / 告警都按上限裁剪后再落盘。
+   *
+   * 锁内调用自动做 CAS：期望值取「state.rev 与本链已写版本」
+   * 的较大者——同一次动作里多次 save 不会因为自己刚写过而判成陈旧，而**别人**在锁外插进来的
+   * 写盘仍然会被发现（期望值落后于盘中值 → {@link StaleWriteError}）。
+   */
   save(state: RunState, options?: SaveOptions): void {
     const path = this.fileFor(state.plan.runId)
     if (path === null) throw new Error(`非法 runId：${state.plan.runId}`)
+    const runId = state.plan.runId
+    const frame = this.lockContext.getStore()
+    const inLock = frame !== undefined && frame.held.has(runId)
+    const diskRev = this.revOf(runId)
+    const stateRev = normalizeRev(state.rev)
+    // 严格 CAS：调用方显式给了 `expectRev` 就以它为准，不匹配直接抛。
+    const explicit = options?.expectRev
+    if (explicit !== undefined && explicit !== diskRev) {
+      throw new StaleWriteError(runId, explicit, diskRev)
+    }
+    /**
+     * 锁内自动 CAS：期望值 = 「手里这份 state 的版本」与「本链已写版本」的较大者。
+     *
+     * 不匹配说明锁外有人写过盘（用量投影、宿主端口回调、测试的直接写盘）。锁本身已经保证
+     * 同 run 的锁内写者不交叉，所以这里**重读一次盘上版本再重基**、不把动作整体判失败：
+     * 抛给用户就是「点回执偶发失败」，比覆盖掉一次视图字段（下一帧会重写）更糟。
+     * 需要严格保护时调用方显式传 `expectRev`（见上）。
+     */
+    let base = diskRev
+    if (explicit === undefined && inLock) {
+      const expected = Math.max(stateRev, frame.revs.get(runId) ?? 0)
+      if (expected !== base) base = this.revOf(runId)
+    }
+    const rev = Math.max(base, stateRev) + 1
+    // 回写内存对象的版本号：调用方手里的 state 与盘上保持同一版本，下一次 CAS 才不会
+    // 把自己刚写的盘判成「陈旧」（list→改→save 的同一份 state 反复保存是常态）。
+    state.rev = rev
     mkdirSync(this.dir, { recursive: true })
     const bindings = state.bindings ?? []
     const normalized: RunState = {
       ...state,
+      rev,
       version: RUN_STATE_VERSION,
       messages: capMessages(state.messages),
       bindings,
@@ -522,6 +655,8 @@ export class RunsStore {
     // 写后失效点：只有 rename 成功才算「盘上真的变了」。写失败不推进版本号，
     // 历史 memo 继续保持 —— 读到的仍是上一次成功落盘的那份，不存在半截状态。
     if (options?.historyNeutral !== true) this.writeCount += 1
+    // 锁内记账：同一次动作后续的 save 以这个版本为 CAS 基准（否则会被自己刚写的盘判成陈旧）。
+    if (inLock) frame.revs.set(runId, rev)
   }
 
   /** 按会话取最近一次运行（面板「计划」页与「恢复」的默认数据源）。 */
@@ -603,6 +738,9 @@ export function wrapLegacy(raw: unknown): RunState | null {
   if (plan === null) return null
   return {
     version: RUN_STATE_VERSION,
+    // 并发版本号必须随 run 一起读回：丢了它，CAS 会把每次写盘都当成「盘中无版本」，
+    // 旧文件的 rev 归一成 0（首次写盘得 1），不需要迁移脚本。
+    rev: normalizeRev(raw.rev),
     plan,
     plannedAt: finiteNumber(raw.plannedAt, plan.createdAt),
     messages: capMessages(asArray<MessageRecord>(raw.messages)),
@@ -861,6 +999,12 @@ const SUMMARY_TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
 /** 可选毫秒值：有限、非负、取整；其余（含 `NaN` / `-1` / 字符串）一律视为缺失。 */
 function finiteOptional(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined
+}
+
+/** 可选并发版本号：正整数才留；非法/缺失一律 0（= 还没有任何写盘，首次写盘得 1）。 */
+function normalizeRev(value: unknown): number {
+  const rev = finiteOptional(value)
+  return rev !== undefined && rev > 0 ? rev : 0
 }
 
 /** 可选标签（项目名 / id / reason）：非空字符串才留，去首尾空白。 */

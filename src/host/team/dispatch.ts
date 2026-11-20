@@ -567,8 +567,18 @@ function appendMissingPointerHint(next: RunState, state: RunState, task: PlanTas
   )
 }
 
-/** 派发：把 ready 的任务按空闲并发位创建成员。 */
+/**
+ * 派发：把 ready 的任务按空闲并发位创建成员。
+ *
+ * 串行：整段（含 spawn 的 await 窗口）在 runId 锁内跑，**锁内重新 load** 一次状态 ——
+ * 调用方传进来的 `state` 只用于取锁键，绝不作为写盘判据（它可能已经在 await 里过期）。
+ */
 export async function dispatchReady(state: RunState, deps: DispatchDeps): Promise<DispatchResult> {
+  const runId = state.plan.runId
+  return deps.store.withRunLock(runId, () => dispatchReadyLocked(state, deps))
+}
+
+async function dispatchReadyLocked(state: RunState, deps: DispatchDeps): Promise<DispatchResult> {
   const now = deps.now ?? Date.now
   const started: string[] = []
   const skipped: DispatchResult['skipped'] = []
@@ -998,6 +1008,12 @@ export async function dispatchReady(state: RunState, deps: DispatchDeps): Promis
  * 且**不新增 binding**（成员数两次相等）——这样面板「续跑」按钮连点也不会造出一堆重复成员。
  */
 export async function resumeRun(state: RunState, deps: ResumeDeps): Promise<ResumeResult> {
+  const runId = state.plan.runId
+  // 与 dispatchReady 同一把锁：同 run 的「读成员 → 改 binding → 写回」不交叉。
+  return deps.store.withRunLock(runId, () => resumeRunLocked(state, deps))
+}
+
+async function resumeRunLocked(state: RunState, deps: ResumeDeps): Promise<ResumeResult> {
   const now = deps.now ?? Date.now
   let next = state
   let resumed = 0

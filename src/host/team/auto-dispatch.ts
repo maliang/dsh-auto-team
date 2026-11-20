@@ -198,7 +198,21 @@ export function createAutoDispatcher(deps: AutoDispatchDeps): AutoDispatcher {
     return { runId, cause, attempted: false, started: [], failed: 0, skipped: 0, errors: [], ...patch }
   }
 
+  /**
+   * 按 run 单飞的派发：与 bridge / watcher 共用同一把 runId 锁。
+   *
+   * `deps.dispatch` 内部还会走 `dispatchReady`（同一把锁，可重入），因此「派发 → 推进计划态」
+   * 整段没有别的写口能插进来；锁内重新 load 一次，`deps.dispatch` 拿到的也是入锁后的状态。
+   */
   async function dispatchOnce(
+    sessionId: string,
+    runId: string,
+    cause: AutoDispatchCause,
+  ): Promise<AutoDispatchReport> {
+    return deps.store.withRunLock(runId, () => dispatchOnceLocked(sessionId, runId, cause))
+  }
+
+  async function dispatchOnceLocked(
     sessionId: string,
     runId: string,
     cause: AutoDispatchCause,

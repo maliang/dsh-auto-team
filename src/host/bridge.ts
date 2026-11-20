@@ -926,6 +926,15 @@ export function createBridge(deps: BridgeDeps): Bridge {
    *  5. 最后一次性落盘（退役已停止的 binding、消息账本、队长告知）。
    */
   async function reviseRun(sessionId: string, runId: string, input: RevisionInput): Promise<ReviseRunResult> {
+    // 跨 await 的读改写（先落「停止中」、停成员、再落最终态）：与 act/dispatch 共用同一把 run 锁。
+    return deps.store.withRunLock(runId, () => reviseRunUnlocked(sessionId, runId, input))
+  }
+
+  async function reviseRunUnlocked(
+    sessionId: string,
+    runId: string,
+    input: RevisionInput,
+  ): Promise<ReviseRunResult> {
     const state = deps.store.load(runId)
     if (state === null) return { ok: false, code: 'NOT_FOUND', reason: `找不到 run ${runId}` }
     if (state.plan.sessionId !== sessionId) {
@@ -2206,12 +2215,49 @@ export function createBridge(deps: BridgeDeps): Bridge {
   }
 
   /**
+   * 锁键：这次动作会改哪一个 run。
+   *
+   * 显式 runId（t3）优先，其次动作自带的 runId（`message` / `receipt` 等可跨 run），
+   * 最后回落到会话的活动 run。都拿不到时返回 null（如 `toggle`、新建计划之前）——
+   * 没有可锁的写目标，直接执行；新 run 的 runId 天然唯一，不存在同键竞争。
+   */
+  function lockKeyOf(sessionId: string, action: PanelAction, runId?: string): string | null {
+    if (runId !== undefined && runId !== '') return runId
+    const own = (action as { runId?: unknown }).runId
+    if (typeof own === 'string' && own !== '') return own
+    return loadState(sessionId)?.plan.runId ?? null
+  }
+
+  /**
+   * 走 store 的按 runId 串行锁（可重入）。桩 store（老测试的 `{ save }` 假实现）没有这把锁时
+   * 退化成直接执行，行为与加锁前一致 —— 单线程测试里不存在真正的并发写口。
+   */
+  function withRunLockOf<T>(runId: string | null, fn: () => Promise<T>): Promise<T> {
+    if (runId === null || typeof deps.store.withRunLock !== 'function') return fn()
+    return deps.store.withRunLock<T>(runId, fn)
+  }
+
+  /**
    * 动作入口（r13 AC-11 / AC-12 / AC-13）：先过确认闸，再走**同一执行体**。
    *
    * 顺序是刻意的：前置闸（未启用/暂停）在挂 pending **之前**跑 —— 用户不该去确认一个
    * 注定被拒绝的动作。可逆动作（AC-12 的 7 类）在这里不产生任何 pending，直接执行。
+   *
+   * 串行：整个入口（含 pending 落盘与执行体）在 runId 锁内跑，锁内重新 load 状态，
+   * 锁外读到的快照只用来挑锁键，绝不参与写盘判据。
    */
   async function act(
+    sessionId: string,
+    action: PanelAction,
+    runId?: string,
+    caller?: ActCaller,
+  ): Promise<ActResult> {
+    return withRunLockOf(lockKeyOf(sessionId, action, runId), () =>
+      actUnlocked(sessionId, action, runId, caller),
+    )
+  }
+
+  async function actUnlocked(
     sessionId: string,
     action: PanelAction,
     runId?: string,
@@ -2305,8 +2351,25 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return { ok: true, runId: state.plan.runId, ready, unbound }
   }
 
-  /** 执行体：所有 Action 的唯一实现（确认闸确认后也回到这里）。 */
+  /**
+   * 执行体入口：**按 runId 串行**（可重入，`act` 已经持锁时直接进入）。
+   *
+   * `receipt` / `reviewTask` / `dispatch` / `confirmPending` 都从 `act` 进来，因此
+   * 「读状态 → 改 → 写回」整体在锁内；锁内的 `loadState` 拿的是入锁之后的盘上状态。
+   */
   async function executeAction(
+    sessionId: string,
+    action: PanelAction,
+    runId?: string,
+    caller?: ActCaller,
+  ): Promise<ActResult> {
+    return withRunLockOf(lockKeyOf(sessionId, action, runId), () =>
+      executeActionUnlocked(sessionId, action, runId, caller),
+    )
+  }
+
+  /** 执行体：所有 Action 的唯一实现（确认闸确认后也回到这里）。 */
+  async function executeActionUnlocked(
     sessionId: string,
     action: PanelAction,
     runId?: string,

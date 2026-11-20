@@ -129,6 +129,15 @@ async function enable(bridge: Bridge): Promise<void> {
   assert.equal(result.rejected, undefined, '启用动作本身不应被拒')
 }
 
+/** 轮询等待门禁子进程写出的标记文件（超时直接抛，避免用例挂死）。 */
+async function waitForFile(path: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`等待文件超时：${path}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 /**
  * r13 AC-11：5 类不可逆动作现在**必须先确认**。
  *
@@ -1897,4 +1906,42 @@ test('t5 面板：复用成员挂两条 binding 时只显示一行，且显示�
     spawns.some((event) => event.text.includes('复用成员 开发-1')),
     `第二条必须是复用，不能谎报新建：${JSON.stringify(spawns.map((event) => event.text))}`,
   )
+})
+
+test('t2：同一 run 的其它动作必须等门禁回执释放锁（锁内重新 load，不信任锁外快照）', async () => {
+  const h = setup()
+  await enable(h.bridge)
+  const gateStart = join(h.dir, 'gate-start.txt')
+  const gateEnd = join(h.dir, 'gate-end.txt')
+  h.store.save(
+    stateOf({
+      plan: planOf({
+        status: 'dispatching',
+        tasks: [
+          taskOf('t1', {
+            status: 'running',
+            memberId: 'member-1',
+            acceptance: `: > '${gateStart}'; sleep 0.3; : > '${gateEnd}'; exit 0`,
+          }),
+        ],
+      }),
+      bindings: [bindingOf()],
+    }),
+  )
+
+  // receipt 进锁后会在门禁里 await（持锁窗口）：这段时间同一 run 的写口必须排队。
+  const receiptP = h.bridge.act(SESSION, { type: 'receipt', taskId: 't1' })
+  await waitForFile(gateStart)
+  const messageP = h.bridge.act(SESSION, { type: 'message', taskId: 't1', text: '门禁期间的并发动作' })
+  await messageP
+
+  // 直接判据：message 完成时门禁必须已经结束；否则说明它没排队（读到了门禁中的旧快照）。
+  assert.equal(
+    existsSync(gateEnd),
+    true,
+    '门禁还没结束就执行了 message —— 同一 run 的动作没有串行化（锁没包住读→改→写回）',
+  )
+  const receipt = await receiptP
+  assert.equal(receipt.rejected, undefined)
+  assert.equal(h.store.load('run-t4')?.plan.tasks[0]?.status, 'done')
 })
