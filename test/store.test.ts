@@ -1001,7 +1001,9 @@ test('r60 D3 边界：三方合并路径重试耗尽仍抛 StaleWriteError，盘
   })
 })
 
-test('r60 D3 边界：外部写盘发生在动作 load 之后、helper 内部 load 之前（base 必须取拿锁时的快照）', async () => {
+// r61：本条覆盖的是 **D4 早窗口**（动作 load 之后、helper 内部 load 之前的外部写盘），不是 D3 的三方合并。
+// 测试名按 r60 QA 报告 §7.5 的非阻塞建议改正（只改名与注释，断言未动）。
+test('r60 D4 早窗口：外部写盘发生在动作 load 之后、helper 内部 load 之前（base 必须取拿锁时的快照）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'auto-team-store-early-'))
   try {
     const runId = 'r-merge-early'

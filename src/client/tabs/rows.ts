@@ -144,13 +144,13 @@ function summaryUsageOf(run: RunSummary): UsageCell {
 }
 
 /**
- * 历史列表行的用时（r20）。
+ * 历史列表行的用时回落派生（r20 引入；r61 起只在**旧快照**缺 `RunSummary.duration` 时使用）。
  *
- * 这里**没有**宿主下发的 `DurationCell`：`RunSummary`（`shared/types.ts:667`）只有
- * `plannedAt`/`finishedAt`，宿主 `bridge.historyOf` 也只额外派生了 `usage`。
- * 但 r20 t1 已经把 `finishedAt` 补成可核实值（终态落盘优先，历史 run 用
- * `store.finishedAtOf` 回退），所以列表行可以用**宿主给的时间戳 + shared/duration.ts
- * 的唯一实现**算出同一个单元格 —— 不是第二套格式化，也没有 0 或估算补位：
+ * 宿主 `bridge.historyOf` 现在会用 `runDurationOf` 填好 `duration`（与快照 `runDuration`
+ * 同一个函数），行视图优先逐字透传它，不再在客户端二次派生。
+ *
+ * 本函数只服务旧宿主/旧快照（`duration === undefined`）：拿宿主给的时间戳 +
+ * shared/duration.ts 的唯一实现算同一个单元格 —— 不是第二套格式化，也没有 0 或估算补位：
  *  - 没有 `plannedAt`（旧 run）→ 不可得；
  *  - 终态（cancelled/terminated）但没有 `finishedAt` → 不可得（不算到「现在」）；
  *  - 有 `finishedAt` → done；否则 running（按 `now` 计时）。
@@ -170,9 +170,16 @@ function historyDurationOf(run: RunSummary, now: number): DurationCell {
   })
 }
 
-/** 历史行「算不出用时」的具体原因（`durationTitleOf` 的通用文案在这几种情况下不够准）。 */
+/**
+ * 历史行「算不出用时」的具体原因（`durationTitleOf` 的通用文案在这几种情况下不够准）。
+ *
+ * r61：宿主给的 `reason` 优先逐字透传（与任务表 `durationTitleOf` 的既有纪律一致）——
+ * `durationTitleOf` 对 `unavailable` 已经优先返回 `cell.reason`，这里只负责「宿主没给原因」
+ * 时按 run 时间戳补更具体的解释。
+ */
 function historyDurationTitleOf(cell: DurationCell, run: RunSummary): string {
   if (cell.state !== 'unavailable') return durationTitleOf(cell)
+  if ((cell.reason ?? '').trim() !== '') return durationTitleOf(cell)
   if (run.plannedAt === undefined) return '该次运行没有记录开始时刻（旧数据），算不出用时'
   if (run.finishedAt === undefined) return '该次运行没有结束时刻（宿主未落盘），算不出用时'
   return durationTitleOf(cell)
@@ -209,7 +216,9 @@ export function liveMembersOfSnapshot(members: readonly MemberView[] | undefined
  * r17：顶部是「任务名」（run 级 goal；缺省走 `goalTitleOf` 的诚实 fallback），
  * 底部是 token 六项（`RunSummary.usage.details`，宿主 `format.ts` 单一来源，客户端只透传）。
  * 旧数据没有 `usage` 时退回 `usageTotals`：只显示合计，不自己拆六项。
- * r20：次行补上用时（`historyDurationOf`，宿主时间戳 + shared 唯一实现；缺值即不可得）。
+ * r20：次行补上用时（宿主时间戳 + shared 唯一实现；缺值即不可得）。
+ * r61：宿主已下发 `run.duration`（`bridge.historyOf` 用 `runDurationOf` 生成）时**逐字透传**，
+ * 只有旧快照缺该字段才回落到 `historyDurationOf` —— 不在宿主已给值后再算一遍。
  *
  * `members` 只在**该 run 就是快照当前 run** 时传入：快照的成员列表不区分 run，
  * 拿别的 run 的成员兜底会把存活数算错。宿主字段 `liveMembers` 优先，快照只是兜底。
@@ -224,7 +233,8 @@ export function runSummaryRowOf(
   // r25：终态 run 即使旧宿主还下发 active=true/ongoing>0，也不能显示成「进行中」。
   const live = run.active === true && !isClosedRun(run)
   const end = live ? '进行中' : formatStamp(run.finishedAt)
-  const duration = historyDurationOf(run, now)
+  // r61：宿主真源优先（逐字透传 text/state/reason）；只有旧快照缺 `duration` 才回落派生。
+  const duration = run.duration ?? historyDurationOf(run, now)
   // r26：历史行 / 顶部 run 卡共用同一个阶段判定（计数由宿主补齐，旧数据缺省时保持 undefined）。
   const stage = runStageOf({
     planStatus: run.status,

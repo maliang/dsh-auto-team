@@ -1858,10 +1858,20 @@ export function createBridge(deps: BridgeDeps): Bridge {
           // 也不拿 0 冒充「没有失败/没有成员」。
           let counts: RunStageCounts | undefined
           let bindings: RunState['bindings'] | null = null
+          let duration: DurationCell | undefined
           try {
             const state = deps.store.load(run.runId)
             counts = runStageCountsOf(state)
             bindings = state === null ? null : state.bindings
+            // 用时与快照 `runDuration` 用**同一个** `runDurationOf`，不得在历史链路另写一套；
+            // 读不到 run 状态就不写该字段（不补 0，也不替客户端写「不可得」占位）。
+            // 终态但算不出结束时刻时 `runDurationOf` 返回 `unavailable` 占位 —— 该字段同样必须
+            // **缺席**（客户端按缺省降级），不能把「不可得」写进历史行；`plannedAt` 用
+            // `Number.isFinite` 判定，避免 NaN 被 `typeof === 'number'` 放行。
+            if (state !== null && Number.isFinite(state.plannedAt)) {
+              const cell = runDurationOf(state, at)
+              if (cell.state !== 'unavailable') duration = cell
+            }
           } catch {
             counts = undefined
             bindings = null
@@ -1872,6 +1882,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
               ...run,
               ...(counts === undefined ? {} : counts),
               usage: usageCellOf(run.usageTotals, HISTORY_USAGE_REASON),
+              ...(duration === undefined ? {} : { duration }),
             },
           }
         })

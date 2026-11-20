@@ -107,6 +107,15 @@ export interface LibraryDeps {
    * 缺省 = 完全旧行为（路径 basename 展示、project 原样分桶），单测与旧宿主都走这条。
    */
   workspaces?: () => HostWorkspaceEntry[]
+  /**
+   * 可配参数读取口（可选）：装配层接**真设置**（`settingsRepo.read()`），
+   * 历史详情的停滞阈值据此解析，而不是永远读缺省值。
+   *
+   * 回退规则：缺省 / 抛错 / 非正数（含 0、NaN、Infinity）→ 回落
+   * `defaultSettings().stallMs`，**绝不取 0**（0 会把每个在跑成员都判成停滞）。
+   * 每次详情装配只读一次，同一个值给该 run 的所有成员用。
+   */
+  settings?: () => { stallMs?: number }
 }
 
 /**
@@ -184,7 +193,7 @@ export function buildLibrary(deps: LibraryDeps, query: LibraryQuery = {}): Libra
   if (runId !== '') {
     const state = deps.store.load(runId)
     // 非法 / 不存在的 runId 不报错：返回不带 detail 的库，客户端显示「这次运行已不存在」。
-    if (state !== null) view.detail = runDetailOf(state, at, roleNameOf(deps), roleListOf(deps))
+    if (state !== null) view.detail = runDetailOf(state, at, roleNameOf(deps), roleListOf(deps), stallMsOf(deps))
   }
   return view
 }
@@ -237,12 +246,16 @@ function cacheKeyOf(deps: LibraryDeps, query: LibraryQuery): string {
  * 必须逐字一致（TECHNICAL §2.4）：口算规则只抄一次在这里，客户端不得二次计算。
  *
  * r54：`members` 与快照的 `membersOf` 同口径（见 `membersOfState`），拿不到名单时**省略**该字段。
+ *
+ * `stallMs` 由 `buildLibrary` 经 `stallMsOf(deps)` 解析后传入（真设置优先），
+ * 一次装配只解析一次、所有成员共用；直接调用方不传时退化为缺省阈值。
  */
 export function runDetailOf(
   state: RunState,
   at: number,
   roleNames?: ReadonlyMap<string, string>,
   roles: ReadonlyArray<LibraryRole> = [],
+  stallMs: number = defaultSettings().stallMs,
 ): RunDetailView {
   const tasks: TaskDetailView[] = state.plan.tasks.map((task) =>
     taskDetailOf(state, task, at, roleNames),
@@ -258,7 +271,7 @@ export function runDetailOf(
     tasks,
     flow: flowOf(tasks),
   }
-  const members = membersOfState(state, at, roles, roleNames)
+  const members = membersOfState(state, at, roles, roleNames, stallMs)
   if (members !== undefined) detail.members = members
   if (state.project !== undefined) detail.project = state.project
   // r21：终止原因与结束时刻同源落盘（旧 run 文件没有该字段 → 字段缺席，客户端显示不可得）。
@@ -287,6 +300,7 @@ function membersOfState(
   at: number,
   roles: ReadonlyArray<LibraryRole>,
   roleNames: ReadonlyMap<string, string> | undefined,
+  stallMs: number,
 ): MemberView[] | undefined {
   const hasLegacy = state.plan.tasks.some((task) => task.memberId !== undefined)
   if (state.bindings.length === 0 && !hasLegacy) return undefined
@@ -302,7 +316,6 @@ function membersOfState(
     const role = roleById.get(roleId)
     return describeRoute(role === undefined ? undefined : ({ model: role.model } as unknown as Role))
   }
-  const stallMs = defaultSettings().stallMs
   const stallFields = (
     memberId: string,
     status: MemberView['status'],
@@ -748,6 +761,23 @@ function roleNameOf(deps: LibraryDeps): ReadonlyMap<string, string> {
     map.set(id, name === '' ? id : name)
   }
   return map
+}
+
+/**
+ * 停滞阈值：优先走装配层注入的真设置（`deps.settings`）。
+ *
+ * 缺省 / 抛错 / 非正数一律回落 `defaultSettings().stallMs`，**绝不返回 0**
+ * （0 会让 `stallOf` 把每个在跑成员都判成停滞）。一次详情装配只调用一次，
+ * 由 `runDetailOf` 的 `stallMs` 参数带给所有成员。
+ */
+function stallMsOf(deps: LibraryDeps): number {
+  const fallback = defaultSettings().stallMs
+  try {
+    const value = deps.settings?.().stallMs
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+  } catch {
+    return fallback
+  }
 }
 
 function addTotals(base: TokenTotals | undefined, next: TokenTotals): TokenTotals {

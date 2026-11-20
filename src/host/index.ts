@@ -776,6 +776,8 @@ export function apply(ctx: HostContext, options?: { workspace?: string }): void 
     // r19：项目名真源（用户命名的工作区标题）+ 老 run 的 sessionId → 工作区反查。
     // 惰性函数：注册表可能晚于 apply 激活，读的时刻才决定看到什么。
     workspaces,
+    // 历史详情成员行的停滞阈值走真设置（`settingsRepo.read()` 自身回落缺省，这里不再兜）。
+    settings: () => settingsRepo.read(),
   }
   const libraryCache = createLibraryCache(libraryDeps)
 

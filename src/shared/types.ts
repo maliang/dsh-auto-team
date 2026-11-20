@@ -1008,6 +1008,14 @@ export interface RunSummary extends RunStageCounts {
    * 旧数据/旧快照缺省时客户端退化为按 `usageTotals` 只显示合计（不自己拆六项）。
    */
   usage?: UsageCell
+  /**
+   * run 级用时单元格（`plannedAt → finishedAt`，进行中用装配时刻 `now`）。
+   *
+   * 由宿主 `bridge.ts#historyOf` 用 `runDurationOf` 生成（与快照 `runDuration` **同一个函数**，
+   * 不得另写一套），**不落盘**。缺任一时刻 / 读不到 run 状态 → 字段缺席：
+   * 不补 0、不写「不可得」占位（由客户端按既有降级策略显示）。
+   */
+  duration?: DurationCell
   /** r13：是否还有非终态任务（左栏「活跃」标记）。 */
   active?: boolean
   /**
